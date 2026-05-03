@@ -1,0 +1,256 @@
+```yaml
+scenario:
+  id: use1_internal_edge_congestion_dec2021
+  title: Internal/Main network edge congestion causing DNS and EC2 control-plane degradation
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A control-plane environment relies on an internal network for DNS, monitoring, and EC2 control-plane backends,
+    connected to the main network by edge gateway devices. An automated scaling activity triggers an unexpected
+    internal-client connection storm, overwhelming the edge and increasing cross-network latency and drops.
+    Internal DNS begins returning SERVFAIL and EC2 APIs show elevated 503 timeouts, while monitoring ingestion lags,
+    slowing mitigation.
+
+  trigger_desc: |
+    An automated capacity scaling activity for a main-network service causes many internal-network clients to
+    rapidly open and retry connections through the edge gateway, creating a sustained surge of connection attempts.
+
+  time:
+    total_minutes: 34
+    phases:
+      n: {start_min: 0, end_min: 16}
+      f: {start_min: 16, end_min: 34}
+
+  phases:
+    n:
+      desc: |
+        Cross-network connectivity is healthy: edge gateways show low drop rates and rare conntrack pressure.
+        Internal DNS health snapshots show near-zero SERVFAIL, and EC2 control-plane calls succeed with normal latency.
+        A small baseline of internal client connection failures occurs but retry backoff is conservative.
+      flows:
+        - ec2_describe_instances
+        - ec2_run_instances
+        - internal_dns_query_ok
+        - internal_client_connect_ok
+        - internal_client_connect_fail
+      manifestation:
+        - edge_gateway.nat_stats
+        - internal_dns.dns_health_normal
+        - ec2_api_frontend.http_200_describe
+        - monitoring_pipeline.metric_ingest_lag
+
+    f:
+      desc: |
+        The edge gateway becomes congested under a connection storm from internal clients, raising latency and drops
+        between the internal and main networks. This degrades foundational services hosted in the internal network:
+        internal DNS begins returning SERVFAIL and EC2 control-plane operations increasingly exceed deadlines, producing
+        503 responses on customer APIs. Monitoring ingestion lag rises, reducing operator real-time visibility and
+        slowing mitigation. DNS is later rerouted away from the congested path, which restores DNS health but leaves
+        residual edge congestion and EC2 control-plane timeouts.
+
+      events:
+        - order: 1
+          at_min: 16
+          component: autoscale_controller
+          event: |
+            Automated scaling begins and triggers a surge of internal-client connection attempts; edge gateways show
+            increased conntrack pressure and higher queueing/drops, while DNS SERVFAIL and EC2 API 503s become frequent.
+          why: |
+            A latent client backoff issue causes aggressive retries during the scaling-triggered behavior, amplifying
+            connection churn through the internal/main edge devices. This is directly observable via edge_gateway
+            pressure logs and rising DNS/API error logs; the precise client bug is partially observable.
+          flows:
+            - internal_client_connect_fail
+            - internal_dns_query_servfail
+            - ec2_describe_instances_timeout
+            - ec2_run_instances_timeout
+          rate_multipliers:
+            internal_client_connect_fail: 1.5
+            internal_dns_query_servfail: 1.3
+            ec2_describe_instances_timeout: 1.2
+            ec2_run_instances_timeout: 1.2
+            edge_gateway.conntrack_overflow: 2.0
+            monitoring_pipeline.metric_ingest_lag: 2.0
+            internal_dns.dns_health_recovered: 0.0
+          latency_multipliers:
+            ec2_describe_instances_timeout: {p50: 1.5, p95: 1.4}
+            ec2_run_instances_timeout: {p50: 1.5, p95: 1.4}
+            internal_dns_query_servfail: {p50: 1.4, p95: 1.4}
+          one_shots:
+            - ref: autoscale_controller.scale_activity_start
+              count: 1
+              hosts: [autoscale-1]
+          manifestation:
+            - autoscale_controller.scale_activity_start
+            - edge_gateway.conntrack_overflow
+            - internal_dns.reply_servfail
+            - ec2_api_frontend.http_503_describe
+            - monitoring_pipeline.metric_ingest_lag
+
+        - order: 2
+          at_min: 24
+          component: ops_tooling
+          event: |
+            Operators complete rerouting internal DNS traffic away from the congested edge path; DNS SERVFAILs stop and
+            DNS health snapshots return to low error rates, while edge congestion and EC2 API timeouts persist.
+          why: |
+            Removing a foundational high-volume cross-network dependency (DNS) reduces load on the stressed edge gateways.
+            DNS recovery is directly observable via the one-shot change marker and the switch from degraded to recovered
+            DNS health snapshots; remaining congestion is observable via continued EC2 503s and edge/monitoring warnings.
+          flows:
+            - internal_dns_query_ok
+            - ec2_describe_instances_timeout
+            - ec2_run_instances_timeout
+            - internal_client_connect_fail
+          rate_multipliers:
+            internal_dns_query_servfail: 0.0
+            internal_dns_query_ok: 0.2
+            internal_dns.dns_health_degraded: 0.0
+            internal_dns.dns_health_recovered: 1.0
+            internal_client_connect_fail: 1.2
+            edge_gateway.conntrack_overflow: 1.2
+            ec2_describe_instances_timeout: 1.0
+            ec2_run_instances_timeout: 1.0
+            monitoring_pipeline.metric_ingest_lag: 2.0
+          latency_multipliers:
+            ec2_describe_instances_timeout: {p50: 1.3, p95: 1.2}
+            ec2_run_instances_timeout: {p50: 1.3, p95: 1.2}
+          one_shots:
+            - ref: ops_tooling.dns_reroute_completed
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_tooling.dns_reroute_completed
+            - internal_dns.dns_health_recovered
+            - ec2_api_frontend.http_503_run
+            - edge_gateway.nat_stats
+
+        - order: 3
+          at_min: 30
+          component: ops_tooling
+          event: |
+            Additional edge capacity is brought online and the triggering scaling activity is disabled; edge pressure
+            and EC2 API timeout volumes decrease, but monitoring ingestion lag remains elevated and RunInstances still
+            experiences notable 503 rates.
+          why: |
+            Adding capacity reduces queueing and conntrack evictions on the edge devices, lowering effective latency and
+            drop rates. Disabling the scaling activity reduces ongoing connection churn. Improvements are directly
+            observable via lower edge pressure warnings and reduced timeout-flow rates; monitoring recovery is only
+            partial because cross-network telemetry remains delayed under residual congestion.
+          flows:
+            - internal_client_connect_fail
+            - ec2_describe_instances_timeout
+            - ec2_run_instances_timeout
+          rate_multipliers:
+            internal_client_connect_fail: 0.7
+            edge_gateway.conntrack_overflow: 0.5
+            ec2_describe_instances_timeout: 0.7
+            ec2_run_instances_timeout: 0.8
+            monitoring_pipeline.metric_ingest_lag: 1.6
+            internal_dns.dns_health_recovered: 1.0
+          latency_multipliers:
+            ec2_describe_instances_timeout: {p50: 1.15, p95: 1.1}
+            ec2_run_instances_timeout: {p50: 1.15, p95: 1.1}
+          one_shots:
+            - ref: ops_tooling.capacity_added
+              count: 1
+              hosts: [ops-1]
+            - ref: autoscale_controller.scale_activity_disabled
+              count: 1
+              hosts: [autoscale-1]
+          manifestation:
+            - ops_tooling.capacity_added
+            - autoscale_controller.scale_activity_disabled
+            - edge_gateway.conntrack_overflow
+            - ec2_api_frontend.http_503_describe
+
+      steady:
+        - component: internal_dns
+          condition: |
+            DNS errors have recovered after traffic is rerouted away from the congested path; health snapshots show low SERVFAIL.
+          user_impact: |
+            Customers and internal services are no longer blocked by internal DNS resolution failures in this region.
+          manifestation:
+            - internal_dns.dns_health_recovered
+
+        - component: edge_gateway
+          condition: |
+            Edge gateways remain partially congested: packet drops and queueing are reduced from peak but still elevated,
+            and conntrack pressure warnings continue intermittently.
+          user_impact: |
+            Cross-network dependencies remain slower and less reliable, prolonging control-plane degradation.
+          manifestation:
+            - edge_gateway.nat_stats
+            - edge_gateway.conntrack_overflow
+
+        - component: ec2_api_frontend
+          condition: |
+            EC2 control-plane requests continue to experience elevated latency and 503 UpstreamTimeouts, with RunInstances
+            more impacted than DescribeInstances.
+          user_impact: |
+            Customers see failures and delays for EC2 APIs, especially for launching new instances and dependent services
+            that require new instance provisioning.
+          manifestation:
+            - ec2_api_frontend.http_503_run
+            - ec2_api_frontend.http_503_describe
+
+        - component: monitoring_pipeline
+          condition: |
+            Monitoring ingestion remains delayed with elevated lag and some dropped samples, limiting operator real-time visibility.
+          user_impact: |
+            Operators and customers relying on monitoring see delayed metrics, complicating diagnosis and impact assessment.
+          manifestation:
+            - monitoring_pipeline.metric_ingest_lag
+
+      feedback_loops:
+        - id: retry_congestion_loop
+          desc: |
+            Connection failures/timeouts increase internal-client retries; retries increase connection churn and NAT/conntrack
+            pressure on the edge gateway, which further increases latency and failures.
+
+        - id: reduced_visibility_loop
+          desc: |
+            Monitoring ingestion lag reduces real-time visibility into edge conditions, slowing mitigation and allowing congestion
+            to persist longer.
+
+      flows:
+        - internal_client_connect_fail
+        - internal_client_connect_ok
+        - internal_dns_query_servfail
+        - ec2_describe_instances_timeout
+        - ec2_run_instances_timeout
+      manifestation:
+        - edge_gateway.conntrack_overflow
+        - internal_dns.reply_servfail
+        - internal_dns.dns_health_recovered
+        - ec2_api_frontend.http_503_describe
+        - monitoring_pipeline.metric_ingest_lag
+
+  assumptions:
+    - |-
+        Timeline compression: minutes 16/24/30 correspond to the real event’s trigger (07:30 PST), DNS reroute completion (09:28 PST),
+        and partial congestion relief (early afternoon). The scenario intentionally ends before full regional recovery to keep an end-state
+        in failure.
+    - |-
+        Failure-phase piecewise breakdown (approximate, using effective multipliers):
+        - 16–24 (8 min): peak congestion; internal_client_connect_fail ~1.5x, dns SERVFAIL flow ~1.3x, EC2 timeout flows ~1.2x;
+          conntrack_overflow and monitoring lag ~2.0x; DNS recovered-health snapshots suppressed.
+        - 24–30 (6 min): DNS rerouted; internal_dns_query_servfail suppressed to 0; DNS health switches to recovered snapshots; EC2 timeouts
+          persist; monitoring lag remains high; client connection failures still elevated.
+        - 30–34 (4 min): added capacity + scaling disabled; client failure and EC2 timeout volumes reduced but not eliminated; monitoring lag
+          improves slightly but remains elevated.
+    - |-
+        One-shots per event: event1=1 (scale start), event2=1 (DNS reroute), event3=2 (capacity added + scaling disabled).
+    - |-
+        Quantitative alignment note: edge_gateway NAT/conntrack counters are modeled as aggregate device metrics (including unmodeled
+        cross-network traffic); their numeric ranges were tightened to avoid orders-of-magnitude conflicts with the modeled flow RPMs
+        while still showing a clear spike at failure onset.
+    - |-
+        Visibility rationale: each event has at least one high-likelihood marker (one-shot change log and/or elevated background warning),
+        while the steady-state failure remains diagnosable via continued EC2 503s plus edge/monitoring warnings; DNS recovery is visible via
+        the switch to internal_dns.dns_health_recovered and the absence of internal_dns.reply_servfail after event2.
+    - |-
+        Total estimated log volume across 34 minutes: ~55k–70k logs (within 20k–100k), dominated by request-flow emissions (DNS and EC2)
+        and internal-client connection failures with retries, with edge/monitoring background logs providing corroborating time-series signals.
+```

@@ -1,0 +1,717 @@
+```yaml
+sys:
+  id: spotify_playback_popcount
+  desc: >
+    A simplified Spotify-like backend where desktop clients connect to regional Accesspoints for login,
+    discovery page rendering, and music playback. Discovery (Bartender) and some client code paths fetch
+    playlist subscriber counts from Popcount. The incident centers on a retry storm to Popcount combined
+    with verbose Accesspoint error logging, leading to I/O stalls, Accesspoint unreachability, and degraded
+    playback and login for many users.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: desktop_client
+    name: Desktop Client
+    svc: desktop-client
+    hosts: []
+    desc: >
+      End-user desktop application that sends HTTPS requests to Accesspoints. Most operations use sane
+      retry/backoff when disconnected, but a legacy Popcount fetch path retries on timeouts with no backoff.
+      During the incident, it amplifies Popcount load and later switches to exponential backoff once Accesspoints
+      are firewalled (connection failures instead of timeouts).
+    to:
+      - dst: accesspoint
+        proto: https
+        desc: Primary regional edge connection for login, discovery, and playback.
+    logs:
+      popcount_retry_no_backoff:
+        desc: Legacy retry loop for Popcount fetches with no backoff (retry storm amplifier).
+        lvl: WARN
+        msg: "retrying popcount request req_id={req_id} attempt={attempt} reason={reason}"
+        vars:
+          req_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 6]}
+          reason: {k: ch, v: ["timeout", "server_error"]}
+      popcount_conn_failed:
+        desc: Connection error when Accesspoints are unreachable/firewalled.
+        lvl: WARN
+        msg: "popcount connection failed req_id={req_id} err={err} target={target}"
+        vars:
+          req_id: {k: uuid, v: null}
+          err: {k: ch, v: ["ECONNREFUSED", "ETIMEDOUT", "ENETUNREACH"]}
+          target: {k: str, v: "host:port"}
+      client_backoff_scheduled:
+        desc: Exponential backoff scheduling when a connection attempt fails.
+        lvl: INFO
+        msg: "backoff scheduled for {op} req_id={req_id} sleep_ms={sleep_ms} attempt={attempt}"
+        vars:
+          op: {k: ch, v: ["connect_accesspoint", "popcount_fetch"]}
+          req_id: {k: uuid, v: null}
+          sleep_ms: {k: i, v: [100, 60000]}
+          attempt: {k: i, v: [2, 6]}
+    beh:
+      n:
+        desc: Client-side background logging is not modeled; logs are request-correlated.
+        emit: []
+      f:
+        desc: Client-side background logging is not modeled; logs are request-correlated.
+        emit: []
+
+  - id: accesspoint
+    name: Accesspoint Edge Proxy
+    svc: accesspoint
+    hosts: ["ap-eu-01", "ap-eu-02", "ap-eu-03", "ap-eu-04", "ap-eu-05", "ap-eu-06"]
+    desc: >
+      Regional edge servers that terminate HTTPS from clients and proxy to internal services.
+      They buffer/queue upstream requests and write logs via syslog. During the incident, Popcount timeouts
+      generate extremely verbose error logs; combined with high request queuing this drives disk I/O stalls,
+      causes the process watchdog to kill instances, and makes login/playback endpoints slow or unreachable.
+    to:
+      - dst: popcount
+        proto: grpc
+        desc: Proxies subscriber-count requests to Popcount.
+      - dst: bartender
+        proto: grpc
+        desc: Proxies discovery page requests to Bartender.
+      - dst: playback_service
+        proto: grpc
+        desc: Proxies playback session start requests to Playback Service.
+      - dst: auth_service
+        proto: grpc
+        desc: Proxies login requests to Auth Service.
+      - dst: log_collector
+        proto: tcp
+        desc: Forwards syslog output to a regional log collector (can block on disk flush).
+    logs:
+      playback_req:
+        desc: Playback start request accepted at the edge.
+        lvl: INFO
+        msg: "playback start request user={user_id} track={track_uri} req_id={req_id} trace_id={trace_id} client_ip={client_ip}"
+        vars:
+          user_id: {k: i, v: [1000000, 9000000]}
+          track_uri: {k: str, v: "spotify:track:{id}"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          client_ip: {k: ip, v: null}
+      playback_resp:
+        desc: Playback start response emitted by the edge.
+        lvl: INFO
+        msg: "playback start response req_id={req_id} status={status} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          bytes: {k: i, v: [0, 2000000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 206]}
+            dur_ms: {k: i, v: [20, 200]}
+          f:
+            status: {k: ch, v: [200, 206, 503, 504]}
+            dur_ms: {k: i, v: [80, 12000]}
+      login_req:
+        desc: Login request accepted at the edge.
+        lvl: INFO
+        msg: "login request user={user_hint} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_hint: {k: str, v: "email_hash"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      login_resp:
+        desc: Login response emitted by the edge.
+        lvl: INFO
+        msg: "login response req_id={req_id} status={status} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 401]}
+            dur_ms: {k: i, v: [30, 400]}
+          f:
+            status: {k: ch, v: [200, 401, 502, 504]}
+            dur_ms: {k: i, v: [80, 15000]}
+      login_timeout:
+        desc: Edge-level timeout before upstream completion (symptom of Accesspoint I/O stalls).
+        lvl: ERROR
+        msg: "login gateway timeout req_id={req_id} wait_ms={wait_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          wait_ms: {k: i, v: [1000, 20000]}
+      discovery_req:
+        desc: Discovery page request accepted at the edge.
+        lvl: INFO
+        msg: "discovery page request user={user_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1000000, 9000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      discovery_resp:
+        desc: Discovery page response emitted by the edge.
+        lvl: INFO
+        msg: "discovery page response req_id={req_id} status={status} dur_ms={dur_ms} source={source}"
+        vars:
+          req_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            status: {k: ch, v: [200]}
+            dur_ms: {k: i, v: [10, 250]}
+            source: {k: ch, v: ["cache"]}
+          f:
+            status: {k: ch, v: [200, 503, 504]}
+            dur_ms: {k: i, v: [50, 20000]}
+            source: {k: ch, v: ["cache", "live", "degraded_cache"]}
+      popcount_req:
+        desc: Playlist-subscribers fetch accepted at the edge.
+        lvl: INFO
+        msg: "popcount subscribers fetch playlist={playlist_uri} req_id={req_id} trace_id={trace_id}"
+        vars:
+          playlist_uri: {k: str, v: "spotify:playlist:{id}"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      popcount_resp:
+        desc: Popcount proxy response emitted by the edge.
+        lvl: INFO
+        msg: "popcount subscribers response req_id={req_id} status={status} dur_ms={dur_ms} subscriber_count={subscriber_count}"
+        vars:
+          req_id: {k: uuid, v: null}
+          subscriber_count: {k: i, v: [0, 5000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [200]}
+            dur_ms: {k: i, v: [5, 150]}
+          f:
+            status: {k: ch, v: [200, 503, 504]}
+            dur_ms: {k: i, v: [5, 15000]}
+      popcount_timeout_verbose:
+        desc: Extremely verbose timeout log written per failed attempt (I/O amplifier).
+        lvl: ERROR
+        msg: "popcount proxy timeout req_id={req_id} timeout_ms={timeout_ms} queued={queued} err={err} stack_id={stack_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          timeout_ms: {k: i, v: [1000, 20000]}
+          queued: {k: i, v: [0, 20000]}
+          err: {k: ch, v: ["upstream_timeout", "context_deadline_exceeded", "client_cancelled"]}
+          stack_id: {k: hex, v: 8}
+      io_wait_high:
+        desc: Background symptom of disk I/O stall on the Accesspoint host.
+        lvl: WARN
+        msg: "io wait high iowait_pct={iowait_pct} disk={disk} pending_writes={pending_writes}"
+        vars:
+          iowait_pct: {k: f, v: [0.0, 100.0]}
+          disk: {k: ch, v: ["/dev/nvme0n1", "/dev/sda"]}
+          pending_writes: {k: i, v: [0, 500000]}
+      syslog_flush_slow:
+        desc: Background warning when syslog flush blocks (log pipeline backpressure).
+        lvl: WARN
+        msg: "syslog flush slow flush_ms={flush_ms} queue_bytes={queue_bytes}"
+        vars:
+          flush_ms: {k: i, v: [10, 20000]}
+          queue_bytes: {k: i, v: [1000000, 800000000]}
+      queue_depth_warn:
+        desc: Background warning when upstream request queues build.
+        lvl: WARN
+        msg: "upstream request queue high upstream={upstream} depth={depth}"
+        vars:
+          upstream: {k: ch, v: ["popcount", "bartender", "playback", "auth"]}
+          depth: {k: i, v: [50, 50000]}
+      process_crash:
+        desc: One-shot crash marker when the Accesspoint process is killed or faults.
+        lvl: CRITICAL
+        msg: "process crashed signal={signal} pid={pid} reason={reason}"
+        vars:
+          signal: {k: ch, v: ["SIGKILL", "SIGABRT", "SIGSEGV"]}
+          pid: {k: i, v: [1000, 65000]}
+          reason: {k: ch, v: ["io_stall", "oom", "watchdog_timeout"]}
+      process_restart:
+        desc: One-shot restart marker when the process is brought back by a supervisor.
+        lvl: INFO
+        msg: "process started pid={pid} build={build} reason={reason}"
+        vars:
+          pid: {k: i, v: [1000, 65000]}
+          build: {k: hex, v: 7}
+          reason: {k: ch, v: ["supervisor_restart", "manual_restart"]}
+      firewall_block_applied:
+        desc: One-shot operational marker when SRE applies temporary firewall rules.
+        lvl: WARN
+        msg: "firewall rule applied action={action} src={src} dst_port={dst_port} ttl_s={ttl_s}"
+        vars:
+          action: {k: ch, v: ["DROP", "REJECT"]}
+          src: {k: ch, v: ["0.0.0.0/0", "eu_clients"]}
+          dst_port: {k: i, v: [1, 65535]}
+          ttl_s: {k: i, v: [60, 3600]}
+      hard_reset:
+        desc: One-shot marker for hard resets of unresponsive hosts.
+        lvl: WARN
+        msg: "host hard reset initiated by={by} reason={reason}"
+        vars:
+          by: {k: ch, v: ["sre_oncall", "infra_automation"]}
+          reason: {k: ch, v: ["unresponsive_io", "kernel_hang"]}
+    beh:
+      n:
+        desc: Mostly healthy; occasional small queues and rare syslog delays.
+        emit:
+          - id: queue_depth_warn
+            per_min: 0.2
+            scope: per_host
+          - id: syslog_flush_slow
+            per_min: 0.1
+            scope: per_host
+          - id: io_wait_high
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: >
+          Popcount-induced timeouts generate heavy log volume, pushing syslog flush and disk I/O into stall.
+          Queue depth warnings rise as requests pile up; some instances crash/restart (modeled as one-shots).
+        emit:
+          - id: queue_depth_warn
+            per_min: 2.0
+            scope: per_host
+          - id: syslog_flush_slow
+            per_min: 3.0
+            scope: per_host
+          - id: io_wait_high
+            per_min: 4.0
+            scope: per_host
+
+  - id: popcount
+    name: Popcount Subscriber Store
+    svc: popcount
+    hosts: ["popcount-01", "popcount-02", "popcount-03"]
+    desc: >
+      Stores subscriber lists/counts for playlists. Designed to fail fast by returning an empty list when slow,
+      but under-provisioning and increased callers (Discovery + clients) cause saturation. During the incident,
+      worker pools saturate and tail latency rises; many calls either fast-fail empty or time out upstream.
+    to:
+      - dst: log_collector
+        proto: tcp
+        desc: Emits service logs via syslog to the collector.
+      - dst: bartender
+        proto: grpc
+        desc: Response path for Bartender's Popcount calls over gRPC.
+      - dst: accesspoint
+        proto: grpc
+        desc: Response path for Accesspoint's Popcount calls over gRPC.
+    logs:
+      get_subscribers_ok:
+        desc: Successful fetch of subscriber list/count.
+        lvl: INFO
+        msg: "get subscribers ok playlist={playlist_uri} req_id={req_id} dur_ms={dur_ms} rows={rows}"
+        vars:
+          playlist_uri: {k: str, v: "spotify:playlist:{id}"}
+          req_id: {k: uuid, v: null}
+          rows: {k: i, v: [0, 5000]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [3, 120]}
+          f:
+            dur_ms: {k: i, v: [10, 20000]}
+      fast_fail_empty:
+        desc: Fast-fail behavior returning empty subscribers under pressure.
+        lvl: WARN
+        msg: "fast fail enabled returning empty subscribers playlist={playlist_uri} req_id={req_id} reason={reason}"
+        vars:
+          playlist_uri: {k: str, v: "spotify:playlist:{id}"}
+          req_id: {k: uuid, v: null}
+          reason: {k: ch, v: ["latency_budget_exceeded", "over_capacity"]}
+      threadpool_saturated:
+        desc: Background saturation marker for worker pools.
+        lvl: ERROR
+        msg: "threadpool saturated pool={pool} active={active} queued={queued} p95_ms={p95_ms}"
+        vars:
+          pool: {k: ch, v: ["http_worker", "grpc_worker"]}
+          active: {k: i, v: [50, 500]}
+          queued: {k: i, v: [500, 50000]}
+          p95_ms: {k: i, v: [50, 30000]}
+      health_unhealthy:
+        desc: Background healthcheck indicating degraded/unhealthy state.
+        lvl: WARN
+        msg: "healthcheck unhealthy status={status} latency_p95_ms={latency_p95_ms}"
+        vars:
+          status: {k: ch, v: ["DEGRADED", "UNHEALTHY"]}
+          latency_p95_ms: {k: i, v: [100, 60000]}
+    beh:
+      n:
+        desc: Generally healthy with rare saturation warnings.
+        emit:
+          - id: threadpool_saturated
+            per_min: 0.1
+            scope: per_host
+          - id: health_unhealthy
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Sustained saturation and unhealthy signals due to overload and tail latency.
+        emit:
+          - id: threadpool_saturated
+            per_min: 2.0
+            scope: per_host
+          - id: health_unhealthy
+            per_min: 1.0
+            scope: per_host
+
+  - id: bartender
+    name: Discovery Service (Bartender)
+    svc: bartender
+    hosts: ["bartender-01", "bartender-02", "bartender-03"]
+    desc: >
+      Renders discovery pages and (during the rollout) fetches playlist-related counts from Popcount.
+      A previously unknown dependency causes Bartender to contribute significantly to Popcount load.
+      When Popcount slows, Bartender logs dependency latency and per-request failures.
+    to:
+      - dst: popcount
+        proto: grpc
+        desc: Fetches playlist subscriber counts from Popcount for discovery content.
+      - dst: accesspoint
+        proto: grpc
+        desc: Returns discovery responses to Accesspoints over gRPC.
+      - dst: log_collector
+        proto: tcp
+        desc: Emits service logs via syslog to the collector.
+    logs:
+      discovery_rendered:
+        desc: Discovery page rendered successfully (often from cache).
+        lvl: INFO
+        msg: "rendered discovery page user={user_id} req_id={req_id} dur_ms={dur_ms} source={source}"
+        vars:
+          user_id: {k: i, v: [1000000, 9000000]}
+          req_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [20, 300]}
+            source: {k: ch, v: ["cache"]}
+          f:
+            dur_ms: {k: i, v: [30, 20000]}
+            source: {k: ch, v: ["cache", "live", "degraded_cache"]}
+      popcount_call_failed:
+        desc: Per-request log when Bartender cannot fetch Popcount data within budget.
+        lvl: WARN
+        msg: "popcount call failed req_id={req_id} playlist={playlist_uri} err={err} attempt_ms={attempt_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          playlist_uri: {k: str, v: "spotify:playlist:{id}"}
+          err: {k: ch, v: ["deadline_exceeded", "unavailable", "over_capacity"]}
+          attempt_ms: {k: i, v: [50, 20000]}
+      popcount_latency_warn:
+        desc: Background dependency SLI warning (tail latency / error rate).
+        lvl: WARN
+        msg: "popcount dependency slow p95_ms={p95_ms} error_rate={error_rate}"
+        vars:
+          p95_ms: {k: i, v: [50, 30000]}
+          error_rate: {k: f, v: [0.0, 1.0]}
+      cache_refresh:
+        desc: Periodic cache refresh for discovery content.
+        lvl: INFO
+        msg: "discovery cache refresh completed items={items} dur_ms={dur_ms}"
+        vars:
+          items: {k: i, v: [1000, 200000]}
+          dur_ms: {k: i, v: [50, 10000]}
+      feature_flag_update:
+        desc: One-shot marker when an operator toggles the Popcount dependency off during mitigation.
+        lvl: INFO
+        msg: "feature flag updated flag={flag} old={old} new={new} actor={actor}"
+        vars:
+          flag: {k: ch, v: ["discovery_popcount_dependency"]}
+          old: {k: ch, v: ["on", "off"]}
+          new: {k: ch, v: ["on", "off"]}
+          actor: {k: ch, v: ["sre_oncall", "bartender_oncall"]}
+    beh:
+      n:
+        desc: Serves discovery mostly from cache; Popcount dependency SLI warnings are rare.
+        emit:
+          - id: cache_refresh
+            per_min: 0.5
+            scope: per_host
+          - id: popcount_latency_warn
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Dependency latency warnings rise as Popcount degrades; cache refresh continues.
+        emit:
+          - id: cache_refresh
+            per_min: 0.5
+            scope: per_host
+          - id: popcount_latency_warn
+            per_min: 1.0
+            scope: per_host
+
+  - id: playback_service
+    name: Playback Service
+    svc: playback-service
+    hosts: ["playback-01", "playback-02", "playback-03", "playback-04"]
+    desc: >
+      Establishes playback sessions and returns stream parameters. Impacted indirectly: when Accesspoints
+      are I/O-stalled, requests arrive late and responses are delayed, creating high playback start latency.
+    to:
+      - dst: accesspoint
+        proto: grpc
+        desc: Response path to Accesspoints over gRPC.
+      - dst: log_collector
+        proto: tcp
+        desc: Emits service logs via syslog to the collector.
+    logs:
+      session_started:
+        desc: Playback session created.
+        lvl: INFO
+        msg: "stream session started user={user_id} track={track_uri} req_id={req_id} codec={codec} startup_ms={startup_ms}"
+        vars:
+          user_id: {k: i, v: [1000000, 9000000]}
+          track_uri: {k: str, v: "spotify:track:{id}"}
+          req_id: {k: uuid, v: null}
+          codec: {k: ch, v: ["aac", "ogg", "mp3"]}
+        state_vars:
+          n:
+            startup_ms: {k: i, v: [20, 200]}
+          f:
+            startup_ms: {k: i, v: [80, 12000]}
+      metrics_flush:
+        desc: Periodic metrics/log pipeline flush.
+        lvl: DEBUG
+        msg: "metrics flush series={series} dur_ms={dur_ms}"
+        vars:
+          series: {k: i, v: [100, 20000]}
+          dur_ms: {k: i, v: [1, 5000]}
+    beh:
+      n:
+        desc: Normal operations; emits periodic metrics flush.
+        emit:
+          - id: metrics_flush
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Still emits metrics flush; request-path latency increases due to edge slowness.
+        emit:
+          - id: metrics_flush
+            per_min: 0.5
+            scope: per_host
+
+  - id: auth_service
+    name: Auth Service
+    svc: auth-service
+    hosts: ["auth-01", "auth-02", "auth-03"]
+    desc: >
+      Authenticates users and issues tokens. During the incident, it is mostly healthy, but users see login
+      issues because Accesspoints are slow/unreachable; some requests time out before reaching Auth.
+    to:
+      - dst: accesspoint
+        proto: grpc
+        desc: Response path to Accesspoints over gRPC.
+      - dst: log_collector
+        proto: tcp
+        desc: Emits service logs via syslog to the collector.
+    logs:
+      login_ok:
+        desc: Successful login processed by Auth.
+        lvl: INFO
+        msg: "login ok req_id={req_id} user={user_id} method={method}"
+        vars:
+          req_id: {k: uuid, v: null}
+          user_id: {k: i, v: [1000000, 9000000]}
+          method: {k: ch, v: ["password", "oauth_refresh", "sso"]}
+      login_failed:
+        desc: Failed login due to auth reasons (not the primary incident signal).
+        lvl: WARN
+        msg: "login failed req_id={req_id} reason={reason}"
+        vars:
+          req_id: {k: uuid, v: null}
+          reason: {k: ch, v: ["invalid_credentials", "rate_limited", "backend_unavailable"]}
+      token_signing_lag:
+        desc: Background marker; usually low, can rise if the node is pressured.
+        lvl: WARN
+        msg: "token signing lag p95_ms={p95_ms} queue={queue}"
+        vars:
+          p95_ms: {k: i, v: [5, 10000]}
+          queue: {k: i, v: [0, 5000]}
+    beh:
+      n:
+        desc: Healthy with occasional token signing lag warnings.
+        emit:
+          - id: token_signing_lag
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Mostly healthy; login user impact is dominated by Accesspoint slowness.
+        emit:
+          - id: token_signing_lag
+            per_min: 0.2
+            scope: per_host
+
+  - id: log_collector
+    name: Regional Log Collector (syslog)
+    svc: log-collector
+    hosts: ["syslog-01", "syslog-02"]
+    desc: >
+      Receives syslog from Accesspoints and services and flushes to disk. During the incident, the write
+      rate spikes from verbose Accesspoint timeout logs and can increase flush latency, worsening edge
+      backpressure and I/O waits.
+    to: []
+    logs:
+      disk_sync_warn:
+        desc: Background marker when disk sync/flush becomes slow and messages may be dropped.
+        lvl: WARN
+        msg: "disk sync slow flush_ms={flush_ms} dropped_messages={dropped}"
+        vars:
+          flush_ms: {k: i, v: [10, 30000]}
+          dropped: {k: i, v: [0, 500000]}
+    beh:
+      n:
+        desc: Generally healthy; occasional sync warnings.
+        emit:
+          - id: disk_sync_warn
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Increased flush latency due to high inbound log volume from Accesspoints.
+        emit:
+          - id: disk_sync_warn
+            per_min: 1.0
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [desktop_client]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal user traffic: playback starts, logins, discovery page loads, and occasional Popcount lookups
+      proxied through Accesspoints. Popcount is usually fast, and Discovery relies on cache with minimal
+      dependency latency.
+    req:
+      - id: playback_start_ok
+        desc: Client starts music playback; Accesspoint proxies to Playback Service and returns stream params.
+        rpm: 200.0
+        path: [desktop_client, accesspoint, playback_service, accesspoint]
+        emit: [accesspoint.playback_req, playback_service.session_started, accesspoint.playback_resp]
+        latency_ms: [[5, 20], [30, 120], [2, 10]]
+        trace: true
+      - id: auth_login_ok
+        desc: Client login succeeds; Accesspoint proxies to Auth Service and returns token.
+        rpm: 70.0
+        path: [desktop_client, accesspoint, auth_service, accesspoint]
+        emit: [accesspoint.login_req, auth_service.login_ok, accesspoint.login_resp]
+        latency_ms: [[5, 20], [40, 200], [2, 10]]
+        trace: true
+      - id: discovery_page_ok
+        desc: Client loads discovery page; Accesspoint proxies to Bartender which serves cached content.
+        rpm: 110.0
+        path: [desktop_client, accesspoint, bartender, accesspoint]
+        emit: [accesspoint.discovery_req, bartender.discovery_rendered, accesspoint.discovery_resp]
+        latency_ms: [[5, 20], [25, 120], [2, 10]]
+        trace: true
+      - id: popcount_subscribers_ok
+        desc: Client fetches playlist subscribers; Accesspoint proxies to Popcount and returns list/count.
+        rpm: 90.0
+        path: [desktop_client, accesspoint, popcount, accesspoint]
+        emit: [accesspoint.popcount_req, popcount.get_subscribers_ok, accesspoint.popcount_resp]
+        latency_ms: [[5, 20], [15, 80], [2, 10]]
+        trace: true
+
+  f:
+    desc: >
+      Failure mode: Discovery rollout introduces heavy Bartender->Popcount calls, Popcount saturates, and the
+      legacy desktop Popcount retry path retries timeouts with no backoff. Accesspoints accumulate queued Popcount
+      work and emit verbose timeout logs, creating syslog/disk I/O stalls and instance crashes. A late mitigation
+      firewalls Accesspoints off briefly, converting timeouts into connection failures that trigger exponential backoff.
+    req:
+      - id: playback_start_degraded
+        desc: Playback starts but is slowed by Accesspoint responsiveness issues; tail latency grows.
+        rpm: 160.0
+        path: [desktop_client, accesspoint, playback_service, accesspoint]
+        emit: [accesspoint.playback_req, playback_service.session_started, accesspoint.playback_resp]
+        latency_ms: [[10, 60], [150, 4000], [5, 40]]
+        trace: true
+      - id: auth_login_ok
+        desc: Some logins still succeed when requests reach Auth; user-perceived slowness is dominated by edge delays.
+        rpm: 45.0
+        path: [desktop_client, accesspoint, auth_service, accesspoint]
+        emit: [accesspoint.login_req, auth_service.login_ok, accesspoint.login_resp]
+        latency_ms: [[10, 80], [60, 800], [5, 40]]
+        trace: true
+      - id: auth_login_timeout
+        desc: Login fails at the edge due to Accesspoint overload/I/O stall (upstream never completes in time).
+        rpm: 20.0
+        path: [desktop_client, accesspoint]
+        emit: [accesspoint.login_req, accesspoint.login_timeout]
+        latency_ms: [[10, 120], [1500, 15000]]
+        trace: true
+      - id: discovery_page_ok_cached
+        desc: Discovery still serves some cached content, but response time degrades.
+        rpm: 50.0
+        path: [desktop_client, accesspoint, bartender, accesspoint]
+        emit: [accesspoint.discovery_req, bartender.discovery_rendered, accesspoint.discovery_resp]
+        latency_ms: [[10, 80], [60, 1500], [5, 40]]
+        trace: true
+      - id: discovery_page_popcount_timeout
+        desc: Bartender tries to enrich discovery with Popcount data; Popcount slowness causes deadline failures and slow responses.
+        rpm: 40.0
+        path: [desktop_client, accesspoint, bartender, popcount, bartender, accesspoint]
+        emit: [accesspoint.discovery_req, bartender.popcount_call_failed, accesspoint.discovery_resp]
+        latency_ms: [[10, 80], [500, 15000], [5, 40]]
+        trace: true
+      - id: popcount_subscribers_empty_fastfail
+        desc: Popcount returns empty subscriber data quickly to keep forward progress under load.
+        rpm: 60.0
+        path: [desktop_client, accesspoint, popcount, accesspoint]
+        emit: [accesspoint.popcount_req, popcount.fast_fail_empty, accesspoint.popcount_resp]
+        latency_ms: [[10, 80], [10, 250], [5, 40]]
+        trace: true
+      - id: popcount_subscribers_timeout_retry_storm
+        desc: Popcount request times out; legacy client retries immediately with no backoff, amplifying load and logging.
+        rpm: 60.0
+        path: [desktop_client, accesspoint, popcount, accesspoint]
+        emit: [accesspoint.popcount_req, accesspoint.popcount_timeout_verbose]
+        latency_ms: [[10, 80], [1500, 20000]]
+        retry:
+          max_attempts: 6
+          expected_attempts: 4.0
+          emit_per_retry: [desktop_client.popcount_retry_no_backoff]
+          backoff_ms: [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]
+        trace: true
+      - id: popcount_subscribers_conn_refused_backoff
+        desc: After Accesspoints are blocked/unreachable, clients see connection failures and apply exponential backoff.
+        rpm: 40.0
+        path: [desktop_client, accesspoint]
+        emit: [desktop_client.popcount_conn_failed]
+        latency_ms: [[5, 50]]
+        retry:
+          max_attempts: 4
+          expected_attempts: 2.5
+          emit_per_retry: [desktop_client.client_backoff_scheduled]
+          backoff_ms: [[200, 800], [800, 3000], [3000, 12000]]
+        trace: true
+
+assumptions:
+  - >
+    Component set is a minimal causal graph based on the post-mortem: Desktop Client, Accesspoints, Popcount,
+    Discovery (Bartender), Playback, Auth, and a syslog collector. Spotify’s real architecture is larger; this model
+    focuses on the Popcount/Accesspoint retry+logging dynamics that caused playback/login impact.
+  - >
+    Accesspoints are modeled as both a proxy and the location where Popcount request queues accumulate, consistent
+    with "Popcount request queues in our Accesspoints". Excessive logging is represented as per-request timeout logs
+    (accesspoint.popcount_timeout_verbose) plus background syslog flush/disk I/O stall signals.
+  - >
+    The Popcount timeout retry-storm flow includes a return hop back to the Accesspoint in the path
+    ([desktop_client, accesspoint, popcount, accesspoint]) to reflect that the terminal timeout log is emitted
+    at the edge while waiting on Popcount rather than inside Popcount itself.
+  - >
+    The Discovery rollout is represented by the failure-state flow discovery_page_popcount_timeout (Bartender calling Popcount),
+    and a one-shot feature-flag hotfix later; after the hotfix, scenario multipliers largely suppress this flow to reflect that
+    the Bartender->Popcount enrichment was mostly removed, while Popcount remains overloaded due to client retries and backlog.
+  - >
+    Estimated normal-phase logs/min:
+    background ~= 7.2/min; flows ~= 1410/min; total ~= 1417/min over 18 min => ~25,506 lines.
+  - >
+    Failure-phase base rates are modulated by scenario events. Piecewise breakdown (effective logs/min * duration):
+    18-21m: ~1789/min * 3 => ~5,367 (io_wait/syslog suppressed; conn_refused flow suppressed);
+    21-25m: ~2187/min * 4 => ~8,749 (retry storm increases; discovery enrichment largely reduced after feature-flag);
+    25-30m: ~2514/min * 5 => ~12,568 (Accesspoint syslog+I/O stall activates; login timeouts rise; discovery enrichment near-zero);
+    30-36m: ~1594/min * 6 => ~9,563 (firewalling reduces timeout storm, activates conn-refused + backoff).
+    One-shots add ~29 lines (feature flag + crash/restart + firewall/hard reset markers). Failure total ~= ~36,277 lines.
+  - >
+    Estimated total logs over the scenario ~= 25,506 + 36,277 ~= 61,783, fitting the target range and reflecting a noisier
+    failure phase due to retries and error logging, followed by partial traffic reduction after firewalling.
+  - >
+    The scenario ends while still in a degraded/mitigation-in-progress state (firewall/backoff active, but not fully returned to
+    baseline), to satisfy the "no recovery phase" constraint while remaining faithful to the incident mechanics.
+```

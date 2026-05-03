@@ -1,0 +1,332 @@
+```yaml
+scenario:
+  id: billing_redis_readonly_auto_recharge_spike
+  title: Redis master restart wipes balances and causes repeated auto-recharge charges
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally prices billable usage events, updates in-flight balances in Redis, and records a durable ledger in a relational DB.
+    A network connectivity loss between Redis replicas and the Redis master triggers simultaneous full resynchronizations and overload.
+    The on-call response restarts the Redis master with an incorrect configuration, wiping in-flight balance data and leaving Redis effectively read-only.
+    With balances missing and writes failing, only auto-recharge-enabled accounts repeatedly charge cards until billing is taken offline; later re-enable still fails because Redis remains READONLY, causing a recurrence.
+
+  trigger_desc: |
+    Loss of network connectivity between Redis replicas and the Redis master causes all replicas to reconnect and request full synchronization at the same time.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Usage events arrive steadily and are priced/applied by the billing API.
+        Redis is writable and in-flight balances update normally, while the ledger DB records each transaction.
+        Auto-recharge occurs at a low rate and manual payments post successfully.
+      flows: [usage_billable_item_n, auto_recharge_charge_n, customer_payment_n]
+      manifestation:
+        - billing_api.health_check
+        - billing_api.pricing_lag_metric
+        - redis_master.stats
+        - ledger_db.db_health
+        - usage_ingest.ingest_backlog
+
+    f:
+      desc: |
+        Failure begins with replica disconnects and full-sync storms that overload the Redis master, causing timeouts for some billing operations.
+        A subsequent Redis master restart uses an incorrect config, fails AOF recovery, drops the balance dataset, and comes up in a read-only state.
+        With balance writes failing, most usage events fail to update in-flight balances; for the subset of accounts with auto-recharge enabled, usage triggers auto-recharge requests and repeated gateway charges that cannot be credited.
+        Billing is taken offline to stop further charges; pricing is deferred while balances are restored from the ledger, but the anomaly recurs when billing is briefly re-enabled while Redis remains READONLY.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: redis_replicas
+          event: |
+            Replicas lose connectivity to the Redis master and begin reconnecting, requesting full resynchronization.
+          why: |
+            The connectivity loss is directly observable from replica-side link-down logs; resync requests increase load on the master via replication full-sync.
+          flows: [usage_billable_item_f_slow_ok]
+          rate_multipliers:
+            redis_replicas.link_down: 20.0
+            redis_replicas.fullsync_requested: 20.0
+            redis_master.replica_sync_start: 10.0
+            redis_master.role_status: 0.0
+            billing_monitor.refund_progress: 0.0
+            usage_billable_item_f_readonly_no_recharge: 0.0
+            usage_billable_item_f_readonly_autorecharge: 0.0
+            usage_billable_item_f_readonly_autorecharge_unwritable: 0.0
+            usage_billable_item_f_offline: 0.0
+            usage_billable_item_f_timeout: 1.0
+            customer_payment_f_readonly: 0.0
+            auto_recharge_charge_f_readonly: 0.0
+            auto_recharge_declined_suspend_f: 0.0
+          latency_multipliers:
+            usage_billable_item_f_slow_ok: {p50: 1.2, p95: 1.5}
+          one_shots: []
+          manifestation:
+            - redis_replicas.link_down
+            - redis_replicas.fullsync_requested
+            - redis_master.replica_sync_start
+
+        - order: 2
+          at_min: 29
+          component: redis_master
+          event: |
+            The Redis master becomes overloaded by simultaneous replica full-sync, and a larger fraction of usage pricing times out and is deferred.
+          why: |
+            Master-side timeout/backlog logs show overload directly; billing_api sees Redis read timeouts and defers pricing for the affected subset.
+          flows: [usage_billable_item_f_timeout, usage_billable_item_f_slow_ok]
+          rate_multipliers:
+            redis_replicas.link_down: 2.0
+            redis_replicas.fullsync_requested: 2.0
+            redis_master.replica_sync_backlog: 8.0
+            redis_master.command_timeout: 6.0
+            usage_billable_item_f_timeout: 3.0
+            usage_billable_item_f_slow_ok: 0.92
+          latency_multipliers:
+            usage_billable_item_f_slow_ok: {p50: 2.0, p95: 3.0}
+          one_shots:
+            - ref: billing_monitor.alert_sent
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - redis_master.replica_sync_backlog
+            - redis_master.command_timeout
+            - billing_api.redis_get_timeout
+
+        - order: 3
+          at_min: 31
+          component: redis_master
+          event: |
+            On-call restarts the Redis master; the process fails AOF recovery and comes up as a slave of itself, leaving the node read-only and dropping in-flight balances.
+          why: |
+            The restart and recovery failure are directly observable in redis_master logs; the read-only state is corroborated by persistent READONLY errors in billing_api writes and periodic role_status.
+          flows:
+            - usage_billable_item_f_readonly_no_recharge
+            - usage_billable_item_f_readonly_autorecharge
+            - customer_payment_f_readonly
+            - auto_recharge_charge_f_readonly
+          rate_multipliers:
+            redis_master.command_timeout: 1.0
+            redis_master.role_status: 1.0
+            usage_billable_item_f_slow_ok: 0.0
+            usage_billable_item_f_timeout: 0.0
+            usage_billable_item_f_readonly_no_recharge: 1.0
+            usage_billable_item_f_readonly_autorecharge: 1.0
+            usage_billable_item_f_readonly_autorecharge_unwritable: 0.0
+            customer_payment_f_readonly: 1.0
+            auto_recharge_charge_f_readonly: 1.0
+            auto_recharge_declined_suspend_f: 1.0
+          latency_multipliers:
+            usage_billable_item_f_readonly_no_recharge: {p50: 1.0, p95: 1.2}
+            usage_billable_item_f_readonly_autorecharge: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: redis_master.restart
+              count: 1
+              hosts: [redis-master-1]
+            - ref: redis_master.aof_open_failed
+              count: 1
+              hosts: [redis-master-1]
+            - ref: redis_master.db_loaded
+              count: 1
+              hosts: [redis-master-1]
+            - ref: redis_master.role_changed
+              count: 1
+              hosts: [redis-master-1]
+          manifestation:
+            - redis_master.aof_open_failed
+            - redis_master.role_changed
+            - billing_api.balance_write_readonly
+
+        - order: 4
+          at_min: 36
+          component: billing_monitor
+          event: |
+            Monitoring detects a spike in credit-card charges and suspensions correlated with auto-recharge activity after balances were wiped.
+          why: |
+            The anomaly is observable via monitor alerts; the underlying mechanism is indirectly confirmed by increased auto-recharge execution combined with READONLY balance write failures and recharge requests on the auto-recharge-enabled subset.
+          flows: [usage_billable_item_f_readonly_autorecharge, auto_recharge_charge_f_readonly, auto_recharge_declined_suspend_f]
+          rate_multipliers:
+            usage_billable_item_f_readonly_autorecharge: 3.0
+            auto_recharge_charge_f_readonly: 3.0
+            auto_recharge_declined_suspend_f: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: billing_monitor.anomaly_detected
+              count: 1
+              hosts: [mon-1]
+            - ref: billing_monitor.alert_sent
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - billing_monitor.anomaly_detected
+            - billing_api.recharge_requested_zero_balance
+            - payment_gateway.charge_request
+            - billing_api.account_suspended
+
+        - order: 5
+          at_min: 39
+          component: billing_api
+          event: |
+            Engineers take billing offline to prevent further charges; usage pricing is deferred rather than updating balances or charging cards.
+          why: |
+            This operational mitigation is directly observable via the billing_mode_changed marker and the shift to pricing_deferred with reason=system_offline.
+          flows: [usage_billable_item_f_offline]
+          rate_multipliers:
+            usage_billable_item_f_readonly_no_recharge: 0.0
+            usage_billable_item_f_readonly_autorecharge: 0.0
+            usage_billable_item_f_readonly_autorecharge_unwritable: 0.0
+            customer_payment_f_readonly: 0.0
+            auto_recharge_charge_f_readonly: 0.0
+            auto_recharge_declined_suspend_f: 0.0
+            usage_billable_item_f_offline: 1.0
+          latency_multipliers:
+            usage_billable_item_f_offline: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: billing_api.billing_mode_changed
+              count: 1
+              hosts: [bill-1]
+          manifestation:
+            - billing_api.billing_mode_changed
+            - billing_api.pricing_deferred_offline
+
+        - order: 6
+          at_min: 45
+          component: billing_api
+          event: |
+            Billing is brought back online after restoring balances from the ledger, but Redis remains READONLY; balance writes fail again and the unsafe auto-recharge logic can trigger on an unwritable balance condition.
+          why: |
+            The ledger-based restore is partially observable (ledger writes exist, but restore actions are not logged here), while the continued Redis misconfiguration is observable via role_status and recurring READONLY errors; renewed recharge requests carry reason=balance_unwritable.
+          flows:
+            - usage_billable_item_f_readonly_no_recharge
+            - usage_billable_item_f_readonly_autorecharge_unwritable
+            - auto_recharge_charge_f_readonly
+            - customer_payment_f_readonly
+          rate_multipliers:
+            usage_billable_item_f_offline: 0.0
+            usage_billable_item_f_readonly_no_recharge: 1.0
+            usage_billable_item_f_readonly_autorecharge: 0.0
+            usage_billable_item_f_readonly_autorecharge_unwritable: 1.0
+            auto_recharge_charge_f_readonly: 1.0
+            customer_payment_f_readonly: 1.0
+            auto_recharge_declined_suspend_f: 1.0
+          latency_multipliers:
+            usage_billable_item_f_readonly_no_recharge: {p50: 1.0, p95: 1.2}
+            usage_billable_item_f_readonly_autorecharge_unwritable: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: billing_api.billing_mode_changed
+              count: 1
+              hosts: [bill-2]
+          manifestation:
+            - billing_api.billing_mode_changed
+            - redis_master.role_status
+            - billing_api.recharge_requested_balance_unwritable
+
+        - order: 7
+          at_min: 48
+          component: billing_monitor
+          event: |
+            Monitoring detects recurrence of the billing anomaly shortly after re-enable; billing is taken offline again and refund processing begins, with refund progress metrics starting to appear.
+          why: |
+            The recurrence is directly observable via anomaly alerts and renewed charge attempts; taking billing offline removes charging flows and returns the system to pricing deferral while refunds are tracked by monitoring.
+          flows: [usage_billable_item_f_offline]
+          rate_multipliers:
+            usage_billable_item_f_readonly_no_recharge: 0.0
+            usage_billable_item_f_readonly_autorecharge: 0.0
+            usage_billable_item_f_readonly_autorecharge_unwritable: 0.0
+            auto_recharge_charge_f_readonly: 0.0
+            customer_payment_f_readonly: 0.0
+            auto_recharge_declined_suspend_f: 0.0
+            usage_billable_item_f_offline: 1.0
+            billing_monitor.refund_progress: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: billing_monitor.anomaly_detected
+              count: 1
+              hosts: [mon-1]
+            - ref: billing_api.billing_mode_changed
+              count: 1
+              hosts: [bill-3]
+            - ref: billing_monitor.refund_job_started
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - billing_monitor.anomaly_detected
+            - billing_api.billing_mode_changed
+            - billing_monitor.refund_job_started
+
+      steady:
+        - component: billing_api
+          condition: |
+            Billing remains offline; incoming usage events are accepted but priced later (deferred), preventing further auto-recharge charging.
+          user_impact: |
+            Usage reports and prices lag for all customers while the system is offline; no new erroneous charges are created during this mitigation window.
+          manifestation:
+            - billing_api.pricing_deferred_offline
+            - billing_api.pricing_lag_metric
+
+        - component: redis_master
+          condition: |
+            Redis master remains in a persistent read-only/self-replication misconfiguration after the restart.
+          user_impact: |
+            If billing were re-enabled without correction, balance writes would fail and auto-recharge could reoccur for the auto-recharge-enabled subset.
+          manifestation:
+            - redis_master.role_status
+            - redis_master.stats
+
+        - component: billing_monitor
+          condition: |
+            Refund processing is underway for erroneous charges while the billing system remains offline.
+          user_impact: |
+            Impacted customers receive refunds after processing completes; some accounts may have been temporarily suspended during the spike.
+          manifestation:
+            - billing_monitor.refund_progress
+            - billing_monitor.monitor_tick
+
+      feedback_loops:
+        - id: zero_balance_recharge_loop
+          desc: |
+            When in-flight balances are wiped to zero and Redis writes are READONLY, each billable usage event for auto-recharge-enabled accounts appears underfunded.
+            That repeatedly triggers auto-recharge, which can succeed at the gateway but cannot credit the in-flight balance, sustaining the spike in charges.
+            Even after a ledger-based restore, if Redis remains READONLY and auto-recharge triggers on unwritable balances, recharge attempts can recur on re-enable.
+
+      flows:
+        - usage_billable_item_f_slow_ok
+        - usage_billable_item_f_timeout
+        - usage_billable_item_f_readonly_no_recharge
+        - usage_billable_item_f_readonly_autorecharge
+        - usage_billable_item_f_readonly_autorecharge_unwritable
+        - auto_recharge_charge_f_readonly
+        - auto_recharge_declined_suspend_f
+        - usage_billable_item_f_offline
+        - customer_payment_f_readonly
+      manifestation:
+        - redis_replicas.fullsync_requested
+        - redis_master.replica_sync_backlog
+        - redis_master.aof_open_failed
+        - billing_api.balance_write_readonly
+        - billing_api.recharge_requested_zero_balance
+        - billing_api.recharge_requested_balance_unwritable
+        - payment_gateway.charge_request
+        - billing_monitor.anomaly_detected
+        - billing_api.pricing_deferred_offline
+        - billing_monitor.refund_progress
+
+  assumptions:
+    - Time compression keeps the causal sequence but condenses many hours and multiple offline/online transitions into a 50-minute window that ends still in failure.
+    - Usage traffic is held at ~250 rpm throughout; during overload, the model shifts volume from the slow-ok usage variant into the timeout/deferred variant rather than increasing total traffic.
+    - |
+      Failure-phase piecewise volumes (approx):
+      - min 25-29 (4m): slow OK usage (~240 rpm, 5 logs/req) + timeout subset (~10 rpm, 4 logs/req) => ~5.0k logs.
+      - min 29-31 (2m): timeout subset amplified (~30 rpm) and slow-ok reduced (~221 rpm) to keep ~250 rpm total => ~2.4k logs.
+      - min 31-39 (8m): READONLY usage without auto-recharge (~245 rpm, 4 logs/req) => ~7.8k logs; auto-recharge-enabled usage (zero_balance) (~5 rpm, 5 logs/req) => ~0.2k logs; auto-recharge execution (~5 rpm, 6 logs/req; 3x from min 36) => ~0.3k logs; payments (~2 rpm, 5 logs/req) => ~0.08k logs.
+      - min 39-45 (6m): offline usage (~250 rpm, 2 logs/req) => ~3.0k logs.
+      - min 45-48 (3m): READONLY again; auto-recharge-enabled usage now uses balance_unwritable variant (~5 rpm, 5 logs/req) plus recharge execution => ~3.2k logs total including the main non-auto-recharge subset.
+      - min 48-50 (2m): offline again (~250 rpm, 2 logs/req) => ~1.0k logs; refund_progress starts (2/min global) => ~4 logs.
+    - One-shot counts per event are 0, 1, 4, 2, 1, 1, 3 (12 total) to ensure restart, anomaly detection, mode changes, and refund kickoff are always visible.
+    - Total log estimate is ~50k-75k including background metrics (pricing_lag_metric, redis stats/replication logs, monitor ticks), within the 20k-100k target; key failure signals (role_changed/role_status, READONLY errors, recharge_requested_* + gateway charges, offline deferrals) are likely to appear in a single run.
+```

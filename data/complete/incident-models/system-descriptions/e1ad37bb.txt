@@ -1,0 +1,686 @@
+```yaml
+sys:
+  id: code_hosting_dns_stack
+  desc: >
+    A code hosting service whose public DNS is served by an internal pair of caching and authoritative name servers.
+    DNS configuration is managed via a deploy/config tool that can update firewall/router ACLs and rebuild zone files
+    from an internal provisioning API. Repository traffic is routed through a routing layer to a small fileserver pool.
+    The modeled incident involves a DNS ACL/IP rollout, a bad DNS zone rebuild, and a downstream fileserver/routing degradation.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: net_edge
+    name: Edge Firewall/Router
+    svc: net-edge
+    hosts: [edge-1]
+    desc: >
+      Filters inbound/outbound DNS traffic and enforces a whitelist of permitted DNS source/destination addresses.
+      During the incident, DNS traffic is dropped due to an ACL mismatch after an IP allowlist change.
+    to:
+      - dst: dns_cache_ns
+        proto: udp
+        desc: Forwards inbound DNS queries to the caching resolver.
+    logs:
+      dns_drop:
+        desc: A DNS packet is dropped by ACL policy.
+        lvl: WARN
+        msg: "drop dns packet dst_ip={dst_ip} reason={reason} rule={rule}"
+        vars:
+          dst_ip: {k: ch, v: ["10.0.10.9"]}
+          reason: {k: ch, v: [not_whitelisted]}
+          rule: {k: ch, v: [dns_whitelist_v2]}
+      acl_update:
+        desc: ACL whitelist update is applied.
+        lvl: INFO
+        msg: "applied dns acl rule={rule} allowed_src_set={allowed_src_set} change_id={change_id}"
+        vars:
+          rule: {k: ch, v: [dns_whitelist_v2]}
+          allowed_src_set: {k: ch, v: [ns_src_ips_v2]}
+          change_id: {k: hex, v: 8}
+    beh:
+      n:
+        desc: Drops are rare during normal operations.
+        emit:
+          - id: dns_drop
+            per_min: 0.05
+            scope: global
+      f:
+        desc: During the failure, DNS drops spike until network and DNS settings are made consistent.
+        emit:
+          - id: dns_drop
+            per_min: 6.0
+            scope: global
+
+  - id: dns_cache_ns
+    name: Caching Name Server
+    svc: dns-cache
+    hosts: [dns-cache-1]
+    desc: >
+      Receives external DNS queries, forwards to the authoritative server, and caches responses.
+      Implements a small number of upstream retries; timeouts manifest as SERVFAIL to clients.
+    to:
+      - dst: dns_auth_ns
+        proto: udp
+        desc: Forwards queries to the authoritative DNS server.
+    logs:
+      query_recv:
+        desc: A DNS query is received.
+        lvl: INFO
+        msg: "recv query id={qid} qname={qname} qtype={qtype} client_ip={client_ip}"
+        vars:
+          qid: {k: i, v: [1000, 9999]}
+          qname: {k: ch, v: [github.com, api.github.com, gist.github.com, assets.github.com, provisioning.service.local]}
+          qtype: {k: ch, v: [A, AAAA, NS]}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+      upstream_retry:
+        desc: A retry is attempted against the upstream authoritative DNS.
+        lvl: WARN
+        msg: "retry upstream auth={auth} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          auth: {k: ch, v: [dns-auth-1]}
+          attempt: {k: i, v: [2, 2]}
+          backoff_ms: {k: i, v: [20, 450]}
+      query_timeout:
+        desc: Upstream authoritative DNS timed out after retries.
+        lvl: ERROR
+        msg: "upstream timeout qname={qname} waited_ms={waited_ms} rcode=SERVFAIL"
+        vars:
+          qname: {k: ch, v: [github.com, api.github.com, gist.github.com, assets.github.com, provisioning.service.local]}
+          waited_ms: {k: i, v: [900, 2200]}
+      respond_noerror:
+        desc: A successful DNS response is returned to the client.
+        lvl: INFO
+        msg: "respond qname={qname} rcode=NOERROR answer_count={answer_count} dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: [github.com, api.github.com, gist.github.com, assets.github.com, provisioning.service.local]}
+          answer_count: {k: i, v: [1, 10]}
+          dur_ms: {k: i, v: [1, 400]}
+      respond_nxdomain:
+        desc: An NXDOMAIN DNS response is returned to the client.
+        lvl: INFO
+        msg: "respond qname={qname} rcode=NXDOMAIN answer_count=0 dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: [github.com, api.github.com, gist.github.com, assets.github.com, provisioning.service.local]}
+          dur_ms: {k: i, v: [1, 200]}
+      dns_stats:
+        desc: Periodic resolver metrics snapshot over a short window (qps is queries/sec; counters are approx per-minute totals).
+        lvl: INFO
+        msg: "stats qps={qps} upstream_timeouts={upstream_timeouts} servfail={servfail} nxdomain={nxdomain}"
+        vars: {}
+        state_vars:
+          n:
+            qps: {k: i, v: [2, 7]}
+            upstream_timeouts: {k: i, v: [0, 5]}
+            servfail: {k: i, v: [0, 8]}
+            nxdomain: {k: i, v: [0, 15]}
+          f:
+            qps: {k: i, v: [2, 10]}
+            upstream_timeouts: {k: i, v: [5, 180]}
+            servfail: {k: i, v: [5, 180]}
+            nxdomain: {k: i, v: [0, 140]}
+      dns_stats_spike:
+        desc: Periodic resolver metrics snapshot during NXDOMAIN spike windows.
+        lvl: INFO
+        msg: "stats spike qps={qps} upstream_timeouts={upstream_timeouts} servfail={servfail} nxdomain={nxdomain}"
+        vars:
+          qps: {k: i, v: [2, 10]}
+          upstream_timeouts: {k: i, v: [0, 40]}
+          servfail: {k: i, v: [0, 40]}
+          nxdomain: {k: i, v: [80, 220]}
+      nxdomain_alert:
+        desc: Anomaly log emitted when NXDOMAIN volume is unusually high.
+        lvl: WARN
+        msg: "anomaly nxdomain_high nxdomain_1m={nxdomain_1m} qps={qps} top_qname={top_qname}"
+        vars:
+          nxdomain_1m: {k: i, v: [80, 220]}
+          qps: {k: i, v: [2, 10]}
+          top_qname: {k: ch, v: [github.com, api.github.com, assets.github.com]}
+      reload:
+        desc: Resolver service reload/restart is performed.
+        lvl: INFO
+        msg: "service reload requested_by={requested_by} result={result}"
+        vars:
+          requested_by: {k: ch, v: [oncall]}
+          result: {k: ch, v: [ok]}
+    beh:
+      n:
+        desc: Emits periodic stats while serving queries.
+        emit:
+          - id: dns_stats
+            per_min: 1.0
+      f:
+        desc: Emits periodic stats reflecting elevated timeouts; spike snapshots/alerts can be enabled during NXDOMAIN events.
+        emit:
+          - id: dns_stats
+            per_min: 1.0
+          - id: dns_stats_spike
+            per_min: 1.0
+          - id: nxdomain_alert
+            per_min: 0.5
+
+  - id: dns_auth_ns
+    name: Authoritative Name Server
+    svc: dns-auth
+    hosts: [dns-auth-1]
+    desc: >
+      Serves authoritative records for public zones. Zone reloads apply changes produced by the deploy tool.
+      During the incident, a corrupted zone reload caused many records to be missing and NXDOMAIN responses to spike.
+    to:
+      - dst: dns_cache_ns
+        proto: udp
+        desc: Returns DNS answers to the caching resolver.
+    logs:
+      serve_noerror:
+        desc: An authoritative NOERROR response is served.
+        lvl: INFO
+        msg: "served qname={qname} rcode=NOERROR rrset_size={rrset_size} dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: [github.com, api.github.com, gist.github.com, assets.github.com, provisioning.service.local]}
+          rrset_size: {k: i, v: [1, 6]}
+          dur_ms: {k: i, v: [1, 80]}
+      serve_nxdomain:
+        desc: An authoritative NXDOMAIN response is served.
+        lvl: INFO
+        msg: "served qname={qname} rcode=NXDOMAIN rrset_size=0 dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: [github.com, api.github.com, gist.github.com, assets.github.com, provisioning.service.local]}
+          dur_ms: {k: i, v: [1, 80]}
+      zone_reload:
+        desc: A DNS zone is reloaded from a generated zone file.
+        lvl: WARN
+        msg: "zone reload zone={zone} serial={serial} records={records} status={status}"
+        vars:
+          zone: {k: ch, v: [github.com]}
+          serial: {k: i, v: [2026010801, 2026010810]}
+        state_vars:
+          n:
+            records: {k: i, v: [5000, 8000]}
+            status: {k: ch, v: [loaded]}
+          f:
+            records: {k: i, v: [200, 2500]}
+            status: {k: ch, v: [loaded, error]}
+      auth_stats:
+        desc: Periodic authoritative server metrics snapshot over a short window (qps is queries/sec; nxdomain is approx per-minute totals).
+        lvl: INFO
+        msg: "stats qps={qps} nxdomain={nxdomain} zones={zones}"
+        vars: {}
+        state_vars:
+          n:
+            qps: {k: i, v: [1, 6]}
+            nxdomain: {k: i, v: [0, 12]}
+            zones: {k: i, v: [1, 1]}
+          f:
+            qps: {k: i, v: [1, 7]}
+            nxdomain: {k: i, v: [0, 140]}
+            zones: {k: i, v: [1, 1]}
+      auth_stats_spike:
+        desc: Periodic authoritative server metrics snapshot during NXDOMAIN spike windows.
+        lvl: INFO
+        msg: "stats spike qps={qps} nxdomain={nxdomain} zones={zones}"
+        vars:
+          qps: {k: i, v: [1, 7]}
+          nxdomain: {k: i, v: [80, 220]}
+          zones: {k: i, v: [1, 1]}
+      nxdomain_alert:
+        desc: Anomaly log emitted when the zone starts producing many NXDOMAIN answers.
+        lvl: WARN
+        msg: "zone anomaly nxdomain_high zone={zone} nxdomain_1m={nxdomain_1m} records={records}"
+        vars:
+          zone: {k: ch, v: [github.com]}
+          nxdomain_1m: {k: i, v: [80, 220]}
+          records: {k: i, v: [200, 2500]}
+      reload:
+        desc: Authoritative service reload/restart is performed.
+        lvl: INFO
+        msg: "service reload requested_by={requested_by} result={result}"
+        vars:
+          requested_by: {k: ch, v: [oncall]}
+          result: {k: ch, v: [ok]}
+    beh:
+      n:
+        desc: Emits periodic stats while serving queries.
+        emit:
+          - id: auth_stats
+            per_min: 0.5
+      f:
+        desc: Emits periodic stats; spike snapshots/alerts can be enabled when NXDOMAIN spikes after a bad zone publish.
+        emit:
+          - id: auth_stats
+            per_min: 0.5
+          - id: auth_stats_spike
+            per_min: 0.5
+          - id: nxdomain_alert
+            per_min: 0.3
+
+  - id: config_deployer
+    name: Config Management / DNS Deployer
+    svc: deployer
+    hosts: [deploy-1]
+    desc: >
+      Applies firewall and DNS configuration and can rebuild/publish DNS zones from provisioning API data.
+      During the incident, a rollout left the cache and authoritative services inconsistent and later a deploy
+      published an incomplete zone file.
+    to:
+      - dst: net_edge
+        proto: ssh
+        desc: Pushes firewall/router ACL changes.
+      - dst: dns_cache_ns
+        proto: ssh
+        desc: Applies DNS cache configuration and manages service restarts.
+      - dst: dns_auth_ns
+        proto: ssh
+        desc: Applies DNS authoritative configuration and manages service restarts.
+      - dst: provisioning_api
+        proto: https
+        desc: Fetches records used to construct zone files.
+    logs:
+      puppet_apply:
+        desc: A configuration management run is applied (target details are omitted in this simplified model).
+        lvl: INFO
+        msg: "puppet apply manifest={manifest} changed={changed} run_id={run_id}"
+        vars:
+          manifest: {k: ch, v: [dns_acl_ip_rollout]}
+          changed: {k: i, v: [1, 25]}
+          run_id: {k: hex, v: 10}
+      dns_deploy_start:
+        desc: DNS zone build/publish begins.
+        lvl: INFO
+        msg: "dns deploy start rev={rev} target={target}"
+        vars:
+          rev: {k: hex, v: 7}
+          target: {k: ch, v: [dns-auth-1]}
+      zone_build:
+        desc: Zone inputs are fetched from provisioning (or fail) prior to publishing.
+        lvl: WARN
+        msg: "zone build input api_status={api_status} items={items}"
+        vars: {}
+        state_vars:
+          n:
+            api_status: {k: ch, v: [ok]}
+            items: {k: i, v: [5000, 8000]}
+          f:
+            api_status: {k: ch, v: [dns_timeout, http_503]}
+            items: {k: i, v: [0, 400]}
+      dns_deploy_end:
+        desc: DNS zone publish completes.
+        lvl: WARN
+        msg: "dns deploy end status={status} removed_records_pct={removed_records_pct}"
+        vars: {}
+        state_vars:
+          n:
+            status: {k: ch, v: [success]}
+            removed_records_pct: {k: f, v: [0.0, 5.0]}
+          f:
+            status: {k: ch, v: [success_with_warnings]}
+            removed_records_pct: {k: f, v: [40.0, 85.0]}
+      manual_zone_restore:
+        desc: Operator manually regenerates and restores records to the zone.
+        lvl: INFO
+        msg: "manual zone restore zone={zone} records={records} serial={serial}"
+        vars:
+          zone: {k: ch, v: [github.com]}
+          records: {k: i, v: [5000, 8000]}
+          serial: {k: i, v: [2026010805, 2026010815]}
+      heartbeat:
+        desc: Deployer scheduler heartbeat.
+        lvl: DEBUG
+        msg: "scheduler heartbeat queue_depth={queue_depth}"
+        vars:
+          queue_depth: {k: i, v: [0, 5]}
+    beh:
+      n:
+        desc: Mostly idle; emits a low-rate heartbeat.
+        emit:
+          - id: heartbeat
+            per_min: 0.05
+      f:
+        desc: Mostly idle aside from operator-triggered actions; emits a low-rate heartbeat.
+        emit:
+          - id: heartbeat
+            per_min: 0.05
+
+  - id: provisioning_api
+    name: Provisioning API
+    svc: provisioning
+    hosts: [prov-1]
+    desc: >
+      Internal API used to enumerate service endpoints/records to generate DNS zone files.
+      In the incident, the zone generation step depended on functional DNS to reach this API.
+    to: []
+    logs:
+      health:
+        desc: Periodic service health log.
+        lvl: INFO
+        msg: "health ok=1 req_1m={req_1m} p95_ms={p95_ms}"
+        vars:
+          req_1m: {k: i, v: [0, 50]}
+          p95_ms: {k: i, v: [5, 120]}
+    beh:
+      n:
+        desc: Low request volume; periodic health.
+        emit:
+          - id: health
+            per_min: 0.2
+      f:
+        desc: Low request volume; periodic health.
+        emit:
+          - id: health
+            per_min: 0.2
+
+  - id: web_frontend
+    name: Web Frontend (github.com)
+    svc: web
+    hosts: [web-1, web-2]
+    desc: >
+      Serves HTTP requests for repository operations and routes to the routing layer.
+      During the incident, a subset of repository requests failed due to routing/fileserver backpressure.
+    to:
+      - dst: routing_lb
+        proto: https
+        desc: Sends repository traffic to the routing layer for backend selection.
+    logs:
+      http_req:
+        desc: HTTP request received.
+        lvl: INFO
+        msg: "http {method} {route} repo={repo} client_ip={client_ip}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/alpha.git/info/refs", "/beta.git/git-upload-pack", "/gamma.git/git-receive-pack", "/"]}
+          repo: {k: ch, v: [alpha, beta, gamma, delta, epsilon]}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+      upstream_err:
+        desc: Upstream routing/fileserver error.
+        lvl: ERROR
+        msg: "upstream failure backend={backend} repo={repo} err={err}"
+        vars:
+          backend: {k: ch, v: [fs-01, fs-02, fs-03, fs-04]}
+          repo: {k: ch, v: [alpha, beta, gamma, delta, epsilon]}
+          err: {k: ch, v: [connect_refused, timeout, reset]}
+      http_resp_ok:
+        desc: Successful HTTP completion.
+        lvl: INFO
+        msg: "http completed status=200 repo={repo} dur_ms={dur_ms}"
+        vars:
+          repo: {k: ch, v: [alpha, beta, gamma, delta, epsilon]}
+          dur_ms: {k: i, v: [20, 1500]}
+      http_resp_err:
+        desc: Error HTTP completion.
+        lvl: WARN
+        msg: "http completed status={status} repo={repo} dur_ms={dur_ms}"
+        vars:
+          status: {k: i, v: [502, 503]}
+          repo: {k: ch, v: [alpha, beta, gamma, delta, epsilon]}
+          dur_ms: {k: i, v: [50, 6000]}
+      worker_stats:
+        desc: Periodic web worker utilization snapshot.
+        lvl: INFO
+        msg: "workers busy={busy} total={total} queue={queue}"
+        vars: {}
+        state_vars:
+          n:
+            busy: {k: i, v: [5, 40]}
+            total: {k: i, v: [48, 48]}
+            queue: {k: i, v: [0, 10]}
+          f:
+            busy: {k: i, v: [10, 48]}
+            total: {k: i, v: [48, 48]}
+            queue: {k: i, v: [0, 80]}
+    beh:
+      n:
+        desc: Periodic worker stats.
+        emit:
+          - id: worker_stats
+            per_min: 0.2
+      f:
+        desc: Periodic worker stats; queue may rise during backend failures.
+        emit:
+          - id: worker_stats
+            per_min: 0.2
+
+  - id: routing_lb
+    name: Routing Layer / Fileserver Load Balancer
+    svc: routing
+    hosts: [router-1]
+    desc: >
+      Selects a fileserver backend for repo requests. When a subset of fileservers refuse connections,
+      connection attempts can build backpressure and block access to healthy backends.
+    to:
+      - dst: fileserver_pool
+        proto: tcp
+        desc: Opens connections to selected fileserver backends.
+      - dst: web_frontend
+        proto: https
+        desc: Returns errors/timeouts back to the web layer.
+    logs:
+      backend_select:
+        desc: Backend chosen for a request.
+        lvl: INFO
+        msg: "route repo={repo} backend={backend} decision={decision}"
+        vars:
+          repo: {k: ch, v: [alpha, beta, gamma, delta, epsilon]}
+          backend: {k: ch, v: [fs-01, fs-02, fs-03, fs-04]}
+          decision: {k: ch, v: [consistent_hash]}
+      conn_refused:
+        desc: Connection to backend is refused / blocked by backpressure.
+        lvl: ERROR
+        msg: "connect failed backend={backend} errno=ECONNREFUSED in_flight={in_flight} queue={queue}"
+        vars:
+          backend: {k: ch, v: [fs-01, fs-02, fs-03, fs-04]}
+          in_flight: {k: i, v: [50, 500]}
+          queue: {k: i, v: [0, 250]}
+      pool_stats:
+        desc: Periodic backend pool snapshot.
+        lvl: INFO
+        msg: "pool stats total={total} available={available} unhealthy={unhealthy}"
+        vars: {}
+        state_vars:
+          n:
+            total: {k: i, v: [4, 4]}
+            available: {k: i, v: [4, 4]}
+            unhealthy: {k: i, v: [0, 0]}
+          f:
+            total: {k: i, v: [4, 4]}
+            available: {k: i, v: [1, 4]}
+            unhealthy: {k: i, v: [0, 3]}
+      pool_degraded:
+        desc: Pool is degraded enough to trigger warning.
+        lvl: WARN
+        msg: "pool degraded unhealthy={unhealthy} available={available} reason={reason}"
+        vars:
+          unhealthy: {k: i, v: [1, 4]}
+          available: {k: i, v: [0, 3]}
+          reason: {k: ch, v: [conn_refused, backend_overload]}
+      backend_removed:
+        desc: Backend is manually removed from pool.
+        lvl: INFO
+        msg: "removed backend={backend} reason={reason}"
+        vars:
+          backend: {k: ch, v: [fs-01, fs-02, fs-03, fs-04]}
+          reason: {k: ch, v: [manual_triage, conn_refused, unhealthy]}
+    beh:
+      n:
+        desc: Periodic pool stats; degradation warnings do not normally appear.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+      f:
+        desc: Pool stats continue; degradation warnings can spike later due to backpressure.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+          - id: pool_degraded
+            per_min: 1.0
+
+  - id: fileserver_pool
+    name: Fileserver Pool
+    svc: fileserver
+    hosts: [fs-01, fs-02, fs-03, fs-04]
+    desc: >
+      Serves git object and packfile operations. During the DNS outage, runaway/hung processes increased memory usage;
+      some nodes later refused connections, forcing routing backpressure and partial repo downtime.
+    to:
+      - dst: web_frontend
+        proto: https
+        desc: Returns git operation results back to the web layer.
+    logs:
+      serve_git:
+        desc: Successfully serves a repository operation.
+        lvl: INFO
+        msg: "git op={op} repo={repo} status=200 bytes={bytes} dur_ms={dur_ms}"
+        vars:
+          op: {k: ch, v: [upload-pack, receive-pack, http-get]}
+          repo: {k: ch, v: [alpha, beta, gamma, delta, epsilon]}
+          bytes: {k: i, v: [1024, 52428800]}
+          dur_ms: {k: i, v: [5, 2500]}
+      mem_pressure:
+        desc: Resource pressure snapshot (process count and memory usage).
+        lvl: WARN
+        msg: "resource pressure procs={procs} rss_mb={rss_mb} load1={load1}"
+        vars: {}
+        state_vars:
+          n:
+            procs: {k: i, v: [80, 220]}
+            rss_mb: {k: i, v: [2048, 6144]}
+            load1: {k: f, v: [0.5, 3.5]}
+          f:
+            procs: {k: i, v: [300, 4500]}
+            rss_mb: {k: i, v: [4096, 32000]}
+            load1: {k: f, v: [2.0, 70.0]}
+      ha_stonith:
+        desc: HA daemon triggers fencing/failover on a node.
+        lvl: INFO
+        msg: "ha failover action=stonith primary={primary} secondary={secondary} reason={reason}"
+        vars:
+          primary: {k: ch, v: [fs-01, fs-02, fs-03, fs-04]}
+          secondary: {k: ch, v: [fs-01b, fs-02b, fs-03b, fs-04b]}
+          reason: {k: ch, v: [memory_exhaustion, unresponsive]}
+      kill_hung_procs:
+        desc: Operator kills hung processes to recover a node.
+        lvl: INFO
+        msg: "operator killed hung processes killed={killed} remaining={remaining}"
+        vars:
+          killed: {k: i, v: [50, 2000]}
+          remaining: {k: i, v: [50, 800]}
+    beh:
+      n:
+        desc: Low-rate resource snapshots on each fileserver.
+        emit:
+          - id: mem_pressure
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: Resource pressure snapshots become frequent and elevated.
+        emit:
+          - id: mem_pressure
+            per_min: 1.0
+            scope: per_host
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal DNS resolution and repository operations succeed with low error rates.
+    req:
+      - id: external_dns_query_ok
+        desc: External resolver queries are answered via cache->authoritative with NOERROR.
+        rpm: 240.0
+        path: [dns_cache_ns, dns_auth_ns, dns_cache_ns]
+        emit: [dns_cache_ns.query_recv, dns_auth_ns.serve_noerror, dns_cache_ns.respond_noerror]
+        latency_ms: [[1, 4], [2, 25], [2, 30]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [dns_cache_ns.upstream_retry]
+          backoff_ms: [[20, 60]]
+        trace: false
+      - id: web_repo_request_ok
+        desc: User HTTP repo operations route to a fileserver and complete successfully.
+        rpm: 140.0
+        path: [web_frontend, routing_lb, fileserver_pool, web_frontend]
+        emit: [web_frontend.http_req, routing_lb.backend_select, fileserver_pool.serve_git, web_frontend.http_resp_ok]
+        latency_ms: [[1, 3], [2, 10], [10, 600], [20, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: DNS timeouts first dominate due to a mis-applied rollout; later NXDOMAIN appears after a bad zone publish; finally repo traffic degrades due to fileserver/routing backpressure.
+    req:
+      - id: external_dns_query_timeout
+        desc: Cache fails to reach authoritative and returns SERVFAIL after retry/timeouts.
+        rpm: 180.0
+        path: [dns_cache_ns]
+        emit: [dns_cache_ns.query_recv, dns_cache_ns.query_timeout]
+        latency_ms: [[1, 4], [1100, 2200]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.8
+          emit_per_retry: [dns_cache_ns.upstream_retry]
+          backoff_ms: [[200, 450]]
+        trace: false
+      - id: external_dns_query_ok_degraded
+        desc: Some DNS queries still succeed (slowly) while the incident progresses.
+        rpm: 80.0
+        path: [dns_cache_ns, dns_auth_ns, dns_cache_ns]
+        emit: [dns_cache_ns.query_recv, dns_auth_ns.serve_noerror, dns_cache_ns.respond_noerror]
+        latency_ms: [[1, 5], [5, 80], [10, 400]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.2
+          emit_per_retry: [dns_cache_ns.upstream_retry]
+          backoff_ms: [[50, 120]]
+        trace: false
+      - id: external_dns_query_nxdomain
+        desc: DNS returns NXDOMAIN for names that should exist due to missing records in a corrupted zone.
+        rpm: 120.0
+        path: [dns_cache_ns, dns_auth_ns, dns_cache_ns]
+        emit: [dns_cache_ns.query_recv, dns_auth_ns.serve_nxdomain, dns_cache_ns.respond_nxdomain]
+        latency_ms: [[1, 4], [2, 40], [2, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: web_repo_request_ok_low
+        desc: Reduced but still-present repo traffic that succeeds (clients with cached DNS / ongoing sessions).
+        rpm: 40.0
+        path: [web_frontend, routing_lb, fileserver_pool, web_frontend]
+        emit: [web_frontend.http_req, routing_lb.backend_select, fileserver_pool.serve_git, web_frontend.http_resp_ok]
+        latency_ms: [[1, 3], [2, 15], [20, 1200], [30, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: web_repo_request_502
+        desc: Repo traffic fails because routing cannot connect to some backends under backpressure.
+        rpm: 70.0
+        path: [web_frontend, routing_lb, web_frontend]
+        emit: [web_frontend.http_req, routing_lb.conn_refused, web_frontend.upstream_err, web_frontend.http_resp_err]
+        latency_ms: [[1, 3], [10, 200], [5, 60], [50, 4000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Names/hosts are simplified to a single cache NS and a single authoritative NS, plus one edge firewall/router, while preserving the rollout bug (cache not restarted) and the ACL drop symptom."
+  - "DNS metric snapshots use qps values consistent with modeled DNS request rates (rpm/60), while counters (timeouts/servfail/nxdomain) represent approximate per-minute totals."
+  - "NXDOMAIN observability uses separate 'spike' metric templates (dns_cache_ns.dns_stats_spike, dns_auth_ns.auth_stats_spike) that can be enabled during the NXDOMAIN window while suppressing the regular stats templates to avoid overlapping/contradictory snapshots."
+  - "Failure-state regular stats templates allow residual NXDOMAIN (up to ~140/min) while spike templates focus on the NXDOMAIN window (~80..220/min)."
+  - "The provisioning-to-DNS circular dependency is modeled via deployer logs that can publish an incomplete zone, producing NXDOMAIN responses observed in authoritative/caching flow logs."
+  - "Fileserver/process exhaustion is modeled via per-host mem_pressure snapshots and routing backpressure leading to HTTP 502/503 responses for a subset of repo requests."
+  - "Normal-phase volume estimate: ~240 rpm DNS * (~3 logs + small retry overhead) + ~140 rpm web * 4 logs + small background ≈ 1.3k logs/min."
+  - "Scenario total log estimate (60-minute slice): ~55k–75k logs (fits 20k..100k) driven primarily by DNS query traffic plus moderate web traffic and per-host resource snapshots."
+  - "Visibility rationale: early failure is evident via dns_cache_ns.query_timeout and net_edge.dns_drop; the NXDOMAIN phase is evident via dns_auth_ns.zone_reload, dns_auth_ns.serve_nxdomain, and enabled spike metrics + nxdomain_alert logs; late degradation is evident via fileserver_pool.mem_pressure, routing_lb.pool_degraded/conn_refused, and web_frontend.upstream_err."
+```

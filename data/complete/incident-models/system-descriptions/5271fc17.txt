@@ -1,0 +1,705 @@
+```yaml
+sys:
+  id: bot_feature_rollout_proxy_outage_2025_11_18
+  desc: >
+    An edge network processes end-user HTTP requests through an edge gateway and a core proxy that applies security modules,
+    including Bot Management. Bot Management consumes a periodically generated "feature file" built from ClickHouse metadata
+    and distributed globally via a configuration distribution service. In this incident, a ClickHouse permission rollout
+    caused the feature generator to duplicate metadata rows, producing an oversized feature file that exceeded a hard limit
+    in the core proxy’s bot module, leading to panics and widespread HTTP 5xx.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: clickhouse_cluster
+    name: ClickHouse Cluster
+    svc: clickhouse
+    hosts: [ch-1, ch-2, ch-3]
+    desc: >
+      Analytics/metadata store queried by the bot feature-file generator. A permissions/grants rollout changes what table
+      metadata is visible, which can alter query result cardinality.
+    to:
+      - dst: bot_feature_builder
+        proto: tcp
+        desc: Returns query results to the feature builder (modeled as a response hop for path connectivity).
+    logs:
+      ch_query_start:
+        desc: Start of a metadata query used by the feature generator.
+        lvl: INFO
+        msg: "query start query_id={query_id} user={user} sql=system.columns table={table}"
+        vars:
+          query_id: {k: uuid, v: null}
+          user: {k: ch, v: [bot_feature_builder, ops_job]}
+          table: {k: ch, v: [http_requests_features]}
+      ch_query_result:
+        desc: Result summary of the metadata query.
+        lvl: INFO
+        msg: "query done query_id={query_id} rows={rows} elapsed_ms={elapsed_ms} shard={shard} dup_columns={dup_columns}"
+        vars:
+          query_id: {k: uuid, v: null}
+          rows: {k: i, v: [50, 320]}
+          elapsed_ms: {k: i, v: [10, 900]}
+          shard: {k: ch, v: [ch-1, ch-2, ch-3]}
+          dup_columns: {k: ch, v: ["true", "false"]}
+      ch_cluster_health:
+        desc: Periodic cluster health noise (unrelated to the incident).
+        lvl: INFO
+        msg: "health ok shard={shard} repl_lag_ms={repl_lag_ms} pending_merges={pending_merges}"
+        vars:
+          shard: {k: ch, v: [ch-1, ch-2, ch-3]}
+          repl_lag_ms: {k: i, v: [0, 500]}
+          pending_merges: {k: i, v: [0, 40]}
+    beh:
+      n:
+        desc: Low-rate operational noise from cluster health.
+        emit:
+          - id: ch_cluster_health
+            per_min: 0.05
+      f:
+        desc: Similar background noise during the incident.
+        emit:
+          - id: ch_cluster_health
+            per_min: 0.05
+
+  - id: bot_feature_builder
+    name: Bot Feature File Builder
+    svc: bot-feature-builder
+    hosts: [fb-1]
+    desc: >
+      Periodic job that queries ClickHouse system tables to construct the Bot Management feature configuration file and
+      enqueues it for global distribution.
+    to:
+      - dst: clickhouse_cluster
+        proto: tcp
+        desc: Executes ClickHouse queries for metadata.
+      - dst: config_distribution
+        proto: https
+        desc: Enqueues generated feature files for propagation.
+    logs:
+      build_start:
+        desc: Start of a feature-file build.
+        lvl: INFO
+        msg: "build start build_id={build_id} source=clickhouse system_table=system.columns table={table}"
+        vars:
+          build_id: {k: uuid, v: null}
+          table: {k: ch, v: [http_requests_features]}
+      build_complete_good:
+        desc: Successful build producing an expected-size feature file.
+        lvl: INFO
+        msg: "build complete build_id={build_id} file_version={file_version} features={features} file_kb={file_kb} sha={sha}"
+        vars:
+          build_id: {k: uuid, v: null}
+          file_version: {k: ch, v: [feat_good]}
+          features: {k: i, v: [55, 70]}
+          file_kb: {k: i, v: [40, 80]}
+          sha: {k: hex, v: 12}
+      build_complete_bad:
+        desc: Build completed but output is unexpectedly large due to duplicated metadata.
+        lvl: WARN
+        msg: "build complete build_id={build_id} file_version={file_version} features={features} file_kb={file_kb} dup_ratio={dup_ratio}"
+        vars:
+          build_id: {k: uuid, v: null}
+          file_version: {k: ch, v: [feat_bad]}
+          features: {k: i, v: [210, 270]}
+          file_kb: {k: i, v: [140, 240]}
+          dup_ratio: {k: f, v: [1.6, 3.5]}
+    beh:
+      n:
+        desc: No independent background emissions; logs are produced as part of publish flows.
+        emit: []
+      f:
+        desc: No independent background emissions; logs are produced as part of publish flows.
+        emit: []
+
+  - id: config_distribution
+    name: Config Distribution Service
+    svc: config-dist
+    hosts: [cd-1]
+    desc: >
+      Distributes the feature file to the fleet. Operators can pause propagation and manually insert a known-good version.
+    to:
+      - dst: core_proxy_fl2
+        proto: https
+        desc: Pushes configuration artifacts to core proxy hosts.
+    logs:
+      queued:
+        desc: A new feature file is queued for propagation.
+        lvl: INFO
+        msg: "queued artifact=bot_features file_version={file_version} size_kb={size_kb} targets={targets} queue_depth={queue_depth}"
+        vars:
+          file_version: {k: ch, v: [feat_good, feat_bad]}
+          size_kb: {k: i, v: [40, 240]}
+          targets: {k: i, v: [100, 350]}
+          queue_depth: {k: i, v: [0, 5000]}
+      push_complete:
+        desc: Propagation cycle completes to most hosts.
+        lvl: INFO
+        msg: "push complete artifact=bot_features file_version={file_version} succeeded={succeeded} failed={failed} elapsed_ms={elapsed_ms}"
+        vars:
+          file_version: {k: ch, v: [feat_good, feat_bad]}
+          succeeded: {k: i, v: [80, 350]}
+          failed: {k: i, v: [0, 40]}
+          elapsed_ms: {k: i, v: [2000, 45000]}
+      propagation_paused:
+        desc: Operator pauses automated propagation.
+        lvl: WARN
+        msg: "propagation paused artifact=bot_features reason={reason}"
+        vars:
+          reason: {k: ch, v: [bad_artifact_detected, incident_mitigation]}
+      manual_insert_good:
+        desc: Operator inserts a known-good feature file version into the queue.
+        lvl: INFO
+        msg: "manual insert artifact=bot_features file_version={file_version} source={source}"
+        vars:
+          file_version: {k: ch, v: [feat_good]}
+          source: {k: ch, v: [last_known_good, operator_upload]}
+    beh:
+      n:
+        desc: Periodic background propagation completion messages.
+        emit:
+          - id: push_complete
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Propagation continues during failure until paused by operators.
+        emit:
+          - id: push_complete
+            per_min: 0.2
+            scope: global
+
+  - id: observability_enricher
+    name: Error Enrichment / Debug Agent
+    svc: obs-enricher
+    hosts: [obs-1, obs-2]
+    desc: >
+      Automatically enriches uncaught errors with debugging context. In this incident model, enrichment is on the synchronous
+      error path for 5xx responses, so increased enrichment load contributes to end-user latency and CPU/queue pressure.
+    to:
+      - dst: core_proxy_fl2
+        proto: tcp
+        desc: Returns enrichment results to the core proxy before the proxy finalizes the response.
+    logs:
+      error_enriched:
+        desc: An uncaught error was enriched with debug context before the proxy completed the request.
+        lvl: WARN
+        msg: "enriched error err_type={err_type} stack_frames={stack_frames} enrich_ms={enrich_ms} dropped={dropped}"
+        vars:
+          err_type: {k: ch, v: [panic_unwrap, module_panic, runtime_panic]}
+          stack_frames: {k: i, v: [10, 120]}
+          enrich_ms: {k: i, v: [5, 400]}
+          dropped: {k: ch, v: ["true", "false"]}
+      queue_metrics:
+        desc: Periodic metrics about the enrichment queue.
+        lvl: INFO
+        msg: "queue metrics depth={depth} cpu_pct={cpu_pct} dropped_per_min={dropped_per_min}"
+        vars:
+          depth: {k: i, v: [0, 20000]}
+          cpu_pct: {k: i, v: [5, 100]}
+          dropped_per_min: {k: i, v: [0, 5000]}
+    beh:
+      n:
+        desc: Low background queue activity in steady state.
+        emit:
+          - id: queue_metrics
+            per_min: 0.2
+      f:
+        desc: Elevated queue activity due to frequent uncaught errors.
+        emit:
+          - id: queue_metrics
+            per_min: 2.5
+
+  - id: core_proxy_fl2
+    name: Core Proxy (FL2)
+    svc: fl2
+    hosts: [fl2-1, fl2-2, fl2-3]
+    desc: >
+      Core proxy applying customer configuration and security modules. Reads the bot feature file and enforces a hard
+      limit on the number of features; exceeding the limit results in panics and 5xx responses.
+    to:
+      - dst: observability_enricher
+        proto: tcp
+        desc: Sends error context for enrichment when uncaught errors occur.
+      - dst: edge_gateway
+        proto: tcp
+        desc: Returns responses to the edge gateway (modeled return hop for path connectivity).
+      - dst: workers_kv_gateway
+        proto: https
+        desc: Returns responses to KV gateway when KV routes via proxy (modeled return hop for path connectivity).
+    logs:
+      req_start:
+        desc: Request enters the proxy processing pipeline.
+        lvl: INFO
+        msg: "req start req_id={req_id} host={host} method={method} uri={uri} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          host: {k: str, v: "customer hostname"}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: str, v: "/path?query"}
+          trace_id: {k: hex, v: 32}
+      bot_features_over_limit:
+        desc: Bot module rejects the feature file as exceeding the hard limit (panic path).
+        lvl: ERROR
+        msg: "bot features over limit file_version={file_version} features={features} limit={limit} action=panic"
+        vars:
+          file_version: {k: ch, v: [feat_bad]}
+          features: {k: i, v: [210, 270]}
+          limit: {k: i, v: [200, 200]}
+      req_responded_200:
+        desc: Proxy successfully completes the request.
+        lvl: INFO
+        msg: "req done req_id={req_id} status=200 dur_ms={dur_ms} cache={cache} bot_score={bot_score}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 2000]}
+          cache: {k: ch, v: [HIT, MISS]}
+          bot_score: {k: i, v: [1, 99]}
+      req_responded_502:
+        desc: Proxy returns a 5xx due to upstream/origin issues (baseline noise).
+        lvl: WARN
+        msg: "req done req_id={req_id} status=502 dur_ms={dur_ms} err={err}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 2500]}
+          err: {k: ch, v: [origin_timeout, origin_reset, upstream_5xx]}
+      req_responded_503:
+        desc: Proxy returns a 5xx due to internal module failure (bot panic path).
+        lvl: ERROR
+        msg: "req done req_id={req_id} status=503 dur_ms={dur_ms} err={err}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 4000]}
+          err: {k: ch, v: [bot_module_panic, module_unavailable]}
+      req_responded_503_recovery:
+        desc: Proxy returns a 503 during recovery churn (e.g., process restarting / module temporarily unavailable).
+        lvl: WARN
+        msg: "req done req_id={req_id} status=503 dur_ms={dur_ms} err={err}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 9000]}
+          err: {k: ch, v: [process_restarting, module_unavailable]}
+      worker_panic_bg:
+        desc: Background crash/panic markers from worker threads.
+        lvl: ERROR
+        msg: "worker panic thread={thread} reason={reason}"
+        vars:
+          thread: {k: ch, v: [fl2_worker_1, fl2_worker_2, fl2_worker_3, fl2_worker_4]}
+          reason: {k: ch, v: [unwrap_err, feature_limit_exceeded]}
+      process_restart:
+        desc: Operator-initiated restart marker.
+        lvl: WARN
+        msg: "process restart requested by={by} reason={reason}"
+        vars:
+          by: {k: ch, v: [sre, incident_bot]}
+          reason: {k: ch, v: [apply_known_good_config, recover_workers]}
+    beh:
+      n:
+        desc: Rare background worker panics are not expected; normal has none in this model.
+        emit: []
+      f:
+        desc: Worker panics occur repeatedly while bad feature files are active.
+        emit:
+          - id: worker_panic_bg
+            per_min: 1.0
+
+  - id: edge_gateway
+    name: Edge HTTP/TLS Gateway
+    svc: edge-gw
+    hosts: [edge-1, edge-2]
+    desc: >
+      Terminates client connections, forwards requests to the core proxy, and serves an error page when upstream fails.
+    to:
+      - dst: core_proxy_fl2
+        proto: tcp
+        desc: Forwards HTTP requests to the core proxy.
+      - dst: synthetic_monitor
+        proto: https
+        desc: Returns probe responses to synthetic monitoring (modeled return hop for path connectivity).
+    logs:
+      edge_req_in:
+        desc: Client request received at the edge.
+        lvl: INFO
+        msg: "edge in req_id={req_id} client_ip={client_ip} host={host} method={method} uri={uri} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          client_ip: {k: ip, v: null}
+          host: {k: str, v: "customer hostname"}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: str, v: "/path?query"}
+          trace_id: {k: hex, v: 32}
+      edge_resp_out_ok:
+        desc: Successful response returned to client.
+        lvl: INFO
+        msg: "edge out req_id={req_id} status={status} bytes={bytes} dur_ms={dur_ms} colo={colo}"
+        vars:
+          req_id: {k: uuid, v: null}
+          status: {k: ch, v: ["200", "301", "304"]}
+          bytes: {k: i, v: [200, 250000]}
+          dur_ms: {k: i, v: [5, 3000]}
+          colo: {k: ch, v: [LHR, FRA, IAD, SJC]}
+      edge_resp_out_5xx:
+        desc: Error page returned to client due to upstream/internal failure.
+        lvl: WARN
+        msg: "edge out req_id={req_id} status={status} cf_error={cf_error} bytes={bytes} dur_ms={dur_ms} colo={colo}"
+        vars:
+          req_id: {k: uuid, v: null}
+          status: {k: ch, v: ["500", "502", "503", "504"]}
+          cf_error: {k: ch, v: ["520", "522", "523"]}
+          bytes: {k: i, v: [400, 12000]}
+          dur_ms: {k: i, v: [10, 6000]}
+          colo: {k: ch, v: [LHR, FRA, IAD, SJC]}
+      edge_5xx_metric:
+        desc: Periodic aggregate of 5xx volume observed at the edge.
+        lvl: INFO
+        msg: "metric http_5xx_rate_per_min={rate} colo={colo}"
+        vars:
+          rate: {k: i, v: [0, 5000]}
+          colo: {k: ch, v: [LHR, FRA, IAD, SJC]}
+    beh:
+      n:
+        desc: Baseline low 5xx metrics.
+        emit:
+          - id: edge_5xx_metric
+            per_min: 0.3
+            scope: global
+      f:
+        desc: Elevated 5xx metrics during the incident.
+        emit:
+          - id: edge_5xx_metric
+            per_min: 1.2
+            scope: global
+
+  - id: workers_kv_gateway
+    name: Workers KV Gateway
+    svc: workers-kv
+    hosts: [kv-1]
+    desc: >
+      Front-end gateway for KV operations. Normally routes through the core proxy; during mitigation can bypass it.
+    to:
+      - dst: core_proxy_fl2
+        proto: https
+        desc: Routes KV gateway requests through the core proxy (normal path).
+      - dst: access_service
+        proto: https
+        desc: Returns KV results to Access (modeled return hop for path connectivity).
+    logs:
+      kv_req:
+        desc: KV gateway receives an operation.
+        lvl: INFO
+        msg: "kv req req_id={req_id} op={op} keyspace={keyspace} key_hash={key_hash} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          op: {k: ch, v: [GET, PUT]}
+          keyspace: {k: ch, v: [sessions, config, tokens]}
+          key_hash: {k: hex, v: 8}
+          trace_id: {k: hex, v: 32}
+      kv_resp_ok_via_proxy:
+        desc: Successful KV response when routed via the core proxy.
+        lvl: INFO
+        msg: "kv resp req_id={req_id} status=200 dur_ms={dur_ms} route=via_proxy"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 2500]}
+      kv_resp_ok_bypass:
+        desc: Successful KV response when using the bypass route.
+        lvl: INFO
+        msg: "kv resp req_id={req_id} status=200 dur_ms={dur_ms} route=bypass"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 2500]}
+      kv_upstream_error:
+        desc: KV gateway failed due to upstream dependency failure.
+        lvl: WARN
+        msg: "kv resp req_id={req_id} status=502 err={err} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          err: {k: ch, v: [core_proxy_unavailable, upstream_5xx]}
+          dur_ms: {k: i, v: [10, 4000]}
+      bypass_enabled:
+        desc: Operator enables KV bypass route.
+        lvl: WARN
+        msg: "bypass enabled route=bypass reason={reason}"
+        vars:
+          reason: {k: ch, v: [incident_mitigation, reduce_dependency_on_proxy]}
+    beh:
+      n:
+        desc: No independent background emissions.
+        emit: []
+      f:
+        desc: No independent background emissions.
+        emit: []
+
+  - id: access_service
+    name: Access Authentication Service
+    svc: access
+    hosts: [access-1]
+    desc: >
+      Authentication layer that relies on KV/session/config lookups. During the proxy outage, authentication attempts fail
+      when KV cannot be reached; existing sessions are not modeled here.
+    to:
+      - dst: workers_kv_gateway
+        proto: https
+        desc: Reads session/config state from KV.
+    logs:
+      auth_request:
+        desc: Authentication attempt begins.
+        lvl: INFO
+        msg: "auth start auth_id={auth_id} user_hint={user_hint} app={app} trace_id={trace_id}"
+        vars:
+          auth_id: {k: uuid, v: null}
+          user_hint: {k: hex, v: 6}
+          app: {k: ch, v: [dashboard, customer_app]}
+          trace_id: {k: hex, v: 32}
+      auth_ok:
+        desc: Authentication succeeds.
+        lvl: INFO
+        msg: "auth ok auth_id={auth_id} dur_ms={dur_ms} method={method}"
+        vars:
+          auth_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 5000]}
+          method: {k: ch, v: [login, token_refresh]}
+      auth_failed_upstream:
+        desc: Authentication fails due to dependency error.
+        lvl: WARN
+        msg: "auth fail auth_id={auth_id} err={err} dur_ms={dur_ms}"
+        vars:
+          auth_id: {k: uuid, v: null}
+          err: {k: ch, v: [kv_unavailable, dependency_5xx]}
+          dur_ms: {k: i, v: [20, 6000]}
+      bypass_enabled:
+        desc: Operator enables Access mitigation relying on KV bypass path.
+        lvl: WARN
+        msg: "mitigation enabled component=access mode=kv_bypass reason={reason}"
+        vars:
+          reason: {k: ch, v: [incident_mitigation, restore_logins]}
+    beh:
+      n:
+        desc: No independent background emissions.
+        emit: []
+      f:
+        desc: No independent background emissions.
+        emit: []
+
+  - id: synthetic_monitor
+    name: Synthetic Monitoring
+    svc: synth-mon
+    hosts: [mon-1]
+    desc: >
+      Internal probes for end-to-end availability, used to detect elevated 5xx early in the incident and confirm partial recovery.
+    to:
+      - dst: edge_gateway
+        proto: https
+        desc: Runs probes against edge endpoints.
+    logs:
+      probe_ok:
+        desc: Probe observed success.
+        lvl: INFO
+        msg: "probe result target={target} status=200 latency_ms={latency_ms} region={region}"
+        vars:
+          target: {k: ch, v: [https_edge_root, https_edge_login]}
+          latency_ms: {k: i, v: [10, 1200]}
+          region: {k: ch, v: [eu, us]}
+      probe_fail:
+        desc: Probe observed failure.
+        lvl: WARN
+        msg: "probe result target={target} status={status} latency_ms={latency_ms} region={region}"
+        vars:
+          target: {k: ch, v: [https_edge_root, https_edge_login]}
+          status: {k: ch, v: ["503", "502"]}
+          latency_ms: {k: i, v: [20, 4000]}
+          region: {k: ch, v: [eu, us]}
+    beh:
+      n:
+        desc: No background; probes are modeled as flows.
+        emit: []
+      f:
+        desc: No background; probes are modeled as flows.
+        emit: []
+
+tracing:
+  on: true
+  origins: [edge_gateway, synthetic_monitor, workers_kv_gateway, access_service]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal request handling with periodic feature-file publishing and low baseline error volume.
+    req:
+      - id: http_user_success
+        desc: End-user HTTP requests succeed through the edge and core proxy.
+        rpm: 240.0
+        path: [edge_gateway, core_proxy_fl2, edge_gateway]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_200, edge_gateway.edge_resp_out_ok]
+        latency_ms: [[1, 3], [2, 6], [15, 80], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: http_user_baseline_5xx
+        desc: Small baseline of upstream/origin-related 5xx responses.
+        rpm: 3.0
+        path: [edge_gateway, core_proxy_fl2, edge_gateway]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_502, edge_gateway.edge_resp_out_5xx]
+        latency_ms: [[1, 3], [2, 6], [80, 600], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: kv_get_via_proxy_ok
+        desc: KV gateway operations routed via the core proxy succeed.
+        rpm: 25.0
+        path: [workers_kv_gateway, core_proxy_fl2, workers_kv_gateway]
+        emit: [workers_kv_gateway.kv_req, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_200, workers_kv_gateway.kv_resp_ok_via_proxy]
+        latency_ms: [[1, 2], [2, 6], [20, 200], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: access_auth_ok
+        desc: Access authentication attempts that perform KV lookups via the KV gateway and core proxy succeed.
+        rpm: 8.0
+        path: [access_service, workers_kv_gateway, core_proxy_fl2, workers_kv_gateway, access_service]
+        emit:
+          - access_service.auth_request
+          - workers_kv_gateway.kv_req
+          - core_proxy_fl2.req_start
+          - core_proxy_fl2.req_responded_200
+          - workers_kv_gateway.kv_resp_ok_via_proxy
+          - access_service.auth_ok
+        latency_ms: [[1, 2], [2, 6], [2, 8], [20, 250], [2, 6], [5, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: bot_feature_publish_good
+        desc: Periodic feature-file generation producing expected-size output.
+        rpm: 0.2
+        path: [bot_feature_builder, clickhouse_cluster, bot_feature_builder, config_distribution]
+        emit: [bot_feature_builder.build_start, clickhouse_cluster.ch_query_start, clickhouse_cluster.ch_query_result, bot_feature_builder.build_complete_good, config_distribution.queued]
+        latency_ms: [[1, 2], [5, 20], [10, 100], [5, 30], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: synth_probe_ok
+        desc: End-to-end synthetic probe succeeds.
+        rpm: 1.0
+        path: [synthetic_monitor, edge_gateway, core_proxy_fl2, edge_gateway, synthetic_monitor]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_200, edge_gateway.edge_resp_out_ok, synthetic_monitor.probe_ok]
+        latency_ms: [[1, 3], [2, 6], [15, 120], [2, 6], [1, 2]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+  f:
+    desc: Failure state where some feature-file publishes are oversized, causing bot module panics and widespread 5xx, with mitigations later reducing dependency impact and leaving a recovery tail.
+    req:
+      - id: http_user_ok_flap
+        desc: Portion of end-user requests that succeed when a good feature file is active (and later during partial recovery).
+        rpm: 120.0
+        path: [edge_gateway, core_proxy_fl2, edge_gateway]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_200, edge_gateway.edge_resp_out_ok]
+        latency_ms: [[1, 3], [2, 8], [25, 200], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: http_user_5xx_bot_panic
+        desc: End-user requests fail due to bot module feature-limit panic; errors are synchronously enriched, increasing latency.
+        rpm: 130.0
+        path: [edge_gateway, core_proxy_fl2, observability_enricher, core_proxy_fl2, edge_gateway]
+        emit:
+          - edge_gateway.edge_req_in
+          - core_proxy_fl2.req_start
+          - core_proxy_fl2.bot_features_over_limit
+          - observability_enricher.error_enriched
+          - core_proxy_fl2.req_responded_503
+          - edge_gateway.edge_resp_out_5xx
+        latency_ms: [[1, 3], [2, 10], [1, 5], [10, 220], [120, 1200], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: http_user_5xx_recovery_tail
+        desc: Residual 503s during recovery after mitigation/restarts (not primarily bot-feature-limit panics).
+        rpm: 0.0
+        path: [edge_gateway, core_proxy_fl2, edge_gateway]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_503_recovery, edge_gateway.edge_resp_out_5xx]
+        latency_ms: [[1, 3], [2, 10], [80, 2500], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: kv_get_via_proxy_fail
+        desc: KV gateway operations fail when routed through the core proxy during the outage.
+        rpm: 25.0
+        path: [workers_kv_gateway, core_proxy_fl2, workers_kv_gateway]
+        emit: [workers_kv_gateway.kv_req, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_503, workers_kv_gateway.kv_upstream_error]
+        latency_ms: [[1, 2], [2, 10], [50, 1200], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: kv_get_bypass_ok
+        desc: KV gateway operations succeed via bypass route that avoids the core proxy.
+        rpm: 0.0
+        path: [workers_kv_gateway]
+        emit: [workers_kv_gateway.kv_req, workers_kv_gateway.kv_resp_ok_bypass]
+        latency_ms: [[1, 2], [5, 120]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: access_auth_fail
+        desc: Access authentication attempts fail when KV lookups via the proxy-backed KV gateway fail.
+        rpm: 8.0
+        path: [access_service, workers_kv_gateway, core_proxy_fl2, workers_kv_gateway, access_service]
+        emit:
+          - access_service.auth_request
+          - workers_kv_gateway.kv_req
+          - core_proxy_fl2.req_start
+          - core_proxy_fl2.req_responded_503
+          - workers_kv_gateway.kv_upstream_error
+          - access_service.auth_failed_upstream
+        latency_ms: [[1, 2], [2, 10], [2, 10], [50, 1500], [2, 10], [5, 50]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: access_auth_ok_after_bypass
+        desc: Access authentication succeeds once KV bypass mitigation is active (KV no longer routes via the core proxy).
+        rpm: 0.0
+        path: [access_service, workers_kv_gateway, access_service]
+        emit: [access_service.auth_request, workers_kv_gateway.kv_req, workers_kv_gateway.kv_resp_ok_bypass, access_service.auth_ok]
+        latency_ms: [[1, 2], [2, 8], [15, 250], [5, 60]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: bot_feature_publish_good_f
+        desc: Feature publish cycle that produces an expected-size file (intermittent early in failure).
+        rpm: 0.1
+        path: [bot_feature_builder, clickhouse_cluster, bot_feature_builder, config_distribution]
+        emit: [bot_feature_builder.build_start, clickhouse_cluster.ch_query_start, clickhouse_cluster.ch_query_result, bot_feature_builder.build_complete_good, config_distribution.queued]
+        latency_ms: [[1, 2], [5, 20], [10, 120], [5, 40], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: bot_feature_publish_bad_f
+        desc: Feature publish cycle that produces an oversized file (dominant later in failure).
+        rpm: 0.1
+        path: [bot_feature_builder, clickhouse_cluster, bot_feature_builder, config_distribution]
+        emit: [bot_feature_builder.build_start, clickhouse_cluster.ch_query_start, clickhouse_cluster.ch_query_result, bot_feature_builder.build_complete_bad, config_distribution.queued]
+        latency_ms: [[1, 2], [5, 20], [10, 120], [5, 40], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: synth_probe_fail
+        desc: End-to-end synthetic probe observes upstream failures.
+        rpm: 1.0
+        path: [synthetic_monitor, edge_gateway, core_proxy_fl2, edge_gateway, synthetic_monitor]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_503, edge_gateway.edge_resp_out_5xx, synthetic_monitor.probe_fail]
+        latency_ms: [[1, 3], [2, 10], [80, 1200], [2, 10], [1, 2]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: synth_probe_ok_f
+        desc: End-to-end synthetic probe succeeds during partial recovery.
+        rpm: 1.0
+        path: [synthetic_monitor, edge_gateway, core_proxy_fl2, edge_gateway, synthetic_monitor]
+        emit: [edge_gateway.edge_req_in, core_proxy_fl2.req_start, core_proxy_fl2.req_responded_200, edge_gateway.edge_resp_out_ok, synthetic_monitor.probe_ok]
+        latency_ms: [[1, 3], [2, 10], [20, 400], [2, 10], [1, 2]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+assumptions:
+  - |
+    Names and architecture are simplified to an edge gateway + core proxy + bot feature-file pipeline; Pingora/origin detail is omitted because it is not causal to the incident.
+  - |
+    To keep file-version correlation consistent across builder, config distribution, and proxy logs, file_version is modeled as a small enumerated semantic token: feat_good vs feat_bad (rather than a timestamped version string).
+  - |
+    The legacy proxy engine behavior (bot score forced to zero without 5xx) is not modeled; the incident focus here is the widespread 5xx caused by FL2 bot-module panics.
+  - |
+    The “every five minutes” generation cadence is modeled as ~0.2 rpm publish flows; early failure includes a mix of good/bad publishes, later failure shifts to all-bad until operators stop automation.
+  - |
+    Failure-onset cleanliness: mitigation/recovery-only flows (kv_get_bypass_ok, access_auth_ok_after_bypass, http_user_5xx_recovery_tail) are set to 0 rpm in failure baseline so they cannot appear at incident onset; mitigations are evidenced via one-shot markers and reduced failure rates instead of sustained bypass-success request logs.
+  - |
+    A recovery tail is primarily represented by sharply reducing bot-panic request volume plus proxy restart markers, rather than by a separate high-volume recovery-tail flow.
+  - |
+    Normal traffic volume is scaled down for log generation: ~240 rpm user success plus small baseline errors; this still yields realistic phase signals and keeps total logs within target.
+  - |
+    Rough volume estimate over a 56-minute scenario: normal ~1125 logs/min * 28 min ≈ 31k; failure ~760–1515 logs/min * 28 min ≈ 38k; total ≈ 69k–75k logs including one-shots (within 20k..100k).
+  - |
+    Diagnostic visibility anchors: bot_feature_builder.build_complete_bad (features>200), core_proxy_fl2.bot_features_over_limit (limit=200), edge_gateway.edge_5xx_metric, observability_enricher.queue_metrics (latency/CPU side-effect), and synthetic_monitor.probe_ok_f confirming partial recovery.
+```

@@ -1,0 +1,546 @@
+```yaml
+sys:
+  id: wikipedia_portal_redirect_loop
+  desc: >
+    A public-facing portal serves https://www.wikipedia.org/ and is fronted by a CDN edge cache.
+    Under normal operation, the CDN serves cached 200 responses and occasionally fetches the portal origin on cache misses.
+    In this incident, a bad Apache vhost rewrite configuration made the origin respond with a self-referential 301 redirect,
+    which was then cached at the edge and gradually surfaced to users as cached 200 entries expired.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: cdn_edge
+    name: CDN Edge Cache
+    svc: edge-cache
+    hosts: [edge-eqiad-1, edge-codfw-1, edge-drmrs-1]
+    desc: >
+      Edge cache serving cached portal responses and fetching from origin on cache misses.
+      The incident is primarily visible here as a growing fraction of cached 301 responses as cached 200 objects expire.
+    to:
+      - dst: portal_apache
+        proto: https
+        desc: On cache miss, fetches the portal response from the Apache origin.
+    logs:
+      edge_access_200_hit_eqiad:
+        desc: Cached portal page served from edge in eqiad.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=eqiad status=200 cache=HIT req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 120]}
+          bytes: {k: i, v: [5000, 22000]}
+      edge_access_200_hit_codfw:
+        desc: Cached portal page served from edge in codfw.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=codfw status=200 cache=HIT req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 120]}
+          bytes: {k: i, v: [5000, 22000]}
+      edge_access_200_hit_drmrs:
+        desc: Cached portal page served from edge in drmrs.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=drmrs status=200 cache=HIT req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 120]}
+          bytes: {k: i, v: [5000, 22000]}
+
+      edge_access_200_miss_eqiad:
+        desc: Portal page served after an origin fetch in eqiad.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=eqiad status=200 cache=MISS req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [25, 350]}
+          bytes: {k: i, v: [5000, 22000]}
+      edge_access_200_miss_codfw:
+        desc: Portal page served after an origin fetch in codfw.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=codfw status=200 cache=MISS req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [25, 350]}
+          bytes: {k: i, v: [5000, 22000]}
+      edge_access_200_miss_drmrs:
+        desc: Portal page served after an origin fetch in drmrs.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=drmrs status=200 cache=MISS req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [25, 350]}
+          bytes: {k: i, v: [5000, 22000]}
+
+      edge_access_301_hit_eqiad:
+        desc: Cached 301 redirect served from edge in eqiad.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=eqiad status=301 cache=HIT req_id={req_id} dur_ms={dur_ms} location=https://www.wikipedia.org/"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [3, 80]}
+      edge_access_301_hit_codfw:
+        desc: Cached 301 redirect served from edge in codfw.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=codfw status=301 cache=HIT req_id={req_id} dur_ms={dur_ms} location=https://www.wikipedia.org/"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [3, 80]}
+      edge_access_301_hit_drmrs:
+        desc: Cached 301 redirect served from edge in drmrs.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=drmrs status=301 cache=HIT req_id={req_id} dur_ms={dur_ms} location=https://www.wikipedia.org/"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [3, 80]}
+
+      edge_access_301_miss_eqiad:
+        desc: 301 redirect served after an origin fetch (cache miss) in eqiad.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=eqiad status=301 cache=MISS req_id={req_id} dur_ms={dur_ms} location=https://www.wikipedia.org/"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 320]}
+      edge_access_301_miss_codfw:
+        desc: 301 redirect served after an origin fetch (cache miss) in codfw.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=codfw status=301 cache=MISS req_id={req_id} dur_ms={dur_ms} location=https://www.wikipedia.org/"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 320]}
+      edge_access_301_miss_drmrs:
+        desc: 301 redirect served after an origin fetch (cache miss) in drmrs.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=drmrs status=301 cache=MISS req_id={req_id} dur_ms={dur_ms} location=https://www.wikipedia.org/"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 320]}
+
+      cache_miss_eqiad:
+        desc: Edge cache miss requiring an origin fetch in eqiad.
+        lvl: INFO
+        msg: "cache miss url=https://www.wikipedia.org/ dc=eqiad origin=portal-eqiad-1 req_id={req_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+      cache_miss_codfw:
+        desc: Edge cache miss requiring an origin fetch in codfw.
+        lvl: INFO
+        msg: "cache miss url=https://www.wikipedia.org/ dc=codfw origin=portal-codfw-1 req_id={req_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+      cache_miss_drmrs:
+        desc: Edge cache miss requiring an origin fetch in drmrs.
+        lvl: INFO
+        msg: "cache miss url=https://www.wikipedia.org/ dc=drmrs origin=portal-drmrs-1 req_id={req_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+
+      edge_metric:
+        desc: Per-minute edge summary highlighting the mix of 200 vs 301 responses (aggregated view).
+        lvl: INFO
+        msg: "edge metrics s200={s200} s301={s301} hit_ratio={hit_ratio}"
+        vars:
+          s200: {k: i, v: [0, 3000]}
+          s301: {k: i, v: [0, 3000]}
+          hit_ratio: {k: f, v: [0.0, 1.0]}
+    beh:
+      n:
+        desc: Normal per-minute edge metrics with mostly 200 responses and high hit ratio.
+        emit:
+          - id: edge_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Failure per-minute edge metrics reflecting elevated 301 responses as cache expiry ramps.
+        emit:
+          - id: edge_metric
+            per_min: 1.0
+            scope: global
+
+  - id: portal_apache
+    name: Portal Apache Origin
+    svc: portal-web
+    hosts: [portal-eqiad-1, portal-codfw-1, portal-drmrs-1]
+    desc: >
+      Apache origin for www.wikipedia.org. In normal operation returns the portal page (200).
+      In failure, some hosts/DCs may still run the bad vhost rewrite configuration returning a 301 redirect to itself,
+      while others may be reverted during mitigation (modeled via separate failure-state flows).
+    to:
+      - dst: cdn_edge
+        proto: https
+        desc: Origin responses return to the edge (modeled as a return hop).
+    logs:
+      apache_access_200_eqiad:
+        desc: Origin returns the portal page successfully in eqiad.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=eqiad status=200 req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [8, 220]}
+          bytes: {k: i, v: [4500, 18000]}
+      apache_access_200_codfw:
+        desc: Origin returns the portal page successfully in codfw.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=codfw status=200 req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [8, 220]}
+          bytes: {k: i, v: [4500, 18000]}
+      apache_access_200_drmrs:
+        desc: Origin returns the portal page successfully in drmrs.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=drmrs status=200 req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [8, 220]}
+          bytes: {k: i, v: [4500, 18000]}
+
+      apache_access_301_self_eqiad:
+        desc: Origin returns a self-referential redirect in eqiad.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=eqiad status=301 location=https://www.wikipedia.org/ req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 160]}
+      apache_access_301_self_codfw:
+        desc: Origin returns a self-referential redirect in codfw.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=codfw status=301 location=https://www.wikipedia.org/ req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 160]}
+      apache_access_301_self_drmrs:
+        desc: Origin returns a self-referential redirect in drmrs.
+        lvl: INFO
+        msg: "GET https://www.wikipedia.org/ dc=drmrs status=301 location=https://www.wikipedia.org/ req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 160]}
+
+      config_snapshot:
+        desc: Periodic snapshot of the active vhost configuration revision on a host.
+        lvl: INFO
+        msg: "loaded vhost config rev={rev}"
+        vars: {}
+        state_vars:
+          n:
+            rev: {k: i, v: [1080300, 1080340]}
+          f:
+            rev: {k: i, v: [1080340, 1080357]}
+    beh:
+      n:
+        desc: Occasional config snapshot logs.
+        emit:
+          - id: config_snapshot
+            per_min: 0.05
+      f:
+        desc: Occasional config snapshot logs (may show mixed revisions during partial mitigation).
+        emit:
+          - id: config_snapshot
+            per_min: 0.05
+
+  - id: deploy_manager
+    name: Configuration Deploy Manager
+    svc: config-deploy
+    hosts: [deploy01]
+    desc: Orchestrates configuration deploys and reverts; logs deploy start and blockers.
+    to:
+      - dst: portal_apache
+        proto: ssh
+        desc: Applies configuration changes and triggers reloads on the portal origin hosts.
+    logs:
+      deploy_start_portal_revert:
+        desc: A portal-web revert deployment begins.
+        lvl: INFO
+        msg: "deploy start change=1080357-revert target=portal-web"
+        vars: {}
+      deploy_blocked_mediawiki_config:
+        desc: Deployment is blocked by unrelated mediawiki-config validation errors.
+        lvl: ERROR
+        msg: "deploy blocked change=1080357-revert reason=\"config validation errors in mediawiki-config\""
+        vars: {}
+      deploy_heartbeat:
+        desc: Periodic deploy manager heartbeat.
+        lvl: INFO
+        msg: "deploy-manager heartbeat queue_depth={queue_depth}"
+        vars:
+          queue_depth: {k: i, v: [0, 20]}
+    beh:
+      n:
+        desc: Low-rate operational heartbeat.
+        emit:
+          - id: deploy_heartbeat
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Low-rate operational heartbeat during incident response.
+        emit:
+          - id: deploy_heartbeat
+            per_min: 0.5
+            scope: global
+
+  - id: cache_purger
+    name: CDN Cache Purger
+    svc: cache-purge
+    hosts: [purge01]
+    desc: Operator tool to purge CDN caches for selected DCs.
+    to:
+      - dst: cdn_edge
+        proto: https
+        desc: Sends purge requests to the CDN edge layer.
+    logs:
+      purge_start_codfw:
+        desc: A purge request is initiated for codfw.
+        lvl: WARN
+        msg: "purge requested url=https://www.wikipedia.org/ scope=dc dc=codfw"
+        vars: {}
+      purge_done_codfw:
+        desc: Purge request completes for codfw.
+        lvl: INFO
+        msg: "purge completed url=https://www.wikipedia.org/ dc=codfw removed={removed}"
+        vars:
+          removed: {k: i, v: [500, 200000]}
+    beh:
+      n: {desc: No scheduled purge activity., emit: []}
+      f: {desc: No scheduled purge activity (purges appear as one-shot operator actions)., emit: []}
+
+  - id: ops_shell
+    name: Operator Shell / Bastion
+    svc: null
+    hosts: [bastion01]
+    desc: Used by responders to run direct origin tests bypassing the CDN cache.
+    to:
+      - dst: portal_apache
+        proto: https
+        desc: Direct HTTPS requests to the portal origin (bypassing edge cache).
+    logs:
+      curl_run_eqiad:
+        desc: Operator runs a curl-style check against the eqiad origin.
+        lvl: INFO
+        msg: "curl https://www.wikipedia.org/ dc=eqiad follow_redirects=--location req_id={req_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+    beh:
+      n: {desc: No routine origin probes configured in normal operation., emit: []}
+      f: {desc: Ad-hoc probes happen via request flows (not periodic background)., emit: []}
+
+  - id: ops_chat
+    name: Ops Chat / User Reports
+    svc: null
+    hosts: [ops01]
+    desc: Captures external user reports that trigger incident response.
+    to:
+      - dst: status_page
+        proto: https
+        desc: Links to status page updates shared with users.
+    logs:
+      user_report:
+        desc: External report of portal unavailability due to redirect loops.
+        lvl: WARN
+        msg: "user report channel={channel} symptom=\"{symptom}\" url=https://www.wikipedia.org/"
+        vars:
+          channel: {k: ch, v: [social_media, phabricator, email]}
+          symptom: {k: ch, v: ["Too Many Redirects", "portal fails to load", "Wikipedia is down"]}
+    beh:
+      n: {desc: No user-report logs in normal operation., emit: []}
+      f: {desc: User-report logs appear as one-shot markers when the incident is detected., emit: []}
+
+  - id: status_page
+    name: Public Status Page
+    svc: status
+    hosts: [status01]
+    desc: Human-updated incident status entries.
+    to: []
+    logs:
+      status_update_investigating:
+        desc: Incident status update posted (investigating).
+        lvl: INFO
+        msg: "status page update state=investigating summary=\"Investigating excessive redirects on www.wikipedia.org\""
+        vars: {}
+    beh:
+      n: {desc: No modeled background updates., emit: []}
+      f: {desc: Updates appear as one-shot operational actions., emit: []}
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Portal traffic is served mostly from CDN cache as HTTP 200.
+      A small percentage of requests miss cache and fetch from the Apache origin, which also returns 200.
+    req:
+      - id: portal_eqiad_hit_200_n
+        desc: Portal home served from edge cache in eqiad.
+        rpm: 700
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_200_hit_eqiad]
+        latency_ms: [[10, 70]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_eqiad_miss_200_n
+        desc: Cache miss in eqiad; edge fetches origin and serves 200.
+        rpm: 35
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_eqiad, portal_apache.apache_access_200_eqiad, cdn_edge.edge_access_200_miss_eqiad]
+        latency_ms: [[2, 8], [25, 140], [40, 320]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: portal_codfw_hit_200_n
+        desc: Portal home served from edge cache in codfw.
+        rpm: 350
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_200_hit_codfw]
+        latency_ms: [[10, 70]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_codfw_miss_200_n
+        desc: Cache miss in codfw; edge fetches origin and serves 200.
+        rpm: 18
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_codfw, portal_apache.apache_access_200_codfw, cdn_edge.edge_access_200_miss_codfw]
+        latency_ms: [[2, 8], [25, 140], [40, 320]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: portal_drmrs_hit_200_n
+        desc: Portal home served from edge cache in drmrs.
+        rpm: 180
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_200_hit_drmrs]
+        latency_ms: [[10, 70]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_drmrs_miss_200_n
+        desc: Cache miss in drmrs; edge fetches origin and serves 200.
+        rpm: 9
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_drmrs, portal_apache.apache_access_200_drmrs, cdn_edge.edge_access_200_miss_drmrs]
+        latency_ms: [[2, 8], [25, 140], [40, 320]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: ops_curl_origin_n
+        desc: No routine direct-origin probing in normal operation.
+        rpm: 0
+        path: [ops_shell, portal_apache]
+        emit: [ops_shell.curl_run_eqiad, portal_apache.apache_access_200_eqiad]
+        latency_ms: [[1, 5], [15, 80]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      As cached 200 entries expire, the edge begins caching and serving 301 responses coming from the misconfigured origin.
+      Some users still receive cached 200s while others receive cached 301s, making reproduction inconsistent.
+      During mitigation, one DC (codfw) may be reverted so that new cache misses fetch 200 again (modeled as a separate miss-200 flow).
+    req:
+      - id: portal_eqiad_hit_200_f
+        desc: eqiad edge still serves some cached 200 portal pages (pre-expiry entries).
+        rpm: 700
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_200_hit_eqiad]
+        latency_ms: [[10, 70]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_eqiad_hit_301_f
+        desc: eqiad edge serves cached 301 redirect loops to clients.
+        rpm: 30
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_301_hit_eqiad]
+        latency_ms: [[6, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_eqiad_miss_301_f
+        desc: eqiad cache misses fetch a 301 from origin (bad config) and serve/cache it.
+        rpm: 10
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_eqiad, portal_apache.apache_access_301_self_eqiad, cdn_edge.edge_access_301_miss_eqiad]
+        latency_ms: [[2, 8], [15, 110], [35, 260]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: portal_codfw_hit_200_f
+        desc: codfw edge serves cached 200 portal pages.
+        rpm: 350
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_200_hit_codfw]
+        latency_ms: [[10, 70]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_codfw_hit_301_f
+        desc: codfw edge serves cached 301 redirect loops to clients.
+        rpm: 10
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_301_hit_codfw]
+        latency_ms: [[6, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_codfw_miss_301_f
+        desc: codfw cache misses fetch a 301 from origin and serve/cache it (pre-revert behavior).
+        rpm: 5
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_codfw, portal_apache.apache_access_301_self_codfw, cdn_edge.edge_access_301_miss_codfw]
+        latency_ms: [[2, 8], [15, 110], [35, 260]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_codfw_miss_200_f
+        desc: codfw cache misses fetch a 200 from origin and serve/cache it (post-revert behavior).
+        rpm: 18
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_codfw, portal_apache.apache_access_200_codfw, cdn_edge.edge_access_200_miss_codfw]
+        latency_ms: [[2, 8], [25, 140], [40, 320]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: portal_drmrs_hit_200_f
+        desc: drmrs edge serves cached 200 portal pages.
+        rpm: 200
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_200_hit_drmrs]
+        latency_ms: [[10, 70]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_drmrs_hit_301_f
+        desc: drmrs edge serves cached 301 redirect loops to clients.
+        rpm: 20
+        path: [cdn_edge]
+        emit: [cdn_edge.edge_access_301_hit_drmrs]
+        latency_ms: [[6, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: portal_drmrs_miss_301_f
+        desc: drmrs cache misses fetch a 301 from origin and serve/cache it.
+        rpm: 5
+        path: [cdn_edge, portal_apache, cdn_edge]
+        emit: [cdn_edge.cache_miss_drmrs, portal_apache.apache_access_301_self_drmrs, cdn_edge.edge_access_301_miss_drmrs]
+        latency_ms: [[2, 8], [15, 110], [35, 260]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: ops_curl_origin_f
+        desc: Responders test the origin directly (bypassing CDN), observing the self-redirect.
+        rpm: 1.0
+        path: [ops_shell, portal_apache]
+        emit: [ops_shell.curl_run_eqiad, portal_apache.apache_access_301_self_eqiad]
+        latency_ms: [[1, 6], [10, 90]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - |
+    The real incident ramped over many hours due to CDN TTLs; this model compresses it into a 44-minute window while preserving the causal core (bad Apache config + cache-expiry ramp + partial mitigation).
+  - |
+    Partial mitigation in codfw is modeled by adding a failure-state flow where codfw cache misses fetch a 200 (portal_codfw_miss_200_f) after a revert, while eqiad continues to fetch/serve 301 on misses.
+  - |
+    portal_apache.config_snapshot uses a mixed revision range in failure ([1080340, 1080357]) to allow partial rollout/revert visibility without requiring per-DC state.
+  - |
+    Normal-phase volume estimate: ~1418 logs/min (mostly cdn_edge hit access logs plus miss chains; ~1/min global edge_metric; ~0.15/min config snapshots; ~0.5/min deploy heartbeat).
+  - |
+    Total volume estimate for a typical run: ~58k–75k logs across 44 minutes, dominated by edge access logs at ~1200–1600 rpm with occasional cache-miss/origin chains and low-rate operational markers.
+  - |
+    Diagnostic visibility relies on: rising cdn_edge.edge_access_301_hit_* per DC, cache-miss chains showing portal_apache.apache_access_301_self_*, the codfw recovery signal via portal_codfw_miss_200_f (edge_access_200_miss_codfw + apache_access_200_codfw), and a few responder/operator one-shots (user reports, status update, purge, deploy blocked).
+```

@@ -1,0 +1,421 @@
+```yaml
+sys:
+  id: tq_cluster_startup_logging_stall
+  desc: >
+    A large MMO game cluster runs on many worker nodes coordinated by a master orchestrator ("Polaris").
+    During maintenance and deployments, all nodes must advance through startup stages (-4..0) before the cluster opens to players.
+    Nodes load sovereignty campaign data during stage -1 and emit developer-oriented logs to a central log collector.
+    In this incident model, a specific "campaign" logging channel becomes backpressured, causing nodes to stall and miss heartbeats so the cluster cannot complete startup.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: login_gateway
+    name: Login Gateway
+    svc: tq-login
+    hosts: [gw-01, gw-02]
+    desc: Terminates client login traffic and routes authenticated sessions to a worker node. During downtime it serves a maintenance response.
+    to:
+      - dst: game_node
+        proto: tcp
+        desc: Forwards accepted sessions to a selected worker node.
+    logs:
+      login_ok:
+        desc: Successful login request handled by the gateway.
+        lvl: INFO
+        msg: "login user={user_id} result=OK node={node} ms={ms}"
+        vars:
+          user_id: {k: i, v: [1000000, 9999999]}
+          node: {k: i, v: [1, 250]}
+          ms: {k: i, v: [5, 300]}
+      login_maintenance:
+        desc: Login rejected because the cluster is in maintenance mode.
+        lvl: WARN
+        msg: "login user={user_id} rejected: maintenance"
+        vars:
+          user_id: {k: i, v: [1000000, 9999999]}
+    beh:
+      n:
+        desc: No background logging beyond request logs.
+        emit: []
+      f:
+        desc: No background logging beyond request logs.
+        emit: []
+
+  - id: ops_console
+    name: Operations Console
+    svc: tq-ops
+    hosts: [ops-01]
+    desc: Operator console used to trigger cluster startup/reboots and run live diagnostic commands.
+    to:
+      - dst: polaris_master
+        proto: tcp
+        desc: Sends administrative commands to the Polaris orchestrator.
+    logs:
+      cmd_startup:
+        desc: Operator initiates a cluster startup sequence.
+        lvl: INFO
+        msg: "ops command: startup cluster={cluster}"
+        vars:
+          cluster: {k: ch, v: [tq]}
+      cmd_reboot:
+        desc: Operator requests a full cluster reboot.
+        lvl: WARN
+        msg: "ops command: reboot cluster={cluster}"
+        vars:
+          cluster: {k: ch, v: [tq]}
+      cmd_load_campaigns:
+        desc: Operator triggers campaign loading across all nodes via a live console command.
+        lvl: WARN
+        msg: "ops console: load_campaigns scope=all_nodes"
+        vars: {}
+      audit_tick:
+        desc: Low-rate audit tick from the ops console.
+        lvl: DEBUG
+        msg: "ops audit tick ok"
+        vars: {}
+    beh:
+      n:
+        desc: Periodic audit noise.
+        emit:
+          - id: audit_tick
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Periodic audit noise continues during incident handling.
+        emit:
+          - id: audit_tick
+            per_min: 0.3
+            scope: global
+
+  - id: deployment_tool
+    name: Deployment Tool
+    svc: tq-deploy
+    hosts: [deploy-01]
+    desc: Pushes build packages to the cluster prior to startup and records deploy outcomes.
+    to:
+      - dst: game_node
+        proto: winrm
+        desc: Pushes packages and triggers service restarts on worker nodes.
+      - dst: polaris_master
+        proto: tcp
+        desc: Notifies the orchestrator that a deploy is complete.
+    logs:
+      deploy_timeout:
+        desc: Deploy attempt times out mid-transfer.
+        lvl: ERROR
+        msg: "deploy failed: timeout uploading package={pkg} cluster={cluster}"
+        vars:
+          pkg: {k: ch, v: [aegis_hotfix_1]}
+          cluster: {k: ch, v: [tq]}
+      deploy_complete:
+        desc: Deploy completes successfully.
+        lvl: INFO
+        msg: "deploy complete package={pkg} cluster={cluster} ms={ms}"
+        vars:
+          pkg: {k: ch, v: [aegis_hotfix_1]}
+          cluster: {k: ch, v: [tq]}
+          ms: {k: i, v: [60000, 900000]}
+    beh:
+      n:
+        desc: Deployment tool is mostly idle.
+        emit: []
+      f:
+        desc: Deployment tool is mostly idle between deploy attempts.
+        emit: []
+
+  - id: polaris_master
+    name: Polaris Orchestrator
+    svc: tq-polaris
+    hosts: [tq-polaris-01]
+    desc: Master node that coordinates startup stages and requires all nodes to reach stage 0 before declaring the cluster ready.
+    to:
+      - dst: game_node
+        proto: tcp
+        desc: Sends stage-advance instructions and receives node status/heartbeats.
+    logs:
+      cluster_ready:
+        desc: Periodic marker that the cluster is running normally.
+        lvl: INFO
+        msg: "cluster ready stage=0 online_nodes={online_nodes}"
+        vars:
+          online_nodes: {k: i, v: [200, 250]}
+      stage_report_rcvd:
+        desc: A worker node reports its current startup stage to Polaris.
+        lvl: INFO
+        msg: "stage report from node={node} stage={stage}"
+        vars:
+          node: {k: i, v: [1, 250]}
+          stage: {k: i, v: [-4, 0]}
+      startup_waiting:
+        desc: Polaris is waiting for nodes to complete startup stages; summarizes blockers.
+        lvl: WARN
+        msg: "startup waiting stage={stage} waiting_nodes={waiting_nodes} stuck_nodes={stuck_nodes} dead_nodes={dead_nodes}"
+        vars:
+          stage: {k: i, v: [-4, 0]}
+          waiting_nodes: {k: i, v: [0, 250]}
+          stuck_nodes: {k: i, v: [0, 250]}
+          dead_nodes: {k: i, v: [0, 250]}
+      node_dead_detected:
+        desc: Polaris marks a node dead after missing heartbeats and triggers remapping.
+        lvl: ERROR
+        msg: "node marked dead node={node} reason=heartbeat_timeout remap_systems={systems}"
+        vars:
+          node: {k: i, v: [1, 250]}
+          systems: {k: i, v: [1, 80]}
+    beh:
+      n:
+        desc: Polaris periodically emits a ready marker while the cluster is healthy.
+        emit:
+          - id: cluster_ready
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During failed startup, Polaris emits waiting summaries; node-death detections can appear once instability sets in.
+        emit:
+          - id: startup_waiting
+            per_min: 1.0
+            scope: global
+          - id: node_dead_detected
+            per_min: 0.1
+            scope: global
+
+  - id: game_node
+    name: Worker Game Node
+    svc: tq-node
+    hosts: [tq-node-01, tq-node-02, tq-node-03, tq-node-04, tq-node-05, tq-node-06, tq-node-07, tq-node-08, tq-node-09, tq-node-10, tq-node-11, tq-node-12]
+    desc: >
+      Runs gameplay services for assigned solar systems and related services.
+      During startup stage -1 it loads sovereignty campaign data and emits developer log lines via the campaign logging channel.
+      When logging blocks, critical threads can stall and nodes may miss heartbeats or exit.
+    to:
+      - dst: polaris_master
+        proto: tcp
+        desc: Reports startup stage and sends heartbeats to Polaris.
+      - dst: db_cluster
+        proto: jdbc
+        desc: Loads sovereignty campaign and other state from the database.
+      - dst: log_collector
+        proto: tcp
+        desc: Streams log events to the central collector.
+    logs:
+      heartbeat:
+        desc: Worker node heartbeat while running.
+        lvl: DEBUG
+        msg: "heartbeat ok node={node}"
+        vars:
+          node: {k: i, v: [1, 250]}
+      session_created:
+        desc: Worker node creates a player session after successful login.
+        lvl: INFO
+        msg: "session created user={user_id} node={node}"
+        vars:
+          user_id: {k: i, v: [1000000, 9999999]}
+          node: {k: i, v: [1, 250]}
+      stage_report_sent:
+        desc: Worker node reports its current startup stage to Polaris.
+        lvl: INFO
+        msg: "sending stage report stage={stage} node={node}"
+        vars:
+          stage: {k: i, v: [-4, 0]}
+          node: {k: i, v: [1, 250]}
+      campaign_log_line:
+        desc: A sovereignty campaign-related developer log line emitted during campaign load/processing.
+        lvl: WARN
+        msg: "campaign channel log action={action} campaign_id={campaign_id} alliance_id={alliance_id}"
+        vars:
+          action: {k: ch, v: [load_campaign, compute_window, spawn_command_node, refresh_cache]}
+          campaign_id: {k: i, v: [1, 5000]}
+          alliance_id: {k: i, v: [1000, 9999]}
+      logger_backpressure:
+        desc: Indicates that logging is blocking on a channel, delaying the node.
+        lvl: WARN
+        msg: "logger backpressure channel={channel} blocked_ms={blocked_ms}"
+        vars:
+          blocked_ms: {k: i, v: [0, 300000]}
+        state_vars:
+          n:
+            channel: {k: ch, v: [generic]}
+          f:
+            channel: {k: ch, v: [campaign, generic]}
+      process_exit:
+        desc: Node process exits unexpectedly under stress.
+        lvl: ERROR
+        msg: "node process exited node={node} exit_code={exit_code}"
+        vars:
+          node: {k: i, v: [1, 250]}
+          exit_code: {k: i, v: [1, 255]}
+    beh:
+      n:
+        desc: Nodes emit heartbeats and very occasional benign logger warnings.
+        emit:
+          - id: heartbeat
+            per_min: 6.0
+          - id: logger_backpressure
+            per_min: 0.05
+          - id: process_exit
+            per_min: 0.002
+      f:
+        desc: During the incident, logging backpressure is more common and some nodes exit after missed deadlines.
+        emit:
+          - id: heartbeat
+            per_min: 4.0
+          - id: logger_backpressure
+            per_min: 1.5
+          - id: process_exit
+            per_min: 0.03
+
+  - id: log_collector
+    name: Central Log Collector
+    svc: tq-logs
+    hosts: [splunk-01]
+    desc: Aggregates logs from all nodes; when under load it applies backpressure and may drop events.
+    to: []
+    logs:
+      ingest_stats:
+        desc: Periodic ingestion statistics.
+        lvl: INFO
+        msg: "ingest stats eps={eps} queue_depth={queue_depth} dropped={dropped}"
+        vars:
+          eps: {k: i, v: [5, 60]}
+          queue_depth: {k: i, v: [0, 150000]}
+          dropped: {k: i, v: [0, 20000]}
+      queue_high:
+        desc: Collector is applying backpressure on a specific channel.
+        lvl: WARN
+        msg: "backpressure active channel={channel} queue_depth={queue_depth}"
+        vars:
+          queue_depth: {k: i, v: [5000, 150000]}
+        state_vars:
+          n:
+            channel: {k: ch, v: [generic]}
+          f:
+            channel: {k: ch, v: [campaign]}
+    beh:
+      n:
+        desc: Normal ingestion with rare backpressure warnings.
+        emit:
+          - id: ingest_stats
+            per_min: 1.0
+            scope: global
+          - id: queue_high
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Backpressure becomes frequent, especially on the campaign channel.
+        emit:
+          - id: ingest_stats
+            per_min: 1.0
+            scope: global
+          - id: queue_high
+            per_min: 1.0
+            scope: global
+
+  - id: db_cluster
+    name: Game Database
+    svc: tq-db
+    hosts: [db-01]
+    desc: Stores sovereignty campaign records and other persistent state used during startup and gameplay.
+    to: []
+    logs:
+      query_slow:
+        desc: Periodic slow-query warning used to corroborate whether the DB is a bottleneck.
+        lvl: WARN
+        msg: "slow query name={qname} ms={ms} rows={rows}"
+        vars:
+          qname: {k: ch, v: [load_campaigns, load_systems, load_market]}
+          ms: {k: i, v: [50, 5000]}
+          rows: {k: i, v: [1, 50000]}
+    beh:
+      n:
+        desc: Occasional slow query noise.
+        emit:
+          - id: query_slow
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Slightly elevated slow query noise, but not the primary failure driver in this incident.
+        emit:
+          - id: query_slow
+            per_min: 0.4
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Players authenticate through the login gateway and are assigned to a worker node; background metrics remain stable.
+    req:
+      - id: player_login_ok
+        desc: A player logs in successfully during normal operations.
+        rpm: 250.0
+        path: [login_gateway, game_node]
+        emit: [login_gateway.login_ok, game_node.session_created]
+        latency_ms: [[10, 80], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: The cluster is in failed startup/maintenance; players see maintenance rejections while internal startup and campaign logging traffic continues.
+    req:
+      - id: player_login_maintenance
+        desc: A player attempts to log in while the cluster is in maintenance mode.
+        rpm: 40.0
+        path: [login_gateway]
+        emit: [login_gateway.login_maintenance]
+        latency_ms: [[5, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: node_stage_report
+        desc: A worker node reports its startup stage to Polaris (high volume during startup attempts).
+        rpm: 80.0
+        path: [game_node, polaris_master]
+        emit: [game_node.stage_report_sent, polaris_master.stage_report_rcvd]
+        latency_ms: [[5, 40], [5, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: campaign_log_line
+        desc: A single sovereignty campaign developer log line emitted on the campaign logging channel.
+        rpm: 60.0
+        path: [game_node]
+        emit: [game_node.campaign_log_line]
+        latency_ms: [[1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+      The real cluster has ~250 nodes; this model uses 12 representative worker hosts while keeping node IDs in logs in the 1..250 range
+      to preserve observability of "many nodes stuck/dead" without simulating 250 separate hosts.
+  - |
+      The causal core is modeled as synchronous/backpressured logging on a specific "campaign" channel causing node stalls and missed
+      heartbeats, preventing Polaris from advancing startup past stage -1.
+  - |
+      Campaign data volume and exact sovereignty mechanics are abstracted into campaign_log_line flow traffic plus logger_backpressure
+      and log_collector.queue_high corroboration.
+  - |
+      Normal-phase volume estimate: ~250 rpm * 2 logs/req ≈ 500 logs/min from logins, plus ~75 logs/min from background across nodes
+      and infrastructure.
+      Total estimated logs for the scenario: ~30k–45k, within the 20k–100k target.
+  - |
+      log_collector.ingest_stats.eps is modeled to match this spec's overall emission envelope (order ~10–30 eps, with headroom),
+      rather than real-world Splunk/cluster-scale event rates.
+```

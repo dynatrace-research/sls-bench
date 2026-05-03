@@ -1,0 +1,497 @@
+```yaml
+sys:
+  id: edge_dns_rrdns
+  desc: >
+    An edge authoritative DNS service answers queries for customer domains and performs on-demand CNAME
+    resolution to discover origin IPs. For CNAME targets, the edge uses an internal recursive resolver pool
+    and keeps smoothed RTT performance stats to weight upstream selection. During a leap-second clock step
+    on a subset of hosts, a non-monotonic time delta could become negative and, after smoothing, feed a
+    negative weight into upstream selection, triggering a panic that was recovered but caused SERVFAIL.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: dns_edge
+    name: Edge DNS (authoritative) + RRDNS
+    svc: rrdns
+    hosts: [dns-edge-01, dns-edge-02, dns-edge-03, dns-edge-04]
+    desc: >
+      Answers authoritative DNS queries. For zones configured with CNAME to an external origin, it performs
+      an internal recursive lookup to obtain origin IPs and maintains smoothed RTT stats per internal resolver
+      to weight selection.
+
+    to:
+      - dst: internal_resolver
+        proto: udp
+        desc: Uses internal recursive resolvers for CNAME target lookups.
+      - dst: monitoring
+        proto: https
+        desc: Exports error/health metrics and logs for alerting.
+
+    logs:
+      dns_query:
+        desc: Entry log for an incoming DNS query handled by the edge.
+        lvl: INFO
+        msg: "dns query received rid={rid} qname={qname} qtype={qtype} client_ip={client_ip}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [example.com, www.example.com, api.example.com, www.theburritobot.com]}
+          qtype: {k: ch, v: [A, AAAA]}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+
+      cname_lookup_begin:
+        desc: Indicates the query requires resolving a CNAME target via internal recursive DNS.
+        lvl: INFO
+        msg: "cname lookup required rid={rid} qname={qname} cname_target={cname_target}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [www.example.com, api.example.com, www.theburritobot.com]}
+          cname_target: {k: ch, v: [origin-server.example-hosting.biz, myapp.herokuapp.com]}
+
+      upstream_selected:
+        desc: Weighted selection of an internal resolver based on smoothed RTT (only logged when selection succeeds).
+        lvl: DEBUG
+        msg: "selected internal resolver rid={rid} resolver={resolver} srtt_ms={srtt_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          resolver: {k: ch, v: [res-dc-a-1, res-dc-a-2, res-dc-a-3]}
+        state_vars:
+          n:
+            srtt_ms: {k: i, v: [1, 15]}
+          f:
+            srtt_ms: {k: i, v: [0, 30]}
+
+      upstream_retry:
+        desc: Marker that the edge switches to another internal resolver after an error.
+        lvl: WARN
+        msg: "retrying internal resolver rid={rid} resolver={resolver} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          resolver: {k: ch, v: [res-dc-a-1, res-dc-a-2, res-dc-a-3]}
+          attempt: {k: i, v: [2, 2]}
+          backoff_ms: {k: i, v: [5, 200]}
+
+      dns_response_ok:
+        desc: Successful DNS response returned to the client.
+        lvl: INFO
+        msg: "dns response sent rid={rid} qname={qname} rcode=NOERROR answer_type={answer_type} latency_ms={latency_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [example.com, www.example.com, api.example.com, www.theburritobot.com]}
+          answer_type: {k: ch, v: [A, AAAA, CNAME+A, CNAME+AAAA]}
+          latency_ms: {k: i, v: [1, 2000]}
+
+      dns_response_servfail:
+        desc: Failed DNS response returned to the client (SERVFAIL).
+        lvl: ERROR
+        msg: "dns response sent rid={rid} qname={qname} rcode=SERVFAIL reason={reason} latency_ms={latency_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [www.example.com, api.example.com, www.theburritobot.com]}
+          reason: {k: ch, v: [rrdns_panic, upstream_timeout]}
+          latency_ms: {k: i, v: [1, 2000]}
+
+      rrdns_panic_recovered:
+        desc: Panic recovered by Go recover() in the RRDNS path; request is failed after recovery.
+        lvl: ERROR
+        msg: "panic recovered in rrdns rid={rid} panic_msg={panic_msg} stack={stack_hash}"
+        vars:
+          rid: {k: hex, v: 16}
+          panic_msg: {k: ch, v: ["invalid argument to Int63n", "panic: invalid argument to Int63n"]}
+          stack_hash: {k: hex, v: 12}
+
+      upstream_stats_reset:
+        desc: Hotfix behavior; reset upstream RTT stats when a negative value is detected.
+        lvl: WARN
+        msg: "reset internal resolver stats rid={rid} resolver={resolver} reason={reason}"
+        vars:
+          rid: {k: hex, v: 16}
+          resolver: {k: ch, v: [res-dc-a-1, res-dc-a-2, res-dc-a-3]}
+          reason: {k: ch, v: [negative_srtt, negative_rtt_sample]}
+
+      rrdns_metrics:
+        desc: Periodic snapshot of resolver-selection health on the host (sanitized/non-negative view).
+        lvl: INFO
+        msg: "rrdns metrics window_s=60 min_srtt_ms={min_srtt_ms} max_srtt_ms={max_srtt_ms} panics_1m={panics_1m} servfail_1m={servfail_1m}"
+        vars: {}
+        state_vars:
+          n:
+            min_srtt_ms: {k: i, v: [1, 6]}
+            max_srtt_ms: {k: i, v: [4, 25]}
+            panics_1m: {k: i, v: [0, 0]}
+            servfail_1m: {k: i, v: [0, 2]}
+          f:
+            min_srtt_ms: {k: i, v: [0, 6]}
+            max_srtt_ms: {k: i, v: [4, 60]}
+            panics_1m: {k: i, v: [0, 25]}
+            servfail_1m: {k: i, v: [0, 45]}
+
+      rrdns_metrics_neg:
+        desc: Periodic anomaly snapshot emitted only when negative smoothed RTT values are present on the host.
+        lvl: WARN
+        msg: "rrdns metrics anomaly window_s=60 min_srtt_ms={min_srtt_ms} max_srtt_ms={max_srtt_ms} panics_1m={panics_1m} servfail_1m={servfail_1m}"
+        vars:
+          min_srtt_ms: {k: i, v: [-800, -1]}
+          max_srtt_ms: {k: i, v: [4, 80]}
+          panics_1m: {k: i, v: [1, 25]}
+          servfail_1m: {k: i, v: [1, 45]}
+
+      process_restart:
+        desc: Service restart marker used during hotfix rollout.
+        lvl: INFO
+        msg: "rrdns restarted reason={reason} version={version}"
+        vars:
+          reason: {k: ch, v: [hotfix_rollout, operator_restart]}
+          version: {k: ch, v: [rrdns-2017.01.01-hotfix1]}
+
+    beh:
+      n:
+        desc: Mostly healthy operation with periodic host-level metrics.
+        emit:
+          - id: rrdns_metrics
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Metrics remain emitted; anomaly metrics are possible but are controlled by scenario events to reflect delayed smoothing.
+        emit:
+          - id: rrdns_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: rrdns_metrics_neg
+            per_min: 0.5
+            scope: per_host
+
+  - id: internal_resolver
+    name: Internal recursive resolver pool
+    svc: recursor
+    hosts: [res-01, res-02]
+    desc: >
+      Performs recursive DNS resolution to the public Internet on behalf of the edge when resolving CNAME targets.
+      RRDNS selects among several logical resolver endpoints per site for redundancy.
+
+    to:
+      - dst: dns_edge
+        proto: udp
+        desc: Returns recursive DNS responses back to the edge DNS requester.
+
+    logs:
+      recursive_query:
+        desc: A recursive query issued upstream to the public Internet.
+        lvl: DEBUG
+        msg: "recursive query sent rid={rid} qname={qname} upstream={public_ns} proto=udp timeout_ms={timeout_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [origin-server.example-hosting.biz, myapp.herokuapp.com]}
+          public_ns: {k: ch, v: [1.1.1.1, 8.8.8.8, 9.9.9.9]}
+          timeout_ms: {k: i, v: [200, 800]}
+
+      recursive_response_ok:
+        desc: Recursive response returned with a successful answer.
+        lvl: DEBUG
+        msg: "recursive response rid={rid} qname={qname} rcode=NOERROR latency_ms={latency_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [origin-server.example-hosting.biz, myapp.herokuapp.com]}
+          latency_ms: {k: i, v: [1, 120]}
+
+      recursive_response_err:
+        desc: Recursive response returned with a server-side failure (transient).
+        lvl: DEBUG
+        msg: "recursive response rid={rid} qname={qname} rcode=SERVFAIL latency_ms={latency_ms}"
+        vars:
+          rid: {k: hex, v: 16}
+          qname: {k: ch, v: [origin-server.example-hosting.biz, myapp.herokuapp.com]}
+          latency_ms: {k: i, v: [20, 800]}
+
+      resolver_health:
+        desc: Periodic resolver health snapshot (background noise + corroboration).
+        lvl: INFO
+        msg: "resolver health qps={qps} p95_ms={p95_ms} udp_drops_1m={udp_drops_1m}"
+        vars:
+          qps: {k: i, v: [50, 400]}
+          p95_ms: {k: i, v: [2, 60]}
+          udp_drops_1m: {k: i, v: [0, 80]}
+
+    beh:
+      n:
+        desc: Periodic health logs; mostly stable.
+        emit:
+          - id: resolver_health
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Resolver pool is not the primary fault; health logs continue similarly.
+        emit:
+          - id: resolver_health
+            per_min: 0.2
+            scope: per_host
+
+  - id: time_sync
+    name: Time sync daemon (NTP/chrony)
+    svc: timesync
+    hosts: [dns-edge-01, dns-edge-02, dns-edge-03, dns-edge-04]
+    desc: >
+      Adjusts system time on hosts. During the modeled incident, a subset of hosts steps the clock backward
+      around the leap second, creating non-monotonic wall-clock intervals for applications using time.Now().
+
+    to: []
+
+    logs:
+      clock_step:
+        desc: A clock step adjustment applied to the system clock.
+        lvl: WARN
+        msg: "clock step applied direction={direction} offset_ms={offset_ms} source={source}"
+        vars:
+          direction: {k: ch, v: [backward]}
+          offset_ms: {k: i, v: [-1100, -900]}
+          source: {k: ch, v: [leap_second_adjust, ntp_step]}
+
+    beh:
+      n:
+        desc: No notable time adjustments during normal minutes.
+        emit: []
+      f:
+        desc: No periodic emission; clock steps are modeled as one-shot incident markers.
+        emit: []
+
+  - id: monitoring
+    name: Monitoring/alerting
+    svc: monitor
+    hosts: [mon-01]
+    desc: Observes edge DNS error-rate metrics and opens alerts when thresholds are exceeded.
+
+    to: []
+
+    logs:
+      alert_open:
+        desc: Alert opened due to elevated SERVFAIL rate.
+        lvl: CRITICAL
+        msg: "alert opened name={name} severity={sev} value={value} threshold={threshold}"
+        vars:
+          name: {k: ch, v: [dns_servfail_rate]}
+          sev: {k: ch, v: [page, critical]}
+          value: {k: f, v: [0.60, 1.50]}
+          threshold: {k: f, v: [0.10, 0.50]}
+
+    beh:
+      n:
+        desc: Alerts are not expected during normal operation in this scenario.
+        emit: []
+      f:
+        desc: Alert opening is modeled as one-shot events.
+        emit: []
+
+  - id: deploy_orchestrator
+    name: Deployment orchestrator
+    svc: deploy
+    hosts: [deploy-01]
+    desc: Pushes the hotfix build and coordinates rolling restarts of the edge DNS service.
+
+    to:
+      - dst: dns_edge
+        proto: https
+        desc: Initiates rollout actions (push + restart) on edge DNS hosts.
+
+    logs:
+      deploy_start:
+        desc: Deployment start marker for the hotfix rollout.
+        lvl: INFO
+        msg: "deploy start service={service} version={version} scope={scope}"
+        vars:
+          service: {k: ch, v: [rrdns]}
+          version: {k: ch, v: [rrdns-2017.01.01-hotfix1]}
+          scope: {k: ch, v: [canary_node, canary_dc, major_dcs]}
+
+      deploy_finish:
+        desc: Deployment completion marker.
+        lvl: INFO
+        msg: "deploy finish service={service} version={version} scope={scope} success={success}"
+        vars:
+          service: {k: ch, v: [rrdns]}
+          version: {k: ch, v: [rrdns-2017.01.01-hotfix1]}
+          scope: {k: ch, v: [canary_node, canary_dc, major_dcs]}
+          success: {k: ch, v: ["true"]}
+
+    beh:
+      n:
+        desc: No background deployment activity.
+        emit: []
+      f:
+        desc: Deployment actions are modeled as one-shot events.
+        emit: []
+
+tracing:
+  on: true
+  origins: [dns_edge]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: DNS queries are answered authoritatively; a subset require CNAME resolution via internal recursive DNS.
+    req:
+      - id: dns_simple_query_n
+        desc: Authoritative answer without internal CNAME recursion (A/AAAA or cached).
+        rpm: 280.0
+        path: [dns_edge]
+        emit: [dns_edge.dns_query, dns_edge.dns_response_ok]
+        latency_ms: [[0, 1], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dns_cname_lookup_n
+        desc: CNAME-based query resolved via a single successful internal recursive lookup.
+        rpm: 108.0
+        path: [dns_edge, internal_resolver, dns_edge]
+        emit:
+          - dns_edge.dns_query
+          - dns_edge.cname_lookup_begin
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_ok
+          - dns_edge.dns_response_ok
+        latency_ms: [[0, 1], [0, 1], [0, 1], [0, 1], [2, 6], [3, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dns_cname_lookup_retry_n
+        desc: CNAME-based query where the first internal resolver returns SERVFAIL and the edge retries another resolver within the same client request.
+        rpm: 12.0
+        path: [dns_edge, internal_resolver, dns_edge, internal_resolver, dns_edge]
+        emit:
+          - dns_edge.dns_query
+          - dns_edge.cname_lookup_begin
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_err
+          - dns_edge.upstream_retry
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_ok
+          - dns_edge.dns_response_ok
+        latency_ms: [[0, 1], [0, 1], [0, 2], [0, 2], [20, 200], [0, 2], [0, 2], [0, 2], [2, 10], [5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: Most queries still succeed, but a small fraction of CNAME lookups fail due to recovered panics in upstream selection.
+    req:
+      - id: dns_simple_query_f
+        desc: Unaffected authoritative answers (non-CNAME path).
+        rpm: 280.0
+        path: [dns_edge]
+        emit: [dns_edge.dns_query, dns_edge.dns_response_ok]
+        latency_ms: [[0, 1], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dns_cname_lookup_f
+        desc: CNAME-based query resolved via a single successful internal recursive lookup (on unaffected or stable hosts).
+        rpm: 105.6
+        path: [dns_edge, internal_resolver, dns_edge]
+        emit:
+          - dns_edge.dns_query
+          - dns_edge.cname_lookup_begin
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_ok
+          - dns_edge.dns_response_ok
+        latency_ms: [[0, 1], [0, 1], [0, 2], [0, 2], [2, 8], [3, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dns_cname_lookup_retry_f
+        desc: CNAME-based query where the first internal resolver returns SERVFAIL and the edge retries another resolver within the same client request.
+        rpm: 12.0
+        path: [dns_edge, internal_resolver, dns_edge, internal_resolver, dns_edge]
+        emit:
+          - dns_edge.dns_query
+          - dns_edge.cname_lookup_begin
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_err
+          - dns_edge.upstream_retry
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_ok
+          - dns_edge.dns_response_ok
+        latency_ms: [[0, 1], [0, 1], [0, 3], [0, 3], [30, 350], [0, 3], [0, 3], [0, 3], [2, 15], [5, 45]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dns_cname_panic_fail_f
+        desc: CNAME lookups that panic during weighted resolver selection; panic is recovered and SERVFAIL returned.
+        rpm: 0.4
+        path: [dns_edge]
+        emit:
+          - dns_edge.dns_query
+          - dns_edge.cname_lookup_begin
+          - dns_edge.rrdns_panic_recovered
+          - dns_edge.dns_response_servfail
+        latency_ms: [[0, 1], [0, 1], [0, 2], [1, 6]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dns_cname_fixed_reset_f
+        desc: Patched hosts detect negative upstream stats, reset them, then proceed with a successful CNAME lookup.
+        rpm: 2.0
+        path: [dns_edge, internal_resolver, dns_edge]
+        emit:
+          - dns_edge.dns_query
+          - dns_edge.cname_lookup_begin
+          - dns_edge.upstream_stats_reset
+          - dns_edge.upstream_selected
+          - internal_resolver.recursive_query
+          - internal_resolver.recursive_response_ok
+          - dns_edge.dns_response_ok
+        latency_ms: [[0, 1], [0, 1], [0, 3], [0, 3], [0, 3], [2, 10], [3, 14]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - >
+    The real system spans many data centers; this model compresses it to four edge hosts and two resolver hosts
+    while preserving the causal mechanism (clock step backward → negative RTT samples → smoothed resolver stats drift negative → panic in weighted selection → SERVFAIL for some CNAME lookups).
+  - >
+    Upstream selection (upstream_selected) is assumed to be logged only on successful selection; therefore its failure-state srtt_ms domain is non-negative even during the incident.
+    Negative smoothed RTT visibility is modeled via a separate periodic anomaly log (rrdns_metrics_neg) that can be enabled later in the failure via scenario controls.
+  - >
+    Only DNS is modeled directly; downstream HTTP error impact is noted in the scenario but not modeled as separate HTTP flows.
+  - >
+    Normal-phase volume estimate: ~1330 logs/min from flows (280 rpm *2 + 108 rpm *6 + 12 rpm *10) + ~2 background logs/min ≈ 1332 logs/min.
+  - >
+    End-to-end scenario volume estimate (with the scenario timings): ~70k–80k total logs, within the 20k–100k target, dominated by per-request DNS logs; extra anomaly-metric lines add only tens of logs.
+  - >
+    Monitoring alert domains are constrained so alert value is always above the possible threshold range (no semantically contradictory alert-open logs).
+```

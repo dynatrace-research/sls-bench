@@ -1,0 +1,260 @@
+```yaml
+scenario:
+  id: cf_like_bot_feature_file_over_limit_2025_11_18
+  title: Oversized bot feature file triggers core proxy panics and widespread 5xx
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The edge network normally serves HTTP traffic through an edge gateway and a core proxy that runs Bot Management.
+    A ClickHouse permissions rollout changes metadata query results used by the bot feature-file builder, producing an oversized
+    feature configuration artifact. Once propagated, the core proxy’s bot module exceeds its hard feature-count limit and panics,
+    returning 5xx error pages to end users and breaking dependent services like KV and Access. Operators later mitigate by bypassing
+    KV/Access and then pausing feature propagation, inserting a known-good file, and restarting proxies; most traffic recovers but a small residual error rate remains by scenario end.
+
+  trigger_desc: |
+    A subset of ClickHouse nodes begins returning duplicated metadata rows to the feature-file builder, which then produces an oversized
+    bot feature file; this file is queued and distributed to the fleet, activating the proxy feature-count limit failure.
+
+  time:
+    total_minutes: 56
+    phases:
+      n: {start_min: 0, end_min: 28}
+      f: {start_min: 28, end_min: 56}
+
+  phases:
+    n:
+      desc: |
+        End-user HTTP traffic is mostly successful with a small baseline of upstream-related 5xx. KV and Access operate normally.
+        The bot feature file is generated periodically from ClickHouse metadata and distributed without issue; proxy bot processing
+        remains within limits.
+      flows: [http_user_success, http_user_baseline_5xx, kv_get_via_proxy_ok, access_auth_ok, bot_feature_publish_good, synth_probe_ok]
+      manifestation:
+        - edge_gateway.edge_resp_out_ok
+        - core_proxy_fl2.req_responded_200
+        - bot_feature_builder.build_complete_good
+        - edge_gateway.edge_5xx_metric
+        - synthetic_monitor.probe_ok
+
+    f:
+      desc: |
+        An oversized bot feature file begins appearing intermittently and is propagated across the fleet. When active, the core proxy’s
+        bot module hits its hard feature-count limit and panics, producing 5xx responses and triggering synchronous error enrichment that
+        increases response latency. As more ClickHouse shards are updated, oversized files become consistent and the system stops “recovering”
+        between bad publishes. KV and Access experience widespread failures until mitigations reduce their dependency on the failing proxy path.
+        Operators then pause automated feature generation/propagation, insert a known-good artifact, and restart core proxies; most traffic succeeds again, but some residual panics persist on unrestarted hosts.
+
+      events:
+        - order: 1
+          at_min: 28
+          component: bot_feature_builder
+          event: |
+            Mixed good/bad bot feature files begin to be generated and queued; proxy 5xx appear and synthetic probes show intermittent success among failures.
+          why: |
+            The feature builder’s ClickHouse metadata query occasionally runs against nodes with updated grants, returning duplicated rows.
+            When the resulting oversized file is active on proxy hosts, the bot module exceeds its feature-count limit and panics. This is directly observable
+            via feature build sizes and proxy "over limit" errors; the ClickHouse grants rollout itself is external to these logs in this model.
+          flows:
+            - bot_feature_publish_good_f
+            - bot_feature_publish_bad_f
+            - http_user_ok_flap
+            - http_user_5xx_bot_panic
+            - kv_get_via_proxy_fail
+            - access_auth_fail
+            - synth_probe_fail
+            - synth_probe_ok_f
+          rate_multipliers:
+            synth_probe_fail: 0.6
+            synth_probe_ok_f: 0.4
+          latency_multipliers:
+            http_user_5xx_bot_panic: {p50: 1.2, p95: 1.6}
+            kv_get_via_proxy_fail: {p50: 1.1, p95: 1.4}
+          one_shots: []
+          manifestation:
+            - bot_feature_builder.build_complete_bad
+            - config_distribution.queued
+            - core_proxy_fl2.bot_features_over_limit
+            - synthetic_monitor.probe_fail
+            - synthetic_monitor.probe_ok
+
+        - order: 2
+          at_min: 36
+          component: clickhouse_cluster
+          event: |
+            The intermittent recoveries stop as oversized feature files become the dominant output; 5xx volume increases and worker panics become frequent.
+          why: |
+            The grants rollout reaches effectively all relevant ClickHouse query paths, so the metadata query returns duplicated results consistently.
+            With the oversized artifact now produced on every publish cycle, proxies repeatedly hit the hard feature-count limit. This is observable via the shift
+            to only "bad" feature publishes and increased bot-module over-limit errors and worker panic markers.
+          flows:
+            - bot_feature_publish_bad_f
+            - http_user_5xx_bot_panic
+            - kv_get_via_proxy_fail
+            - access_auth_fail
+            - synth_probe_fail
+          rate_multipliers:
+            bot_feature_publish_good_f: 0.0
+            bot_feature_publish_bad_f: 2.0
+            http_user_ok_flap: 0.2
+            http_user_5xx_bot_panic: 1.6
+            synth_probe_ok_f: 0.0
+            synth_probe_fail: 1.0
+            core_proxy_fl2.worker_panic_bg: 2.0
+            observability_enricher.queue_metrics: 1.8
+          latency_multipliers:
+            http_user_5xx_bot_panic: {p50: 1.6, p95: 2.6}
+            http_user_ok_flap: {p50: 1.3, p95: 2.0}
+            kv_get_via_proxy_fail: {p50: 1.5, p95: 2.2}
+          one_shots: []
+          manifestation:
+            - bot_feature_builder.build_complete_bad
+            - core_proxy_fl2.worker_panic_bg
+            - edge_gateway.edge_5xx_metric
+            - observability_enricher.queue_metrics
+
+        - order: 3
+          at_min: 44
+          component: workers_kv_gateway
+          event: |
+            KV and Access mitigations are activated to reduce dependence on the failing proxy path, and downstream authentication failures diminish while core HTTP traffic remains degraded.
+          why: |
+            Operators enable internal bypass mechanisms for KV and Access so fewer KV-related requests traverse the failing proxy fleet.
+            This is directly observable via mitigation markers and a reduction in KV/Access failure-request volume in logs; the full
+            bypass path and resulting successes are not modeled as sustained per-request flows here.
+          flows:
+            - kv_get_via_proxy_fail
+            - access_auth_fail
+            - http_user_5xx_bot_panic
+            - synth_probe_fail
+          rate_multipliers:
+            kv_get_via_proxy_fail: 0.2
+            access_auth_fail: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: workers_kv_gateway.bypass_enabled
+              count: 1
+              hosts: [kv-1]
+            - ref: access_service.bypass_enabled
+              count: 1
+              hosts: [access-1]
+          manifestation:
+            - workers_kv_gateway.bypass_enabled
+            - access_service.bypass_enabled
+            - workers_kv_gateway.kv_upstream_error
+            - access_service.auth_failed_upstream
+
+        - order: 4
+          at_min: 52
+          component: config_distribution
+          event: |
+            Automated feature generation/propagation is halted and a known-good bot feature file is inserted; core proxies are restarted and most traffic succeeds again, with only a small residual error rate.
+          why: |
+            Pausing propagation stops new bad artifacts from entering the fleet, and inserting a last-known-good file allows restarted proxies to operate within the feature limit.
+            Remaining errors are from a small set of hosts still serving traffic before restart completion and from transient restart churn.
+            Operator actions are directly observable via config-dist and restart markers; recovery is observable via a sharp drop in bot-limit panics and more successful synthetic probes.
+          flows:
+            - http_user_ok_flap
+            - http_user_5xx_bot_panic
+            - synth_probe_ok_f
+            - synth_probe_fail
+          rate_multipliers:
+            bot_feature_publish_bad_f: 0.0
+            bot_feature_publish_good_f: 0.0
+            config_distribution.push_complete: 0.0
+            http_user_5xx_bot_panic: 0.03
+            http_user_ok_flap: 1.5
+            synth_probe_fail: 0.2
+            synth_probe_ok_f: 1.0
+            core_proxy_fl2.worker_panic_bg: 0.3
+            observability_enricher.queue_metrics: 0.6
+            edge_gateway.edge_5xx_metric: 0.3
+            kv_get_via_proxy_fail: 0.05
+            access_auth_fail: 0.05
+          latency_multipliers:
+            http_user_ok_flap: {p50: 1.2, p95: 1.7}
+            synth_probe_ok_f: {p50: 1.1, p95: 1.4}
+          one_shots:
+            - ref: config_distribution.propagation_paused
+              count: 1
+              hosts: [cd-1]
+            - ref: config_distribution.manual_insert_good
+              count: 1
+              hosts: [cd-1]
+            - ref: core_proxy_fl2.process_restart
+              count: 3
+              hosts: [fl2-1, fl2-2, fl2-3]
+          manifestation:
+            - config_distribution.propagation_paused
+            - config_distribution.manual_insert_good
+            - core_proxy_fl2.process_restart
+            - synthetic_monitor.probe_ok
+            - edge_gateway.edge_5xx_metric
+
+      steady:
+        - component: core_proxy_fl2
+          condition: |
+            After propagation is halted and proxies restart onto a known-good feature file, bot-feature-limit panics drop sharply but persist at a low rate from unrestarted or still-converging hosts.
+          user_impact: |
+            Most end users succeed again, but a small fraction still see intermittent Cloudflare 5xx error pages and elevated latency.
+          manifestation:
+            - core_proxy_fl2.bot_features_over_limit
+            - core_proxy_fl2.worker_panic_bg
+            - edge_gateway.edge_resp_out_5xx
+        - component: synthetic_monitor
+          condition: |
+            Probes largely return to success with occasional failures during the residual tail.
+          user_impact: |
+            External monitors show improving availability but not yet fully back to baseline by scenario end.
+          manifestation:
+            - synthetic_monitor.probe_ok
+            - synthetic_monitor.probe_fail
+        - component: observability_enricher
+          condition: |
+            Error-enrichment queues and CPU remain elevated but trend down as error volume decreases.
+          user_impact: |
+            Added tail latency on a subset of requests and slower convergence to normal performance.
+          manifestation:
+            - observability_enricher.queue_metrics
+            - observability_enricher.error_enriched
+
+      feedback_loops:
+        - id: error_enrichment_cpu_tail
+          desc: |
+            Higher 5xx volume triggers synchronous error enrichment, consuming CPU and increasing response latency, which increases retries and prolongs the residual tail.
+        - id: fleetwide_artifact_fanout
+          desc: |
+            A single oversized artifact is distributed fleetwide, causing correlated failures across many proxy hosts and amplifying user-facing error rates.
+
+      flows:
+        - http_user_ok_flap
+        - http_user_5xx_bot_panic
+        - kv_get_via_proxy_fail
+        - access_auth_fail
+        - bot_feature_publish_good_f
+        - bot_feature_publish_bad_f
+        - synth_probe_fail
+        - synth_probe_ok_f
+      manifestation:
+        - bot_feature_builder.build_complete_bad
+        - core_proxy_fl2.bot_features_over_limit
+        - edge_gateway.edge_5xx_metric
+        - observability_enricher.queue_metrics
+        - synthetic_monitor.probe_ok
+
+  assumptions:
+    - |
+      Timeline is compressed into 56 minutes; real incident lasted hours. Relative ordering is preserved: intermittent onset -> stabilized failure -> KV/Access mitigation -> propagation halt + known-good insertion + proxy restarts -> residual tail.
+    - |
+      Failure-onset cleanliness: mitigation/recovery-only flows are not used and have 0 rpm in failure baseline; mitigations are represented by one-shot markers and reductions in KV/Access failure-flow rates.
+    - |
+      The “every five minutes” regeneration cadence is approximated by ~0.2 rpm publish flows; early failure includes both bot_feature_publish_good_f and bot_feature_publish_bad_f, then shifts to only bad at event 2 until halted at event 4.
+    - |
+      Volume/visibility reasoning (rough): normal phase ~1125–1130 logs/min * 28 min ≈ 31k–32k logs. Failure phase varies by interval:
+      - 28–36: ~1420 logs/min * 8 min ≈ 11k
+      - 36–44: ~1510 logs/min * 8 min ≈ 12k
+      - 44–52: ~1390 logs/min * 8 min ≈ 11k
+      - 52–56: ~760 logs/min * 4 min ≈ 3k
+      Total ≈ 69k–75k logs including one-shots (event3:2, event4:5).
+    - |
+      Key diagnostic signals are expected to be visible multiple times: bot_feature_builder.build_complete_bad (periodic before halt), core_proxy_fl2.bot_features_over_limit (high-rpm during events 1–3), observability_enricher.queue_metrics elevated during the 5xx spike, and synthetic_monitor.probe_ok_f rising after event 4.
+```

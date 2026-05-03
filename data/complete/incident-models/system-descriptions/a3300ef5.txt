@@ -1,0 +1,492 @@
+```yaml
+sys:
+  id: gitlab_com_db_primary_wipe_20170131
+  desc: >
+    GitLab.com is a web application that serves git project pages and APIs and stores most metadata
+    (projects, issues, comments, users) in PostgreSQL. A single PostgreSQL primary (db1) handles all
+    production read/write traffic, with a hot-standby secondary (db2) intended only for failover.
+    Backups are attempted by a cron-driven pg_dump job running on an application host and notifying
+    on failure via email.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: gitlab_web
+    name: GitLab Rails Web/API
+    svc: gitlab-web
+    hosts: [web-01.gitlab.com, web-02.gitlab.com]
+    desc: >
+      Serves web and API requests and performs synchronous PostgreSQL queries for reads and writes.
+      Emits request lifecycle logs and database error logs when the DB is slow or unavailable.
+    to:
+      - dst: postgres_primary
+        proto: tcp
+        desc: PostgreSQL client connections for all user-facing requests.
+    logs:
+      req_start:
+        desc: Incoming HTTP request accepted by the Rails app.
+        lvl: INFO
+        msg: "Started {method} {route} for {client_ip} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/projects", "/api/v4/projects", "/api/v4/notes"]}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          req_id: {k: uuid, v: null}
+      req_done_200:
+        desc: Successful request completion.
+        lvl: INFO
+        msg: "Completed 200 in {duration_ms}ms req_id={req_id} db_ms={db_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [30, 900]}
+            db_ms: {k: i, v: [10, 700]}
+          f:
+            duration_ms: {k: i, v: [80, 12000]}
+            db_ms: {k: i, v: [40, 11000]}
+      req_done_500:
+        desc: Failed request completion (DB-related 5xx).
+        lvl: INFO
+        msg: "Completed {status} in {duration_ms}ms req_id={req_id}"
+        vars:
+          status: {k: ch, v: ["500", "503"]}
+          req_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [80, 2000]}
+          f:
+            duration_ms: {k: i, v: [200, 20000]}
+      db_error:
+        desc: Rails-level DB exception while serving a request.
+        lvl: ERROR
+        msg: "DB error req_id={req_id} error={error}"
+        vars:
+          req_id: {k: uuid, v: null}
+          error: {k: ch, v: ["connection refused", "could not connect to server", "statement timeout", "unexpected EOF on client connection"]}
+    beh:
+      n: {desc: "No notable background emission from the web tier.", emit: []}
+      f: {desc: "No notable background emission from the web tier.", emit: []}
+
+  - id: sidekiq_worker
+    name: Sidekiq Background Workers
+    svc: gitlab-sidekiq
+    hosts: [worker-01.gitlab.com, worker-02.gitlab.com]
+    desc: >
+      Executes asynchronous jobs (notifications, cleanup, abuse workflows). Some jobs can create
+      heavy DB load and long-running transactions.
+    to:
+      - dst: postgres_primary
+        proto: tcp
+        desc: PostgreSQL connections for background jobs.
+    logs:
+      job_start:
+        desc: Background job started.
+        lvl: INFO
+        msg: "Job started job={job} jid={jid}"
+        vars:
+          job: {k: ch, v: ["UserDestroyJob", "AbuseReportProcessJob", "ProjectCacheWarmJob"]}
+          jid: {k: hex, v: 16}
+      job_done:
+        desc: Background job finished.
+        lvl: INFO
+        msg: "Job done job={job} jid={jid} status={status} duration_ms={duration_ms}"
+        vars:
+          job: {k: ch, v: ["UserDestroyJob", "AbuseReportProcessJob", "ProjectCacheWarmJob"]}
+          jid: {k: hex, v: 16}
+          status: {k: ch, v: [ok, error]}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [200, 5000]}
+          f:
+            duration_ms: {k: i, v: [500, 90000]}
+    beh:
+      n: {desc: "Normal background jobs complete routinely.", emit: []}
+      f: {desc: "Jobs can run longer due to DB contention.", emit: []}
+
+  - id: postgres_primary
+    name: PostgreSQL Primary (db1)
+    svc: postgres
+    hosts: [db1.cluster.gitlab.com]
+    desc: >
+      Primary PostgreSQL 9.6 instance handling all production writes and most reads.
+      Streams WAL to the hot-standby. During the incident it experiences load, replication pressure,
+      configuration restart attempts, and then data directory deletion leading to startup failure.
+    to:
+      - dst: postgres_standby
+        proto: tcp
+        desc: Streaming replication WAL sender connections to the standby.
+    logs:
+      checkpoint_complete:
+        desc: Periodic checkpoint completion log.
+        lvl: INFO
+        msg: "checkpoint complete write={write_mb}MB sync={sync_mb}MB"
+        vars:
+          write_mb: {k: i, v: [50, 800]}
+          sync_mb: {k: i, v: [10, 300]}
+      wal_removed:
+        desc: WAL segment removal while a standby is behind.
+        lvl: WARN
+        msg: "removed WAL segment {wal_segment} before standby replay"
+        vars:
+          wal_segment: {k: hex, v: 24}
+      startup_panic:
+        desc: PostgreSQL fails to start due to missing data files after data directory deletion.
+        lvl: CRITICAL
+        msg: "could not open file \"{file}\" (No such file or directory)"
+        vars:
+          file: {k: ch, v: ["/var/opt/gitlab/postgresql/data/global/pg_control", "/var/opt/gitlab/postgresql/data/base/16384/2609"]}
+      config_apply_raise_wal:
+        desc: Operator-applied config change increasing wal senders (and existing high max_connections).
+        lvl: INFO
+        msg: "restarting postgres apply max_wal_senders=32 max_connections=8000"
+        vars: {}
+      restart_failed_semaphores:
+        desc: Restart refused due to semaphore allocation limits.
+        lvl: ERROR
+        msg: "could not create semaphores: exceeded system limit"
+        vars: {}
+      config_apply_reduce_conn:
+        desc: Operator-applied config change reducing max_connections to allow restart.
+        lvl: INFO
+        msg: "restarting postgres apply max_wal_senders=32 max_connections=2000"
+        vars: {}
+      server_ready:
+        desc: PostgreSQL reports ready after successful restart.
+        lvl: INFO
+        msg: "database system is ready to accept connections"
+        vars: {}
+      repl_conn_limit:
+        desc: Replication connection attempt refused due to max_wal_senders saturation.
+        lvl: ERROR
+        msg: "replication connection refused: too many wal senders"
+        vars: {}
+    beh:
+      n:
+        desc: "Normal checkpoint logging; replication generally healthy."
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.25
+            scope: per_host
+      f:
+        desc: >
+          During failure the primary may remove WAL needed by the lagging standby; after the wipe
+          it repeatedly fails to start and emits startup error logs.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.25
+            scope: per_host
+          - id: wal_removed
+            per_min: 1.5
+            scope: per_host
+          - id: startup_panic
+            per_min: 5.0
+            scope: per_host
+
+  - id: postgres_standby
+    name: PostgreSQL Standby (db2)
+    svc: postgres
+    hosts: [db2.cluster.gitlab.com]
+    desc: >
+      Hot-standby replica used for failover. Streams WAL from the primary but can fall behind under
+      load. Operators attempt to re-seed it using pg_basebackup when replication breaks.
+    to:
+      - dst: postgres_primary
+        proto: tcp
+        desc: Streaming replication client connection and pg_basebackup to the primary.
+    logs:
+      repl_status:
+        desc: Periodic standby status report while streaming.
+        lvl: INFO
+        msg: "streaming from {primary_host} replay_lag={lag_s}s"
+        vars:
+          primary_host: {k: ch, v: ["db1.cluster.gitlab.com"]}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 5]}
+          f:
+            lag_s: {k: i, v: [60, 20000]}
+      wal_missing:
+        desc: Standby cannot continue because required WAL segment is missing on the primary.
+        lvl: ERROR
+        msg: "requested WAL segment {wal_segment} has already been removed"
+        vars:
+          wal_segment: {k: hex, v: 24}
+      basebackup_start:
+        desc: Operator initiates pg_basebackup from standby to re-seed the standby.
+        lvl: INFO
+        msg: "pg_basebackup started from {primary_host} dest={dest}"
+        vars:
+          primary_host: {k: ch, v: ["db1.cluster.gitlab.com"]}
+          dest: {k: ch, v: ["/var/opt/gitlab/postgresql/data"]}
+      basebackup_wait:
+        desc: pg_basebackup remains blocked waiting for streaming to begin.
+        lvl: INFO
+        msg: "pg_basebackup: waiting for replication data..."
+        vars: {}
+      basebackup_error:
+        desc: pg_basebackup fails to establish replication streaming.
+        lvl: ERROR
+        msg: "pg_basebackup failed: {error}"
+        vars:
+          error: {k: ch, v: ["too many replication connections", "timeout while waiting for WAL", "connection reset by peer"]}
+    beh:
+      n:
+        desc: "Standby streams normally with low lag."
+        emit:
+          - id: repl_status
+            per_min: 0.8
+            scope: per_host
+      f:
+        desc: "During failure the standby lags and can report missing WAL segments."
+        emit:
+          - id: repl_status
+            per_min: 0.8
+            scope: per_host
+          - id: wal_missing
+            per_min: 0.7
+            scope: per_host
+
+  - id: backup_runner
+    name: Backup Cron Runner
+    svc: gitlab-backup
+    hosts: [app-backup-01.gitlab.com]
+    desc: >
+      Runs a scheduled pg_dump logical backup against the production database and attempts to notify
+      via email on failure. In this incident it uses pg_dump 9.2 against a 9.6 server, causing failures.
+    to:
+      - dst: postgres_primary
+        proto: tcp
+        desc: Connects to PostgreSQL to run pg_dump.
+      - dst: mail_relay
+        proto: smtp
+        desc: Sends cron failure notifications.
+    logs:
+      pg_dump_start:
+        desc: Backup attempt starts.
+        lvl: INFO
+        msg: "Starting pg_dump backup db_host={db_host} pg_dump_ver={pg_dump_ver}"
+        vars:
+          db_host: {k: ch, v: ["db1.cluster.gitlab.com"]}
+          pg_dump_ver: {k: ch, v: ["9.2"]}
+      pg_dump_error:
+        desc: Backup fails due to version mismatch.
+        lvl: ERROR
+        msg: "pg_dump failed: server version {server_ver}; pg_dump version {pg_dump_ver}"
+        vars:
+          server_ver: {k: ch, v: ["9.6"]}
+          pg_dump_ver: {k: ch, v: ["9.2"]}
+    beh:
+      n: {desc: "No independent background logs; backups are modeled as flows.", emit: []}
+      f: {desc: "No independent background logs; backups are modeled as flows.", emit: []}
+
+  - id: mail_relay
+    name: Outbound Mail Relay
+    svc: smtp-relay
+    hosts: [mail-01.gitlab.com]
+    desc: >
+      Relays system emails. DMARC policy can cause unsigned automated notifications to be rejected,
+      making backup failures effectively silent to operators.
+    to: []
+    logs:
+      dmarc_reject:
+        desc: Automated notification rejected due to DMARC policy.
+        lvl: WARN
+        msg: "rejected outbound mail from={from_addr} reason=DMARC_POLICY"
+        vars:
+          from_addr: {k: ch, v: ["cron@app-backup-01.gitlab.com", "gitlab-backup@app-backup-01.gitlab.com"]}
+    beh:
+      n:
+        desc: "Cron/system emails occasionally get rejected due to DMARC policy."
+        emit:
+          - id: dmarc_reject
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: "Cron/system emails continue to be rejected due to DMARC policy."
+        emit:
+          - id: dmarc_reject
+            per_min: 0.2
+            scope: per_host
+
+  - id: ops_bastion
+    name: Ops Bastion / Shell Audit
+    svc: bastion
+    hosts: [bastion-01.gitlab.com]
+    desc: >
+      Administrative entry point used by engineers. Captures high-signal operational commands such as
+      data-directory wipes, config edits, and long-running restore copy operations.
+    to:
+      - dst: postgres_primary
+        proto: ssh
+        desc: Operators connect to db1 to run recovery and maintenance commands.
+      - dst: postgres_standby
+        proto: ssh
+        desc: Operators connect to db2 for replication rebuild actions.
+    logs:
+      cmd_exec:
+        desc: Administrative command executed on a target host.
+        lvl: WARN
+        msg: "audit user={user} target={target} cmd=\"{cmd}\""
+        vars:
+          user: {k: ch, v: ["eng1", "eng2", "eng3"]}
+          target: {k: ch, v: ["db1.cluster.gitlab.com", "db2.cluster.gitlab.com"]}
+          cmd: {k: ch, v: ["systemctl restart postgresql", "pg_basebackup --verbose -D /var/opt/gitlab/postgresql/data", "strace -p 12345"]}
+      cmd_exec_rm_primary:
+        desc: Destructive rm command executed (accidentally) against the primary data directory.
+        lvl: CRITICAL
+        msg: "audit user={user} target=db1.cluster.gitlab.com cmd=\"rm -rf /var/opt/gitlab/postgresql/data\""
+        vars:
+          user: {k: ch, v: ["eng2"]}
+      s3_backup_check_empty:
+        desc: Operator check finds no recent logical backups available.
+        lvl: ERROR
+        msg: "backup check: no recent pg_dump files found in S3 bucket={bucket}"
+        vars:
+          bucket: {k: ch, v: ["gitlab-com-db-backups"]}
+      rsync_start:
+        desc: Restore copy from staging to production initiated.
+        lvl: INFO
+        msg: "restore copy started src=staging-db dest=db1 size_gb={size_gb}"
+        vars:
+          size_gb: {k: i, v: [400, 1200]}
+      rsync_progress:
+        desc: Periodic restore copy progress log (slow network disks).
+        lvl: INFO
+        msg: "restore copy progress pct={pct} rate_mbps={rate_mbps}"
+        vars:
+          pct: {k: i, v: [1, 99]}
+          rate_mbps: {k: i, v: [40, 80]}
+    beh:
+      n:
+        desc: "Occasional administrative commands; not continuous."
+        emit: []
+      f:
+        desc: "During failure, restore copy progress logs may appear once the copy is started."
+        emit:
+          - id: rsync_progress
+            per_min: 4.0
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [gitlab_web]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: "Normal GitLab.com request traffic with a healthy primary DB; backups are attempted but alerts are ineffective."
+    req:
+      - id: web_read_ok_n
+        desc: Typical read-only web/API requests succeeding.
+        rpm: 600.0
+        path: [gitlab_web, postgres_primary]
+        emit: [gitlab_web.req_start, gitlab_web.req_done_200]
+        latency_ms: [[1, 5], [80, 350]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: web_post_comment_ok_n
+        desc: Typical write request (posting notes/comments) succeeding.
+        rpm: 120.0
+        path: [gitlab_web, postgres_primary]
+        emit: [gitlab_web.req_start, gitlab_web.req_done_200]
+        latency_ms: [[1, 5], [120, 700]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: sidekiq_misc_job_n
+        desc: Background jobs performing routine DB work.
+        rpm: 8.0
+        path: [sidekiq_worker, postgres_primary]
+        emit: [sidekiq_worker.job_start, sidekiq_worker.job_done]
+        latency_ms: [[1, 5], [500, 4000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: pg_dump_backup_n
+        desc: Scheduled logical backup attempt from an app host (fails due to pg_dump version mismatch).
+        rpm: 0.2
+        path: [backup_runner, postgres_primary]
+        emit: [backup_runner.pg_dump_start, backup_runner.pg_dump_error]
+        latency_ms: [[1, 5], [800, 3000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      Failure starts as heavy DB load causing slow requests and elevated 5xx, then replication breaks.
+      Operational attempts to rebuild the standby lead to an accidental wipe of the primary data directory,
+      taking the DB fully down.
+    req:
+      - id: web_read_ok_f
+        desc: Read-only requests that still succeed during partial degradation.
+        rpm: 420.0
+        path: [gitlab_web, postgres_primary]
+        emit: [gitlab_web.req_start, gitlab_web.req_done_200]
+        latency_ms: [[1, 5], [200, 1400]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: web_read_5xx_f
+        desc: Read-only requests failing due to DB unavailability/timeouts.
+        rpm: 180.0
+        path: [gitlab_web, postgres_primary]
+        emit: [gitlab_web.req_start, gitlab_web.db_error, gitlab_web.req_done_500]
+        latency_ms: [[1, 5], [50, 400], [300, 5000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: web_post_comment_ok_f
+        desc: Write requests that still succeed during early degradation.
+        rpm: 35.0
+        path: [gitlab_web, postgres_primary]
+        emit: [gitlab_web.req_start, gitlab_web.req_done_200]
+        latency_ms: [[1, 5], [400, 2500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: web_post_comment_5xx_f
+        desc: Write requests failing due to lock timeouts / DB down.
+        rpm: 65.0
+        path: [gitlab_web, postgres_primary]
+        emit: [gitlab_web.req_start, gitlab_web.db_error, gitlab_web.req_done_500]
+        latency_ms: [[1, 5], [80, 600], [600, 12000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: sidekiq_user_destroy_f
+        desc: Heavy background job attempting to remove a user and associated data (DB-intensive).
+        rpm: 1.0
+        path: [sidekiq_worker, postgres_primary]
+        emit: [sidekiq_worker.job_start, sidekiq_worker.job_done]
+        latency_ms: [[1, 5], [5000, 90000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: standby_basebackup_attempt_f
+        desc: Operator attempts to re-seed the standby with pg_basebackup; can stall and then error.
+        rpm: 0.35
+        path: [postgres_standby, postgres_primary]
+        emit: [postgres_standby.basebackup_start, postgres_standby.basebackup_wait, postgres_standby.basebackup_error]
+        latency_ms: [[1, 10], [30000, 240000], [10, 100]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: pg_dump_backup_f
+        desc: Backup attempt continues to fail due to version mismatch.
+        rpm: 0.2
+        path: [backup_runner, postgres_primary]
+        emit: [backup_runner.pg_dump_start, backup_runner.pg_dump_error]
+        latency_ms: [[1, 5], [800, 4000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - |
+    Time is compressed to a 50-minute scenario; real incident and restoration lasted many hours.
+  - |
+    Git repositories/wikis are stored outside PostgreSQL and are not modeled; the incident focuses on metadata DB loss and service outage.
+  - |
+    pg_dump backups are modeled as running about once every 5 minutes (rpm=0.2) to ensure the version-mismatch signal appears in a single log file;
+    in reality they were daily and failing over a longer period.
+  - |
+    DMARC mail rejection is modeled as a low-rate background signal on the mail relay (rather than a hop in the pg_dump flow path) to keep path
+    connectivity valid while still showing that failure notifications are not delivered.
+  - |
+    Failure-state background logs for WAL removal and startup failures are modeled as periodic emissions to represent repeated occurrences
+    (WAL cleanup under lag; repeated restart attempts after data deletion).
+  - |
+    Rough log volume estimate over 50 minutes: normal ~36k; failure ~40k-50k; total ~75k-90k (within the 20k-100k target).
+```

@@ -1,0 +1,138 @@
+```yaml
+scenario:
+  id: ravendb_cloud_ca_trust_store_split_2021_09_24
+  title: Partial cluster split from TLS chain trust regression after ca-certificates update
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    RavenDB Cloud nodes use TLS certificates for both client access and node-to-node cluster communication.
+    An unattended OS ca-certificates update removes a soon-to-expire root (DST Root CA X3) from the system trust store on part of the fleet.
+    Existing pooled connections mostly keep working, but new TLS handshakes start failing with certificate-chain errors, leading to partial cluster splits and failed cluster-wide tasks.
+    Ops begins remediation (trust-store refresh and clearing cached chain artifacts), which reduces but does not fully eliminate failures before the scenario ends.
+
+  trigger_desc: |
+    Automatic security updates install a new ca-certificates package on a subset of RavenDB hosts, changing the trusted root set and causing TLS chain validation for some Let’s Encrypt paths to fail on new connections.
+
+  time:
+    total_minutes: 32
+    phases:
+      n: {start_min: 0, end_min: 16}
+      f: {start_min: 16, end_min: 32}
+
+  phases:
+    n:
+      desc: |
+        Nodes serve client traffic normally and maintain stable node-to-node cluster links.
+        Monitoring probes succeed and cluster-wide commands (like index deployment) complete.
+        New node-to-node TLS connections occur only occasionally due to connection pooling.
+      flows: [client_api_request_n, cluster_connect_n, cluster_task_deploy_index_n]
+      manifestation: [monitoring.probe_ok, ravendb_node.cluster_link_state, ravendb_node.http_access, ravendb_node.cluster_connect_ok]
+
+    f:
+      desc: |
+        After a trust-store update on part of the fleet, new TLS handshakes intermittently fail.
+        Cluster nodes can still reach each other over the network, but they reject new connections due to certificate chain validation.
+        The cluster experiences partial connectivity loss (split-like behavior), so reads/writes usually keep working while quorum-dependent tasks start failing.
+
+      events:
+        - order: 1
+          at_min: 16
+          component: host_os
+          event: |
+            Unattended ca-certificates updates land on a subset of hosts; shortly after, monitoring observes TLS probe failures and nodes begin rejecting some new cluster connections as untrusted.
+          why: |
+            The OS trust store no longer contains a previously-trusted root used by some served/selected chains, so new TLS validation can fail.
+            Existing pooled connections remain mostly unaffected because they do not re-run a full handshake.
+          flows: [cluster_connect_tls_fail_f, inbound_client_handshake_fail_f]
+          rate_multipliers:
+            cluster_task_deploy_index_fail_f: 0.0
+            ops_automation.rollout_status: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: host_os.ca_certs_update
+              count: 3
+              hosts: [rdb-b, rdb-e, rdb-f]
+          manifestation: [host_os.ca_certs_update, monitoring.probe_tls_fail, ravendb_node.cluster_peer_untrusted]
+
+        - order: 2
+          at_min: 22
+          component: ravendb_node
+          event: |
+            As connection churn increases, failed node-to-node reconnect attempts become more frequent and cluster-wide commands begin failing due to lack of quorum.
+          why: |
+            Connection pooling delays the impact; once connections recycle, more handshakes hit the broken trust path.
+            Reduced peer connectivity prevents quorum formation for cluster operations, even though basic reads/writes continue.
+          flows: [cluster_connect_tls_fail_f, cluster_task_deploy_index_fail_f]
+          rate_multipliers:
+            cluster_connect_tls_fail_f: 1.8
+            cluster_task_deploy_index_fail_f: 1.4
+            monitoring.probe_tls_fail: 1.7
+            monitoring.alert_cluster_connectivity: 1.5
+          latency_multipliers:
+            cluster_task_deploy_index_fail_f: {p50: 1.3, p95: 1.4}
+          one_shots: []
+          manifestation: [ravendb_node.raft_quorum_lost, monitoring.alert_cluster_connectivity, ravendb_node.cluster_link_state]
+
+        - order: 3
+          at_min: 28
+          component: ops_automation
+          event: |
+            Ops starts a remediation rollout: refreshing the system trust store and clearing cached certificate-chain artifacts on some hosts; TLS failures decrease but remain present on not-yet-remediated nodes.
+          why: |
+            Updating the trust store and removing cached chain files forces selection/validation to follow an available trusted chain.
+            Rollout is only partial within the scenario window, so residual handshake failures persist.
+          flows: [cluster_connect_tls_fail_f, inbound_client_handshake_fail_f]
+          rate_multipliers:
+            cluster_connect_tls_fail_f: 0.6
+            inbound_client_handshake_fail_f: 0.6
+            monitoring.probe_tls_fail: 0.7
+            monitoring.alert_cluster_connectivity: 0.8
+            ops_automation.rollout_status: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_automation.cmd_exec
+              count: 9
+              hosts: [ops-1]
+            - ref: host_os.trust_store_refresh
+              count: 3
+              hosts: [rdb-b, rdb-e, rdb-f]
+          manifestation: [ops_automation.rollout_status, host_os.trust_store_refresh, ravendb_node.cluster_peer_untrusted]
+
+      steady:
+        - component: ravendb_node
+          condition: |
+            A portion of new TLS handshakes (node-to-node and rare inbound client handshakes) still fail/abort,
+            leaving the cluster in a partially-connected state.
+          user_impact: |
+            Most read/write operations continue, but cluster-wide/quorum-dependent tasks intermittently fail and some nodes appear unreachable to peers;
+            a small number of new/renewed client connections abort during handshake.
+          manifestation: [ravendb_node.cluster_peer_untrusted, ravendb_node.raft_quorum_lost, ravendb_node.cluster_link_state]
+
+        - component: monitoring
+          condition: |
+            Monitoring continues to observe elevated TLS probe failures and periodic connectivity alerts, though reduced after partial remediation.
+          user_impact: |
+            Operators receive ongoing alerts indicating unresolved partial outage risk.
+          manifestation: [monitoring.probe_tls_fail, monitoring.alert_cluster_connectivity]
+
+      feedback_loops:
+        - id: pooled_connections_delay_then_spike
+          desc: |
+            Connection pooling delays the onset because established connections stay healthy, but as connections churn (retries, restarts, idle timeout),
+            the fraction of new handshakes rises and amplifies observed failures and cluster link instability.
+        - id: retry_pressure_on_broken_handshakes
+          desc: |
+            Failed cluster reconnect attempts trigger retries/backoff, producing repeated handshake attempts that keep error rates elevated
+            until trust-store/cached-chain remediation is complete.
+
+      flows: [client_api_request_f, cluster_connect_tls_fail_f, inbound_client_handshake_fail_f, cluster_task_deploy_index_fail_f]
+      manifestation: [ravendb_node.cluster_peer_untrusted, ravendb_node.raft_quorum_lost, monitoring.probe_tls_fail, monitoring.alert_cluster_connectivity]
+
+  assumptions:
+    - "The modeled incident window ends before full fleet remediation completes; real-world follow-ups (full fix everywhere) are intentionally outside this scenario so it ends in a failure state."
+    - "Failure-phase piecewise breakdown (16 minutes total): min 16-22 (6 min) baseline failure rates with quorum/task failures suppressed (cluster_task_deploy_index_fail_f multiplier=0.0; cluster_connect_tls_fail_f at 15 rpm; monitoring.probe_tls_fail at 6/min; alerts ~1/min); min 22-28 (6 min) worsening via multipliers (cluster_connect_tls_fail_f ~27 rpm; cluster_task_deploy_index_fail_f ~4.2 rpm; probe TLS failures increase; cluster-task failures have higher tail latency); min 28-32 (4 min) partial remediation reduces TLS-related rates (cluster_connect_tls_fail_f ~9 rpm; probe TLS failures reduced; ops rollout status begins at ~2/min) while quorum/task failures can still occur due to remaining partial splits."
+    - "One-shot counts: 3 host_os.ca_certs_update at min 16; 9 ops_automation.cmd_exec and 3 host_os.trust_store_refresh at min 28."
+    - "Normal-phase logs/min estimate ≈ 900–930; failure-phase logs/min estimate ≈ 920–1035 dominated by per-request access logs plus visible TLS/alert signals; total estimated logs ≈ 29k–35k (within 20k–100k)."
+    - "Visibility rationale: chain-validation failures are visible via recurring ravendb_node.cluster_peer_untrusted plus monitoring.probe_tls_fail and periodic alerts; cluster_link_state snapshots show split-like connectivity; quorum/task failures are made onset-visible by activating them at minute 22; rare client impact is represented as low-rate server-side inbound handshake aborts (inbound_tls_handshake_failed) rather than client-side issuer-chain details."
+```

@@ -1,0 +1,726 @@
+```yaml
+sys:
+  id: buildkite_dashboard_2016
+  desc: >
+    A hosted CI service with a web dashboard for logins, build views, and documentation, plus an Agent API used by build agents.
+    Web traffic for the dashboard is served by an AWS load balancer to a fleet of Rails application instances backed by PostgreSQL via PgBouncer.
+    During the modeled incident, a downgraded RDS PostgreSQL instance saturates under peak load, causing DB-dependent health checks to fail and the dashboard ELB to drain targets.
+    Auto Scaling cannot replace capacity because new instances fail to self-deploy and run an old health check that references a removed DB shard; later mitigations upgrade RDS and roll out a fixed bootstrap path.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: dashboard_elb
+    name: Dashboard ELB
+    svc: aws-elb
+    hosts: [elb-dashboard]
+    desc: >
+      Load balancer for the Buildkite dashboard site. Performs periodic health checks and forwards user requests to dashboard app instances.
+
+    to:
+      - dst: dashboard_app
+        proto: https
+        desc: Forwards dashboard HTTP requests and health checks to Rails app instances.
+
+    logs:
+      req_ok:
+        desc: Access log line for successful proxied dashboard requests (emitted after the backend response is known).
+        lvl: INFO
+        msg: "ELB request {method} {url_path} -> {status} target={target} latency_ms={lat_ms} req={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          url_path: {k: str, v: "dashboard path (e.g. /login, /builds/<id>/log, /docs)"}
+          status: {k: ch, v: [200, 302]}
+          target: {k: ch, v: [dash-1, dash-2, dash-3]}
+          req_id: {k: hex, v: 16}
+        state_vars:
+          n:
+            lat_ms: {k: i, v: [10, 250]}
+          f:
+            lat_ms: {k: i, v: [200, 5000]}
+
+      req_no_healthy:
+        desc: Access log line when no healthy dashboard targets are available.
+        lvl: WARN
+        msg: "ELB request {method} {url_path} -> 503 no_healthy_backends latency_ms={lat_ms} req={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          url_path: {k: str, v: "dashboard path (e.g. /login, /builds/<id>/log, /docs)"}
+          lat_ms: {k: i, v: [1, 120]}
+          req_id: {k: hex, v: 16}
+
+      hc_access:
+        desc: Access log line for ELB health check requests.
+        lvl: INFO
+        msg: "ELB healthcheck GET /healthcheck target={target} req={req_id}"
+        vars:
+          target: {k: ch, v: [dash-1, dash-2, dash-3]}
+          req_id: {k: hex, v: 16}
+
+      hc_result_ok:
+        desc: Health check result for a target returning 200.
+        lvl: INFO
+        msg: "ELB healthcheck result target={target} status=200 latency_ms={lat_ms} req={req_id}"
+        vars:
+          target: {k: ch, v: [dash-1, dash-2, dash-3]}
+          lat_ms: {k: i, v: [1, 800]}
+          req_id: {k: hex, v: 16}
+
+      hc_result_500:
+        desc: Health check result for a target returning 500.
+        lvl: WARN
+        msg: "ELB healthcheck result target={target} status=500 latency_ms={lat_ms} req={req_id}"
+        vars:
+          target: {k: ch, v: [dash-1, dash-2, dash-3]}
+          lat_ms: {k: i, v: [50, 5000]}
+          req_id: {k: hex, v: 16}
+
+    beh:
+      n:
+        desc: ELB emits logs only as part of request/healthcheck flows.
+        emit: []
+      f:
+        desc: ELB emits logs only as part of request/healthcheck flows.
+        emit: []
+
+  - id: dashboard_app
+    name: Dashboard Rails App
+    svc: buildkite-web
+    hosts: [dash-1, dash-2, dash-3]
+    desc: >
+      Rails application handling logins, build viewing, and documentation. Uses PgBouncer for PostgreSQL connections.
+      The /healthcheck endpoint is used by the ELB and (in this modeled version) fails if the DB ping fails.
+
+    to:
+      - dst: pgbouncer_central
+        proto: tcp
+        desc: Uses PgBouncer for pooled PostgreSQL connections.
+      - dst: dashboard_elb
+        proto: https
+        desc: Returns HTTP responses to the ELB (modeled as a coarse return hop for access/healthcheck result logs).
+
+    logs:
+      req_started:
+        desc: Start of an HTTP request handled by the Rails app.
+        lvl: INFO
+        msg: "Started {method} {url_path} controller={controller} action={action} req={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          url_path: {k: str, v: "dashboard path (e.g. /login, /builds/<id>/log, /docs)"}
+          controller: {k: ch, v: [sessions, builds, docs]}
+          action: {k: ch, v: [new, show, index]}
+          req_id: {k: hex, v: 16}
+
+      req_completed_ok:
+        desc: Successful completion of an HTTP request.
+        lvl: INFO
+        msg: "Completed {status} in {dur_ms}ms req={req_id}"
+        vars:
+          status: {k: ch, v: [200, 302]}
+          req_id: {k: hex, v: 16}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [30, 800]}
+          f:
+            dur_ms: {k: i, v: [500, 12000]}
+
+      healthcheck_ok:
+        desc: Health check succeeded.
+        lvl: INFO
+        msg: "Healthcheck OK dur_ms={dur_ms} req={req_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [5, 40]}
+          f:
+            dur_ms: {k: i, v: [20, 3000]}
+
+      healthcheck_db_timeout:
+        desc: Health check failed due to database ping timing out.
+        lvl: ERROR
+        msg: "Healthcheck failed: database ping timeout waited_ms={waited_ms} shard=two req={req_id}"
+        vars:
+          waited_ms: {k: i, v: [200, 5000]}
+          req_id: {k: hex, v: 16}
+
+      healthcheck_old_shard_error:
+        desc: Health check failed because the instance is running old code referencing a removed DB shard.
+        lvl: ERROR
+        msg: "Healthcheck failed: database shard missing shard=one err=\"{err}\" req={req_id}"
+        vars:
+          err: {k: ch, v: ["relation does not exist", "connection refused"]}
+          req_id: {k: hex, v: 16}
+
+    beh:
+      n:
+        desc: App emits logs only when handling requests and ELB health checks.
+        emit: []
+      f:
+        desc: App emits logs only when handling requests and ELB health checks.
+        emit: []
+
+  - id: pgbouncer_central
+    name: Central PgBouncer
+    svc: pgbouncer
+    hosts: [pgb-1]
+    desc: >
+      Centralized PgBouncer instance pooling PostgreSQL connections across dashboard app instances.
+      Under DB pressure it accumulates waiting clients and increases request latency; after rollback to per-host pooling, waiting largely clears.
+
+    to:
+      - dst: postgres_rds
+        proto: tcp
+        desc: Maintains a pool of connections to the PostgreSQL RDS instance.
+
+    logs:
+      pool_stats:
+        desc: Periodic pool statistics for the buildkite database (overloaded profile).
+        lvl: INFO
+        msg: "pgbouncer stats db=buildkite active={active} waiting={waiting} max_client_conn={max_conn} avg_wait_ms={avg_wait_ms}"
+        vars:
+          active: {k: i, v: [50, 600]}
+          max_conn: {k: i, v: [800, 1200]}
+        state_vars:
+          n:
+            waiting: {k: i, v: [0, 5]}
+            avg_wait_ms: {k: i, v: [0, 10]}
+          f:
+            waiting: {k: i, v: [20, 300]}
+            avg_wait_ms: {k: i, v: [50, 2000]}
+
+      pool_stats_recovered:
+        desc: Periodic pool statistics after mitigation (recovered profile).
+        lvl: INFO
+        msg: "pgbouncer stats db=buildkite active={active} waiting={waiting} max_client_conn={max_conn} avg_wait_ms={avg_wait_ms} profile=recovered"
+        vars:
+          active: {k: i, v: [40, 450]}
+          waiting: {k: i, v: [0, 20]}
+          max_conn: {k: i, v: [800, 1200]}
+          avg_wait_ms: {k: i, v: [0, 80]}
+
+      server_connect_failed:
+        desc: Failure to connect to the PostgreSQL server.
+        lvl: WARN
+        msg: "pgbouncer server connect failed db=buildkite err=\"{err}\""
+        vars:
+          err: {k: ch, v: ["timeout", "too many connections"]}
+
+      config_change:
+        desc: Operator changes pooling topology during mitigation.
+        lvl: INFO
+        msg: "pgbouncer config change pooling_mode={mode} reason=\"{reason}\""
+        vars:
+          mode: {k: ch, v: [per_host]}
+          reason: {k: ch, v: [rollback_from_central]}
+
+    beh:
+      n:
+        desc: Emits low-rate pool stats during normal operations.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Under overload the default stats show high waiting; during later mitigation a recovered-profile stats line is emitted instead.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+            scope: per_host
+          - id: pool_stats_recovered
+            per_min: 1.0
+            scope: per_host
+          - id: server_connect_failed
+            per_min: 0.2
+            scope: per_host
+
+  - id: postgres_rds
+    name: PostgreSQL RDS
+    svc: aws-rds-postgres
+    hosts: [rds-primary]
+    desc: >
+      Primary PostgreSQL database serving both the dashboard and Agent API.
+      During failure it saturates CPU and times out connections, contributing to failing health checks and elevated app latency; later the instance type is upgraded.
+
+    to:
+      - dst: pgbouncer_central
+        proto: tcp
+        desc: Returns query results/connection responses to PgBouncer clients.
+      - dst: dashboard_app
+        proto: tcp
+        desc: Returns query results/connection responses to dashboard app clients.
+      - dst: agent_api
+        proto: tcp
+        desc: Returns query results/connection responses to Agent API clients.
+
+    logs:
+      rds_metrics:
+        desc: Periodic RDS performance snapshot (overloaded profile).
+        lvl: INFO
+        msg: "rds metrics cpu_pct={cpu_pct} conn_used={conn_used} qps={qps} profile=overloaded"
+        vars:
+          qps: {k: i, v: [500, 4000]}
+        state_vars:
+          n:
+            cpu_pct: {k: i, v: [10, 45]}
+            conn_used: {k: i, v: [80, 250]}
+          f:
+            cpu_pct: {k: i, v: [80, 100]}
+            conn_used: {k: i, v: [250, 800]}
+
+      rds_metrics_recovered:
+        desc: Periodic RDS performance snapshot after upgrade (recovered profile).
+        lvl: INFO
+        msg: "rds metrics cpu_pct={cpu_pct} conn_used={conn_used} qps={qps} profile=recovered"
+        vars:
+          qps: {k: i, v: [800, 4500]}
+        state_vars:
+          n:
+            cpu_pct: {k: i, v: [10, 45]}
+            conn_used: {k: i, v: [80, 250]}
+          f:
+            cpu_pct: {k: i, v: [25, 70]}
+            conn_used: {k: i, v: [120, 450]}
+
+      connection_timeout:
+        desc: Client connection attempts time out.
+        lvl: WARN
+        msg: "postgres connection timeout from={client} timeout_ms={timeout_ms}"
+        vars:
+          client: {k: ch, v: [pgb-1, dash-1, agent-1]}
+          timeout_ms: {k: i, v: [200, 5000]}
+
+      slow_query:
+        desc: Slow query execution observed.
+        lvl: WARN
+        msg: "slow query tag={tag} dur_ms={dur_ms}"
+        vars:
+          tag: {k: ch, v: [healthcheck_select1, dashboard_login, build_log_fetch]}
+          dur_ms: {k: i, v: [500, 8000]}
+
+      modify_instance:
+        desc: Operator modifies the RDS instance type during mitigation.
+        lvl: INFO
+        msg: "rds modify instance_id=buildkite from={from} to={to} apply_immediately=true"
+        vars:
+          from: {k: ch, v: [r3.2xlarge]}
+          to: {k: ch, v: [m4.10xlarge]}
+
+    beh:
+      n:
+        desc: Periodic metrics with occasional slow queries.
+        emit:
+          - id: rds_metrics
+            per_min: 1.0
+            scope: global
+          - id: slow_query
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Metrics indicate saturation with frequent timeouts and more slow queries; recovered metrics are enabled later via scenario controls.
+        emit:
+          - id: rds_metrics
+            per_min: 1.0
+            scope: global
+          - id: rds_metrics_recovered
+            per_min: 1.0
+            scope: global
+          - id: connection_timeout
+            per_min: 1.2
+            scope: global
+          - id: slow_query
+            per_min: 0.6
+            scope: global
+
+  - id: agent_api
+    name: Agent API
+    svc: buildkite-agent-api
+    hosts: [agent-1, agent-2]
+    desc: >
+      API used by build agents to poll for work and report status. Kept mostly functional during the incident,
+      though it shares the same database and can see mild latency increases.
+
+    to:
+      - dst: postgres_rds
+        proto: tcp
+        desc: Reads/writes job and build state.
+
+    logs:
+      agent_req:
+        desc: Request handled by the Agent API.
+        lvl: INFO
+        msg: "agent-api {method} {url_path} -> {status} dur_ms={dur_ms} req={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          url_path: {k: ch, v: ["/agent/ping", "/agent/jobs/next"]}
+          status: {k: ch, v: [200, 204, 500]}
+          req_id: {k: hex, v: 16}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [20, 300]}
+          f:
+            dur_ms: {k: i, v: [30, 800]}
+
+      agent_retry:
+        desc: Retry marker for Agent API requests.
+        lvl: WARN
+        msg: "agent-api retry attempt={attempt} reason=\"{reason}\" req={req_id}"
+        vars:
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: ["upstream timeout", "db busy"]}
+          req_id: {k: hex, v: 16}
+
+    beh:
+      n:
+        desc: No background logs; request-driven.
+        emit: []
+      f:
+        desc: No background logs; request-driven.
+        emit: []
+
+  - id: autoscaling
+    name: Dashboard Auto Scaling
+    svc: aws-asg
+    hosts: [asg-dashboard]
+    desc: >
+      Auto Scaling Group responsible for maintaining dashboard app capacity. During the incident it repeatedly launches and terminates instances
+      due to failing ELB health checks, and eventually encounters EC2 request limits. Replacement instances also fail bootstrap when they cannot
+      fetch the deployed revision from the same site, leaving them on a baked revision with an outdated health check.
+
+    to:
+      - dst: dashboard_elb
+        proto: aws
+        desc: Registers/deregisters instances with the dashboard ELB.
+      - dst: dashboard_app
+        proto: aws
+        desc: Launches/terminates dashboard instances.
+
+    logs:
+      instance_launch:
+        desc: Instance launch event.
+        lvl: INFO
+        msg: "asg launch instance={instance_id} ami={ami} reason=\"{reason}\""
+        vars:
+          instance_id: {k: str, v: "i-<hex8>"}
+          ami: {k: str, v: "ami-<hex8>"}
+          reason: {k: ch, v: [replace_unhealthy, scale_out]}
+
+      instance_terminate:
+        desc: Instance termination event.
+        lvl: WARN
+        msg: "asg terminate instance={instance_id} reason=\"{reason}\""
+        vars:
+          instance_id: {k: str, v: "i-<hex8>"}
+          reason: {k: ch, v: [failed_elb_healthcheck, user_initiated]}
+
+      userdata_fetch_rev_failed:
+        desc: New instance bootstrap cannot fetch the currently deployed revision from the dashboard endpoint.
+        lvl: ERROR
+        msg: "userdata fetch deploy revision failed url={url} err=\"{err}\""
+        vars:
+          url: {k: ch, v: ["https://buildkite.com/_secret/version"]}
+          err: {k: ch, v: ["connection refused", "timeout", "503 Service Unavailable"]}
+
+      desired_capacity_set:
+        desc: Operator locks desired capacity to stop churn during mitigation.
+        lvl: INFO
+        msg: "asg desired capacity set to {desired} reason=\"{reason}\""
+        vars:
+          desired: {k: i, v: [1, 10]}
+          reason: {k: ch, v: [mitigation_lock, scale_policy]}
+
+      register_instance_to_elb:
+        desc: Operator registers an instance (borrowed capacity) to the dashboard ELB.
+        lvl: INFO
+        msg: "registered instance={instance_id} to elb=dashboard"
+        vars:
+          instance_id: {k: str, v: "i-<hex8>"}
+
+      launch_failed_rate_limit:
+        desc: EC2 API request limit prevents new instances from being launched.
+        lvl: ERROR
+        msg: "ec2 api error api=RunInstances code=RequestLimitExceeded retry_after_s={retry_s}"
+        vars:
+          retry_s: {k: i, v: [30, 300]}
+
+      ami_rollout_started:
+        desc: Operator begins rolling out a new AMI that no longer depends on the dashboard endpoint for revision discovery.
+        lvl: INFO
+        msg: "ami rollout started ami={ami} revision_source={rev_src} reason=\"{reason}\""
+        vars:
+          ami: {k: str, v: "ami-<hex8>"}
+          rev_src: {k: ch, v: [s3_file]}
+          reason: {k: ch, v: [fix_bootstrap_revision_source]}
+
+    beh:
+      n:
+        desc: Occasional instance lifecycle events in normal operation.
+        emit:
+          - id: instance_launch
+            per_min: 0.02
+            scope: global
+          - id: instance_terminate
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Elevated launch/terminate activity and occasional AWS API errors during the outage.
+        emit:
+          - id: instance_launch
+            per_min: 0.4
+            scope: global
+          - id: instance_terminate
+            per_min: 0.4
+            scope: global
+          - id: userdata_fetch_rev_failed
+            per_min: 0.2
+            scope: global
+          - id: launch_failed_rate_limit
+            per_min: 0.05
+            scope: global
+
+  - id: monitoring
+    name: External Monitoring + PagerDuty
+    svc: monitoring
+    hosts: [monitor-1]
+    desc: >
+      Synthetic probes and alerting that detect dashboard unavailability and open PagerDuty incidents.
+      In the real incident, notification settings prevented the team from being woken up promptly; the model reflects unacked escalation activity.
+
+    to:
+      - dst: dashboard_elb
+        proto: https
+        desc: Runs synthetic probes against the dashboard via the ELB.
+
+    logs:
+      probe_result:
+        desc: Synthetic probe result line.
+        lvl: INFO
+        msg: "probe {probe} status={status} rtt_ms={rtt_ms}"
+        vars:
+          probe: {k: ch, v: [dashboard_login, docs_page]}
+          rtt_ms: {k: i, v: [20, 8000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [ok]}
+          f:
+            status: {k: ch, v: [critical, timeout]}
+
+      pagerduty_incident:
+        desc: PagerDuty incident opened for the dashboard service (modeled only as a scenario one-shot marker).
+        lvl: ERROR
+        msg: "pagerduty incident opened service=dashboard severity={sev} incident_id={inc_id}"
+        vars:
+          sev: {k: ch, v: [high, critical]}
+          inc_id: {k: hex, v: 8}
+
+      pagerduty_escalation:
+        desc: PagerDuty escalation step recorded without acknowledgement.
+        lvl: WARN
+        msg: "pagerduty escalation step={step} result={result} incident_id={inc_id}"
+        vars:
+          step: {k: i, v: [1, 3]}
+          result: {k: ch, v: [no_ack, notified_secondary]}
+          inc_id: {k: hex, v: 8}
+
+    beh:
+      n:
+        desc: Probes succeed and no PagerDuty escalation occurs.
+        emit:
+          - id: probe_result
+            per_min: 2.0
+            scope: global
+          - id: pagerduty_escalation
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Probes fail and escalation activity continues (incident open is represented via scenario one-shot).
+        emit:
+          - id: probe_result
+            per_min: 2.0
+            scope: global
+          - id: pagerduty_escalation
+            per_min: 0.2
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation with healthy DB, stable dashboard capacity, and regular ELB health checks.
+    req:
+      - id: dashboard_login
+        desc: User loads login page / starts a session.
+        rpm: 120.0
+        path: [dashboard_elb, dashboard_app, pgbouncer_central, postgres_rds, dashboard_app, dashboard_elb]
+        emit: [dashboard_app.req_started, dashboard_app.req_completed_ok, dashboard_elb.req_ok]
+        latency_ms: [[1, 10], [30, 800], [1, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_view_build_log
+        desc: User views build logs in the dashboard.
+        rpm: 80.0
+        path: [dashboard_elb, dashboard_app, pgbouncer_central, postgres_rds, dashboard_app, dashboard_elb]
+        emit: [dashboard_app.req_started, dashboard_app.req_completed_ok, dashboard_elb.req_ok]
+        latency_ms: [[1, 10], [80, 1200], [1, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_elb_healthcheck
+        desc: ELB health check against /healthcheck returning 200 (30s cadence across multiple LB nodes).
+        rpm: 12.0
+        path: [dashboard_elb, dashboard_app, dashboard_elb]
+        emit: [dashboard_elb.hc_access, dashboard_app.healthcheck_ok, dashboard_elb.hc_result_ok]
+        latency_ms: [[1, 3], [1, 10], [1, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: agent_job_poll
+        desc: Agents poll for work; generally light and steady.
+        rpm: 300.0
+        path: [agent_api, postgres_rds]
+        emit: [agent_api.agent_req]
+        latency_ms: [[20, 300]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.05
+          emit_per_retry: [agent_api.agent_retry]
+          backoff_ms: [[50, 200], [200, 800]]
+        trace: false
+
+  f:
+    desc: Failure mode where dashboard capacity drains due to DB-driven health check failures and replacement instances never become healthy.
+    req:
+      - id: dashboard_login_503
+        desc: Login requests fail at the ELB due to no healthy dashboard targets.
+        rpm: 150.0
+        path: [dashboard_elb]
+        emit: [dashboard_elb.req_no_healthy]
+        latency_ms: [[1, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_view_build_log_503
+        desc: Viewing build logs fails at the ELB due to no healthy dashboard targets.
+        rpm: 100.0
+        path: [dashboard_elb]
+        emit: [dashboard_elb.req_no_healthy]
+        latency_ms: [[1, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_login_slow
+        desc: After mitigation, some login requests reach a target but are slow due to DB saturation (improves after DB upgrade but remains above normal).
+        rpm: 20.0
+        path: [dashboard_elb, dashboard_app, pgbouncer_central, postgres_rds, dashboard_app, dashboard_elb]
+        emit: [dashboard_app.req_started, dashboard_app.req_completed_ok, dashboard_elb.req_ok]
+        latency_ms: [[5, 80], [500, 12000], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_elb_healthcheck_fail_db
+        desc: ELB health check fails because DB ping times out on instances under DB overload.
+        rpm: 12.0
+        path: [dashboard_elb, dashboard_app, dashboard_elb]
+        emit: [dashboard_elb.hc_access, dashboard_app.healthcheck_db_timeout, dashboard_elb.hc_result_500]
+        latency_ms: [[1, 3], [200, 5000], [10, 100]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_elb_healthcheck_fail_old_shard
+        desc: ELB health check fails on newly launched instances running old code referencing shard one.
+        rpm: 12.0
+        path: [dashboard_elb, dashboard_app, dashboard_elb]
+        emit: [dashboard_elb.hc_access, dashboard_app.healthcheck_old_shard_error, dashboard_elb.hc_result_500]
+        latency_ms: [[1, 3], [5, 80], [5, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: dashboard_elb_healthcheck_ok
+        desc: A subset of health checks succeed (targets become healthy during mitigation despite overall degradation).
+        rpm: 12.0
+        path: [dashboard_elb, dashboard_app, dashboard_elb]
+        emit: [dashboard_elb.hc_access, dashboard_app.healthcheck_ok, dashboard_elb.hc_result_ok]
+        latency_ms: [[1, 3], [20, 3000], [1, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: agent_job_poll
+        desc: Agent API remains available, though it may see mild DB-related latency and retries.
+        rpm: 300.0
+        path: [agent_api, postgres_rds]
+        emit: [agent_api.agent_req]
+        latency_ms: [[30, 800]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.3
+          emit_per_retry: [agent_api.agent_retry]
+          backoff_ms: [[100, 400], [400, 1500]]
+        trace: false
+
+assumptions:
+  - >
+    Coarse "return hops" back to dashboard_elb are explicitly modeled so that ELB request-completion and health-check result logs
+    can occur after the backend handler logs while remaining path-traversable.
+  - >
+    ELB health checks are described as running every 30 seconds; we model this as ~2 ELB nodes each probing 3 targets every 30s,
+    resulting in ~12 health-check requests per minute across the target set.
+  - >
+    To make partial service causally consistent, failure-mode health checks are modeled with three mutually exclusive variants (DB-timeout 500,
+    old-shard 500, and 200 OK). Scenario events control their mixture via rate multipliers so the effective total stays ~12 rpm.
+  - >
+    PagerDuty incident-open is modeled only as a scenario one-shot marker (not as a background emission); recurring alert activity
+    is represented by pagerduty_escalation.
+  - >
+    Recovery actions are modeled within the failure phase (RDS instance upgrade, AMI rollout fixing revision bootstrap, and PgBouncer rollback)
+    but the scenario still ends in a degraded state (residual latency and intermittent 503/500) to satisfy the two-phase normal/failure format.
+  - >
+    Redis and Memcached are not modeled as separate components; their presence in the real health check is acknowledged but omitted because
+    the incident’s dominant path is database saturation plus the bootstrapping/healthcheck regression.
+  - >
+    The pgbouncer component represents the pooling layer; a later rollback to per-host pooling is represented by switching emitted metrics
+    from pool_stats (overloaded) to pool_stats_recovered (via scenario multipliers) rather than introducing new per-host components.
+  - >
+    Normal-phase log volume estimate (25 min): ~24k logs, dominated by dashboard requests (~15k) and Agent API polling/retries (~8k).
+    Total scenario estimate (50 min): ~42k logs (within 20k..100k), with failure-phase volume dominated by dashboard 503s/successes, ELB health checks,
+    Agent API polling/retries, and steady DB/PgBouncer/RDS metrics plus elevated ASG churn mid-incident.
+```

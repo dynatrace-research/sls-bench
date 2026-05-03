@@ -1,0 +1,258 @@
+```yaml
+scenario:
+  id: incident_2013_04_13_peering_quorum_loss
+  title: Peering degradation causes quorum loss and notification dispatch outage
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally accepts events via /v1/events and dispatches outbound notifications using workers gated by a
+    cross-datacenter quorum. A network peering point degradation impacts connectivity between two AWS regions,
+    increasing RTT/loss and causing coordinator session expirations. Notification dispatch first degrades (higher
+    latency and provider errors), then loses quorum entirely and requeues work, while the events API continues to
+    accept events and the queue backlog grows.
+
+  trigger_desc: |
+    A shared network peering point used by two AWS regions degrades, increasing inter-region latency/loss and
+    intermittently partitioning the coordinator cluster.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Events arrive steadily and are accepted with low latency. Dispatch workers consistently obtain quorum and
+        send notifications successfully. The durable queue remains small with low message age, and network probes
+        report stable RTT and negligible loss between datacenters.
+      flows: [post_event, dispatch_notification, get_incident_200]
+      manifestation:
+        - api_gateway.http_events_202
+        - event_ingest.event_ingested
+        - dispatch_worker.job_done_success
+        - event_queue.queue_depth_metric
+        - net_probe.ping_metric
+        - coordinator.leader_heartbeat
+
+    f:
+      desc: |
+        Inter-datacenter connectivity degrades, causing higher RTT/loss and coordinator session expirations.
+        Dispatch initially continues but slows and produces more provider-facing errors; monitoring later flags
+        multi-provider failures. Eventually the coordinator cannot form a majority view, so dispatch workers requeue
+        jobs and notifications stop flowing while new events are still accepted and queued. A manual coordinator
+        configuration adjustment and restarts later allow quorum to return with two nodes, enabling backlog drain,
+        but latency and queue age remain elevated by the end of the scenario.
+      events:
+        - order: 1
+          at_min: 20
+          component: net_probe
+          event: |
+            Network probes observe a sharp increase in RTT and packet loss between aws_r1 and aws_r2 (and to linode),
+            coinciding with the start of dispatch instability.
+          why: |
+            The underlying peering point degradation is external to the system but is observable via synthetic probes.
+            Elevated latency triggers coordinator timeouts and increases the chance of session expiration.
+          flows: [dispatch_degraded, post_event]
+          rate_multipliers:
+            net_probe.ping_metric: 6.0
+            coordinator.session_expired: 2.5
+            monitoring.alert_multi_provider_failure: 0.0
+            dispatch_blocked_no_quorum: 0.0
+            dispatch_backlog_drain: 0.0
+          latency_multipliers:
+            dispatch_degraded: {p50: 1.5, p95: 2.0}
+            get_incident_500: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: monitoring.oncall_page_sent
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - net_probe.ping_metric
+            - coordinator.session_expired
+            - dispatch_worker.job_done_degraded
+
+        - order: 2
+          at_min: 22
+          component: dispatch_worker
+          event: |
+            An operator attempts to restart a dispatch node to recover from apparent node failure, but it does not restore
+            normal dispatch behavior.
+          why: |
+            The node restart is directly observable. The root issue is network/coordinator instability, so restarting a single
+            worker does not remove the quorum pressure.
+          flows: [dispatch_degraded]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: dispatch_worker.dispatch_node_restart
+              count: 1
+              hosts: [dispatch-r1-1]
+          manifestation:
+            - dispatch_worker.dispatch_node_restart
+            - coordinator.session_expired
+
+        - order: 3
+          at_min: 27
+          component: monitoring
+          event: |
+            Monitoring detects multi-provider notification delivery failures and elevated p95 latencies; a SEV-2 is declared
+            and additional engineers are paged.
+          why: |
+            Provider errors are a secondary symptom: under high latency, dispatch attempts take longer and providers time out.
+            The alert is directly observable in monitoring logs.
+          flows: [dispatch_degraded]
+          rate_multipliers:
+            monitoring.alert_multi_provider_failure: 1.5
+          latency_multipliers:
+            dispatch_degraded: {p50: 2.0, p95: 3.0}
+          one_shots:
+            - ref: monitoring.incident_sev_set
+              count: 1
+              hosts: [mon-1]
+            - ref: monitoring.oncall_page_sent
+              count: 2
+              hosts: [mon-1]
+          manifestation:
+            - monitoring.alert_multi_provider_failure
+            - monitoring.incident_sev_set
+            - dispatch_worker.job_done_degraded
+
+        - order: 4
+          at_min: 32
+          component: coordinator
+          event: |
+            Coordinator quorum cannot be established (majority unreachable) and dispatch workers begin requeuing jobs rather
+            than sending notifications; SEV-1 is declared.
+          why: |
+            With two datacenters impaired, only one coordinator node may be reliably reachable, which is insufficient for a
+            majority quorum. This is directly observable via a cluster-level "lost quorum" marker plus high-rate per-attempt
+            quorum failures and dispatch requeues.
+          flows: [dispatch_blocked_no_quorum, post_event]
+          rate_multipliers:
+            dispatch_degraded: 0.0
+            dispatch_blocked_no_quorum: 9.0
+            coordinator.session_expired: 4.0
+          latency_multipliers:
+            dispatch_blocked_no_quorum: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: monitoring.incident_sev_set
+              count: 1
+              hosts: [mon-1]
+            - ref: monitoring.oncall_page_sent
+              count: 1
+              hosts: [mon-1]
+            - ref: coordinator.quorum_lost
+              count: 3
+              hosts: [coord-r1-1, coord-r2-1, coord-l1-1]
+            - ref: event_queue.queue_depth_snapshot
+              count: 1
+              hosts: [queue-l1-1]
+          manifestation:
+            - coordinator.quorum_lost
+            - coordinator.quorum_fail
+            - dispatch_worker.job_requeued
+            - event_queue.queue_depth_snapshot
+
+        - order: 5
+          at_min: 40
+          component: coordinator
+          event: |
+            Operators reload coordinator configuration and restart coordinator processes; quorum becomes reachable with two
+            nodes and workers begin draining the queued notifications, though latency remains elevated.
+          why: |
+            A misconfiguration (overly aggressive timeout) makes recovery slower under high latency; increasing timeouts and
+            restarting processes allows sessions to stabilize long enough to form a majority. The operational actions are
+            directly observable via one-shot logs; improved dispatch is observable via backlog-drain job logs.
+          flows: [dispatch_backlog_drain, post_event]
+          rate_multipliers:
+            dispatch_blocked_no_quorum: 0.2
+            dispatch_backlog_drain: 2.0
+            coordinator.session_expired: 1.5
+            net_probe.ping_metric: 2.5
+          latency_multipliers:
+            dispatch_backlog_drain: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: coordinator.config_reload
+              count: 1
+              hosts: [coord-l1-1]
+            - ref: coordinator.proc_restart
+              count: 3
+              hosts: [coord-r1-1, coord-r2-1, coord-l1-1]
+            - ref: event_queue.queue_depth_snapshot
+              count: 1
+              hosts: [queue-l1-1]
+          manifestation:
+            - coordinator.config_reload
+            - coordinator.proc_restart
+            - dispatch_worker.job_done_backlog
+            - event_queue.queue_depth_metric
+
+      steady:
+        - component: dispatch_worker
+          condition: |
+            Dispatch is partially restored but continues draining backlog with elevated queue age and higher end-to-end latency.
+          user_impact: |
+            Notifications are delivered late; some delivery attempts still fail or time out intermittently.
+          manifestation: [dispatch_worker.job_done_backlog, dispatch_worker.worker_pool_metric]
+        - component: event_queue
+          condition: |
+            Queue depth and oldest message age remain elevated compared to normal.
+          user_impact: |
+            Events are accepted, but notifications may be delayed until the backlog is cleared.
+          manifestation: [event_queue.queue_depth_metric]
+        - component: coordinator
+          condition: |
+            Quorum is intermittently fragile under residual network degradation, with occasional session expirations and some
+            quorum checks still failing.
+          user_impact: |
+            Dispatch throughput fluctuates and may briefly stall.
+          manifestation: [coordinator.session_expired, coordinator.quorum_fail]
+        - component: api_gateway
+          condition: |
+            Events API continues to return 202, while some read requests intermittently fail.
+          user_impact: |
+            Customers can still send events, but some API reads may return 500.
+          manifestation: [api_gateway.http_events_202, api_gateway.http_incident_500]
+
+      feedback_loops:
+        - id: backlog_latency_feedback
+          desc: |
+            When dispatch is blocked, queue depth and message age grow; once dispatch resumes, higher queue age and higher
+            attempt latency reduce throughput, prolonging the period of delayed notifications.
+        - id: quorum_timeout_feedback
+          desc: |
+            Elevated RTT causes session expirations; session churn makes it harder to hold a stable majority long enough to
+            process work, increasing requeues and reducing effective dispatch rate.
+
+      flows:
+        - post_event
+        - dispatch_degraded
+        - dispatch_blocked_no_quorum
+        - dispatch_backlog_drain
+        - get_incident_200
+        - get_incident_500
+      manifestation:
+        - net_probe.ping_metric
+        - coordinator.session_expired
+        - coordinator.quorum_fail
+        - dispatch_worker.job_requeued
+        - event_queue.queue_depth_metric
+        - monitoring.alert_multi_provider_failure
+
+  assumptions:
+    - |
+      Timeline is compressed to 50 minutes while preserving ordering: early network degradation → degraded dispatch → quorum loss → partial recovery/backlog drain (the scenario ends before full AWS network recovery).
+    - |
+      Failure starts at minute 20 (first strong operator-visible symptoms/paging) though the external degradation began earlier; net_probe provides the earliest in-scenario signal.
+    - |
+      coordinator.quorum_lost is modeled as a one-shot cluster transition marker at minute 32 (one per coordinator host) to make the "first loss of quorum" boundary unambiguous, while ongoing inability to dispatch is shown by high-rate coordinator.quorum_fail within dispatch_blocked_no_quorum.
+    - |
+      Piecewise volume estimate (very rough): minutes 0-20 ~1.2k logs/min (~24k). Minutes 20-32 ~1.2k logs/min (~14k). Minutes 32-40 ~1.15k logs/min (~9k). Minutes 40-50 ~2.1k logs/min (~21k). Background adds ~1-2k total. Expected total ~70k logs.
+    - |
+      Visibility rationale: event4 guarantees clear no-quorum evidence via elevated dispatch_worker.job_requeued + coordinator.quorum_fail and a coordinator.quorum_lost one-shot plus queue_depth_snapshot; event5 guarantees recovery attempt evidence via coordinator.config_reload/proc_restart one-shots and high-rate dispatch_worker.job_done_backlog.
+    - |
+      dispatch_blocked_no_quorum is explicitly suppressed (multiplier 0.0) until minute 32 so that "begin requeuing jobs" is a true phase boundary; dispatch_backlog_drain is suppressed (multiplier 0.0) until quorum is restored.
+```

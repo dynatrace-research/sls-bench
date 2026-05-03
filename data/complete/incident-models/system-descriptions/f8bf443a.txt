@@ -1,0 +1,790 @@
+```yaml
+sys:
+  id: use1_ddb_ec2_nlb_stack
+  desc: >
+    A regional cloud control-plane stack provides (1) a DynamoDB-like key/value API behind a public DNS name,
+    (2) an EC2-like instance launch API, and (3) an NLB-like load balancer service. DynamoDB endpoint DNS is
+    maintained by an automated planner/enactor pair that continuously updates Route53 records. EC2 launches
+    depend on a Droplet Workflow Manager (DWFM) that maintains per-host leases and a Network Manager that
+    propagates instance network state. The modeled incident is a DNS automation race that empties the DynamoDB
+    regional endpoint record, cascading into EC2 launch impairment and later NLB health-check instability.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: customer_app
+    name: Customer Application / SDK
+    svc: app
+    hosts: [app-1, app-2, app-3]
+    desc: >
+      Represents customer and internal clients issuing DynamoDB API calls, EC2 launches, and TCP connects to NLBs.
+      Logs capture request attempts, DNS resolution outcomes, and user-visible errors.
+    to:
+      - dst: route53_controlplane
+        proto: udp
+        desc: DNS resolution for public service endpoints.
+      - dst: ddb_api
+        proto: https
+        desc: DynamoDB API requests when DNS resolution succeeds.
+      - dst: ec2_api
+        proto: https
+        desc: EC2 RunInstances API calls.
+      - dst: nlb_controlplane
+        proto: tcp
+        desc: TCP connects to NLB frontends (modeled as a single service endpoint).
+    logs:
+      ddb_call_start:
+        desc: Client begins a DynamoDB API call.
+        lvl: INFO
+        msg: "ddb_call start op={op} table={table} endpoint={endpoint} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [PutItem, GetItem, Query]}
+          table: {k: ch, v: [users, orders, sessions]}
+          endpoint: {k: ch, v: [dynamodb.us-east-1.amazonaws.com]}
+          trace_id: {k: hex, v: 32}
+      dns_resolve_fail:
+        desc: Client DNS resolution failure for a service endpoint.
+        lvl: ERROR
+        msg: "dns_resolve failed host={host} err={err} cache_ttl_s={ttl_s} trace={trace_id}"
+        vars:
+          host: {k: ch, v: [dynamodb.us-east-1.amazonaws.com]}
+          err: {k: ch, v: [NO_ANSWER, SERVFAIL]}
+          ttl_s: {k: i, v: [0, 1200]}
+          trace_id: {k: hex, v: 32}
+      ddb_call_ok:
+        desc: Client observes a successful DynamoDB call completion.
+        lvl: INFO
+        msg: "ddb_call ok status=200 op={op} duration_ms={dur_ms} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [PutItem, GetItem, Query]}
+          dur_ms: {k: i, v: [5, 800]}
+          trace_id: {k: hex, v: 32}
+      retrying:
+        desc: Client retry marker for a request attempt beyond the first.
+        lvl: WARN
+        msg: "retrying attempt={attempt} reason={reason} trace={trace_id}"
+        vars:
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: [dns_fail, http_503, timeout]}
+          trace_id: {k: hex, v: 32}
+      ec2_run_instances_req:
+        desc: Client begins a RunInstances request.
+        lvl: INFO
+        msg: "run_instances start count={count} itype={itype} az={az} trace={trace_id}"
+        vars:
+          count: {k: i, v: [1, 3]}
+          itype: {k: ch, v: [t3.medium, m5.large, c6i.large]}
+          az: {k: ch, v: [use1-az1, use1-az2, use1-az3]}
+          trace_id: {k: hex, v: 32}
+      ec2_run_instances_ok:
+        desc: Client observes a successful RunInstances completion.
+        lvl: INFO
+        msg: "run_instances ok instance_id={iid} duration_ms={dur_ms} trace={trace_id}"
+        vars:
+          iid: {k: uuid, v: null}
+          dur_ms: {k: i, v: [200, 30000]}
+          trace_id: {k: hex, v: 32}
+      ec2_run_instances_err_unavailable:
+        desc: Client observes a ServiceUnavailable-type RunInstances failure.
+        lvl: WARN
+        msg: "run_instances failed code=ServiceUnavailable duration_ms={dur_ms} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [200, 30000]}
+          trace_id: {k: hex, v: 32}
+      ec2_run_instances_err_capacity:
+        desc: Client observes an InsufficientCapacity RunInstances failure.
+        lvl: WARN
+        msg: "run_instances failed code=InsufficientCapacity duration_ms={dur_ms} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [100, 20000]}
+          trace_id: {k: hex, v: 32}
+      ec2_run_instances_err_throttle:
+        desc: Client observes a RequestLimitExceeded RunInstances failure.
+        lvl: WARN
+        msg: "run_instances failed code=RequestLimitExceeded duration_ms={dur_ms} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [50, 8000]}
+          trace_id: {k: hex, v: 32}
+      nlb_connect_ok:
+        desc: Client TCP connect succeeds to an NLB.
+        lvl: INFO
+        msg: "nlb_connect ok lb={lb} rtt_ms={rtt_ms}"
+        vars:
+          lb: {k: ch, v: [app-lb-a, app-lb-b]}
+          rtt_ms: {k: i, v: [1, 60]}
+      nlb_connect_err:
+        desc: Client TCP connect fails to an NLB.
+        lvl: ERROR
+        msg: "nlb_connect failed lb={lb} err={err}"
+        vars:
+          lb: {k: ch, v: [app-lb-a, app-lb-b]}
+          err: {k: ch, v: [ECONNRESET, ETIMEDOUT]}
+      app_metric:
+        desc: Periodic client-side summary rates.
+        lvl: INFO
+        msg: "app_metrics ddb_err_rate={ddb_err} ec2_launch_err_rate={ec2_err} nlb_conn_err_rate={nlb_err}"
+        vars:
+          ddb_err: {k: f, v: [0.0, 1.0]}
+          ec2_err: {k: f, v: [0.0, 1.0]}
+          nlb_err: {k: f, v: [0.0, 1.0]}
+    beh:
+      n:
+        desc: Clients emit a low-rate aggregate metric line while servicing traffic normally.
+        emit:
+          - id: app_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Clients continue to emit aggregate metric lines during the incident.
+        emit:
+          - id: app_metric
+            per_min: 1.0
+            scope: global
+
+  - id: route53_controlplane
+    name: Route53 Control Plane (Modeled)
+    svc: dns
+    hosts: [route53-use1-1]
+    desc: >
+      Models authoritative DNS record updates for the DynamoDB regional endpoint and NLB endpoints.
+      Emissions represent change events, not per-query DNS traffic.
+    to:
+      - dst: ddb_api
+        proto: dns
+        desc: DNS answers point clients to the DynamoDB API load balancers.
+    logs:
+      rrset_change:
+        desc: A DNS record set is updated (including empty record sets).
+        lvl: INFO
+        msg: "route53 change zone={zone} name={name} type=A records={records} ttl_s={ttl_s} action={action}"
+        vars:
+          zone: {k: ch, v: [Z-DDB-USE1, Z-NLB-USE1]}
+          name: {k: ch, v: [dynamodb.us-east-1.amazonaws.com, nlb.app-lb-a.use1.amazonaws.com, nlb.app-lb-b.use1.amazonaws.com]}
+          records: {k: i, v: [0, 8]}
+          ttl_s: {k: i, v: [30, 60]}
+          action: {k: ch, v: [UPSERT, DELETE]}
+    beh:
+      n:
+        desc: Occasional normal DNS plan churn and NLB endpoint adjustments.
+        emit:
+          - id: rrset_change
+            per_min: 0.4
+            scope: global
+      f:
+        desc: Elevated DNS change activity due to DynamoDB plan thrash and NLB health/DNS activity.
+        emit:
+          - id: rrset_change
+            per_min: 0.8
+            scope: global
+
+  - id: ddb_dns_planner
+    name: DynamoDB DNS Planner
+    svc: ddb-dns-planner
+    hosts: [ddb-planner-1]
+    desc: >
+      Periodically computes DNS plans for multiple DynamoDB endpoints based on fleet health/capacity.
+      The planner continues to generate newer plan generations during the incident.
+    to:
+      - dst: ddb_dns_enactor
+        proto: kafka
+        desc: Publishes plan generations for enactors to apply.
+    logs:
+      plan_generated:
+        desc: Planner produced a new plan generation.
+        lvl: INFO
+        msg: "dns_plan_generated gen={gen} endpoints={endpoints} lbs={lbs}"
+        vars:
+          gen: {k: i, v: [980, 1150]}
+          endpoints: {k: i, v: [2, 3]}
+          lbs: {k: i, v: [20, 80]}
+    beh:
+      n:
+        desc: Generates plans continuously.
+        emit:
+          - id: plan_generated
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Continues generating plans even while enactors are stuck.
+        emit:
+          - id: plan_generated
+            per_min: 1.0
+            scope: global
+
+  - id: ddb_dns_enactor
+    name: DynamoDB DNS Enactor
+    svc: ddb-dns-enactor
+    hosts: [ddb-enactor-az1-1, ddb-enactor-az2-1, ddb-enactor-az3-1]
+    desc: >
+      Independently runs in three AZs, applying DNS plans to Route53 using transactional updates.
+      Under the modeled race, an older plan overwrites a newer one and is then deleted by cleanup,
+      leaving an empty/invalid record and an inconsistent state blocking further updates.
+    to:
+      - dst: route53_controlplane
+        proto: https
+        desc: Applies and cleans up DNS plans via Route53 changes.
+    logs:
+      enact_start:
+        desc: Enactor begins applying a plan generation to an endpoint.
+        lvl: INFO
+        msg: "enact_start enactor={enactor} gen={gen} prev_gen={prev_gen} endpoint={endpoint}"
+        vars:
+          enactor: {k: ch, v: [az1, az2, az3]}
+          gen: {k: i, v: [980, 1150]}
+          prev_gen: {k: i, v: [970, 1149]}
+          endpoint: {k: ch, v: [dynamodb.us-east-1.amazonaws.com, dynamodb-ipv6.us-east-1.amazonaws.com, dynamodb-fips.us-east-1.amazonaws.com]}
+      route53_txn_conflict:
+        desc: Transaction conflict while trying to update an endpoint; will retry.
+        lvl: WARN
+        msg: "route53_txn_conflict endpoint={endpoint} gen={gen} wait_ms={wait_ms}"
+        vars:
+          endpoint: {k: ch, v: [dynamodb.us-east-1.amazonaws.com, dynamodb-ipv6.us-east-1.amazonaws.com, dynamodb-fips.us-east-1.amazonaws.com]}
+          gen: {k: i, v: [980, 1150]}
+          wait_ms: {k: i, v: [50, 8000]}
+      enact_ok:
+        desc: Enactor successfully applied a plan generation to an endpoint.
+        lvl: INFO
+        msg: "enact_ok endpoint={endpoint} gen={gen}"
+        vars:
+          endpoint: {k: ch, v: [dynamodb.us-east-1.amazonaws.com, dynamodb-ipv6.us-east-1.amazonaws.com, dynamodb-fips.us-east-1.amazonaws.com]}
+          gen: {k: i, v: [980, 1150]}
+      cleanup_plans:
+        desc: Cleanup process deletes older plan generations after applying a new plan.
+        lvl: INFO
+        msg: "cleanup_plans current_gen={gen} deleted={deleted}"
+        vars:
+          gen: {k: i, v: [980, 1150]}
+          deleted: {k: i, v: [0, 10]}
+      plan_missing:
+        desc: Enactor attempted to apply a plan generation that is no longer available.
+        lvl: ERROR
+        msg: "plan_missing gen={gen} endpoint={endpoint} action=skip"
+        vars:
+          gen: {k: i, v: [980, 1150]}
+          endpoint: {k: ch, v: [dynamodb.us-east-1.amazonaws.com, dynamodb-ipv6.us-east-1.amazonaws.com, dynamodb-fips.us-east-1.amazonaws.com]}
+      automation_disabled:
+        desc: Operator disables DNS automation to stop further plan churn.
+        lvl: INFO
+        msg: "automation_disabled by={actor} reason={reason}"
+        vars:
+          actor: {k: ch, v: [oncall]}
+          reason: {k: ch, v: [inconsistent_state, manual_repair]}
+      manual_route53_upsert:
+        desc: Operator manually restores DNS A records for an endpoint.
+        lvl: INFO
+        msg: "manual_route53_upsert endpoint={endpoint} records={records}"
+        vars:
+          endpoint: {k: ch, v: [dynamodb.us-east-1.amazonaws.com]}
+          records: {k: i, v: [4, 8]}
+    beh:
+      n:
+        desc: Regularly enacts new plans; occasional conflicts during concurrent updates.
+        emit:
+          - id: enact_start
+            per_min: 0.6
+            scope: global
+          - id: enact_ok
+            per_min: 0.6
+            scope: global
+          - id: route53_txn_conflict
+            per_min: 0.05
+            scope: global
+          - id: cleanup_plans
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Conflicts and missing-plan errors become more frequent due to the race/inconsistent state.
+        emit:
+          - id: enact_start
+            per_min: 0.8
+            scope: global
+          - id: enact_ok
+            per_min: 0.3
+            scope: global
+          - id: route53_txn_conflict
+            per_min: 0.4
+            scope: global
+          - id: cleanup_plans
+            per_min: 0.2
+            scope: global
+          - id: plan_missing
+            per_min: 0.1
+            scope: global
+
+  - id: ddb_api
+    name: DynamoDB API Frontend
+    svc: ddb-api
+    hosts: [ddb-api-1, ddb-api-2]
+    desc: >
+      Handles DynamoDB API calls that reach the service after DNS resolution succeeds.
+      During the DNS outage, inbound request volume drops sharply (clients fail before connecting).
+    to:
+      - dst: customer_app
+        proto: https
+        desc: Returns API responses to callers.
+    logs:
+      http_req:
+        desc: API frontend received a request.
+        lvl: INFO
+        msg: "ddb_api recv op={op} table={table} req_id={rid} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [PutItem, GetItem, Query]}
+          table: {k: ch, v: [users, orders, sessions]}
+          rid: {k: hex, v: 16}
+          trace_id: {k: hex, v: 32}
+      http_200:
+        desc: API frontend completed a request successfully.
+        lvl: INFO
+        msg: "ddb_api resp status=200 req_id={rid} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          rid: {k: hex, v: 16}
+          dur_ms: {k: i, v: [3, 900]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: No background logs modeled; request logs come from traffic flows.
+        emit: []
+      f:
+        desc: No background logs modeled; request logs come from traffic flows.
+        emit: []
+
+  - id: ec2_api
+    name: EC2 API Frontend
+    svc: ec2-api
+    hosts: [ec2-api-1, ec2-api-2]
+    desc: >
+      Accepts RunInstances requests and returns success or well-known error codes.
+      During the incident it first returns ServiceUnavailable due to dependency breakage,
+      then InsufficientCapacity and RequestLimitExceeded while DWFM recovers under throttling.
+    to:
+      - dst: dwfm
+        proto: grpc
+        desc: Requests capacity allocation / lease status from DWFM.
+      - dst: network_manager
+        proto: grpc
+        desc: Enqueues network propagation work for newly launched instances.
+      - dst: customer_app
+        proto: https
+        desc: Returns API responses to callers.
+    logs:
+      api_recv:
+        desc: API frontend received a RunInstances request.
+        lvl: INFO
+        msg: "ec2_api recv action=RunInstances req_id={req_id} trace={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          trace_id: {k: hex, v: 32}
+      api_resp_ok:
+        desc: API frontend returned 200 OK.
+        lvl: INFO
+        msg: "ec2_api resp status=200 req_id={req_id} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [150, 30000]}
+          trace_id: {k: hex, v: 32}
+      api_resp_unavailable:
+        desc: API frontend returned ServiceUnavailable.
+        lvl: WARN
+        msg: "ec2_api resp status=503 code=ServiceUnavailable req_id={req_id} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [150, 30000]}
+          trace_id: {k: hex, v: 32}
+      api_resp_insufficient:
+        desc: API frontend returned InsufficientCapacity.
+        lvl: WARN
+        msg: "ec2_api resp status=400 code=InsufficientCapacity req_id={req_id} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [80, 20000]}
+          trace_id: {k: hex, v: 32}
+      api_resp_throttle:
+        desc: API frontend returned RequestLimitExceeded.
+        lvl: WARN
+        msg: "ec2_api resp status=429 code=RequestLimitExceeded req_id={req_id} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [30, 8000]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: No background logs modeled.
+        emit: []
+      f:
+        desc: No background logs modeled.
+        emit: []
+
+  - id: dwfm
+    name: DropletWorkflow Manager (DWFM)
+    svc: dwfm
+    hosts: [dwfm-az1-1, dwfm-az2-1, dwfm-az3-1]
+    desc: >
+      Maintains leases for physical hosts ("droplets") and performs periodic state checks.
+      State checks depend on DynamoDB availability; when they fail, leases expire over time.
+      After DynamoDB DNS is repaired, DWFM attempts large-scale lease recovery and can enter a
+      congestive-collapse mode with large queues until throttling/restarts reduce load.
+    to:
+      - dst: ddb_api
+        proto: https
+        desc: Reads/writes lease and droplet state in DynamoDB.
+      - dst: network_manager
+        proto: grpc
+        desc: Notifies Network Manager about instance state changes during launches/terminations.
+    logs:
+      state_check_fail:
+        desc: Periodic droplet check failed due to dependency issues.
+        lvl: ERROR
+        msg: "droplet_state_check failed droplet={droplet} err={err}"
+        vars:
+          droplet: {k: hex, v: 8}
+          err: {k: ch, v: [ddb_dns_fail, ddb_timeout]}
+      lease_timeout:
+        desc: Lease expired after missed state checks.
+        lvl: WARN
+        msg: "droplet_lease expired droplet={droplet} age_s={age_s}"
+        vars:
+          droplet: {k: hex, v: 8}
+          age_s: {k: i, v: [300, 1800]}
+      lease_recover:
+        desc: Lease (re)acquired for a droplet.
+        lvl: INFO
+        msg: "droplet_lease acquired droplet={droplet} lease_id={lease} dur_ms={dur_ms}"
+        vars:
+          droplet: {k: hex, v: 8}
+          lease: {k: uuid, v: null}
+          dur_ms: {k: i, v: [50, 20000]}
+      queue_depth:
+        desc: Work queue depth and age metric.
+        lvl: WARN
+        msg: "dwfm_queue depth={depth} oldest_age_s={old_s}"
+        vars:
+          depth: {k: i, v: [0, 60000]}
+          old_s: {k: i, v: [0, 3600]}
+      throttle_enabled:
+        desc: Operator enables throttling of incoming work.
+        lvl: INFO
+        msg: "throttle_enabled limit_rps={rps} scope=run_instances"
+        vars:
+          rps: {k: i, v: [5, 50]}
+      host_restart:
+        desc: Operator restarts DWFM hosts to clear queues.
+        lvl: WARN
+        msg: "dwfm_host_restart host={host} mode={mode}"
+        vars:
+          host: {k: ch, v: [dwfm-az1-1, dwfm-az2-1, dwfm-az3-1]}
+          mode: {k: ch, v: [selective, rolling]}
+    beh:
+      n:
+        desc: DWFM is healthy; only low-rate queue metrics appear.
+        emit:
+          - id: queue_depth
+            per_min: 0.3
+      f:
+        desc: State checks fail, leases expire, and later lease recovery/queue growth becomes visible.
+        emit:
+          - id: state_check_fail
+            per_min: 2.0
+          - id: lease_timeout
+            per_min: 0.2
+          - id: queue_depth
+            per_min: 0.5
+          - id: lease_recover
+            per_min: 1.0
+
+  - id: network_manager
+    name: Network Manager
+    svc: netmgr
+    hosts: [netmgr-1]
+    desc: >
+      Propagates network configuration/state for newly launched instances and terminations.
+      During DWFM recovery, delayed and queued state changes can create a backlog and high propagation lag.
+    to:
+      - dst: nlb_controlplane
+        proto: grpc
+        desc: Provides instance/network readiness that health checks depend on.
+      - dst: ec2_api
+        proto: grpc
+        desc: Acknowledges propagation work and surfaces readiness/lag to the EC2 control plane.
+    logs:
+      netprop_metric:
+        desc: Periodic propagation lag/backlog metrics.
+        lvl: INFO
+        msg: "netprop_metrics lag_s={lag_s} backlog={backlog}"
+        vars:
+          lag_s: {k: i, v: [0, 1800]}
+          backlog: {k: i, v: [0, 60000]}
+      netprop_enqueue:
+        desc: A per-instance propagation task is enqueued.
+        lvl: INFO
+        msg: "netprop_enqueue instance_id={iid} backlog={backlog} trace={trace_id}"
+        vars:
+          iid: {k: uuid, v: null}
+          backlog: {k: i, v: [0, 60000]}
+          trace_id: {k: hex, v: 32}
+      netprop_lag_high:
+        desc: High propagation lag alert when backlog drains slowly.
+        lvl: WARN
+        msg: "netprop_lag_high lag_s={lag_s} backlog={backlog}"
+        vars:
+          lag_s: {k: i, v: [300, 1800]}
+          backlog: {k: i, v: [5000, 60000]}
+    beh:
+      n:
+        desc: Stable low lag; emits periodic metrics.
+        emit:
+          - id: netprop_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Metrics continue; lag-high alerts are possible later as backlog grows.
+        emit:
+          - id: netprop_metric
+            per_min: 1.0
+            scope: global
+          - id: netprop_lag_high
+            per_min: 0.6
+            scope: global
+
+  - id: nlb_controlplane
+    name: Network Load Balancer Control Plane (Health Checks)
+    svc: nlb
+    hosts: [nlbcp-1]
+    desc: >
+      Runs health checks and triggers AZ DNS failover when checks flap. During network state propagation lag,
+      health checks can alternate pass/fail for otherwise healthy nodes, increasing failover activity and
+      causing intermittent client connection errors on some load balancers.
+    to:
+      - dst: route53_controlplane
+        proto: https
+        desc: Updates DNS entries when nodes/targets are removed or restored.
+    logs:
+      hc_result:
+        desc: Health check result for an NLB node/target.
+        lvl: INFO
+        msg: "nlb_healthcheck lb={lb} az={az} result={result} rtt_ms={rtt_ms}"
+        vars:
+          lb: {k: ch, v: [app-lb-a, app-lb-b]}
+          az: {k: ch, v: [use1-az1, use1-az2, use1-az3]}
+          result: {k: ch, v: [pass, fail]}
+          rtt_ms: {k: i, v: [1, 800]}
+      az_failover:
+        desc: Automatic AZ failover triggered by health check instability.
+        lvl: WARN
+        msg: "nlb_az_failover lb={lb} az={az} removed_pct={pct}"
+        vars:
+          lb: {k: ch, v: [app-lb-a, app-lb-b]}
+          az: {k: ch, v: [use1-az1, use1-az2, use1-az3]}
+          pct: {k: i, v: [10, 60]}
+      failover_disabled:
+        desc: Operator disables automatic failover for stability.
+        lvl: INFO
+        msg: "nlb_failover_disabled by={actor}"
+        vars:
+          actor: {k: ch, v: [oncall]}
+      failover_enabled:
+        desc: Operator re-enables automatic failover after recovery.
+        lvl: INFO
+        msg: "nlb_failover_enabled by={actor}"
+        vars:
+          actor: {k: ch, v: [oncall]}
+    beh:
+      n:
+        desc: Regular health checks with minimal failover activity.
+        emit:
+          - id: hc_result
+            per_min: 2.0
+            scope: global
+          - id: az_failover
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Health checks continue; failovers can rise later when network propagation lags.
+        emit:
+          - id: hc_result
+            per_min: 2.0
+            scope: global
+          - id: az_failover
+            per_min: 0.5
+            scope: global
+
+tracing:
+  on: true
+  origins: [customer_app]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation: clients resolve DynamoDB endpoint and succeed on API calls; EC2 launches allocate capacity
+      and enqueue network propagation; NLB connects are stable.
+    req:
+      - id: ddb_api_call
+        desc: Successful DynamoDB API call via the public regional endpoint.
+        rpm: 120.0
+        path: [customer_app, route53_controlplane, ddb_api, customer_app]
+        emit: [customer_app.ddb_call_start, ddb_api.http_req, ddb_api.http_200, customer_app.ddb_call_ok]
+        latency_ms: [[2, 10], [5, 30], [3, 80], [1, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.05
+          emit_per_retry: [customer_app.retrying]
+          backoff_ms: [[50, 200], [120, 500]]
+        trace: true
+      - id: ec2_run_instances
+        desc: Successful EC2 RunInstances that triggers network propagation.
+        rpm: 6.0
+        path: [customer_app, ec2_api, dwfm, network_manager, ec2_api, customer_app]
+        emit:
+          - customer_app.ec2_run_instances_req
+          - ec2_api.api_recv
+          - dwfm.lease_recover
+          - network_manager.netprop_enqueue
+          - ec2_api.api_resp_ok
+          - customer_app.ec2_run_instances_ok
+        latency_ms: [[2, 10], [5, 30], [30, 200], [10, 80], [100, 800], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: nlb_tcp_connect_ok
+        desc: Successful TCP connect to an NLB endpoint.
+        rpm: 60.0
+        path: [customer_app, nlb_controlplane]
+        emit: [customer_app.nlb_connect_ok]
+        latency_ms: [[1, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Failure operation: initially the DynamoDB public DNS name resolves to no records due to DNS automation race.
+      After manual repair, some clients still fail while caches expire, while EC2 and NLB remain degraded due to
+      lease recovery congestion and network propagation backlog.
+    req:
+      - id: ddb_api_call_dns_fail
+        desc: DynamoDB call attempt fails locally at DNS resolution (no connection established).
+        rpm: 120.0
+        path: [customer_app, route53_controlplane]
+        emit: [customer_app.ddb_call_start, customer_app.dns_resolve_fail]
+        latency_ms: [[2, 10], [1, 20]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.0
+          emit_per_retry: [customer_app.retrying]
+          backoff_ms: [[100, 800], [250, 1500]]
+        trace: true
+      - id: ddb_api_call_ok_f
+        desc: DynamoDB call succeeds after DNS repair (some residual failures persist).
+        rpm: 120.0
+        path: [customer_app, route53_controlplane, ddb_api, customer_app]
+        emit: [customer_app.ddb_call_start, ddb_api.http_req, ddb_api.http_200, customer_app.ddb_call_ok]
+        latency_ms: [[2, 10], [6, 40], [4, 120], [1, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.05
+          emit_per_retry: [customer_app.retrying]
+          backoff_ms: [[50, 300], [120, 600]]
+        trace: true
+      - id: ec2_run_instances_service_unavailable
+        desc: RunInstances fails early due to control-plane dependency breakage during the DynamoDB DNS outage.
+        rpm: 6.0
+        path: [customer_app, ec2_api, customer_app]
+        emit:
+          - customer_app.ec2_run_instances_req
+          - ec2_api.api_recv
+          - ec2_api.api_resp_unavailable
+          - customer_app.ec2_run_instances_err_unavailable
+        latency_ms: [[2, 10], [5, 30], [200, 6000], [1, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.2
+          emit_per_retry: [customer_app.retrying]
+          backoff_ms: [[200, 1500], [500, 2500]]
+        trace: true
+      - id: ec2_run_instances_insufficient_capacity
+        desc: RunInstances fails with InsufficientCapacity because many droplets have no active lease.
+        rpm: 6.0
+        path: [customer_app, ec2_api, customer_app]
+        emit:
+          - customer_app.ec2_run_instances_req
+          - ec2_api.api_recv
+          - ec2_api.api_resp_insufficient
+          - customer_app.ec2_run_instances_err_capacity
+        latency_ms: [[2, 10], [5, 30], [80, 2500], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ec2_run_instances_throttled
+        desc: RunInstances fails with RequestLimitExceeded due to throttling during DWFM recovery.
+        rpm: 4.0
+        path: [customer_app, ec2_api, customer_app]
+        emit:
+          - customer_app.ec2_run_instances_req
+          - ec2_api.api_recv
+          - ec2_api.api_resp_throttle
+          - customer_app.ec2_run_instances_err_throttle
+        latency_ms: [[2, 10], [5, 30], [30, 1200], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: nlb_tcp_connect_ok_f
+        desc: Successful TCP connect continues for many clients/load balancers.
+        rpm: 60.0
+        path: [customer_app, nlb_controlplane]
+        emit: [customer_app.nlb_connect_ok]
+        latency_ms: [[1, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: nlb_tcp_connect_err_f
+        desc: Intermittent NLB TCP connect failures when AZ capacity is removed due to health check flapping.
+        rpm: 15.0
+        path: [customer_app, nlb_controlplane]
+        emit: [customer_app.nlb_connect_err]
+        latency_ms: [[1, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    The full multi-hour real-world timeline is compressed into a single 50-minute incident slice while preserving causal order:
+    DNS automation race -> DynamoDB endpoint empty -> DWFM lease expiry -> lease-recovery congestion -> network propagation lag -> NLB health-check instability.
+  - |
+    Route53 is modeled as a control-plane change log source only (no per-query DNS logs); client-side DNS failures are emitted by customer_app.
+  - |
+    customer_app.dns_resolve_fail.cache_ttl_s includes multi-minute values to support a post-repair tail where some clients still use cached
+    empty/failed DNS results before converging.
+  - |
+    DWFM lease recovery is modeled as a background stream (suppressed early by scenario multipliers) to make the recovery/congestion phase observable
+    without modeling every droplet.
+  - |
+    Paths include return hops (e.g., ddb_api->customer_app, ec2_api->customer_app, and ec2_api repeated after network_manager) so that per-request
+    response logs appear in a forward-traversable component sequence.
+  - |
+    Normal-phase log volume estimate: ~580 logs/min (dominant: 120 rpm DynamoDB * 4 logs + 60 rpm NLB * 1 log + light background).
+  - |
+    Total scenario log volume estimate: ~26k logs (normal ~10.5k + failure ~15.5k), within the 20k..100k target.
+  - |
+    Diagnostic visibility anchors: customer_app.dns_resolve_fail (client impact), route53_controlplane.rrset_change (empty record update),
+    ddb_dns_enactor.plan_missing/route53_txn_conflict (automation stuck), dwfm.lease_timeout/queue_depth (lease decay and congestion),
+    ec2_api error responses (customer impact shift), network_manager.netprop_lag_high and nlb_controlplane.az_failover (later cascade).
+```

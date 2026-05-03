@@ -1,0 +1,515 @@
+```yaml
+sys:
+  id: fintech_api_rds_multiaz
+  desc: >
+    A fintech API service serves read/write requests and stores transactional data in an AWS RDS MySQL
+    Multi-AZ deployment. Reads are normally served from five MySQL read replicas, while writes go to
+    the primary endpoint. During an RDS Multi-AZ failover, the API briefly cannot connect to the DB
+    and returns elevated 5xx responses. With a non-ACID durability setting (innodb_flush_log_at_trx_commit=2),
+    a small window of committed transactions can be missing on the new primary after failover, later causing
+    replica SQL thread crashes with duplicate-key errors.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_service
+    name: API Service
+    svc: api
+    hosts: [api-1, api-2]
+    desc: >
+      Public-facing service handling client requests. It queries MySQL for reads and writes and emits
+      access logs, DB timing, and trace-like commit markers for write transactions.
+    to:
+      - dst: rds_primary
+        proto: tcp
+        desc: Writes and some reads use the RDS primary endpoint.
+      - dst: rds_replicas
+        proto: tcp
+        desc: Read traffic is normally routed to read replicas.
+    logs:
+      http_access_ok:
+        desc: Successful HTTP response returned to client.
+        lvl: INFO
+        msg: "req {req_id} {method} {route} status=200 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/v1/txns, /v1/balance, /v1/payments]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [5, 250]}
+          f:
+            dur_ms: {k: i, v: [10, 1200]}
+      http_access_5xx:
+        desc: Failed HTTP response when backend dependency is unavailable.
+        lvl: ERROR
+        msg: "req {req_id} {method} {route} status=502 err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/v1/txns, /v1/balance, /v1/payments]}
+          err: {k: ch, v: [DB_CONN]}
+          dur_ms: {k: i, v: [200, 5000]}
+          trace_id: {k: hex, v: 32}
+      db_query:
+        desc: DB query timing and target role for the request.
+        lvl: DEBUG
+        msg: "sql {op} db_role={db_role} host={db_host} db_dur_ms={db_dur_ms}"
+        vars:
+          op: {k: ch, v: [SELECT, INSERT]}
+          db_role: {k: ch, v: [replica, master]}
+          db_host: {k: ch, v: [db-primary-1, db-replica-1, db-replica-2, db-replica-3, db-replica-4, db-replica-5]}
+        state_vars:
+          n:
+            db_dur_ms: {k: i, v: [2, 120]}
+          f:
+            db_dur_ms: {k: i, v: [5, 650]}
+      db_connect_error:
+        desc: Connection establishment failure to the DB endpoint.
+        lvl: ERROR
+        msg: "db connect failed host={db_host} err={db_err} waited_ms={waited_ms}"
+        vars:
+          db_host: {k: ch, v: [db-primary-1]}
+          db_err: {k: ch, v: [timeout, connection_refused, host_unreachable]}
+          waited_ms: {k: i, v: [200, 3500]}
+      trace_txn_commit:
+        desc: Application trace marker indicating a write transaction was committed from the API perspective.
+        lvl: INFO
+        msg: "txn commit txn_id={txn_id} table={table} pk={pk} amount_cents={amount_cents}"
+        vars:
+          txn_id: {k: uuid, v: null}
+          table: {k: ch, v: [transactions]}
+          pk: {k: i, v: [1000000, 1010000]}
+          amount_cents: {k: i, v: [100, 500000]}
+      health:
+        desc: Periodic health marker.
+        lvl: INFO
+        msg: "health ok build={build}"
+        vars:
+          build: {k: ch, v: [api-2019.12.14]}
+    beh:
+      n:
+        desc: Low-volume health markers.
+        emit:
+          - id: health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Health markers continue during failure.
+        emit:
+          - id: health
+            per_min: 0.5
+            scope: per_host
+
+  - id: rds_primary
+    name: RDS MySQL Primary
+    svc: rds-mysql
+    hosts: [db-primary-1]
+    desc: >
+      The active MySQL primary behind the RDS endpoint. During failover it drops connections; after
+      read traffic is moved from replicas to primary, CPU/load increase.
+    to:
+      - dst: rds_replicas
+        proto: tcp
+        desc: Asynchronous replication to read replicas (modeled as a replica pool).
+      - dst: rds_controlplane
+        proto: https
+        desc: RDS control plane emits failover/snapshot events and reads instance state.
+    logs:
+      metric_cpu:
+        desc: Periodic CPU and connection count metric.
+        lvl: INFO
+        msg: "metric cpu_pct={cpu_pct} connections={connections}"
+        vars: {}
+        state_vars:
+          n:
+            cpu_pct: {k: i, v: [15, 35]}
+            connections: {k: i, v: [50, 300]}
+          f:
+            cpu_pct: {k: i, v: [25, 85]}
+            connections: {k: i, v: [80, 650]}
+      mysql_aborted_conn:
+        desc: MySQL error log entries when connections are cut during failover.
+        lvl: WARN
+        msg: "Aborted connection {conn_id} from {client_ip} (Got an error reading communication packets)"
+        vars:
+          conn_id: {k: i, v: [1000, 9000]}
+          client_ip: {k: ip, v: "10.0.0.0/16"}
+    beh:
+      n:
+        desc: Normal CPU metrics.
+        emit:
+          - id: metric_cpu
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: CPU metrics remain; aborted connections are expected mainly around the failover window.
+        emit:
+          - id: metric_cpu
+            per_min: 1.0
+            scope: per_host
+          - id: mysql_aborted_conn
+            per_min: 15.0
+            scope: per_host
+
+  - id: rds_replicas
+    name: RDS MySQL Read Replicas (pool)
+    svc: rds-mysql
+    hosts: [db-replica-1, db-replica-2, db-replica-3, db-replica-4, db-replica-5]
+    desc: >
+      Five read replicas serving SELECT-heavy workload. During the incident, their SQL thread stops
+      with duplicate-key errors and replication lag grows.
+    to:
+      - dst: rds_primary
+        proto: tcp
+        desc: Replication source is the primary.
+    logs:
+      replication_status:
+        desc: Periodic replication status/lag.
+        lvl: INFO
+        msg: "replica {replica_id} lag_s={lag_s} io_running={io_running} sql_running={sql_running}"
+        vars:
+          replica_id: {k: ch, v: [r1, r2, r3, r4, r5]}
+          io_running: {k: ch, v: [Yes]}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 2]}
+            sql_running: {k: ch, v: [Yes]}
+          f:
+            lag_s: {k: i, v: [30, 900]}
+            sql_running: {k: ch, v: [No]}
+      replication_error:
+        desc: SQL thread stop point due to duplicate primary key while applying binlog events.
+        lvl: ERROR
+        msg: "replica {replica_id} SQL thread stopped: Duplicate entry {pk} for key 'PRIMARY' exec_pos={exec_pos}"
+        vars:
+          replica_id: {k: ch, v: [r1, r2, r3, r4, r5]}
+          pk: {k: i, v: [1000000, 1010000]}
+          exec_pos: {k: i, v: [100000, 250000]}
+    beh:
+      n:
+        desc: Normal replication is healthy with near-zero lag.
+        emit:
+          - id: replication_status
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Replication status shows stopped SQL thread and high lag; the duplicate-key error itself is a discrete stop event.
+        emit:
+          - id: replication_status
+            per_min: 1.0
+            scope: per_host
+
+  - id: rds_controlplane
+    name: RDS Control Plane Events
+    svc: rds-control
+    hosts: [rds-ctrl-1]
+    desc: >
+      Emits high-level RDS events (failover lifecycle) and snapshot progress used during replica rebuilds.
+    to:
+      - dst: rds_primary
+        proto: https
+        desc: Tracks primary instance state and starts snapshots.
+    logs:
+      heartbeat:
+        desc: Periodic control-plane heartbeat.
+        lvl: INFO
+        msg: "rds-control heartbeat ok region={region}"
+        vars:
+          region: {k: ch, v: [us-east-1]}
+      failover_start:
+        desc: Failover start event for the Multi-AZ primary.
+        lvl: WARN
+        msg: "Multi-AZ failover started db_id={db_id} reason={reason}"
+        vars:
+          db_id: {k: ch, v: [api-mysql]}
+          reason: {k: ch, v: [instance_unreachable, storage_issue, network_issue]}
+      failover_complete:
+        desc: Failover completion event and endpoint cutover marker.
+        lvl: INFO
+        msg: "Failover complete db_id={db_id} new_primary_host={new_primary_host}"
+        vars:
+          db_id: {k: ch, v: [api-mysql]}
+          new_primary_host: {k: ch, v: [db-primary-1]}
+      snapshot_start:
+        desc: Snapshot initiation for replica rebuild.
+        lvl: INFO
+        msg: "Snapshot started snap_id={snap_id} db_id={db_id} size_gb={size_gb}"
+        vars:
+          snap_id: {k: hex, v: 12}
+          db_id: {k: ch, v: [api-mysql]}
+          size_gb: {k: i, v: [200, 900]}
+      snapshot_progress:
+        desc: Periodic snapshot progress during long-running snapshot operations.
+        lvl: INFO
+        msg: "Snapshot progress snap_id={snap_id} pct={pct} elapsed_min={elapsed_min}"
+        vars:
+          snap_id: {k: hex, v: 12}
+          pct: {k: i, v: [0, 99]}
+          elapsed_min: {k: i, v: [1, 360]}
+    beh:
+      n:
+        desc: Heartbeat only.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Heartbeat continues; snapshot progress exists but is typically enabled only after rebuild starts.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: global
+          - id: snapshot_progress
+            per_min: 1.0
+            scope: global
+
+  - id: monitoring
+    name: Internal Monitoring / Alerting
+    svc: monitor
+    hosts: [mon-1]
+    desc: >
+      Internal monitoring that alerts on API 5xx rate, replica replication failures, and primary CPU pressure.
+      Alerts are modeled as discrete one-shot logs in the scenario.
+    to:
+      - dst: api_service
+        proto: https
+        desc: Scrapes API metrics and error rate.
+      - dst: rds_primary
+        proto: https
+        desc: Scrapes DB primary metrics.
+      - dst: rds_replicas
+        proto: https
+        desc: Scrapes replica health/replication state.
+    logs:
+      heartbeat:
+        desc: Monitoring heartbeat.
+        lvl: INFO
+        msg: "monitor heartbeat ok"
+        vars: {}
+      alert_5xx:
+        desc: Alert when API 5xx rate spikes.
+        lvl: CRITICAL
+        msg: "ALERT api 5xx_rate_per_min={rate_per_min} threshold_per_min={threshold_per_min}"
+        vars:
+          rate_per_min: {k: i, v: [50, 800]}
+          threshold_per_min: {k: i, v: [50, 200]}
+      alert_replication:
+        desc: Alert when replicas report replication stopped.
+        lvl: CRITICAL
+        msg: "ALERT db replicas replication_failed={failed_count}/5"
+        vars:
+          failed_count: {k: i, v: [1, 5]}
+      alert_cpu:
+        desc: Alert when DB primary CPU is elevated.
+        lvl: WARN
+        msg: "ALERT db_primary cpu_pct={cpu_pct} threshold={threshold}"
+        vars:
+          cpu_pct: {k: i, v: [70, 95]}
+          threshold: {k: i, v: [70, 85]}
+    beh:
+      n:
+        desc: Monitoring heartbeat.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Monitoring heartbeat continues; alerts are emitted as one-shots in the scenario.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: global
+
+  - id: sre_console
+    name: SRE Console / Ops Actions
+    svc: ops
+    hosts: [sre-1]
+    desc: >
+      Operator actions and investigation notes. Used to record routing changes, snapshot rebuild initiation,
+      AWS support interaction, and findings about data gaps and MySQL durability variables.
+    to:
+      - dst: api_service
+        proto: https
+        desc: Changes API read-routing configuration.
+      - dst: rds_controlplane
+        proto: https
+        desc: Starts snapshot-based replica rebuilds.
+      - dst: rds_primary
+        proto: tcp
+        desc: Runs administrative queries to read/set MySQL variables.
+    logs:
+      action_shift_reads:
+        desc: Operator changes read routing away from replicas.
+        lvl: INFO
+        msg: "ops changed read routing from={from} to={to} reason={reason}"
+        vars:
+          from: {k: ch, v: [replicas]}
+          to: {k: ch, v: [master]}
+          reason: {k: ch, v: [replication_failed]}
+      action_start_rebuild:
+        desc: Operator starts replica rebuild using a snapshot.
+        lvl: INFO
+        msg: "ops started replica rebuild replicas={replicas} snap_id={snap_id}"
+        vars:
+          replicas: {k: i, v: [5, 5]}
+          snap_id: {k: hex, v: 12}
+      action_open_support:
+        desc: Operator opens an AWS support case.
+        lvl: INFO
+        msg: "ops opened aws support case_id={case_id} sev={sev}"
+        vars:
+          case_id: {k: str, v: "case-[0-9]{7}"}
+          sev: {k: ch, v: [high]}
+      action_support_note:
+        desc: Operator note from AWS support about snapshot behavior after failover.
+        lvl: INFO
+        msg: "aws support note: snapshot_type={snap_type} due_to={due_to} est_hours={est_hours}"
+        vars:
+          snap_type: {k: ch, v: [full]}
+          due_to: {k: ch, v: [host_replacement_after_failover]}
+          est_hours: {k: i, v: [4, 8]}
+      action_check_variables:
+        desc: Operator checks durability-related MySQL variables.
+        lvl: INFO
+        msg: "checked mysql vars innodb_flush_log_at_trx_commit={innodb_flush} sync_binlog={sync_binlog}"
+        vars:
+          innodb_flush: {k: i, v: [2, 2]}
+          sync_binlog: {k: i, v: [1, 1]}
+      action_set_variable:
+        desc: Operator sets a MySQL variable.
+        lvl: WARN
+        msg: "set mysql var innodb_flush_log_at_trx_commit new={new_val} old={old_val}"
+        vars:
+          new_val: {k: i, v: [1, 1]}
+          old_val: {k: i, v: [2, 2]}
+      action_data_gap:
+        desc: Operator reconciliation note that a gap exists between application traces/binlog and DB contents.
+        lvl: ERROR
+        msg: "data reconciliation gap window_s={gap_s} txn_count={txn_count} source={source}"
+        vars:
+          gap_s: {k: i, v: [5, 5]}
+          txn_count: {k: i, v: [1, 50]}
+          source: {k: ch, v: [binlog_vs_traces]}
+    beh:
+      n:
+        desc: No background operator logs.
+        emit: []
+      f:
+        desc: No background operator logs; actions appear as one-shots.
+        emit: []
+
+tracing:
+  on: true
+  origins: [api_service]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic consists of frequent reads served by replicas and less frequent writes served by the primary.
+      Requests emit a DB timing log and an access log; write requests also emit a commit trace marker.
+    req:
+      - id: api_read_replicas_n
+        desc: Read-only API calls served from read replicas.
+        rpm: 360.0
+        path: [api_service, rds_replicas]
+        emit: [api_service.db_query, api_service.http_access_ok]
+        latency_ms: [[8, 40], [4, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: api_write_master_n
+        desc: Transactional writes served by the primary.
+        rpm: 90.0
+        path: [api_service, rds_primary]
+        emit: [api_service.db_query, api_service.trace_txn_commit, api_service.http_access_ok]
+        latency_ms: [[10, 60], [1, 5], [5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: >
+      Failure begins with an RDS Multi-AZ failover (brief DB connectivity loss causing 5xx),
+      followed by replica replication failures. Reads are shifted to the primary, increasing latency and CPU,
+      while a snapshot-based replica rebuild runs for an extended time.
+    req:
+      - id: api_db_conn_fail_f
+        desc: Requests failing due to DB endpoint unavailability during failover cutover.
+        rpm: 225.0
+        path: [api_service, rds_primary]
+        emit: [api_service.db_connect_error, api_service.http_access_5xx]
+        latency_ms: [[300, 2200], [5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: api_read_replicas_f
+        desc: Reads routed to replicas (unsafe once replication stops); activated only during part of failure.
+        rpm: 180.0
+        path: [api_service, rds_replicas]
+        emit: [api_service.db_query, api_service.http_access_ok]
+        latency_ms: [[10, 70], [5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: api_read_master_f
+        desc: Reads routed to the primary after replicas are taken out of service; activated later in failure.
+        rpm: 180.0
+        path: [api_service, rds_primary]
+        emit: [api_service.db_query, api_service.http_access_ok]
+        latency_ms: [[20, 140], [5, 35]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: api_write_master_f
+        desc: Transactional writes to the primary continue after failover.
+        rpm: 45.0
+        path: [api_service, rds_primary]
+        emit: [api_service.db_query, api_service.trace_txn_commit, api_service.http_access_ok]
+        latency_ms: [[18, 120], [1, 6], [8, 55]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - >-
+    Names/hosts are genericized; "RDS control plane" represents AWS RDS event and snapshot progress visibility.
+  - >-
+    The five replicas are modeled as one pool component emitting per-replica status logs on five hosts; the
+    duplicate-key "SQL thread stopped" error is modeled as a discrete stop-point (scenario one-shots), not a continuous stream.
+  - >-
+    The causal core preserved: Multi-AZ failover causes brief DB connectivity loss; with
+    innodb_flush_log_at_trx_commit=2 and sync_binlog=1, a small window of transactions can exist in
+    binlogs/traces but not on the new primary, later causing duplicate-key replication crashes.
+  - >-
+    Snapshot/replica rebuild is represented by snapshot_start (one-shot), snapshot_progress (periodic), and an
+    AWS support note; the real 6-hour completion is compressed and not modeled as completing within the scenario.
+  - >-
+    Normal log volume estimate is ~1000 logs/min (reads 360 rpm *2 + writes 90 rpm *3 + light background), over
+    15 minutes ≈ 15k logs.
+  - >-
+    Total scenario log volume estimate is ~60k–80k logs depending on multipliers and background, within 20k–100k.
+  - >-
+    Visibility anchors: api_service.http_access_5xx and db_connect_error during failover; rds_controlplane
+    failover markers (one-shots); rds_replicas.replication_status showing SQL stopped/lag after failover plus a one-time
+    replication_error stop-point; snapshot_progress once rebuild starts; and ops variable check/set showing innodb_flush 2→1.
+```

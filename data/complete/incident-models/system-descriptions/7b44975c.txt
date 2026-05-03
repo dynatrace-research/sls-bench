@@ -1,0 +1,626 @@
+```yaml
+sys:
+  id: m365_wan_connectivity
+  desc: >
+    A simplified model of Microsoft 365 client connectivity where an edge gateway uses internal DNS to
+    locate regional backends and traverses a wide-area network (WAN) to reach those services.
+    A planned WAN router IP address change triggers control-plane adjacency/forwarding-table recomputation,
+    causing packet forwarding issues (latency/packet loss) that surface as timeouts and 5xx responses.
+    Automated WAN health and traffic-engineering systems can pause during instability, prolonging residual
+    packet loss on some paths.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: wan_router_fleet
+    name: WAN Router Fleet
+    svc: wan-core
+    hosts: [wan-rtr-01, wan-rtr-02, wan-rtr-03]
+    desc: >
+      Core WAN routers that forward traffic between edge gateways, DNS, and service backends.
+      Control-plane changes can trigger adjacency recomputation and transient forwarding impairment.
+
+    to:
+      - dst: m365_edge_gateway
+        proto: tcp
+        desc: Forwards WAN traffic to/from edge gateways.
+      - dst: m365_app_cluster
+        proto: tcp
+        desc: Forwards WAN traffic to the Microsoft 365 backend cluster.
+      - dst: status_portal_app
+        proto: tcp
+        desc: Forwards WAN traffic to the service status portal backend.
+      - dst: dns_resolver
+        proto: udp
+        desc: Carries DNS traffic across regions.
+      - dst: wan_automation_controller
+        proto: grpc
+        desc: Carries telemetry/control traffic between routers and WAN automation.
+
+    logs:
+      router_heartbeat:
+        desc: Periodic router liveness/uptime marker.
+        lvl: INFO
+        msg: "router alive router_id={router_id} uptime_s={uptime_s}"
+        vars:
+          router_id: {k: ch, v: [wan-rtr-01, wan-rtr-02, wan-rtr-03]}
+          uptime_s: {k: i, v: [1000, 900000]}
+
+      config_cmd_ip_change:
+        desc: A configuration command changes a router IP address as part of a planned update.
+        lvl: WARN
+        msg: "config change: set interface ip {old_ip}->{new_ip} cmd={cmd} change_id={change_id}"
+        vars:
+          old_ip: {k: ip, v: null}
+          new_ip: {k: ip, v: null}
+          cmd: {k: ch, v: [set-ip-fast, set-ip]}
+          change_id: {k: str, v: "CHG[0-9]{6}"}
+
+      adjacency_recompute_start:
+        desc: Routing processes begin recomputing adjacency and forwarding tables.
+        lvl: WARN
+        msg: "routing recompute started reason={reason} scope={scope}"
+        vars:
+          reason: {k: ch, v: [ip_change, protocol_update]}
+          scope: {k: ch, v: [wan-wide, local]}
+
+      routing_recompute_metric:
+        desc: Periodic control-plane convergence metric during recomputation/instability.
+        lvl: WARN
+        msg: "routing convergence in_progress={in_progress} adjacencies_changed={adj_changed}"
+        vars:
+          in_progress: {k: ch, v: ["true", "false"]}
+          adj_changed: {k: i, v: [0, 500]}
+
+      fwd_drop_metric:
+        desc: Periodic forwarding-plane loss/queue metric indicating packet loss pressure.
+        lvl: WARN
+        msg: "fwd impairment loss_pct={loss_pct} queue_depth={qdepth} vrf=core"
+        vars:
+          loss_pct: {k: f, v: [0.0, 25.0]}
+          qdepth: {k: i, v: [0, 5000]}
+
+    beh:
+      n:
+        desc: Routers are stable; only low-rate heartbeat logs are emitted.
+        emit:
+          - id: router_heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: During the incident, routers emit periodic convergence and packet-loss metrics.
+        emit:
+          - id: routing_recompute_metric
+            per_min: 0.6
+            scope: per_host
+          - id: fwd_drop_metric
+            per_min: 1.5
+            scope: per_host
+
+  - id: wan_automation_controller
+    name: WAN Automation Controller
+    svc: wan-automation
+    hosts: [wan-auto-01, wan-auto-02]
+    desc: >
+      Automated systems that monitor WAN health, eliminate unhealthy devices, and optimize traffic engineering.
+      Under severe WAN instability, automation may pause and require manual restart.
+
+    to:
+      - dst: wan_router_fleet
+        proto: grpc
+        desc: Collects telemetry and pushes traffic-engineering adjustments to routers.
+      - dst: m365_edge_gateway
+        proto: https
+        desc: Runs synthetic probes against the edge gateway health endpoint.
+
+    logs:
+      te_optimizer_tick:
+        desc: Periodic traffic-engineering optimization iteration.
+        lvl: INFO
+        msg: "TE optimizer tick iter={iter} active_paths={paths} cost_delta={delta}"
+        vars:
+          iter: {k: i, v: [1, 200000]}
+          paths: {k: i, v: [50, 500]}
+          delta: {k: i, v: [-50, 50]}
+
+      device_health_scan:
+        desc: Periodic scan for unhealthy network devices and remediation activity.
+        lvl: INFO
+        msg: "device health scan unhealthy={unhealthy} remediated={remediated}"
+        vars:
+          unhealthy: {k: i, v: [0, 30]}
+          remediated: {k: i, v: [0, 30]}
+
+      automation_paused:
+        desc: Automation pauses due to inability to safely act during WAN instability.
+        lvl: ERROR
+        msg: "automation paused subsystem={subsystem} reason={reason}"
+        vars:
+          subsystem: {k: ch, v: [traffic_engineering, device_health]}
+          reason: {k: ch, v: [control_plane_unreachable, excessive_timeouts]}
+
+      automation_manual_restart:
+        desc: Operator manually restarts automation subsystems.
+        lvl: WARN
+        msg: "operator restarted automation subsystem={subsystem} run_id={run_id}"
+        vars:
+          subsystem: {k: ch, v: [traffic_engineering, device_health]}
+          run_id: {k: hex, v: 8}
+
+      probe_send:
+        desc: Synthetic WAN probe is sent toward the edge gateway.
+        lvl: INFO
+        msg: "wan probe send probe_id={probe_id} src_region={src} dst_region={dst} timeout_ms={timeout_ms}"
+        vars:
+          probe_id: {k: hex, v: 16}
+          src: {k: ch, v: [eu, us, apac]}
+          dst: {k: ch, v: [eu, us, apac]}
+          timeout_ms: {k: i, v: [500, 5000]}
+
+      probe_result_ok:
+        desc: Probe result indicates acceptable WAN RTT.
+        lvl: INFO
+        msg: "wan probe ok probe_id={probe_id} rtt_ms={rtt_ms}"
+        vars:
+          probe_id: {k: hex, v: 16}
+          rtt_ms: {k: i, v: [10, 300]}
+
+      probe_result_fail:
+        desc: Probe result indicates probe failure (timeout/loss).
+        lvl: WARN
+        msg: "wan probe failed probe_id={probe_id} err={err} waited_ms={waited_ms}"
+        vars:
+          probe_id: {k: hex, v: 16}
+          err: {k: ch, v: [timeout, packet_loss]}
+          waited_ms: {k: i, v: [300, 8000]}
+
+    beh:
+      n:
+        desc: Automation runs continuously and emits periodic operational ticks.
+        emit:
+          - id: te_optimizer_tick
+            per_min: 2.0
+            scope: global
+          - id: device_health_scan
+            per_min: 0.6
+            scope: global
+      f:
+        desc: Automation continues initially, but can be paused during the incident.
+        emit:
+          - id: te_optimizer_tick
+            per_min: 2.0
+            scope: global
+          - id: device_health_scan
+            per_min: 0.6
+            scope: global
+
+  - id: dns_resolver
+    name: Internal DNS Resolver
+    svc: dns-internal
+    hosts: [dns-01, dns-02]
+    desc: >
+      Internal DNS used by the edge gateway to discover regional backends.
+      WAN instability can increase lookup latency or cause timeouts.
+
+    to:
+      - dst: wan_router_fleet
+        proto: udp
+        desc: DNS traffic traverses the WAN to reach authoritative sources/caches.
+      - dst: m365_edge_gateway
+        proto: udp
+        desc: Returns DNS answers/timeouts back to the edge gateway.
+
+    logs:
+      dns_query:
+        desc: DNS query received from the edge gateway.
+        lvl: INFO
+        msg: "dns query name={qname} type=A client=edge-gw"
+        vars:
+          qname: {k: ch, v: [m365-backend.internal, status-backend.internal]}
+
+      dns_answer_ok:
+        desc: Successful DNS answer returned.
+        lvl: INFO
+        msg: "dns answer name={qname} rcode=NOERROR dur_ms={dur_ms} ttl_s={ttl_s}"
+        vars:
+          qname: {k: ch, v: [m365-backend.internal, status-backend.internal]}
+          dur_ms: {k: i, v: [1, 3000]}
+          ttl_s: {k: i, v: [10, 300]}
+
+      dns_timeout:
+        desc: DNS lookup timed out before an answer could be returned.
+        lvl: WARN
+        msg: "dns timeout name={qname} waited_ms={waited_ms}"
+        vars:
+          qname: {k: ch, v: [m365-backend.internal, status-backend.internal]}
+          waited_ms: {k: i, v: [100, 6000]}
+
+    beh:
+      n:
+        desc: No meaningful background logs beyond request-driven queries.
+        emit: []
+      f:
+        desc: No meaningful background logs beyond request-driven queries.
+        emit: []
+
+  - id: m365_edge_gateway
+    name: Microsoft 365 Edge Gateway
+    svc: m365-edge
+    hosts: [edge-01, edge-02, edge-03, edge-04]
+    desc: >
+      Front door for Microsoft 365 APIs and UI traffic. It performs internal DNS lookup for backend selection
+      and connects across the WAN. When WAN forwarding is impaired, it returns 504/503 and exhibits high latency.
+
+    to:
+      - dst: dns_resolver
+        proto: udp
+        desc: Resolves internal backend endpoints.
+      - dst: wan_router_fleet
+        proto: tcp
+        desc: Connects across WAN to reach service backends.
+      - dst: wan_automation_controller
+        proto: https
+        desc: Returns health responses to synthetic probes from WAN automation.
+
+    logs:
+      req_in_m365:
+        desc: Incoming end-user request for Microsoft 365 services.
+        lvl: INFO
+        msg: "incoming req req_id={req_id} method={method} route={route} client_region={region}"
+        vars:
+          req_id: {k: uuid, v: null}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/teams, /exchange, /sharepoint, /onedrive, /graph, /admin]}
+          region: {k: ch, v: [eu, us, apac]}
+
+      req_in_status:
+        desc: Incoming request for the service status portal.
+        lvl: INFO
+        msg: "incoming req req_id={req_id} method=GET route=/status client_region={region}"
+        vars:
+          req_id: {k: uuid, v: null}
+          region: {k: ch, v: [eu, us, apac]}
+
+      upstream_retry:
+        desc: A retry to an alternate upstream/backend due to connection failure.
+        lvl: WARN
+        msg: "retrying upstream svc={svc} attempt={attempt} reason={reason}"
+        vars:
+          svc: {k: ch, v: [m365, status_portal]}
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: [connect_timeout, packet_loss, no_route]}
+
+      upstream_timeout:
+        desc: The gateway times out connecting to or reading from the upstream.
+        lvl: WARN
+        msg: "upstream timeout svc={svc} attempt={attempt} waited_ms={waited_ms}"
+        vars:
+          svc: {k: ch, v: [m365, status_portal]}
+          attempt: {k: i, v: [1, 3]}
+          waited_ms: {k: i, v: [300, 25000]}
+
+      resp_200_m365:
+        desc: Successful response returned to the client.
+        lvl: INFO
+        msg: "response sent req_id={req_id} status=200 dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 20000]}
+          bytes: {k: i, v: [500, 5000000]}
+
+      resp_503_m365:
+        desc: Service unavailable returned to the client (e.g., upstream discovery failure).
+        lvl: WARN
+        msg: "response sent req_id={req_id} status=503 dur_ms={dur_ms} err={err}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 20000]}
+          err: {k: ch, v: [dns_timeout, upstream_unreachable]}
+
+      resp_504_m365:
+        desc: Gateway timeout returned to the client.
+        lvl: WARN
+        msg: "response sent req_id={req_id} status=504 dur_ms={dur_ms} err=upstream_timeout"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [500, 80000]}
+
+      resp_200_status:
+        desc: Successful status portal response returned to the client.
+        lvl: INFO
+        msg: "response sent req_id={req_id} status=200 dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 20000]}
+          bytes: {k: i, v: [500, 300000]}
+
+      resp_504_status:
+        desc: Status portal gateway timeout returned to the client.
+        lvl: WARN
+        msg: "response sent req_id={req_id} status=504 dur_ms={dur_ms} err=upstream_timeout"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [500, 80000]}
+
+      healthz_ok:
+        desc: Health endpoint responded to a synthetic probe.
+        lvl: INFO
+        msg: "healthz ok probe_id={probe_id} rtt_ms={rtt_ms}"
+        vars:
+          probe_id: {k: hex, v: 16}
+          rtt_ms: {k: i, v: [5, 800]}
+
+      healthz_timeout:
+        desc: Health endpoint did not respond within probe timeout due to WAN issues.
+        lvl: WARN
+        msg: "healthz timeout probe_id={probe_id} waited_ms={waited_ms}"
+        vars:
+          probe_id: {k: hex, v: 16}
+          waited_ms: {k: i, v: [200, 8000]}
+
+    beh:
+      n:
+        desc: Request-driven logs dominate; no meaningful background emissions are modeled.
+        emit: []
+      f:
+        desc: Request-driven logs dominate; no meaningful background emissions are modeled.
+        emit: []
+
+  - id: m365_app_cluster
+    name: Microsoft 365 Backend Cluster
+    svc: m365-core
+    hosts: [m365-app-01, m365-app-02, m365-app-03]
+    desc: >
+      Aggregated backend for Microsoft 365 services (Teams/Exchange/SharePoint/etc.).
+      During WAN impairment, fewer requests arrive and those that do can be delayed.
+
+    to:
+      - dst: wan_router_fleet
+        proto: tcp
+        desc: Returns responses to the edge gateway over the WAN.
+
+    logs:
+      req_received:
+        desc: Backend received and began processing a request.
+        lvl: INFO
+        msg: "backend received req_id={req_id} op={op}"
+        vars:
+          req_id: {k: uuid, v: null}
+          op: {k: ch, v: [auth, mailbox, chat, files, graph]}
+
+    beh:
+      n:
+        desc: No background logs modeled.
+        emit: []
+      f:
+        desc: No background logs modeled.
+        emit: []
+
+  - id: status_portal_app
+    name: Service Status Portal Backend
+    svc: status-portal
+    hosts: [status-01, status-02]
+    desc: >
+      Backend that serves the public/service status page. It depends on the same edge/WAN path and can
+      intermittently return 504 during WAN impairment.
+
+    to:
+      - dst: wan_router_fleet
+        proto: tcp
+        desc: Returns responses to the edge gateway over the WAN.
+
+    logs:
+      req_received:
+        desc: Status portal backend received a request.
+        lvl: INFO
+        msg: "status backend received req_id={req_id} page={page}"
+        vars:
+          req_id: {k: uuid, v: null}
+          page: {k: ch, v: [/status, /history]}
+
+    beh:
+      n:
+        desc: No background logs modeled.
+        emit: []
+      f:
+        desc: No background logs modeled.
+        emit: []
+
+tracing:
+  on: true
+  origins: [m365_edge_gateway, wan_automation_controller]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation: edge gateway resolves backends via internal DNS and reaches them over the WAN with low latency.
+      Synthetic probes show healthy RTT and near-zero timeouts.
+    req:
+      - id: m365_http_ok
+        desc: Successful Microsoft 365 request path.
+        rpm: 220.0
+        path: [m365_edge_gateway, dns_resolver, wan_router_fleet, m365_app_cluster, wan_router_fleet, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_m365
+          - dns_resolver.dns_query
+          - dns_resolver.dns_answer_ok
+          - m365_app_cluster.req_received
+          - m365_edge_gateway.resp_200_m365
+        latency_ms: [[2, 6], [3, 10], [4, 14], [15, 50], [18, 70]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: status_portal_ok
+        desc: Successful service status portal request.
+        rpm: 8.0
+        path: [m365_edge_gateway, dns_resolver, wan_router_fleet, status_portal_app, wan_router_fleet, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_status
+          - dns_resolver.dns_query
+          - dns_resolver.dns_answer_ok
+          - status_portal_app.req_received
+          - m365_edge_gateway.resp_200_status
+        latency_ms: [[2, 6], [3, 10], [4, 14], [10, 40], [15, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: wan_probe_ok
+        desc: Synthetic WAN probe succeeds with low RTT.
+        rpm: 4.0
+        path: [wan_automation_controller, wan_router_fleet, m365_edge_gateway, wan_router_fleet, wan_automation_controller]
+        emit:
+          - wan_automation_controller.probe_send
+          - m365_edge_gateway.healthz_ok
+          - wan_automation_controller.probe_result_ok
+        latency_ms: [[1, 3], [15, 80], [1, 3]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      Failure operation: WAN forwarding impairment and DNS delays/timeouts cause elevated latency, 504 gateway timeouts,
+      and some 503 due to DNS failures. The edge gateway may retry upstream selection, increasing variability.
+    req:
+      - id: m365_http_slow_success
+        desc: Microsoft 365 requests succeed but with high WAN-induced latency.
+        rpm: 130.0
+        path: [m365_edge_gateway, dns_resolver, wan_router_fleet, m365_app_cluster, wan_router_fleet, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_m365
+          - dns_resolver.dns_query
+          - dns_resolver.dns_answer_ok
+          - m365_app_cluster.req_received
+          - m365_edge_gateway.resp_200_m365
+        latency_ms: [[5, 20], [20, 120], [40, 220], [200, 1400], [250, 1600]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: m365_http_504
+        desc: Microsoft 365 request fails after multiple upstream timeouts and internal retries, returning a single 504 to the client.
+        rpm: 70.0
+        path: [m365_edge_gateway, dns_resolver, wan_router_fleet, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_m365
+          - dns_resolver.dns_query
+          - dns_resolver.dns_answer_ok
+          - m365_edge_gateway.upstream_timeout
+          - m365_edge_gateway.upstream_retry
+          - m365_edge_gateway.upstream_timeout
+          - m365_edge_gateway.upstream_retry
+          - m365_edge_gateway.upstream_timeout
+          - m365_edge_gateway.resp_504_m365
+        latency_ms: [[5, 20], [20, 120], [40, 220], [800, 12000], [10, 60], [800, 12000], [10, 60], [800, 12000], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: m365_dns_timeout_503
+        desc: Microsoft 365 requests fail fast due to internal DNS timeouts.
+        rpm: 25.0
+        path: [m365_edge_gateway, dns_resolver, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_m365
+          - dns_resolver.dns_query
+          - dns_resolver.dns_timeout
+          - m365_edge_gateway.resp_503_m365
+        latency_ms: [[3, 12], [20, 120], [200, 6000], [5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: status_portal_ok_degraded
+        desc: Status portal still loads, but slower than normal due to WAN impairment.
+        rpm: 4.0
+        path: [m365_edge_gateway, dns_resolver, wan_router_fleet, status_portal_app, wan_router_fleet, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_status
+          - dns_resolver.dns_query
+          - dns_resolver.dns_answer_ok
+          - status_portal_app.req_received
+          - m365_edge_gateway.resp_200_status
+        latency_ms: [[5, 20], [20, 120], [40, 220], [80, 800], [120, 1000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: status_portal_504
+        desc: Status portal request fails after upstream timeouts and an internal retry, returning a single 504 to the client.
+        rpm: 1.0
+        path: [m365_edge_gateway, dns_resolver, wan_router_fleet, m365_edge_gateway]
+        emit:
+          - m365_edge_gateway.req_in_status
+          - dns_resolver.dns_query
+          - dns_resolver.dns_answer_ok
+          - m365_edge_gateway.upstream_timeout
+          - m365_edge_gateway.upstream_retry
+          - m365_edge_gateway.upstream_timeout
+          - m365_edge_gateway.resp_504_status
+        latency_ms: [[5, 20], [20, 120], [40, 220], [800, 12000], [10, 60], [800, 12000], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: wan_probe_lossy
+        desc: Synthetic WAN probe experiences elevated RTT and timeouts due to packet loss.
+        rpm: 4.0
+        path: [wan_automation_controller, wan_router_fleet, m365_edge_gateway, wan_router_fleet, wan_automation_controller]
+        emit:
+          - wan_automation_controller.probe_send
+          - m365_edge_gateway.healthz_timeout
+          - wan_automation_controller.probe_result_fail
+        latency_ms: [[1, 3], [500, 6000], [1, 3]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.5
+          emit_per_retry: []
+          backoff_ms: [[200, 1200]]
+        trace: true
+
+assumptions:
+  - |
+    The post-mortem describes many Microsoft 365 services; this model collapses them into one edge gateway and one backend cluster
+    to preserve the WAN/DNS failure mechanism.
+  - |
+    DNS answers/timeouts return to the edge gateway (modeled as dns_resolver -> m365_edge_gateway) to keep request paths traversable.
+  - |
+    Gateway "retries" are modeled as explicit upstream_retry/upstream_timeout log steps within a single request lifecycle, so the terminal
+    client response log (resp_504_*) is emitted exactly once per failed request (no retry block on those flows).
+  - |
+    WAN impact "in waves" is represented via time-windowed multiplier changes (one prominent spike and subsequent easing), not a strict periodic function.
+  - |
+    Normal-phase volume estimate is ~1150 logs/min (dominated by request flows), with low background router/automation logs.
+  - |
+    Scenario-sized volume estimate is ~52k–68k logs over ~40 minutes (request flows dominate; router/automation metrics add corroboration without overwhelming volume).
+  - |
+    Key diagnostic visibility is ensured by: router fwd_drop_metric and routing_recompute_metric (background), edge 504/503 response logs (per-request),
+    DNS timeout logs (per-request), and automation pause/restart one-shots.
+```

@@ -1,0 +1,463 @@
+```yaml
+sys:
+  id: qa_site_homepage_healthcheck_outage
+  desc: >
+    A Q&A website serves pages through a load balancer to a small pool of web frontend servers.
+    The load balancer performs periodic health checks by requesting the home page ("/") and only routes
+    user traffic to backends that pass. The web frontend renders the home page by formatting post snippets,
+    including trimming leading/trailing Unicode whitespace from some text fields. During the incident,
+    a malformed post triggers an unexpectedly expensive whitespace-trimming routine, causing home page
+    requests (including health checks) to time out and the load balancer to remove all backends.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: load_balancer
+    name: Edge Load Balancer
+    svc: edge-lb
+    hosts: [lb-1, lb-2]
+    desc: >
+      Terminates client connections, forwards requests to web frontends, and runs active health checks
+      against "/" to decide whether a backend is healthy.
+
+    to:
+      - dst: web_frontend
+        proto: https
+        desc: Forwards user requests and health checks to the web frontend pool.
+
+    logs:
+      lb_req_ok:
+        desc: Access log for a successfully proxied request.
+        lvl: INFO
+        msg: "req_id={req_id} client={client_ip} {method} {uri} status=200 upstream={upstream} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: ["/", "/questions", "/search"]}
+          upstream: {k: ch, v: [web-1, web-2, web-3, web-4]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [5, 250]}
+          f:
+            dur_ms: {k: i, v: [10, 5000]}
+
+      lb_req_upstream_timeout:
+        desc: Access log when the upstream does not respond before the proxy timeout.
+        lvl: WARN
+        msg: "req_id={req_id} client={client_ip} {method} {uri} status=504 upstream={upstream} timeout_ms={timeout_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: ["/"]}
+          upstream: {k: ch, v: [web-1, web-2, web-3, web-4]}
+          timeout_ms: {k: i, v: [1500, 3000]}
+
+      lb_req_no_backend:
+        desc: Access log when no healthy upstream is available and the LB returns 503 immediately.
+        lvl: ERROR
+        msg: "req_id={req_id} client={client_ip} {method} {uri} status=503 reason=no_healthy_upstreams"
+        vars:
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: ["/", "/questions", "/search"]}
+
+      lb_healthcheck_ok:
+        desc: Health check request succeeded for a backend.
+        lvl: INFO
+        msg: "healthcheck backend={upstream} uri=/ status=200 dur_ms={dur_ms}"
+        vars:
+          upstream: {k: ch, v: [web-1, web-2, web-3, web-4]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [2, 120]}
+          f:
+            dur_ms: {k: i, v: [5, 3000]}
+
+      lb_healthcheck_fail_timeout:
+        desc: Health check request timed out before receiving a response.
+        lvl: WARN
+        msg: "healthcheck backend={upstream} uri=/ result=timeout timeout_ms={timeout_ms}"
+        vars:
+          upstream: {k: ch, v: [web-1, web-2, web-3, web-4]}
+          timeout_ms: {k: i, v: [1500, 3000]}
+
+      lb_pool_status:
+        desc: Periodic snapshot of backend pool indicating how many backends are healthy (total is fixed at 4).
+        lvl: INFO
+        msg: "pool_status healthy={healthy} total=4"
+        vars: {}
+        state_vars:
+          n:
+            healthy: {k: i, v: [4, 4]}
+          f:
+            healthy: {k: i, v: [1, 4]}
+
+      lb_pool_status_all_unhealthy:
+        desc: Periodic snapshot indicating the LB has no healthy backends.
+        lvl: INFO
+        msg: "pool_status healthy={healthy} unhealthy={unhealthy}"
+        vars:
+          healthy: {k: i, v: [0, 0]}
+          unhealthy: {k: i, v: [4, 4]}
+
+      lb_backend_marked_unhealthy:
+        desc: Backend marked unhealthy due to health check timeouts.
+        lvl: INFO
+        msg: "backend {upstream} marked unhealthy reason=healthcheck_timeout"
+        vars:
+          upstream: {k: ch, v: [web-1, web-2, web-3, web-4]}
+
+      lb_backend_marked_healthy:
+        desc: Backend marked healthy after passing health checks.
+        lvl: INFO
+        msg: "backend {upstream} marked healthy reason=healthcheck_ok"
+        vars:
+          upstream: {k: ch, v: [web-1, web-2, web-3, web-4]}
+
+    beh:
+      n:
+        desc: Emits periodic pool health snapshots.
+        emit:
+          - id: lb_pool_status
+            per_min: 1.0
+      f:
+        desc: Emits periodic pool health snapshots; which snapshot type appears is controlled by scenario events.
+        emit:
+          - id: lb_pool_status
+            per_min: 1.0
+          - id: lb_pool_status_all_unhealthy
+            per_min: 1.0
+
+  - id: web_frontend
+    name: Web Frontend
+    svc: web-frontend
+    hosts: [web-1, web-2, web-3, web-4]
+    desc: >
+      Renders the home page and question pages. The home page includes a list of posts and performs
+      whitespace trimming on some text snippets during rendering.
+
+    to:
+      - dst: load_balancer
+        proto: https
+        desc: Returns HTTP responses back through the load balancer (modeled as a logical return hop for path connectivity).
+
+    logs:
+      web_req_completed:
+        desc: Request completion log emitted after the handler finishes.
+        lvl: INFO
+        msg: "req_id={req_id} {method} {uri} status={status} dur_ms={dur_ms} user_agent={ua}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: ["/", "/questions", "/search"]}
+          status: {k: ch, v: [200]}
+          ua: {k: ch, v: [browser, lb-healthcheck]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [5, 1200]}
+          f:
+            dur_ms: {k: i, v: [10, 30000]}
+
+      web_req_aborted:
+        desc: Request aborted due to client disconnect or server-side timeout while still executing.
+        lvl: ERROR
+        msg: "req_id={req_id} {method} {uri} aborted reason={reason} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: ["/"]}
+          reason: {k: ch, v: [client_closed, server_timeout]}
+          dur_ms: {k: i, v: [1500, 30000]}
+
+      web_trim_slow:
+        desc: Slow-trim warning emitted when trimming exceeds a local threshold (elapsed time so far, not total completion time).
+        lvl: WARN
+        msg: "trim_unicode_whitespace slow elapsed_ms={elapsed_ms} input_len={input_len} sample='{sample}'"
+        vars:
+          elapsed_ms: {k: i, v: [250, 1400]}
+          input_len: {k: i, v: [15000, 25000]}
+          sample: {k: str, v: "short text snippet"}
+
+      web_cpu_metric:
+        desc: Periodic runtime metrics from the web process.
+        lvl: INFO
+        msg: "runtime cpu_pct={cpu} gc_pause_ms={gc_pause} run_queue={runq}"
+        vars: {}
+        state_vars:
+          n:
+            cpu: {k: i, v: [5, 60]}
+            gc_pause: {k: i, v: [0, 60]}
+            runq: {k: i, v: [0, 20]}
+          f:
+            cpu: {k: i, v: [20, 100]}
+            gc_pause: {k: i, v: [5, 200]}
+            runq: {k: i, v: [5, 200]}
+
+      web_deploy:
+        desc: Deployment marker from the web service (start of rollout for this incident).
+        lvl: INFO
+        msg: "deploy version={version} sha={sha} stage={stage}"
+        vars:
+          version: {k: ch, v: [2016.07.20-hotfix]}
+          sha: {k: hex, v: 7}
+          stage: {k: ch, v: [start]}
+
+    beh:
+      n:
+        desc: Emits low-rate runtime metrics while serving traffic.
+        emit:
+          - id: web_cpu_metric
+            per_min: 1.0
+      f:
+        desc: Emits runtime metrics under heavy CPU and queue pressure, plus asynchronous abort logs when clients time out.
+        emit:
+          - id: web_cpu_metric
+            per_min: 1.0
+          - id: web_req_aborted
+            per_min: 2.0
+
+  - id: monitoring
+    name: Monitoring / Alerting
+    svc: site-monitor
+    hosts: [mon-1]
+    desc: >
+      Periodically probes the site through the load balancer and raises alerts when latency or availability
+      crosses thresholds.
+
+    to:
+      - dst: load_balancer
+        proto: https
+        desc: Probes the site via the same public endpoint users hit.
+
+    logs:
+      mon_probe:
+        desc: Periodic synthetic probe observation.
+        lvl: INFO
+        msg: "probe name={name} target={target} status={status} latency_ms={lat_ms}"
+        vars:
+          name: {k: ch, v: [homepage]}
+          target: {k: ch, v: [edge-lb]}
+        state_vars:
+          n:
+            status: {k: ch, v: [ok]}
+            lat_ms: {k: i, v: [20, 300]}
+          f:
+            status: {k: ch, v: [warn, crit]}
+            lat_ms: {k: i, v: [5, 5000]}
+
+      mon_alert_homepage_latency:
+        desc: Alert indicating sustained elevated home page latency.
+        lvl: CRITICAL
+        msg: "ALERT homepage_latency severity=P1 p95_ms={p95_ms} window_s={window_s}"
+        vars:
+          p95_ms: {k: i, v: [2000, 15000]}
+          window_s: {k: i, v: [60, 600]}
+
+      mon_alert_all_backends_unhealthy:
+        desc: Alert indicating the load balancer has no healthy backends.
+        lvl: CRITICAL
+        msg: "ALERT all_backends_unhealthy severity=P1 healthy={healthy} unhealthy={unhealthy}"
+        vars:
+          healthy: {k: i, v: [0, 0]}
+          unhealthy: {k: i, v: [4, 4]}
+
+      mon_incident_update:
+        desc: Operator-visible incident timeline marker.
+        lvl: INFO
+        msg: "incident_update status={status} note='{note}'"
+        vars:
+          status: {k: ch, v: [investigating, identified]}
+          note: {k: str, v: "short note"}
+
+    beh:
+      n:
+        desc: Emits probes; alerts are typically absent in normal operation.
+        emit:
+          - id: mon_probe
+            per_min: 1.0
+            scope: global
+          - id: mon_alert_homepage_latency
+            per_min: 0.0
+            scope: global
+          - id: mon_alert_all_backends_unhealthy
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Emits probes and, depending on conditions, availability/latency alerts (scenario events can suppress either).
+        emit:
+          - id: mon_probe
+            per_min: 1.0
+            scope: global
+          - id: mon_alert_homepage_latency
+            per_min: 0.2
+            scope: global
+          - id: mon_alert_all_backends_unhealthy
+            per_min: 0.2
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user traffic is successfully routed to web frontends; health checks keep all backends in rotation.
+    req:
+      - id: homepage_view_ok
+        desc: Browser loads the home page through the load balancer.
+        rpm: 240.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_req_completed, load_balancer.lb_req_ok]
+        latency_ms: [[25, 120], [30, 160]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: question_view_ok
+        desc: Browser loads a question page (representative non-homepage endpoint).
+        rpm: 480.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_req_completed, load_balancer.lb_req_ok]
+        latency_ms: [[30, 180], [35, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: lb_healthcheck_ok
+        desc: Load balancer health check GET / succeeds on backends.
+        rpm: 24.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_req_completed, load_balancer.lb_healthcheck_ok]
+        latency_ms: [[10, 60], [10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Home page rendering becomes slow, causing health checks to fail and eventually the LB to serve 503 due to no healthy backends.
+      Even when all backends are marked unhealthy for user routing, the LB continues probing them with health checks to detect recovery.
+    req:
+      - id: homepage_slow_timeout
+        desc: Home page requests trigger slow whitespace trimming and overrun the LB timeout, leading to 504 at the edge.
+        rpm: 200.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_trim_slow, load_balancer.lb_req_upstream_timeout]
+        latency_ms: [[300, 1400], [1500, 3000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: question_view_ok_f
+        desc: Non-homepage endpoints still succeed early in the incident but may be slower under CPU pressure.
+        rpm: 400.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_req_completed, load_balancer.lb_req_ok]
+        latency_ms: [[60, 1200], [80, 1500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: healthcheck_timeout
+        desc: Health checks to / time out while the home page handler is CPU-bound.
+        rpm: 24.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_trim_slow, load_balancer.lb_healthcheck_fail_timeout]
+        latency_ms: [[250, 1200], [1500, 3000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: site_req_no_backend
+        desc: With all backends marked unhealthy for routing, the LB returns 503 for all user requests.
+        rpm: 720.0
+        path: [load_balancer]
+        emit: [load_balancer.lb_req_no_backend]
+        latency_ms: [[1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: site_req_ok_degraded
+        desc: During partial recovery, a small fraction of requests are served by the remaining healthy backend(s).
+        rpm: 720.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_req_completed, load_balancer.lb_req_ok]
+        latency_ms: [[80, 4000], [100, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: healthcheck_ok_degraded
+        desc: During partial recovery, some health checks succeed again on the newly healthy backend(s).
+        rpm: 24.0
+        path: [load_balancer, web_frontend, load_balancer]
+        emit: [web_frontend.web_req_completed, load_balancer.lb_healthcheck_ok]
+        latency_ms: [[30, 1500], [30, 2500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+      The modeled system is a simplified Stack Overflow-like site; only the load balancer, web frontends, and monitoring are included.
+  - |
+      The root cause is represented as a slow whitespace-trimming step during home page rendering (web_frontend.web_trim_slow), driven by an unusually long whitespace run (~20k chars).
+  - |
+      web_frontend.web_trim_slow is defined as a threshold warning with elapsed time-so-far (elapsed_ms), not a completion duration, so it can occur before the LB logs an upstream timeout.
+      elapsed_ms is constrained below the LB timeout envelope to avoid non-chronological timeout sequences.
+  - |
+      Modeled endpoints in this incident spec always return HTTP 200 on success; redirects (302) are omitted to keep LB and app completion logs consistent.
+  - |
+      The load balancer health check is modeled as GET / with an effective timeout around 1.5–3s; repeated failures lead to marking backends unhealthy for routing.
+      Health checks are assumed to continue probing backends even when all are currently marked unhealthy, enabling recovery once a backend starts responding again.
+  - |
+      Request-abort logs (web_frontend.web_req_aborted) are modeled as asynchronous/background emissions during failure (and suppressed when the LB is not routing traffic),
+      to avoid forcing a per-request chronology that would conflict with LB timeout logging.
+  - |
+      To keep pool snapshots physically coherent with 4 modeled backends, lb_pool_status now logs only healthy=N (total=4),
+      and the separate lb_pool_status_all_unhealthy template represents the healthy=0/unhealthy=4 case. Scenario events suppress/enable these to match the timeline.
+  - |
+      Monitoring's homepage-latency alert is modeled as conditionally emitted during the initial slow-timeout phase and can be suppressed later when the LB is fast-failing 503s,
+      to keep alert behavior consistent with symptom transitions.
+  - |
+      The deploy marker is constrained to stage=start for this incident so event narratives about "rollout starts" cannot contradict generated logs.
+  - |
+      Normal-phase traffic is approximated at ~720 rpm user requests plus ~24 rpm health checks; with ~2 logs per request this yields ~1488 flow-logs/min plus ~7 background logs/min.
+  - |
+      Total scenario log volume target remains ~48k logs over 40 minutes, within the 20k–100k requirement.
+  - |
+      Partial recovery is modeled as a small fraction of requests succeeding again (site_req_ok_degraded) while most still receive 503 (site_req_no_backend),
+      representing an in-progress rollout before full restoration.
+```

@@ -1,0 +1,297 @@
+```yaml
+scenario:
+  id: ops_6000_popcount_retry_storm
+  title: "OPS-6000: Popcount overload triggers retry storm and Accesspoint I/O collapse"
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system streams music and serves discovery content to desktop clients through regional Accesspoints.
+    A Discovery rollout introduces a new Bartender→Popcount dependency and increases Popcount traffic beyond its capacity.
+    As Popcount slows, a legacy desktop-client Popcount fetch path retries timeouts with no backoff, and Accesspoints emit
+    very verbose timeout logs; this combination causes request queues to grow, disk I/O stalls, and widespread Accesspoint
+    unreachability. Users see high playback start latency and intermittent inability to log in.
+
+  trigger_desc: |
+    A feature rollout enables a Discovery page change where Bartender (Discovery service) fetches playlist subscriber
+    counts from Popcount for a slice of European traffic. This newly introduced dependency increases Popcount call volume
+    abruptly on a busy Saturday night, before Popcount capacity has been adjusted for the additional load.
+
+  time:
+    total_minutes: 36
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 36}
+
+  phases:
+    n:
+      desc: |
+        During normal operation, desktop clients connect to regional Accesspoints for login, discovery page loads, and
+        playback start. Accesspoints proxy login requests to Auth Service (auth_login_ok) and playback start requests to
+        Playback Service (playback_start_ok). Discovery page loads (discovery_page_ok) are mostly served from Bartender’s
+        cache, so Bartender emits fast render logs and only rare dependency warnings. Popcount subscriber lookups
+        (popcount_subscribers_ok) are occasional and typically complete quickly, producing normal Popcount success logs
+        and Accesspoint 200 responses. Background infrastructure signals such as Accesspoint syslog flush delays and
+        Popcount saturation warnings are rare and low-rate.
+      flows: [playback_start_ok, auth_login_ok, discovery_page_ok, popcount_subscribers_ok]
+      manifestation:
+        - accesspoint.playback_resp
+        - accesspoint.login_resp
+        - accesspoint.discovery_resp
+        - accesspoint.popcount_resp
+
+    f:
+      desc: |
+        The failure begins when the Discovery rollout causes Bartender to fetch playlist subscriber counts from Popcount.
+        Popcount is underprovisioned for this added demand and becomes slow, which increases Popcount tail latency and error
+        rate. As Popcount calls time out, the desktop client’s legacy Popcount code retries immediately without backoff
+        (popcount_subscribers_timeout_retry_storm), amplifying the load and prolonging the slow state. Accesspoints
+        accumulate large upstream queues while waiting on Popcount and produce highly verbose timeout logs per attempt,
+        pushing syslog and disk flush into I/O stall. Accesspoint responsiveness collapses: many clients see slow or failed
+        logins and high playback start latency because requests can’t be processed reliably at the edge. A late mitigation
+        blocks Accesspoints off briefly, converting timeouts into connection failures and triggering exponential backoff
+        (popcount_subscribers_conn_refused_backoff), which reduces pressure but does not fully restore service by the end of
+        the scenario.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: bartender
+          event: |
+            Discovery rollout traffic starts hitting Bartender with playlist cards that require subscriber counts, and
+            Bartender begins issuing Popcount calls during discovery renders. Popcount dependency latency warnings rise,
+            and discovery requests that need Popcount enrichment begin returning slower responses and occasional errors.
+          why: |
+            The rollout adds a previously absent Bartender→Popcount synchronous dependency on a hot user path.
+            Popcount capacity was sized for prior callers; the new call volume increases concurrent work and tail latency,
+            which is directly observable via bartender.popcount_latency_warn and the flow discovery_page_popcount_timeout
+            (bartender.popcount_call_failed). The fact that the dependency is new requires external knowledge (rollout/config)
+            to confirm, but the onset pattern (dependency warnings + discovery enrichment failures) is observable in logs.
+          flows: [discovery_page_popcount_timeout, discovery_page_ok_cached, popcount_subscribers_timeout_retry_storm]
+          rate_multipliers:
+            accesspoint.io_wait_high: 0.0
+            accesspoint.syslog_flush_slow: 0.0
+            accesspoint.queue_depth_warn: 0.5
+            popcount_subscribers_conn_refused_backoff: 0.0
+          manifestation:
+            - bartender.popcount_latency_warn
+            - bartender.popcount_call_failed
+            - popcount.threadpool_saturated
+
+        - order: 2
+          at_min: 21
+          component: bartender
+          event: |
+            Popcount becomes consistently slow under load, and direct subscriber fetches begin failing more often.
+            An operator disables the Discovery→Popcount enrichment via a feature flag, and the rate of discovery renders
+            that attempt Popcount enrichment drops sharply, while Popcount-related failures continue from accumulated edge
+            queues and ongoing client traffic.
+          why: |
+            Once Popcount is saturated, timeouts increase and the desktop client’s legacy timeout-retry path amplifies
+            request rate (observable via accesspoint.popcount_timeout_verbose paired with desktop_client.popcount_retry_no_backoff
+            in popcount_subscribers_timeout_retry_storm). Disabling the Bartender enrichment removes one synchronous caller,
+            which is directly observable via a one-shot bartender.feature_flag_update and a reduced rate of the enrichment
+            failure flow (discovery_page_popcount_timeout), but it does not drain existing Accesspoint queues or stop the
+            client retry loop quickly. The remaining overload is observable from Popcount saturation/health logs and Accesspoint
+            timeout logs; confirming the feature flag’s full rollout/propagation scope requires external knowledge of config/flags.
+          flows: [popcount_subscribers_timeout_retry_storm, discovery_page_popcount_timeout, popcount_subscribers_empty_fastfail]
+          rate_multipliers:
+            popcount_subscribers_timeout_retry_storm: 1.8
+            discovery_page_popcount_timeout: 0.2
+            popcount_subscribers_empty_fastfail: 0.7
+            accesspoint.queue_depth_warn: 1.5
+            accesspoint.io_wait_high: 0.0
+            accesspoint.syslog_flush_slow: 0.0
+            popcount.threadpool_saturated: 2.0
+            popcount.health_unhealthy: 1.2
+            bartender.popcount_latency_warn: 1.5
+            popcount_subscribers_conn_refused_backoff: 0.0
+          one_shots:
+            - ref: bartender.feature_flag_update
+              count: 1
+              hosts: ["bartender-01"]
+          manifestation:
+            - accesspoint.popcount_timeout_verbose
+            - desktop_client.popcount_retry_no_backoff
+            - popcount.health_unhealthy
+
+        - order: 3
+          at_min: 25
+          component: accesspoint
+          event: |
+            Accesspoints begin exhibiting severe I/O symptoms while handling large Popcount queues and emitting verbose timeout
+            logs. Many instances crash and are restarted by supervisors; edge endpoints become intermittently unreachable or
+            extremely slow, increasing login timeouts and extending playback start latency.
+          why: |
+            Verbose per-timeout logging creates a high write rate; syslog flush blocks and disk I/O wait rises, which reduces
+            the Accesspoint’s ability to accept/process requests, causing more upstream timeouts and more error logs. This is
+            directly observable via accesspoint.syslog_flush_slow and accesspoint.io_wait_high increasing alongside
+            accesspoint.popcount_timeout_verbose and one-shot accesspoint.process_crash/accesspoint.process_restart.
+            The reinforcing effect (I/O stall → slow handling → more timeouts → more logs) is inferred from known logging/I/O
+            behavior but strongly suggested by the correlated signals.
+          flows: [auth_login_timeout, popcount_subscribers_timeout_retry_storm, playback_start_degraded]
+          rate_multipliers:
+            popcount_subscribers_timeout_retry_storm: 2.3
+            auth_login_timeout: 2.0
+            discovery_page_ok_cached: 0.6
+            discovery_page_popcount_timeout: 0.1
+            popcount_subscribers_empty_fastfail: 0.5
+            accesspoint.io_wait_high: 1.0
+            accesspoint.syslog_flush_slow: 1.0
+            accesspoint.queue_depth_warn: 2.5
+            popcount.threadpool_saturated: 3.0
+            popcount.health_unhealthy: 1.5
+            bartender.popcount_latency_warn: 2.0
+            log_collector.disk_sync_warn: 2.0
+            popcount_subscribers_conn_refused_backoff: 0.0
+          latency_multipliers:
+            playback_start_degraded: {p50: 1.3, p95: 1.8}
+            auth_login_timeout: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: accesspoint.process_crash
+              count: 10
+              hosts: ["ap-eu-01", "ap-eu-02", "ap-eu-03", "ap-eu-04", "ap-eu-05", "ap-eu-06"]
+            - ref: accesspoint.process_restart
+              count: 10
+              hosts: ["ap-eu-01", "ap-eu-02", "ap-eu-03", "ap-eu-04", "ap-eu-05", "ap-eu-06"]
+          manifestation:
+            - accesspoint.syslog_flush_slow
+            - accesspoint.io_wait_high
+            - accesspoint.popcount_timeout_verbose
+            - accesspoint.process_crash
+
+        - order: 4
+          at_min: 30
+          component: accesspoint
+          event: |
+            SRE applies temporary firewall blocks and hard-resets the most unresponsive Accesspoints. Client traffic shifts from
+            long Popcount timeouts to immediate connection failures, and the client’s exponential backoff is triggered for
+            reconnect attempts; load and logging reduce, but the service remains degraded.
+          why: |
+            Firewalling/unreachability changes the failure mode from “slow timeout” to “fast connection error”.
+            That stops the legacy no-backoff timeout retry loop from dominating and activates the client’s backoff path
+            (observable via desktop_client.popcount_conn_failed and desktop_client.client_backoff_scheduled in
+            popcount_subscribers_conn_refused_backoff). Reduced request concurrency and log write rate lessen syslog flush
+            pressure (observable via decreased accesspoint.syslog_flush_slow and accesspoint.io_wait_high), but Popcount and
+            Accesspoints do not instantly return to normal due to remaining backlog and continued high overall demand.
+          flows: [popcount_subscribers_conn_refused_backoff, popcount_subscribers_timeout_retry_storm, auth_login_timeout]
+          rate_multipliers:
+            popcount_subscribers_timeout_retry_storm: 0.7
+            popcount_subscribers_conn_refused_backoff: 1.0
+            auth_login_timeout: 0.7
+            playback_start_degraded: 0.95
+            discovery_page_ok_cached: 0.8
+            discovery_page_popcount_timeout: 0.05
+            popcount_subscribers_empty_fastfail: 0.9
+            accesspoint.io_wait_high: 0.6
+            accesspoint.syslog_flush_slow: 0.6
+            accesspoint.queue_depth_warn: 1.3
+            popcount.threadpool_saturated: 1.8
+            popcount.health_unhealthy: 1.2
+            bartender.popcount_latency_warn: 1.2
+            log_collector.disk_sync_warn: 1.0
+          one_shots:
+            - ref: accesspoint.firewall_block_applied
+              count: 6
+              hosts: ["ap-eu-01", "ap-eu-02", "ap-eu-03", "ap-eu-04", "ap-eu-05", "ap-eu-06"]
+            - ref: accesspoint.hard_reset
+              count: 2
+              hosts: ["ap-eu-02", "ap-eu-05"]
+          manifestation:
+            - accesspoint.firewall_block_applied
+            - desktop_client.popcount_conn_failed
+            - desktop_client.client_backoff_scheduled
+            - accesspoint.io_wait_high
+
+      steady:
+        - component: popcount
+          condition: |
+            Popcount remains in a saturated/degraded state: worker pools are frequently near capacity and healthchecks
+            oscillate between DEGRADED and UNHEALTHY. Many requests are served via fast-fail empty responses, while others
+            still time out upstream when concurrency spikes; Discovery enrichment is mostly disabled, but the retry-driven
+            backlog keeps load elevated.
+          user_impact: |
+            Discovery cards and playlist subscriber information may be missing or slow to load; some pages degrade gracefully
+            with empty subscriber lists, while others experience long waits or transient errors.
+          manifestation:
+            - popcount.threadpool_saturated
+            - popcount.health_unhealthy
+            - popcount.fast_fail_empty
+
+        - component: accesspoint
+          condition: |
+            Accesspoints continue to show elevated I/O wait and syslog flush latency compared to baseline, with intermittent
+            request queue build-up. Some login requests still time out at the edge due to uneven instance health and backlog.
+          user_impact: |
+            Users experience intermittent inability to log in and sporadic slow API responses, especially during traffic bursts.
+          manifestation:
+            - accesspoint.io_wait_high
+            - accesspoint.syslog_flush_slow
+            - accesspoint.login_timeout
+
+        - component: playback_service
+          condition: |
+            Playback Service is largely healthy, but playback start latency stays high because Accesspoints are slow to proxy
+            requests and deliver responses; tail startup times remain elevated.
+          user_impact: |
+            Music playback starts slowly; some users see long “loading” before audio begins.
+          manifestation:
+            - playback_service.session_started
+            - accesspoint.playback_resp
+
+      feedback_loops:
+        - id: retry_storm_popcount
+          desc: |
+            Popcount slows → more upstream timeouts → legacy client retries with no backoff → higher request rate to Popcount
+            → even slower Popcount. This loop explains the rapid growth of popcount_subscribers_timeout_retry_storm volume.
+
+        - id: log_io_collapse
+          desc: |
+            Popcount timeouts → verbose per-timeout logging at Accesspoints → syslog flush + disk I/O wait rises →
+            Accesspoints process fewer requests and time out more often → even more error logging. This loop sustains the
+            Accesspoint unreachability and broadens impact to login and playback.
+
+      flows:
+        - playback_start_degraded
+        - auth_login_ok
+        - auth_login_timeout
+        - discovery_page_ok_cached
+        - discovery_page_popcount_timeout
+        - popcount_subscribers_empty_fastfail
+        - popcount_subscribers_timeout_retry_storm
+        - popcount_subscribers_conn_refused_backoff
+
+      manifestation:
+        - popcount.threadpool_saturated
+        - popcount.health_unhealthy
+        - bartender.popcount_latency_warn
+        - bartender.popcount_call_failed
+        - accesspoint.popcount_timeout_verbose
+        - accesspoint.syslog_flush_slow
+        - accesspoint.io_wait_high
+        - accesspoint.login_timeout
+        - desktop_client.popcount_retry_no_backoff
+        - desktop_client.client_backoff_scheduled
+
+  assumptions:
+    - >
+      The post-mortem spans hours and includes eventual recovery; this scenario compresses the timeline to 36 minutes and
+      ends during mitigation (firewall/backoff active) but before a full return to baseline, to keep a two-phase model
+      (normal→failure) without a separate recovery phase.
+    - >
+      After the feature-flag change, the Discovery→Popcount enrichment is modeled as largely removed (multipliers near-zero),
+      while Popcount overload persists due to client retries and accumulated Accesspoint queues; this matches the narrative that
+      “removing that dependency” was attempted but did not resolve the incident.
+    - >
+      Login impact is modeled primarily as Accesspoint edge timeouts (auth_login_timeout) rather than Auth Service failures,
+      matching the narrative that Accesspoints became unreachable/slow due to I/O and logging pressure.
+    - >
+      The retry-storm timeout flow is interpreted as “edge waited on Popcount and timed out”, so the flow’s path includes the
+      Popcount hop and the return to the Accesspoint where the terminal timeout log is emitted.
+    - >
+      Volume estimate summary (matches system description):
+      normal ~= 1417 logs/min * 18 min ~= 25,506;
+      failure piecewise ~= 5,367 + 8,749 + 12,568 + 9,563 + one-shots(29) ~= 36,277;
+      total ~= 61,783 logs. This is intentionally noisier during failure due to retries and verbose timeout logging,
+      then partially reduced after firewalling triggers exponential backoff.
+```

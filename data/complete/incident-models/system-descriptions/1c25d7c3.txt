@@ -1,0 +1,675 @@
+```yaml
+sys:
+  id: control_plane_api_dashboard
+  desc: >
+    A control-plane system providing an HTTPS API and a web dashboard. Requests are
+    authenticated by an auth service that depends on a highly-available relational
+    database cluster coordinated via an etcd-backed cluster manager. The control
+    plane is deployed across two regions, but the primary database is normally read
+    locally; cross-region reads can be enabled manually for some traffic.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: rack_switch
+    name: Rack Switch Pair
+    svc: null
+    hosts: [sw-r12a]
+    desc: >
+      Top-of-rack switch pair for a rack containing one etcd member and part of the
+      control-plane cluster. During the incident, one switch enters a partial failure
+      mode causing selective packet loss while link aggregation remains up.
+    to: []
+    logs:
+      switch_ping_loss:
+        desc: NOC monitoring reports intermittent reachability loss to the switch management IP.
+        lvl: WARN
+        msg: "switch {switch} ping loss {loss_pct}% over 60s"
+        vars:
+          switch: {k: ch, v: [sw-r12a]}
+          loss_pct: {k: i, v: [5, 60]}
+      switch_recovered:
+        desc: Monitoring indicates the switch has returned to stable forwarding.
+        lvl: INFO
+        msg: "switch {switch} forwarding stable (loss back to {loss_pct}%)"
+        vars:
+          switch: {k: ch, v: [sw-r12a]}
+          loss_pct: {k: i, v: [0, 1]}
+    beh:
+      n:
+        desc: Occasional benign monitoring blips.
+        emit:
+          - id: switch_ping_loss
+            per_min: 0.02
+            scope: global
+      f:
+        desc: During the incident window the switch is frequently reported as lossy until it recovers.
+        emit:
+          - id: switch_ping_loss
+            per_min: 4.0
+            scope: global
+
+  - id: etcd_cluster
+    name: Etcd Cluster
+    svc: etcd
+    hosts: [etcd-1, etcd-2, etcd-3]
+    desc: >
+      Strongly-consistent key-value store used for coordination (RAFT). Election churn
+      and write blocking are observable when a member has a partial network failure.
+    to: []
+    logs:
+      raft_election_started:
+        desc: A member starts a leader election term due to perceived leader unavailability.
+        lvl: WARN
+        msg: "raft election started member={member} term={term} reason={reason}"
+        vars:
+          member: {k: ch, v: [etcd-1, etcd-2, etcd-3]}
+          term: {k: i, v: [1200, 1400]}
+          reason: {k: ch, v: [election_timeout, heartbeat_missed]}
+      raft_write_blocked:
+        desc: Writes are blocked while there is no stable leader quorum.
+        lvl: ERROR
+        msg: "write blocked (no leader) member={member} wait_ms={wait_ms}"
+        vars:
+          member: {k: ch, v: [etcd-1, etcd-2, etcd-3]}
+          wait_ms: {k: i, v: [200, 5000]}
+      raft_leader_heartbeat:
+        desc: Periodic health marker indicating a stable leader is known.
+        lvl: INFO
+        msg: "raft leader heartbeat leader={leader} term={term}"
+        vars:
+          leader: {k: ch, v: [etcd-1, etcd-2, etcd-3]}
+          term: {k: i, v: [1200, 1400]}
+      raft_leader_stable:
+        desc: Operator/automation marker that a stable leader has been observed after churn.
+        lvl: INFO
+        msg: "raft leader stabilized leader={leader} term={term}"
+        vars:
+          leader: {k: ch, v: [etcd-1, etcd-2, etcd-3]}
+          term: {k: i, v: [1200, 1400]}
+    beh:
+      n:
+        desc: Stable leadership produces periodic heartbeats; elections are rare.
+        emit:
+          - id: raft_leader_heartbeat
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Election churn and write blocking appear during the partial network fault, then subside.
+        emit:
+          - id: raft_leader_heartbeat
+            per_min: 1.0
+            scope: global
+          - id: raft_election_started
+            per_min: 5.0
+            scope: global
+          - id: raft_write_blocked
+            per_min: 4.0
+            scope: global
+
+  - id: db_cluster_mgr
+    name: Database Cluster Manager
+    svc: db-cluster-mgr
+    hosts: [dbmgr-a1, dbmgr-a2]
+    desc: >
+      Orchestrates primary/replica roles for the authentication database using etcd
+      for coordination and discovery. A promotion triggers an (undesired) full replica
+      rebuild, extending the period with no usable replicas.
+    to:
+      - dst: etcd_cluster
+        proto: grpc
+        desc: Reads/writes coordination state and cluster membership via etcd.
+      - dst: auth_db_primary
+        proto: tcp
+        desc: Performs health checks and issues role change commands.
+    logs:
+      promote_primary:
+        desc: Automatic failover selects a (new) primary for the cluster.
+        lvl: INFO
+        msg: "promoted primary cluster={cluster} new_primary={new_primary} reason={reason}"
+        vars:
+          cluster: {k: ch, v: [auth-db]}
+          new_primary: {k: ch, v: [authdb-a1, authdb-a2]}
+          reason: {k: ch, v: [coordination_unavailable, primary_not_confirmed]}
+      replica_rebuild_started:
+        desc: Replica rebuild begins after promotion.
+        lvl: WARN
+        msg: "replica rebuild started cluster={cluster} primary={primary} estimated_minutes={eta_min}"
+        vars:
+          cluster: {k: ch, v: [auth-db]}
+          primary: {k: ch, v: [authdb-a1, authdb-a2]}
+          eta_min: {k: i, v: [120, 420]}
+      replica_rebuild_progress:
+        desc: Periodic rebuild progress marker while replicas are being reconstructed.
+        lvl: INFO
+        msg: "replica rebuild progress cluster={cluster} pct={pct} bytes_copied_gb={gb}"
+        vars:
+          cluster: {k: ch, v: [auth-db]}
+          pct: {k: i, v: [0, 99]}
+          gb: {k: i, v: [0, 600]}
+      read_routing_enabled_all:
+        desc: Operator enables cross-region read routing for authentication reads (all traffic).
+        lvl: INFO
+        msg: "read routing enabled scope=all_traffic target=dr_replica"
+        vars: {}
+      read_routing_enabled_api_only:
+        desc: Operator enables cross-region read routing for authentication reads (API-only).
+        lvl: INFO
+        msg: "read routing enabled scope=api_only target=dr_replica"
+        vars: {}
+      noncritical_work_throttled:
+        desc: Operator reduces non-critical background work to protect the auth database.
+        lvl: WARN
+        msg: "noncritical work throttled features={features} new_limit_rps={limit_rps}"
+        vars:
+          features: {k: ch, v: [cert_push, email, analytics]}
+          limit_rps: {k: i, v: [5, 50]}
+    beh:
+      n:
+        desc: No rebuild activity under normal operation.
+        emit: []
+      f:
+        desc: Rebuild progress logs are present when a promotion has occurred.
+        emit:
+          - id: replica_rebuild_progress
+            per_min: 1.0
+            scope: global
+
+  - id: auth_db_primary
+    name: Auth Database (Region A, current primary)
+    svc: auth-db
+    hosts: [authdb-a1, authdb-a2]
+    desc: >
+      Authentication relational database node currently acting as primary in region A.
+      Under normal operation authdb-a1 is primary with authdb-a2 as a synchronous replica.
+      During the incident an automatic promotion can switch primacy, and missing replicas
+      leave the primary absorbing full read load and becoming saturated.
+    to:
+      - dst: auth_db_dr_replica
+        proto: tcp
+        desc: Asynchronous replication stream to the disaster-recovery region.
+    logs:
+      db_health:
+        desc: Periodic health sample for the current primary DB node.
+        lvl: INFO
+        msg: "db health node={node} role=primary cpu_pct={cpu_pct} connections={connections} qps={qps}"
+        vars:
+          cpu_pct: {k: i, v: [10, 95]}
+          connections: {k: i, v: [50, 800]}
+          qps: {k: i, v: [200, 6000]}
+        state_vars:
+          n:
+            node: {k: ch, v: [authdb-a1]}
+          f:
+            node: {k: ch, v: [authdb-a1, authdb-a2]}
+      db_overload:
+        desc: Saturation warning when connections and CPU are high on the current primary.
+        lvl: ERROR
+        msg: "db overload node={node} role=primary cpu_pct={cpu_pct} connections={connections} queue_ms={queue_ms}"
+        vars:
+          node: {k: ch, v: [authdb-a1, authdb-a2]}
+          cpu_pct: {k: i, v: [85, 99]}
+          connections: {k: i, v: [600, 1500]}
+          queue_ms: {k: i, v: [50, 4000]}
+    beh:
+      n:
+        desc: Regular health metrics for the current primary; overload warnings are absent.
+        emit:
+          - id: db_health
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Health metrics continue; overload warnings appear once replicas are unavailable.
+        emit:
+          - id: db_health
+            per_min: 1.0
+            scope: global
+          - id: db_overload
+            per_min: 2.0
+            scope: global
+
+  - id: auth_db_dr_replica
+    name: Auth Database (DR Read Replica, Region B)
+    svc: auth-db
+    hosts: [authdb-b1]
+    desc: >
+      Disaster-recovery read replica that remains online. It is not part of the local
+      failover process but can be used for manual cross-region read routing.
+    to: []
+    logs:
+      replica_health:
+        desc: Periodic health marker for the DR replica.
+        lvl: INFO
+        msg: "db health role=dr_replica cpu_pct={cpu_pct} qps={qps} repl_lag_s={lag_s}"
+        vars:
+          cpu_pct: {k: i, v: [5, 70]}
+          qps: {k: i, v: [100, 5000]}
+          lag_s: {k: i, v: [0, 60]}
+    beh:
+      n:
+        desc: Replica health is steady and periodically logged.
+        emit:
+          - id: replica_health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Replica health continues through the incident.
+        emit:
+          - id: replica_health
+            per_min: 0.5
+            scope: per_host
+
+  - id: redis_cache
+    name: Session Redis Cluster (Region A)
+    svc: redis
+    hosts: [redis-a1, redis-a2, redis-a3]
+    desc: >
+      Stores dashboard session state for logged-in users. Session locality makes cross-region
+      steering undesirable for dashboard traffic.
+    to: []
+    logs:
+      redis_latency:
+        desc: Periodic Redis p95 latency sample.
+        lvl: INFO
+        msg: "redis p95_ms={p95_ms} ops_s={ops_s} node={node}"
+        vars:
+          p95_ms: {k: i, v: [1, 40]}
+          ops_s: {k: i, v: [500, 6000]}
+          node: {k: ch, v: [redis-a1, redis-a2, redis-a3]}
+    beh:
+      n:
+        desc: Normal latency samples.
+        emit:
+          - id: redis_latency
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Redis remains mostly healthy; latency samples continue and serve as a comparator.
+        emit:
+          - id: redis_latency
+            per_min: 1.0
+            scope: global
+
+  - id: auth_service
+    name: Authentication Service
+    svc: auth-svc
+    hosts: [auth-a1, auth-a2, auth-a3]
+    desc: >
+      Validates API tokens and dashboard sessions by reading session data from Redis and
+      reading account/user data from the auth database. Can be configured to read from the
+      DR replica to reduce load on the primary, at the cost of added latency.
+    to:
+      - dst: auth_db_primary
+        proto: jdbc
+        desc: Reads/writes authentication data on the current primary in region A.
+      - dst: auth_db_dr_replica
+        proto: jdbc
+        desc: Cross-region read path used when manual routing is enabled.
+      - dst: redis_cache
+        proto: redis
+        desc: Reads/writes dashboard session data.
+      - dst: api_gateway
+        proto: https
+        desc: Returns auth decisions to the API gateway (response path).
+      - dst: dashboard_web
+        proto: https
+        desc: Returns auth decisions to the dashboard service (response path).
+    logs:
+      auth_ok_primary:
+        desc: Authentication succeeded using the region-A primary DB path.
+        lvl: INFO
+        msg: "auth ok user={user_id} db=primary req_id={req_id}"
+        vars:
+          user_id: {k: i, v: [1000, 9999]}
+          req_id: {k: uuid, v: null}
+      auth_ok_dr:
+        desc: Authentication succeeded using the DR read replica.
+        lvl: INFO
+        msg: "auth ok user={user_id} db=dr_replica req_id={req_id}"
+        vars:
+          user_id: {k: i, v: [1000, 9999]}
+          req_id: {k: uuid, v: null}
+      auth_fail_primary:
+        desc: Authentication failed due to dependency issues while using the region-A primary DB path.
+        lvl: ERROR
+        msg: "auth failed reason={reason} db=primary req_id={req_id}"
+        vars:
+          reason: {k: ch, v: [db_timeout, db_overloaded]}
+          req_id: {k: uuid, v: null}
+      auth_fail_dr:
+        desc: Authentication failed while using the DR replica (typically timeout/latency).
+        lvl: ERROR
+        msg: "auth failed reason={reason} db=dr_replica req_id={req_id}"
+        vars:
+          reason: {k: ch, v: [db_timeout]}
+          req_id: {k: uuid, v: null}
+    beh:
+      n:
+        desc: No background emissions required for this incident model.
+        emit: []
+      f:
+        desc: No background emissions required for this incident model.
+        emit: []
+
+  - id: api_gateway
+    name: Control Plane API Gateway
+    svc: api-gw
+    hosts: [api-a1, api-a2, api-a3, api-a4]
+    desc: >
+      Terminates HTTPS for API traffic and calls the auth service. Retries authentication
+      on transient failures before returning 5xx to clients.
+    to:
+      - dst: auth_service
+        proto: https
+        desc: Calls auth service for token validation and identity lookup.
+    logs:
+      api_req:
+        desc: Incoming API request.
+        lvl: INFO
+        msg: "api req {method} {endpoint} client={client_ip} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          endpoint: {k: ch, v: [/client/v4/zones, /client/v4/user, /client/v4/accounts]}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          req_id: {k: uuid, v: null}
+      auth_call:
+        desc: Gateway issues an authentication call attempt to the auth service.
+        lvl: DEBUG
+        msg: "auth call attempt={attempt} req_id={req_id} target=auth-svc"
+        vars:
+          attempt: {k: i, v: [1, 3]}
+          req_id: {k: uuid, v: null}
+      api_resp_200:
+        desc: Successful API response.
+        lvl: INFO
+        msg: "api resp 200 req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 3000]}
+          bytes: {k: i, v: [200, 60000]}
+      api_resp_503:
+        desc: API response failed due to auth dependency.
+        lvl: WARN
+        msg: "api resp 503 upstream=auth err={err} req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          err: {k: ch, v: [timeout, upstream_unavailable, db_busy]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [50, 30000]}
+      api_retry:
+        desc: Gateway retries authentication after a transient failure.
+        lvl: WARN
+        msg: "retry auth req_id={req_id} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [50, 3000]}
+    beh:
+      n:
+        desc: No background emissions required for this incident model.
+        emit: []
+      f:
+        desc: No background emissions required for this incident model.
+        emit: []
+
+  - id: dashboard_web
+    name: Control Plane Dashboard Web
+    svc: dash-web
+    hosts: [dash-a1, dash-a2, dash-a3]
+    desc: >
+      Serves dashboard web requests. Uses the auth service to validate sessions, which
+      are backed by Redis and the auth database; high auth latency or DB overload makes
+      dashboard requests slow or time out.
+    to:
+      - dst: auth_service
+        proto: https
+        desc: Calls auth service for session validation and identity.
+    logs:
+      page_req:
+        desc: Incoming dashboard HTTP request.
+        lvl: INFO
+        msg: "dash req {method} {route} session={session_id} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/login, /dash, /dash/zones]}
+          session_id: {k: uuid, v: null}
+          req_id: {k: uuid, v: null}
+      page_resp_200:
+        desc: Successful dashboard response.
+        lvl: INFO
+        msg: "dash resp 200 req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 40000]}
+          bytes: {k: i, v: [500, 120000]}
+      page_resp_504:
+        desc: Dashboard timeout due to slow auth.
+        lvl: WARN
+        msg: "dash resp 504 upstream=auth req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [500, 40000]}
+    beh:
+      n:
+        desc: No background emissions required for this incident model.
+        emit: []
+      f:
+        desc: No background emissions required for this incident model.
+        emit: []
+
+tracing:
+  on: true
+  origins: [api_gateway, dashboard_web]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal API and dashboard traffic authenticate via the primary DB in region A.
+    req:
+      - id: api_primary_ok_n
+        desc: Successful API requests authenticated using the primary DB.
+        rpm: 315.0
+        path: [api_gateway, auth_service, api_gateway]
+        emit: [api_gateway.api_req, auth_service.auth_ok_primary, api_gateway.api_resp_200]
+        latency_ms: [[2, 5], [6, 20], [8, 35]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_ingress_503_n
+        desc: Client-visible API 503 responses (terminal response once per request; retries modeled separately).
+        rpm: 5.0
+        path: [api_gateway]
+        emit: [api_gateway.api_req, api_gateway.api_resp_503]
+        latency_ms: [[2, 6], [80, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_auth_primary_fail_n
+        desc: Internal auth call attempts that fail against the primary DB and are retried by the gateway.
+        rpm: 5.0
+        path: [api_gateway, auth_service, api_gateway]
+        emit: [api_gateway.auth_call, auth_service.auth_fail_primary]
+        latency_ms: [[3, 10], [40, 300]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.3
+          emit_per_retry: [api_gateway.api_retry]
+          backoff_ms: [[80, 250], [150, 600]]
+        trace: true
+
+      - id: dash_primary_ok_n
+        desc: Successful dashboard requests validated via Redis + primary DB.
+        rpm: 118.0
+        path: [dashboard_web, auth_service, dashboard_web]
+        emit: [dashboard_web.page_req, auth_service.auth_ok_primary, dashboard_web.page_resp_200]
+        latency_ms: [[3, 8], [15, 50], [60, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dash_primary_504_n
+        desc: Rare dashboard timeouts from occasional auth slowness.
+        rpm: 2.0
+        path: [dashboard_web, auth_service, dashboard_web]
+        emit: [dashboard_web.page_req, auth_service.auth_fail_primary, dashboard_web.page_resp_504]
+        latency_ms: [[3, 10], [200, 1200], [800, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: Failure begins with network impairment, then coordination and DB role changes lead to auth DB overload.
+    req:
+      - id: api_primary_ok_f
+        desc: API requests that succeed while authenticating against the primary DB.
+        rpm: 315.0
+        path: [api_gateway, auth_service, api_gateway]
+        emit: [api_gateway.api_req, auth_service.auth_ok_primary, api_gateway.api_resp_200]
+        latency_ms: [[2, 6], [10, 40], [10, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_ingress_503_primary_f
+        desc: Client-visible API 503 responses while using the primary DB path (terminal response once per request).
+        rpm: 5.0
+        path: [api_gateway]
+        emit: [api_gateway.api_req, api_gateway.api_resp_503]
+        latency_ms: [[2, 6], [400, 12000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_auth_primary_fail_f
+        desc: Internal auth call attempts that fail against the primary DB and are retried by the gateway.
+        rpm: 5.0
+        path: [api_gateway, auth_service, api_gateway]
+        emit: [api_gateway.auth_call, auth_service.auth_fail_primary]
+        latency_ms: [[3, 12], [120, 1200]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [api_gateway.api_retry]
+          backoff_ms: [[100, 400], [200, 1200]]
+        trace: true
+
+      - id: api_dr_ok_f
+        desc: API requests succeeding while auth reads are routed to the DR replica.
+        rpm: 315.0
+        path: [api_gateway, auth_service, api_gateway]
+        emit: [api_gateway.api_req, auth_service.auth_ok_dr, api_gateway.api_resp_200]
+        latency_ms: [[2, 6], [60, 250], [20, 90]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_ingress_503_dr_f
+        desc: Client-visible API 503 responses while auth reads are routed to DR (cross-region timeouts).
+        rpm: 5.0
+        path: [api_gateway]
+        emit: [api_gateway.api_req, api_gateway.api_resp_503]
+        latency_ms: [[2, 6], [600, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_auth_dr_fail_f
+        desc: Internal auth call attempts that fail against the DR replica and are retried by the gateway.
+        rpm: 5.0
+        path: [api_gateway, auth_service, api_gateway]
+        emit: [api_gateway.auth_call, auth_service.auth_fail_dr]
+        latency_ms: [[3, 12], [200, 2000]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.6
+          emit_per_retry: [api_gateway.api_retry]
+          backoff_ms: [[120, 500], [250, 1400]]
+        trace: true
+
+      - id: dash_primary_ok_f
+        desc: Dashboard requests succeeding with auth using the primary DB (can be slow under load).
+        rpm: 118.0
+        path: [dashboard_web, auth_service, dashboard_web]
+        emit: [dashboard_web.page_req, auth_service.auth_ok_primary, dashboard_web.page_resp_200]
+        latency_ms: [[3, 10], [50, 600], [150, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dash_primary_504_f
+        desc: Dashboard timeouts due to slow auth while using the primary DB.
+        rpm: 2.0
+        path: [dashboard_web, auth_service, dashboard_web]
+        emit: [dashboard_web.page_req, auth_service.auth_fail_primary, dashboard_web.page_resp_504]
+        latency_ms: [[3, 10], [500, 6000], [2000, 30000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dash_dr_ok_f
+        desc: Dashboard requests succeeding while auth reads are routed to the DR replica (very high latency).
+        rpm: 118.0
+        path: [dashboard_web, auth_service, dashboard_web]
+        emit: [dashboard_web.page_req, auth_service.auth_ok_dr, dashboard_web.page_resp_200]
+        latency_ms: [[3, 10], [600, 12000], [1200, 35000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: dash_dr_504_f
+        desc: Dashboard timeouts while routing auth reads to DR.
+        rpm: 2.0
+        path: [dashboard_web, auth_service, dashboard_web]
+        emit: [dashboard_web.page_req, auth_service.auth_fail_dr, dashboard_web.page_resp_504]
+        latency_ms: [[3, 10], [1500, 20000], [5000, 40000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "The real control plane has many microservices; this model keeps only API gateway, dashboard, auth service, etcd, DB manager, DBs, Redis, and a rack switch to preserve the causal chain."
+  - "The partial switch failure is represented by sustained switch ping-loss alerts plus a temporary burst of etcd election/write-block logs; exact LACP/vPC details are abstracted."
+  - "DB primary failover realism fix: region-A auth DB is modeled as two possible primary nodes (authdb-a1 and authdb-a2). The promotion log can select either, and primary health/overload metrics sample whichever is currently primary."
+  - "Retry modeling fix: client-visible API 503 responses are emitted by non-retrying ingress flows, while retrying behavior is modeled in separate internal auth-attempt flows (gateway->auth) that emit only attempt-scoped logs plus retry markers."
+  - "Replica rebuild duration is modeled as ongoing progress logs rather than completion; the scenario ends before rebuild finishes (incident still in failure)."
+  - "Manual traffic steering is represented as enabling DR read routing for all authentication reads (API + dashboard), then narrowing to API-only; this is implemented by shifting request volume between primary-vs-DR flow variants."
+  - "Normal-phase expected log volume: ~24 min * (~1333 logs/min from flows+background) ≈ ~32k."
+  - "Whole-scenario expected log volume (incl. retries, background, and failure multipliers): ~60k–75k, within the 20k–100k target."
+```

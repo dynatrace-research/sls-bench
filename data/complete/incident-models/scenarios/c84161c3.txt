@@ -1,0 +1,229 @@
+```yaml
+scenario:
+  id: leap_day_ga_cert_and_bad_ha_plugin
+  title: Leap-day GA certificate failure followed by incompatible HA networking plugin blast update
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The cluster normally provisions and heals VMs via FC/HA, with the GA initializing inside each VM and a dependent
+    identity service (ACS-like) issuing tokens. At UTC midnight on leap day, GA transfer certificate creation fails,
+    causing repeated HA timeouts/reimages and an escalating HI count that forces FC to constrain autonomic operations.
+    Operators disable service management to prevent additional deploy/scale churn. A later blast remediation deploys a fixed GA
+    but an incompatible HA networking plugin, disconnecting many VMs and producing widespread 503s in dependent services.
+
+  trigger_desc: |
+    GA instances attempt to generate a one-year transfer certificate at UTC midnight on leap day and hit an invalid
+    "2013-02-29" valid-to date, causing GA initialization to fail immediately.
+
+  time:
+    total_minutes: 55
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 55}
+
+  phases:
+    n:
+      desc: |
+        Customers perform deploy/scale operations through the Service Management API, which are accepted asynchronously (202)
+        and queued as FC VM operations. HA boots VMs and GA initializes successfully and connects to HA. Dependent token issuance
+        traffic remains healthy with low error rates.
+      flows: [service_mgmt_deploy, vm_bootstrap_success_n, acs_token_success_n]
+      manifestation:
+        - fabric_controller.fc_cluster_health
+        - host_agent.ha_host_status
+        - service_mgmt_api.sm_response_success
+        - guest_agent.ga_connect_success
+        - acs_service.acs_resp_200
+
+    f:
+      desc: |
+        After UTC midnight on leap day, GA initialization begins failing on transfer certificate creation. HA repeatedly times out
+        waiting for GA and reimages VMs, increasing perceived host faults and HI counts until FC constrains autonomic operations.
+        Service management is then disabled to reduce additional VM churn. A later blast remediation stops the GA certificate failures,
+        but a packaging mistake ships an incompatible HA networking plugin, disconnecting many VMs from the virtual network and causing
+        dependent services to return 503/timeouts. A corrected package reduces the network failures but leaves residual HI/corrupted hosts.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: guest_agent
+          event: |
+            GA initialization starts failing on transfer certificate creation during VM boots, and HA begins timeout/reimage cycles.
+          why: |
+            The leap-day date arithmetic makes the computed certificate valid-to date invalid; GA exits early and never completes the HA handshake.
+            This is directly observable in GA certificate failure logs and subsequent HA GA-connection timeouts.
+          flows: [vm_bootstrap_leapday_fail, acs_token_success_f]
+          rate_multipliers:
+            vm_bootstrap_leapday_fail: 1.2
+            vm_bootstrap_fixed_success_f: 0.0
+            service_mgmt_request_disabled: 0.0
+            acs_token_timeout_f: 0.0
+            host_agent.ha_network_plugin_incompatible: 0.0
+          latency_multipliers:
+            vm_bootstrap_leapday_fail: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - guest_agent.ga_transfer_cert_error
+            - host_agent.ha_ga_timeout
+            - fabric_controller.fc_cluster_health
+
+        - order: 2
+          at_min: 35
+          component: fabric_controller
+          event: |
+            HI threshold is exceeded; FC constrains autonomic operations and operators disable service management to reduce further VM churn.
+          why: |
+            Repeated clean-boot failures and HA timeouts are misclassified as host faults, raising HI counts until the cluster HI threshold is hit.
+            Disabling service management is an operator action to prevent additional deploy/scale operations from triggering more failing VM boots.
+          flows: [vm_bootstrap_leapday_fail, service_mgmt_request_disabled]
+          rate_multipliers:
+            vm_bootstrap_leapday_fail: 0.5
+            vm_bootstrap_fixed_success_f: 0.0
+            service_mgmt_request_disabled: 1.5
+            acs_token_timeout_f: 0.0
+            host_agent.ha_network_plugin_incompatible: 0.0
+            acs_token_success_f: 0.9
+          latency_multipliers:
+            vm_bootstrap_leapday_fail: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: fabric_controller.fc_hi_threshold_hit
+              count: 1
+              hosts: [fc-01]
+            - ref: fabric_controller.fc_autonomic_change_hi
+              count: 1
+              hosts: [fc-01]
+            - ref: service_mgmt_api.sm_disable_action_global
+              count: 1
+              hosts: [sm-01]
+          manifestation:
+            - fabric_controller.fc_hi_threshold_hit
+            - fabric_controller.fc_autonomic_change_hi
+            - service_mgmt_api.sm_response_disabled
+
+        - order: 3
+          at_min: 43
+          component: host_agent
+          event: |
+            A blast remediation is deployed to affected hosts: GA certificate failures stop, but an incompatible networking plugin is installed and
+            many VMs lose networking, causing dependent token requests to spike in 503/timeouts.
+          why: |
+            The remediation includes a fixed GA (removing the leap-day cert failure) but mixes an older HA with a newer networking plugin; the plugin
+            cannot configure VM virtual networking. The incompatibility is directly observable in HA plugin error logs and the concurrent rise in
+            dependent-service 503s.
+          flows: [acs_token_timeout_f, acs_token_success_f, vm_bootstrap_fixed_success_f, service_mgmt_request_disabled]
+          rate_multipliers:
+            vm_bootstrap_leapday_fail: 0.0
+            vm_bootstrap_fixed_success_f: 1.0
+            service_mgmt_request_disabled: 1.5
+            host_agent.ha_network_plugin_incompatible: 30.0
+            acs_token_timeout_f: 20.0
+            acs_token_success_f: 0.2
+          latency_multipliers:
+            acs_token_timeout_f: {p50: 1.4, p95: 1.3}
+          one_shots:
+            - ref: host_agent.ha_blast_update_start_rollback
+              count: 7
+              hosts: [host-101, host-102, host-103, host-104, host-105, host-106, host-107]
+          manifestation:
+            - host_agent.ha_blast_update_start_rollback
+            - host_agent.ha_network_plugin_incompatible
+            - acs_service.acs_resp_503
+
+        - order: 4
+          at_min: 50
+          component: host_agent
+          event: |
+            A corrected HA package is blasted out; VM networking begins to recover, reducing but not eliminating dependent-service failures.
+          why: |
+            Replacing the incompatible plugin/HA combination restores VM network configuration on most hosts.
+            Some hosts remain in HI/corrupted intermediate states, so errors persist at a reduced level.
+          flows: [acs_token_timeout_f, acs_token_success_f, vm_bootstrap_fixed_success_f, service_mgmt_request_disabled]
+          rate_multipliers:
+            vm_bootstrap_leapday_fail: 0.0
+            vm_bootstrap_fixed_success_f: 1.0
+            service_mgmt_request_disabled: 1.2
+            host_agent.ha_network_plugin_incompatible: 0.5
+            acs_token_timeout_f: 4.0
+            acs_token_success_f: 0.6
+          latency_multipliers:
+            acs_token_timeout_f: {p50: 1.1, p95: 1.1}
+          one_shots:
+            - ref: host_agent.ha_blast_update_start_corrected
+              count: 7
+              hosts: [host-101, host-102, host-103, host-104, host-105, host-106, host-107]
+            - ref: host_agent.ha_blast_update_complete_corrected
+              count: 7
+              hosts: [host-101, host-102, host-103, host-104, host-105, host-106, host-107]
+            - ref: fabric_controller.fc_manual_repair
+              count: 1
+              hosts: [fc-02]
+          manifestation:
+            - host_agent.ha_blast_update_complete_corrected
+            - acs_service.acs_resp_503
+            - fabric_controller.fc_cluster_health
+
+      steady:
+        - component: fabric_controller
+          condition: |
+            Cluster remains in a constrained state with elevated HI nodes and reduced autonomic servicing/healing.
+          user_impact: |
+            Capacity and recovery are degraded; some VMs remain unavailable or stuck in intermediate states until manual repair completes.
+          manifestation:
+            - fabric_controller.fc_cluster_health
+            - host_agent.ha_host_status
+        - component: service_mgmt_api
+          condition: |
+            Service management remains disabled or partially effective for the affected cluster, rejecting deploy/scale operations.
+          user_impact: |
+            Customers cannot reliably deploy, update, or scale; management calls may return 503 even while some workloads continue running.
+          manifestation:
+            - service_mgmt_api.sm_response_disabled
+            - service_mgmt_api.sm_metric
+        - component: acs_service
+          condition: |
+            Dependent service continues to experience intermittent backend unreachability due to remaining disconnected/corrupted VM nodes.
+          user_impact: |
+            Token requests intermittently fail with 503/timeouts, impacting services that depend on identity and authorization.
+          manifestation:
+            - acs_service.acs_upstream_unreachable
+            - acs_service.acs_resp_503
+            - acs_service.acs_metric
+
+      feedback_loops:
+        - id: reboot_loop_to_hi_escalation
+          desc: |
+            GA init failure causes HA to timeout and reimage/retry; repeated clean-boot failures are treated as host faults,
+            which increases HI nodes and triggers broader constraints that slow recovery and complicate servicing.
+        - id: blast_update_widening_impact
+          desc: |
+            Attempting to quickly fix skew via blast updates increases simultaneous host transitions; a bad package can abruptly
+            expand impact by disconnecting previously healthy VMs.
+
+      flows: [vm_bootstrap_leapday_fail, vm_bootstrap_fixed_success_f, service_mgmt_request_disabled, acs_token_success_f, acs_token_timeout_f]
+      manifestation:
+        - guest_agent.ga_transfer_cert_error
+        - host_agent.ha_ga_timeout
+        - fabric_controller.fc_hi_threshold_hit
+        - service_mgmt_api.sm_response_disabled
+        - host_agent.ha_network_plugin_incompatible
+        - acs_service.acs_resp_503
+
+  assumptions:
+    - |
+      The scenario compresses the real-world multi-hour outage into 55 minutes while preserving ordering and causal structure;
+      HA's "25-minute timeout × 3" is represented as shorter but still clearly dominant wait times in vm_bootstrap_leapday_fail.
+    - |
+      Piecewise volume estimate (rough): normal 0-25m ~800 logs/min (~20k). Failure:
+      25-35m ~1450 logs/min (~14.5k) with GA cert failures and HA timeouts;
+      35-43m ~1100 logs/min (~8.8k) after HI threshold and mgmt disablement;
+      43-50m ~1860 logs/min (~13.0k) during networking plugin incompatibility and ACS 503 spike (GA cert failures suppressed);
+      50-55m ~990 logs/min (~5.0k) after corrected blast update.
+      Total ~61k logs.
+    - |
+      One-shot counts: event2 emits 3 markers (FC HI threshold + autonomic constraint + SM disable);
+      event3 emits 7 rollback blast-update-start markers; event4 emits 15 markers (7 corrected start + 7 corrected complete + 1 manual-repair).
+    - |
+      Visibility rationale: early failure is evident via ga_transfer_cert_error + ha_ga_timeout at high rate; management disablement is visible
+      via sustained sm_response_disabled; the secondary outage is visible via a burst of ha_network_plugin_incompatible and a concurrent spike in acs_resp_503.
+```

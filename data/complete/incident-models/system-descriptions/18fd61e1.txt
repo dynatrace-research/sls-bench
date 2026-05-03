@@ -1,0 +1,533 @@
+```yaml
+sys:
+  id: platformsh_eu_routing_plane
+  desc: >
+    A regional hosting routing/control plane where HTTP gateways route tenant website requests to application runtimes.
+    Gateways rely on an orchestration service to obtain and refresh a routing table of application endpoints.
+    The orchestration service persists coordination state in a ZooKeeper quorum and performs a large lock-acquisition
+    startup sequence over a very large ZooKeeper namespace. The incident models an outage where gateways lose routes
+    after restart and cannot repopulate them until orchestration/ZooKeeper issues are remediated.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ops_runner
+    name: Ops Runner
+    svc: ops-runner
+    hosts: [opsctl-1]
+    desc: >
+      Operator automation host used to perform maintenance steps, restarts, deployments, and probes during the incident.
+    to:
+      - dst: gateway
+        proto: ssh
+        desc: Used to restart/upgrade gateway hosts during maintenance.
+      - dst: orchestrator
+        proto: ssh
+        desc: Used to deploy orchestration hotfixes and inspect processes.
+      - dst: zookeeper
+        proto: ssh
+        desc: Used to apply ZooKeeper configuration changes and restarts.
+      - dst: app_backend
+        proto: https
+        desc: Used for direct backend probes bypassing gateways.
+    logs:
+      gateway_restart:
+        desc: Operator restarts gateway hosts during upgrade.
+        lvl: INFO
+        msg: "Maintenance step: restarting gateways target={target} reason={reason}"
+        vars:
+          target: {k: ch, v: [gateway_cluster]}
+          reason: {k: ch, v: [upgrade_apply]}
+      deploy_kazoo_patch:
+        desc: Operator deploys a hotfix build of the orchestrator that throttles ZooKeeper client startup burst behavior.
+        lvl: INFO
+        msg: "Deploy: orchestrator hotfix applied build={build} change={change}"
+        vars:
+          build: {k: ch, v: [orch-2.7.4-hotfix1]}
+          change: {k: ch, v: [kazoo_startup_throttle_semaphore_1000]}
+      debug_strace_attached:
+        desc: Operator attaches strace to observe low-level errors.
+        lvl: INFO
+        msg: "Attached strace pid={pid} focus={focus}"
+        vars:
+          pid: {k: i, v: [1200, 9800]}
+          focus: {k: ch, v: [zookeeper_client_io]}
+      strace_epipe_seen:
+        desc: Operator notes repeated EPIPE errors observed via strace on the orchestrator process.
+        lvl: INFO
+        msg: "strace observation pid={pid} syscall={syscall} errno={errno}"
+        vars:
+          pid: {k: i, v: [1200, 9800]}
+          syscall: {k: ch, v: [write]}
+          errno: {k: ch, v: [EPIPE]}
+      zookeeper_maxbuffer_increase:
+        desc: Operator increases ZooKeeper max buffer size to allow oversized nodes/packets.
+        lvl: INFO
+        msg: "ZooKeeper config change: jute.maxbuffer from={from_bytes} to={to_bytes}"
+        vars:
+          from_bytes: {k: i, v: [1048576, 1048576]}
+          to_bytes: {k: i, v: [4194304, 4194304]}
+      zookeeper_restart:
+        desc: Operator restarts ZooKeeper quorum to apply configuration.
+        lvl: INFO
+        msg: "ZooKeeper restart initiated reason={reason}"
+        vars:
+          reason: {k: ch, v: [apply_maxbuffer_change]}
+      probe_start:
+        desc: Start of a direct backend probe.
+        lvl: INFO
+        msg: "Probe start url={url} trace={trace_id}"
+        vars:
+          url: {k: ch, v: ["https://app-backend.internal/health"]}
+          trace_id: {k: hex, v: 32}
+      probe_ok:
+        desc: Successful completion of a direct backend probe.
+        lvl: INFO
+        msg: "Probe ok status={status} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          status: {k: i, v: [200, 200]}
+          dur_ms: {k: i, v: [8, 80]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: Operational actions are not periodic in this model.
+        emit: []
+      f:
+        desc: Operational actions are not periodic in this model.
+        emit: []
+
+  - id: gateway
+    name: HTTP Gateway
+    svc: edge-gateway
+    hosts: [gw-eu-1, gw-eu-2, gw-eu-3, gw-eu-4]
+    desc: >
+      Entry point for tenant websites. Routes requests to the correct backend based on an in-memory routing table
+      refreshed from the orchestrator service. If the route table is empty, requests are rejected with 503.
+    to:
+      - dst: orchestrator
+        proto: https
+        desc: Fetches routing table snapshots from orchestrator.
+      - dst: app_backend
+        proto: https
+        desc: Forwards user traffic to tenant application runtimes.
+    logs:
+      req_start:
+        desc: A request has been received and routing begins.
+        lvl: INFO
+        msg: "Incoming {method} {host}{uri} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [shop.example.eu, api.example.eu, www.example.eu]}
+          uri: {k: ch, v: ["/", "/api/v1/items", "/login", "/static/app.js"]}
+          trace_id: {k: hex, v: 32}
+      http_access:
+        desc: Successful request completion with upstream backend.
+        lvl: INFO
+        msg: "HTTP {method} {host}{uri} -> {status} dur_ms={dur_ms} upstream={upstream} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [shop.example.eu, api.example.eu, www.example.eu]}
+          uri: {k: ch, v: ["/", "/api/v1/items", "/login", "/static/app.js"]}
+          status: {k: i, v: [200, 304]}
+          dur_ms: {k: i, v: [10, 220]}
+          upstream: {k: ch, v: [app_backend]}
+          trace_id: {k: hex, v: 32}
+      http_503_no_route_empty:
+        desc: Request rejected because the gateway has an empty routing table.
+        lvl: WARN
+        msg: "HTTP {method} {host}{uri} -> 503 no_route dur_ms={dur_ms} route_table={route_table} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [shop.example.eu, api.example.eu, www.example.eu]}
+          uri: {k: ch, v: ["/", "/api/v1/items", "/login", "/static/app.js"]}
+          dur_ms: {k: i, v: [1, 40]}
+          route_table: {k: ch, v: [empty]}
+          trace_id: {k: hex, v: 32}
+      http_503_no_route_partial:
+        desc: Request rejected because the gateway routing table is present but missing a route for the host/uri (partial convergence).
+        lvl: WARN
+        msg: "HTTP {method} {host}{uri} -> 503 no_route dur_ms={dur_ms} route_table={route_table} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [shop.example.eu, api.example.eu, www.example.eu]}
+          uri: {k: ch, v: ["/", "/api/v1/items", "/login", "/static/app.js"]}
+          dur_ms: {k: i, v: [1, 60]}
+          route_table: {k: ch, v: [partial]}
+          trace_id: {k: hex, v: 32}
+      refresh_start:
+        desc: Gateway begins refreshing its routing table.
+        lvl: DEBUG
+        msg: "Route refresh start cached_gen={cached_gen}"
+        vars:
+          cached_gen: {k: i, v: [1000, 1400]}
+      refresh_ok:
+        desc: Routing table refresh succeeded.
+        lvl: INFO
+        msg: "Refreshed routes gen={gen} routes={routes} dur_ms={dur_ms}"
+        vars:
+          gen: {k: i, v: [1001, 1500]}
+          routes: {k: i, v: [5000, 12000]}
+          dur_ms: {k: i, v: [15, 180]}
+      refresh_fail:
+        desc: Routing table refresh failed after receiving an error response while fetching a snapshot.
+        lvl: ERROR
+        msg: "Route refresh failed err={err} dur_ms={dur_ms}"
+        vars:
+          err: {k: ch, v: [upstream_503, upstream_500]}
+          dur_ms: {k: i, v: [200, 5000]}
+      refresh_retry:
+        desc: Retry marker for a routing table refresh attempt.
+        lvl: WARN
+        msg: "Retrying route refresh attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [80, 1200]}
+      gw_metrics:
+        desc: Periodic gateway metrics during healthy routing.
+        lvl: INFO
+        msg: "Gateway metrics route_count={route_count} refresh_age_s={refresh_age_s}"
+        vars:
+          route_count: {k: i, v: [5000, 12000]}
+          refresh_age_s: {k: i, v: [0, 300]}
+      gw_metrics_degraded:
+        desc: Periodic gateway metrics when routes are empty/stale.
+        lvl: INFO
+        msg: "Gateway metrics route_count={route_count} refresh_age_s={refresh_age_s}"
+        vars:
+          route_count: {k: i, v: [0, 50]}
+          refresh_age_s: {k: i, v: [60, 900]}
+    beh:
+      n:
+        desc: Gateways emit low-rate operational metrics.
+        emit:
+          - id: gw_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: >
+          During the incident, gateways emit degraded metrics due to empty routing state; later, after control-plane
+          recovery, they return to healthy metrics.
+        emit:
+          - id: gw_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: gw_metrics_degraded
+            per_min: 1.0
+            scope: per_host
+
+  - id: orchestrator
+    name: Orchestrator
+    svc: orchestrator
+    hosts: [orch-eu-1, orch-eu-2]
+    desc: >
+      Control-plane service that reads and maintains application routing state in ZooKeeper and serves it to gateways.
+      On startup it acquires ownership locks by creating many ephemeral nodes under a large namespace and uses the Kazoo
+      client library to talk to ZooKeeper.
+    to:
+      - dst: zookeeper
+        proto: tcp
+        desc: Uses ZooKeeper quorum for coordination and routing state.
+      - dst: gateway
+        proto: https
+        desc: Returns routing table snapshots / errors back to gateways (response hop).
+    logs:
+      serve_app_list_ok:
+        desc: Successfully served a routing table snapshot to a gateway.
+        lvl: INFO
+        msg: "Served app list gen={gen} apps={apps} dur_ms={dur_ms}"
+        vars:
+          gen: {k: i, v: [1001, 1500]}
+          apps: {k: i, v: [800, 4000]}
+          dur_ms: {k: i, v: [10, 120]}
+      zk_fetch_fail:
+        desc: Failed to read or compute state from ZooKeeper while serving a gateway request.
+        lvl: ERROR
+        msg: "Failed to read state from ZooKeeper reason={reason}"
+        vars:
+          reason: {k: ch, v: [session_lost, connection_closed]}
+      zk_session_expired:
+        desc: ZooKeeper session expired and the orchestrator reconnects.
+        lvl: WARN
+        msg: "ZooKeeper session expired; reconnecting session={session_id}"
+        vars:
+          session_id: {k: hex, v: 16}
+      startup_waiting_locks:
+        desc: Startup is still acquiring ownership locks across a large namespace.
+        lvl: INFO
+        msg: "Startup waiting for ownership locks acquired={acquired} total={total}"
+        vars:
+          acquired: {k: i, v: [0, 1100000]}
+          total: {k: i, v: [900000, 1100000]}
+      zk_jute_buffer_error:
+        desc: ZooKeeper rejected a request due to max buffer size, causing consistent disconnects.
+        lvl: ERROR
+        msg: "ZooKeeper server rejected request: packet_len={packet_len} max_buffer={max_buffer}"
+        vars:
+          packet_len: {k: i, v: [1100000, 2500000]}
+          max_buffer: {k: i, v: [1048576, 1048576]}
+      orch_metrics:
+        desc: Periodic orchestrator metrics during healthy/starting state.
+        lvl: INFO
+        msg: "Orchestrator metrics zk_state={zk_state} owned_locks={owned_locks}"
+        vars:
+          owned_locks: {k: i, v: [0, 1100000]}
+        state_vars:
+          n:
+            zk_state: {k: ch, v: [connected]}
+          f:
+            zk_state: {k: ch, v: [starting, disconnected]}
+      orch_metrics_recovered:
+        desc: Periodic orchestrator metrics after ZooKeeper connectivity is restored.
+        lvl: INFO
+        msg: "Orchestrator metrics zk_state={zk_state} owned_locks={owned_locks}"
+        vars:
+          zk_state: {k: ch, v: [connected]}
+          owned_locks: {k: i, v: [700000, 1100000]}
+    beh:
+      n:
+        desc: Orchestrator periodically emits healthy metrics.
+        emit:
+          - id: orch_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the incident the orchestrator struggles to complete startup and experiences ZooKeeper session churn.
+        emit:
+          - id: orch_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: orch_metrics_recovered
+            per_min: 1.0
+            scope: per_host
+          - id: zk_session_expired
+            per_min: 0.4
+            scope: per_host
+          - id: startup_waiting_locks
+            per_min: 1.0
+            scope: per_host
+          - id: zk_jute_buffer_error
+            per_min: 4.0
+            scope: per_host
+
+  - id: zookeeper
+    name: ZooKeeper Quorum
+    svc: zookeeper
+    hosts: [zk-eu-1, zk-eu-2, zk-eu-3]
+    desc: >
+      ZooKeeper quorum storing orchestration state and locks. Enforces a maximum packet/node buffer size (jute.maxbuffer).
+      When oversized nodes are read or transferred, servers may reject requests and close client connections.
+    to:
+      - dst: orchestrator
+        proto: tcp
+        desc: Responds to ZooKeeper client sessions from the orchestrator (response hop).
+    logs:
+      quorum_ok:
+        desc: Periodic quorum status log.
+        lvl: INFO
+        msg: "Quorum OK leader={leader} zxid={zxid}"
+        vars:
+          leader: {k: ch, v: [zk-eu-1, zk-eu-2, zk-eu-3]}
+          zxid: {k: hex, v: 8}
+      packet_too_large:
+        desc: Server rejects a request because it exceeds jute.maxbuffer.
+        lvl: WARN
+        msg: "Rejecting request packetLen={packet_len} exceeds jute.maxbuffer={max_buffer}"
+        vars:
+          packet_len: {k: i, v: [1100000, 2500000]}
+          max_buffer: {k: i, v: [1048576, 1048576]}
+    beh:
+      n:
+        desc: ZooKeeper emits low-rate health status.
+        emit:
+          - id: quorum_ok
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: ZooKeeper continues quorum logs; oversized packet rejections may occur depending on the incident sub-phase.
+        emit:
+          - id: quorum_ok
+            per_min: 0.2
+            scope: per_host
+          - id: packet_too_large
+            per_min: 1.0
+            scope: global
+
+  - id: app_backend
+    name: Application Runtime
+    svc: app-runtime
+    hosts: [app-eu-1, app-eu-2, app-eu-3, app-eu-4]
+    desc: >
+      Tenant application processes. In this incident they remain healthy; they are simply unreachable through gateways
+      when routing information is missing.
+    to:
+      - dst: gateway
+        proto: https
+        desc: Sends responses back to gateways (response hop).
+      - dst: ops_runner
+        proto: https
+        desc: Sends probe responses back to ops runner (response hop).
+    logs:
+      app_access:
+        desc: Application handled a request.
+        lvl: INFO
+        msg: "Handled {method} {uri} status={status} dur_ms={dur_ms} app={app} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/", "/api/v1/items", "/login", "/health"]}
+          status: {k: i, v: [200, 200]}
+          dur_ms: {k: i, v: [3, 80]}
+          app: {k: ch, v: [shop, api, www]}
+          trace_id: {k: hex, v: 32}
+      app_metrics:
+        desc: Periodic backend health metric.
+        lvl: INFO
+        msg: "App metrics healthy={healthy} p95_ms={p95_ms}"
+        vars:
+          healthy: {k: ch, v: ["true"]}
+          p95_ms: {k: i, v: [20, 120]}
+    beh:
+      n:
+        desc: Backends emit low-rate health metrics.
+        emit:
+          - id: app_metrics
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Backends remain healthy and continue emitting low-rate health metrics.
+        emit:
+          - id: app_metrics
+            per_min: 0.5
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [gateway, ops_runner]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal traffic where gateways have routes and can refresh them from a healthy orchestrator/ZooKeeper.
+    req:
+      - id: user_web_request_ok
+        desc: User HTTP request routed successfully to an application backend.
+        rpm: 400.0
+        path: [gateway, app_backend, gateway]
+        emit: [gateway.req_start, app_backend.app_access, gateway.http_access]
+        latency_ms: [[1, 4], [8, 25], [1, 6]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: gateway_config_refresh_ok
+        desc: Gateway refreshes its routing table from the orchestrator.
+        rpm: 60.0
+        path: [gateway, orchestrator, gateway]
+        emit: [gateway.refresh_start, orchestrator.serve_app_list_ok, gateway.refresh_ok]
+        latency_ms: [[1, 4], [15, 80], [2, 12]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.1
+          emit_per_retry: [gateway.refresh_retry]
+          backoff_ms: [[80, 300], [200, 600]]
+        trace: false
+      - id: ops_backend_probe
+        desc: Operator probe directly hits the backend health endpoint (bypassing gateways).
+        rpm: 1.0
+        path: [ops_runner, app_backend, ops_runner]
+        emit: [ops_runner.probe_start, app_backend.app_access, ops_runner.probe_ok]
+        latency_ms: [[1, 4], [5, 30], [1, 3]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: Incident traffic where gateways lose routes after restart and cannot refresh until orchestrator/ZooKeeper issues are remediated.
+    req:
+      - id: user_web_request_503_empty
+        desc: User HTTP request rejected by the gateway due to an empty routing table (immediately after restart).
+        rpm: 350.0
+        path: [gateway]
+        emit: [gateway.http_503_no_route_empty]
+        latency_ms: [[2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_web_request_503_partial
+        desc: User HTTP request rejected due to a partially converged routing table (late failure).
+        rpm: 350.0
+        path: [gateway]
+        emit: [gateway.http_503_no_route_partial]
+        latency_ms: [[2, 35]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_web_request_ok_recovered
+        desc: User HTTP request routed successfully after routes are repopulated during remediation.
+        rpm: 350.0
+        path: [gateway, app_backend, gateway]
+        emit: [gateway.req_start, app_backend.app_access, gateway.http_access]
+        latency_ms: [[1, 4], [8, 28], [1, 6]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: gateway_config_refresh_fail
+        desc: Gateway attempts to refresh routes but the orchestrator cannot serve a valid snapshot.
+        rpm: 60.0
+        path: [gateway, orchestrator, zookeeper, orchestrator, gateway]
+        emit: [gateway.refresh_start, orchestrator.zk_fetch_fail, gateway.refresh_fail]
+        latency_ms: [[1, 4], [250, 1600], [2, 15]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.4
+          emit_per_retry: [gateway.refresh_retry]
+          backoff_ms: [[120, 700], [300, 1200]]
+        trace: false
+      - id: gateway_config_refresh_ok_recovered
+        desc: Gateway successfully refreshes routes after orchestration/ZooKeeper remediation.
+        rpm: 60.0
+        path: [gateway, orchestrator, gateway]
+        emit: [gateway.refresh_start, orchestrator.serve_app_list_ok, gateway.refresh_ok]
+        latency_ms: [[1, 4], [20, 120], [2, 12]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.1
+          emit_per_retry: [gateway.refresh_retry]
+          backoff_ms: [[80, 300], [200, 600]]
+        trace: false
+      - id: ops_backend_probe
+        desc: Operator probe directly hits the backend health endpoint (bypassing gateways) to verify app health during outage.
+        rpm: 2.0
+        path: [ops_runner, app_backend, ops_runner]
+        emit: [ops_runner.probe_start, app_backend.app_access, ops_runner.probe_ok]
+        latency_ms: [[1, 4], [5, 35], [1, 3]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "The real incident spanned ~4 hours; this model compresses the same causal progression into a 50-minute window while preserving ordering, symptoms, and remediation."
+  - "Git/UI maintenance downtime is treated as out-of-scope noise; the modeled impact focuses on website routing failure at the gateways."
+  - "The ZooKeeper namespace size (~1 million nodes) is represented via aggregated orchestrator startup/lock metrics rather than per-node logs."
+  - "Kazoo's scaling bug is represented as elevated orchestrator ZooKeeper session churn and inability to complete startup; the specific EPIPE evidence is modeled as an operator strace observation one-shot rather than a frequent application log line."
+  - "Late in failure, residual 503s are modeled as 'partial' routing-table convergence (http_503_no_route_partial) rather than implying the route table is fully empty."
+  - "Gateway refresh failures in the main failure flow are constrained to upstream error responses (upstream_500/upstream_503) because the modeled chain reaches the orchestrator (orchestrator.zk_fetch_fail) before the gateway logs its failure."
+  - "Normal-phase log volume estimate: ~1.4k logs/min (user traffic + route refresh + light metrics), ~28k logs over 20 minutes."
+  - "Failure-phase log volume estimate: ~0.63k logs/min for most of early failure (empty-table 503s + refresh failures/retries + degraded gateway metrics + modest orchestrator churn) and ~1.25k logs/min late (mostly recovered user traffic + successful refreshes + residual partial 503s), totaling ~21k–24k logs over 30 minutes."
+  - "Total estimated logs across scenario: ~49k–53k, fitting the 20k–100k target while keeping key diagnostic signals frequent (gateway 503s, refresh failures/retries, orchestrator startup/zk churn, later ZooKeeper max-buffer rejections, and then successful refresh/traffic restoration)."
+```

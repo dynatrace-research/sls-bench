@@ -1,0 +1,177 @@
+```yaml
+scenario:
+  id: pi_day_k8s_upgrade_network_outage
+  title: Pi Day outage from Kubernetes upgrade breaking Calico routing/DNS
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A legacy web stack runs on a large Kubernetes cluster fronted by an edge gateway.
+    During a control-plane upgrade from Kubernetes 1.23 to 1.24, Calico's route-reflector selection no longer matches the intended nodes, leading to widespread route withdrawals.
+    In-cluster DNS begins failing and the control plane becomes noisy with slow requests and (initially) OPA admission webhook timeouts, while user requests return 5xx or edge-served empty pages.
+    Responders mitigate by removing the OPA webhook and then start preparing a restore, but the modeled window ends while the site is still largely unavailable.
+
+  trigger_desc: |
+    A Compute engineer starts the Kubernetes control-plane upgrade (1.23 -> 1.24) on the legacy-prod cluster that serves the legacy web stack.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Users browse the homepage/feed through the edge gateway, which proxies to healthy legacy app pods.
+        CoreDNS successfully resolves both internal cluster names and public DNS.
+        The Kubernetes API server has low background noise and OPA admission decisions are processed normally.
+      flows: [homepage_view_ok]
+      manifestation:
+        - edge_gateway.http_access_ok
+        - legacy_app.req_done
+        - coredns.dns_public_ok
+        - kube_apiserver.apiserver_slow_request
+        - opa_webhook.opa_decision
+
+    f:
+      desc: |
+        Immediately after the control-plane upgrade begins, Calico route programming destabilizes and many routes are withdrawn across nodes.
+        Internal DNS resolution starts returning SERVFAIL while public DNS continues to work, and most user traffic fails at the edge with 5xx (with a smaller portion timing out or being served by an edge fallback empty page).
+        The API server becomes heavily loaded with slow requests; early on it also logs timeouts calling the OPA admission webhook, which responders later remove without restoring the cluster.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: compute_ops
+          event: |
+            The control-plane upgrade is initiated and the cluster rapidly experiences widespread Calico route withdrawals; internal DNS queries start failing and user browsing returns 5xx or edge fallback empty pages.
+          why: |
+            During the upgrade, node labeling changes cause Calico's route-reflector selector to match zero nodes, destabilizing routing.
+            This breaks pod networking and service discovery (CoreDNS), and cascades into control-plane stress (slow API calls).
+            The label mismatch is not directly stated by the systems; it is inferred from Calico's selector-mismatch messages (directly observable) combined with the upgrade context (external).
+          flows: [homepage_view_edge_5xx, homepage_view_backend_timeout, homepage_view_empty_200]
+          rate_multipliers:
+            calico_node.route_withdraw: 2.5
+            calico_node.reflector_selector_zero: 2.0
+            coredns.dns_internal_servfail: 3.0
+            kube_apiserver.apiserver_slow_request: 5.0
+            kube_apiserver.admission_webhook_timeout: 5.0
+            kube_apiserver.etcd_write_timeout: 3.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: compute_ops.incident_opened
+              count: 1
+              hosts: [ops-1]
+            - ref: compute_ops.upgrade_started
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - calico_node.reflector_selector_zero
+            - calico_node.route_withdraw
+            - coredns.dns_internal_servfail
+            - kube_apiserver.admission_webhook_timeout
+            - edge_gateway.http_access_5xx
+
+        - order: 2
+          at_min: 35
+          component: compute_ops
+          event: |
+            Responders remove the OPA validating webhook configuration; API server admission webhook timeout logs disappear, but user-facing failures and DNS issues persist.
+          why: |
+            Removing the webhook stops the API server from blocking on calls to an unavailable OPA endpoint (directly observable via the timeout log ceasing).
+            However, the underlying networking/routing failure remains, so CoreDNS and workloads are still impaired (directly observable via continued DNS SERVFAIL and route withdrawals).
+          flows: [homepage_view_edge_5xx, homepage_view_backend_timeout, homepage_view_empty_200]
+          rate_multipliers:
+            kube_apiserver.admission_webhook_timeout: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: compute_ops.deleted_opa_webhook
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - kube_apiserver.apiserver_slow_request
+            - coredns.dns_internal_servfail
+            - calico_node.route_withdraw
+            - edge_gateway.http_access_5xx
+
+        - order: 3
+          at_min: 48
+          component: compute_ops
+          event: |
+            With no fix-forward path found, responders begin draining/terminating worker nodes to prepare for a restore; API server node-delete activity becomes prominent while edge errors remain dominant.
+          why: |
+            Bulk worker termination produces a surge of API server node delete operations and adds additional route churn, while the routing/DNS fault remains.
+            The decision to prep a restore is an operator action (directly observable via the ops marker), while the sustained network failure is inferred from ongoing Calico/CoreDNS symptoms.
+          flows: [homepage_view_edge_5xx, homepage_view_backend_timeout, homepage_view_empty_200]
+          rate_multipliers:
+            kube_apiserver.apiserver_node_delete: 800.0
+            calico_node.route_withdraw: 4.0
+            homepage_view_edge_5xx: 1.2
+            homepage_view_empty_200: 0.6
+            homepage_view_backend_timeout: 1.1
+          latency_multipliers:
+            homepage_view_backend_timeout: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: compute_ops.worker_termination_started
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - kube_apiserver.apiserver_node_delete
+            - calico_node.route_withdraw
+            - coredns.dns_internal_servfail
+            - edge_gateway.http_access_5xx
+
+      steady:
+        - component: calico_node
+          condition: |
+            Calico routing remains unstable with frequent route withdrawals and repeated reports that the route-reflector selector matches zero nodes.
+          user_impact: |
+            Pod-to-pod and pod-to-service networking remains unreliable, preventing workloads (including legacy app pods) from communicating normally.
+          manifestation: [calico_node.reflector_selector_zero, calico_node.route_withdraw]
+
+        - component: coredns
+          condition: |
+            Internal DNS resolution continues to return SERVFAIL for cluster/local service names and consul-based service discovery, while public DNS queries still succeed.
+          user_impact: |
+            Applications and controllers fail to resolve internal dependencies, contributing to missing endpoints, request failures, and prolonged recovery attempts.
+          manifestation: [coredns.dns_internal_servfail, coredns.dns_public_ok]
+
+        - component: edge_gateway
+          condition: |
+            Most homepage/feed requests are returned as 5xx at the edge, with a smaller amount served via an edge fallback empty 200 response.
+          user_impact: |
+            Users see errors or empty pages when browsing; core legacy user flows are largely unavailable.
+          manifestation: [edge_gateway.http_access_5xx, edge_gateway.http_access_empty]
+
+      feedback_loops:
+        - id: control_plane_retry_amplification
+          desc: |
+            Routing/DNS failures prevent controllers and workloads from stabilizing, which increases API server churn (retries, slow requests, node/pod reconciliations),
+            further slowing convergence and prolonging unavailability.
+
+      flows: [homepage_view_edge_5xx, homepage_view_backend_timeout, homepage_view_empty_200]
+      manifestation:
+        - calico_node.route_withdraw
+        - coredns.dns_internal_servfail
+        - kube_apiserver.apiserver_slow_request
+        - edge_gateway.http_access_5xx
+
+  assumptions:
+    - |
+      Timeline is compressed into a 60-minute window; it models the onset and early mitigation steps, ending before the eventual restore/recovery described in the post-mortem.
+    - |
+      Failure-phase piecewise rates (rough): minutes 25-35 use Event 1 multipliers; minutes 35-48 keep routing/DNS stress but remove admission timeouts; minutes 48-60 add worker-termination churn (API-server node deletes become a clear new signal at this boundary).
+    - |
+      Expected log volume estimate (rough):
+      Normal (25 min): homepage_view_ok ~250 rpm * 3 logs/req ≈ 18.8k plus ~0.3k background.
+      Failure (35 min): request logs ≈ (220*2 + 30*3 + 25*2) ≈ 580 logs/min, with minutes 48-60 slightly higher due to flow multipliers (~650 logs/min); background roughly:
+        - min 25-35: ~307 logs/min
+        - min 35-48: ~257 logs/min
+        - min 48-60: ~401 logs/min (includes prominent apiserver node-deletes at ~80/min)
+      Total scenario ≈ ~52k logs, within the 20k–100k target.
+    - |
+      One-shots per event: Event1=2 (incident opened + upgrade started), Event2=1 (OPA webhook deleted), Event3=1 (worker termination started).
+    - |
+      Visibility rationale: Calico route withdrawals and CoreDNS SERVFAIL are high-rate and persist through failure; API server admission timeouts are high-rate early and then drop to zero at Event2, and API server node-deletes surge at Event3, providing clear boundaries.
+```

@@ -1,0 +1,710 @@
+```yaml
+sys:
+  id: github_metadata_platform_oct21
+  desc: >
+    A simplified model of GitHub's metadata-serving platform running primarily in a US East data center.
+    User web requests are handled by an edge layer and an API tier that reads from MySQL replicas and writes to MySQL primaries.
+    Orchestrator manages MySQL topology and automated failover using Raft consensus across East, West, and a cloud node.
+    Background job workers process webhook deliveries and Pages builds using the same metadata stores and internal queues.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: dc_link
+    name: Inter-DC Network Link Monitor
+    svc: wan-link
+    hosts: [linkmon-1]
+    desc: >
+      Emits health and event logs for connectivity between the US East network hub and the primary US East data center.
+      A brief partition is the initiating trigger for the incident.
+    to:
+      - dst: orchestrator
+        proto: tcp
+        desc: Connectivity loss influences cross-site control-plane quorum behavior.
+    logs:
+      link_health:
+        desc: Periodic health sample for the WAN link segment relevant to the incident.
+        lvl: INFO
+        msg: "link health east_hub->east_dc rtt_ms={rtt_ms} loss_pct={loss_pct}"
+        vars:
+          rtt_ms: {k: i, v: [2, 120]}
+        state_vars:
+          n:
+            loss_pct: {k: f, v: [0.0, 1.0]}
+          f:
+            loss_pct: {k: f, v: [0.0, 100.0]}
+      link_down:
+        desc: One-shot indicating the link segment went down.
+        lvl: CRITICAL
+        msg: "wan link down east_hub->east_dc loss_pct={loss_pct}"
+        vars:
+          loss_pct: {k: f, v: [90.0, 100.0]}
+      link_up:
+        desc: One-shot indicating the link segment restored.
+        lvl: INFO
+        msg: "wan link restored east_hub->east_dc after {outage_s}s"
+        vars:
+          outage_s: {k: i, v: [20, 120]}
+    beh:
+      n:
+        desc: Emits periodic link health samples.
+        emit:
+          - id: link_health
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Continues periodic link health samples; loss/latency may spike during the incident.
+        emit:
+          - id: link_health
+            per_min: 1.0
+            scope: global
+
+  - id: edge
+    name: Edge Router / Web Front Door
+    svc: edge
+    hosts: [edge-1, edge-2]
+    desc: >
+      Receives inbound HTTPS requests and routes them to the API tier.
+      Emits request-received logs and small amounts of TLS-related noise.
+    to:
+      - dst: api
+        proto: https
+        desc: Routes user requests to the API tier in the primary data center.
+    logs:
+      req_received:
+        desc: Entry log for a routed request.
+        lvl: INFO
+        msg: "recv {method} {route} trace={trace_id} src={src_ip}"
+        vars:
+          method: {k: ch, v: [GET, POST, PATCH]}
+          route: {k: ch, v: [/graphql, /login, /repos/issues, /repos/pulls, /repos/push]}
+          trace_id: {k: hex, v: 32}
+          src_ip: {k: ip, v: "203.0.113.0/24"}
+      tls_handshake_fail:
+        desc: Low-rate TLS handshake failures from the edge.
+        lvl: WARN
+        msg: "tls handshake failed src={src_ip} err={err}"
+        vars:
+          src_ip: {k: ip, v: "203.0.113.0/24"}
+          err: {k: ch, v: [timeout, bad_record_mac, unknown_ca]}
+    beh:
+      n:
+        desc: Mostly quiet; occasional TLS handshake failures.
+        emit:
+          - id: tls_handshake_fail
+            per_min: 0.2
+      f:
+        desc: TLS noise slightly increases during the incident.
+        emit:
+          - id: tls_handshake_fail
+            per_min: 0.5
+
+  - id: api
+    name: GitHub Web/API Service
+    svc: api
+    hosts: [api-1, api-2, api-3]
+    desc: >
+      Serves user requests, reading from MySQL replicas and writing to MySQL primaries.
+      During the incident, cross-country DB access and replica lag cause timeouts, slow writes, and stale reads.
+    to:
+      - dst: mysql_east
+        proto: tcp
+        desc: Normal-path local MySQL access within the primary US East data center.
+      - dst: mysql_west
+        proto: tcp
+        desc: Failover-path MySQL access to US West during the incident.
+    logs:
+      req_start:
+        desc: Marks the start of request handling in the API tier.
+        lvl: INFO
+        msg: "start {method} {route} rid={req_id} trace={trace_id} user={user_tier}"
+        vars:
+          method: {k: ch, v: [GET, POST, PATCH]}
+          route: {k: ch, v: [/graphql, /login, /repos/issues, /repos/pulls, /repos/push]}
+          req_id: {k: hex, v: 16}
+          trace_id: {k: hex, v: 32}
+          user_tier: {k: ch, v: [anon, authed]}
+      req_end_ok:
+        desc: Successful request completion with DB placement metadata.
+        lvl: INFO
+        msg: "end {method} {route} rid={req_id} status={status} dur_ms={dur_ms} db_dc={db_dc} db_role={db_role}"
+        vars:
+          method: {k: ch, v: [GET, POST, PATCH]}
+          route: {k: ch, v: [/graphql, /login, /repos/issues, /repos/pulls, /repos/push]}
+          req_id: {k: hex, v: 16}
+          status: {k: i, v: [200, 302]}
+          db_dc: {k: ch, v: [east, west]}
+          db_role: {k: ch, v: [primary, replica]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [20, 800]}
+          f:
+            dur_ms: {k: i, v: [50, 20000]}
+      req_end_err:
+        desc: Terminal error completion (typically from DB timeouts in this incident).
+        lvl: ERROR
+        msg: "end {method} {route} rid={req_id} status=503 dur_ms={dur_ms} db_dc={db_dc} db_role={db_role} err={err} attempts={attempts}"
+        vars:
+          method: {k: ch, v: [GET, POST, PATCH]}
+          route: {k: ch, v: [/graphql, /login, /repos/issues, /repos/pulls, /repos/push]}
+          req_id: {k: hex, v: 16}
+          db_dc: {k: ch, v: [east, west]}
+          db_role: {k: ch, v: [primary, replica]}
+          err: {k: ch, v: [timeout, connect_timeout, txn_deadlock]}
+          attempts: {k: i, v: [1, 3]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [80, 3000]}
+          f:
+            dur_ms: {k: i, v: [500, 30000]}
+      req_end_stale:
+        desc: Read request completed but served from a lagged replica (stale/behind).
+        lvl: WARN
+        msg: "end {method} {route} rid={req_id} status=200 dur_ms={dur_ms} replica_lag_s={replica_lag_s} served_from=east_replica"
+        vars:
+          method: {k: ch, v: [GET]}
+          route: {k: ch, v: [/graphql, /repos/issues, /repos/pulls]}
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 5000]}
+          replica_lag_s: {k: i, v: [300, 20000]}
+      db_retry:
+        desc: Per-retry marker when the API retries DB operations.
+        lvl: WARN
+        msg: "db retry rid={req_id} attempt={attempt} backoff_ms={backoff_ms} err={err}"
+        vars:
+          req_id: {k: hex, v: 16}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [50, 800]}
+          err: {k: ch, v: [timeout, connect_timeout]}
+      pool_stats:
+        desc: Periodic DB connection pool metrics from the API tier.
+        lvl: INFO
+        msg: "db pool stats dc={dc} in_use={in_use} idle={idle} wait_ms_p95={wait_ms_p95}"
+        vars:
+          dc: {k: ch, v: [east, west]}
+          in_use: {k: i, v: [0, 200]}
+          idle: {k: i, v: [0, 200]}
+          wait_ms_p95: {k: i, v: [1, 5000]}
+    beh:
+      n:
+        desc: Periodic pool statistics; request-level logs are emitted via flows.
+        emit:
+          - id: pool_stats
+            per_min: 0.5
+      f:
+        desc: Pool contention increases during cross-region DB access and during replica catch-up.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+
+  - id: orchestrator
+    name: Orchestrator (MySQL Topology Manager)
+    svc: orchestrator
+    hosts: [orch-e1, orch-w1, orch-c1]
+    desc: >
+      Manages MySQL cluster topology and automated failover.
+      Uses Raft for consensus; during the network partition, a West+Cloud quorum can promote primaries in US West.
+    to:
+      - dst: mysql_east
+        proto: tcp
+        desc: Monitors and controls MySQL instances in the East data center.
+      - dst: mysql_west
+        proto: tcp
+        desc: Monitors and controls MySQL instances in the West data center.
+    logs:
+      raft_tick:
+        desc: Low-level Raft progress marker.
+        lvl: DEBUG
+        msg: "raft tick node={node} leader={leader} term={term} commit_idx={commit_idx}"
+        vars:
+          node: {k: ch, v: [orch-e1, orch-w1, orch-c1]}
+          leader: {k: ch, v: [orch-e1, orch-w1, orch-c1]}
+          term: {k: i, v: [1, 50]}
+          commit_idx: {k: i, v: [1000, 100000]}
+      raft_leader_change:
+        desc: One-shot leader change under Raft due to partition/election.
+        lvl: WARN
+        msg: "raft leader change old={old_leader} new={new_leader} term={term} reason={reason}"
+        vars:
+          old_leader: {k: ch, v: [orch-e1, orch-w1, orch-c1, none]}
+          new_leader: {k: ch, v: [orch-e1, orch-w1, orch-c1]}
+          term: {k: i, v: [1, 50]}
+          reason: {k: ch, v: [leader_deselected, election_timeout]}
+      promotion_start:
+        desc: One-shot indicating a cluster failover/promotion has been initiated.
+        lvl: WARN
+        msg: "cluster failover cluster={cluster} from_dc=east to_dc=west new_primary={new_primary}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          new_primary: {k: ch, v: [mysql-w1, mysql-w2]}
+      api_get_topology:
+        desc: Logs Orchestrator API responses used by responders to understand topology.
+        lvl: INFO
+        msg: "api get-topology cluster={cluster} servers={servers} dc_set={dc_set}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          servers: {k: i, v: [2, 20]}
+          dc_set: {k: ch, v: [west_only, mixed]}
+    beh:
+      n:
+        desc: Regular Raft ticks; topology actions are event-driven.
+        emit:
+          - id: raft_tick
+            per_min: 1.0
+      f:
+        desc: Regular Raft ticks continue during the incident.
+        emit:
+          - id: raft_tick
+            per_min: 1.0
+
+  - id: mysql_east
+    name: MySQL Clusters (US East)
+    svc: mysql
+    hosts: [mysql-e1, mysql-e2]
+    desc: >
+      Primary metadata clusters in US East under normal operations.
+      During the incident, East has errant writes vs West, cannot safely fail back immediately,
+      and later is rebuilt/restored and repopulated via replication from West, leading to high replica lag.
+    to:
+      - dst: mysql_west
+        proto: tcp
+        desc: Replication relationship is re-established during recovery (modeled as telemetry).
+    logs:
+      repl_lag_metric:
+        desc: Replication lag telemetry for East replicas catching up.
+        lvl: INFO
+        msg: "repl lag cluster={cluster} source_dc={source_dc} lag_s={lag_s} relay_mb={relay_mb}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          source_dc: {k: ch, v: [west]}
+          relay_mb: {k: i, v: [0, 50000]}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 2]}
+          f:
+            lag_s: {k: i, v: [300, 20000]}
+      repl_error:
+        desc: Replication/topology errors caused by divergence and reconnect attempts.
+        lvl: ERROR
+        msg: "repl error cluster={cluster} last_error={last_error}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          last_error: {k: ch, v: [errant_transactions, duplicate_key, relay_log_corrupt, cannot_connect_source]}
+      restore_progress:
+        desc: Restore progress while rebuilding East clusters from backups/streams.
+        lvl: INFO
+        msg: "restore cluster={cluster} stage={stage} pct={pct}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          stage: {k: ch, v: [download, decompress, prepare, load]}
+          pct: {k: f, v: [0.0, 100.0]}
+      restore_started:
+        desc: One-shot indicating restore initiation for a cluster.
+        lvl: INFO
+        msg: "restore started cluster={cluster} source={source}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          source: {k: ch, v: [cloud_backup, west_stream]}
+      role_change:
+        desc: One-shot indicating a role change back to primary in East.
+        lvl: INFO
+        msg: "mysql role change cluster={cluster} role={role} dc=east"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          role: {k: ch, v: [primary, replica]}
+      replica_provisioned:
+        desc: One-shot indicating new read replicas were provisioned to spread load.
+        lvl: INFO
+        msg: "read replica provisioned cluster={cluster} location={location} count={count}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          location: {k: ch, v: [east_dc, east_cloud]}
+          count: {k: i, v: [1, 20]}
+    beh:
+      n:
+        desc: Normal operations show near-zero replication lag telemetry.
+        emit:
+          - id: repl_lag_metric
+            per_min: 1.0
+      f:
+        desc: Replication errors persist while topology is inconsistent; restore and lag telemetry are enabled by incident events.
+        emit:
+          - id: repl_error
+            per_min: 0.3
+          - id: restore_progress
+            per_min: 0.6
+          - id: repl_lag_metric
+            per_min: 1.0
+
+  - id: mysql_west
+    name: MySQL Clusters (US West)
+    svc: mysql
+    hosts: [mysql-w1, mysql-w2]
+    desc: >
+      Receives promoted primaries during the incident and takes write traffic from the API tier.
+      Emits status telemetry indicating write load while East is rebuilding/catching up.
+    to: []
+    logs:
+      primary_status:
+        desc: Periodic status telemetry from West primaries.
+        lvl: INFO
+        msg: "mysql primary status cluster={cluster} dc=west qps={qps} repl_clients={repl_clients}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          qps: {k: i, v: [200, 5000]}
+          repl_clients: {k: i, v: [0, 50]}
+    beh:
+      n:
+        desc: Normal status telemetry.
+        emit:
+          - id: primary_status
+            per_min: 1.0
+      f:
+        desc: Elevated write traffic persists during fail-forward.
+        emit:
+          - id: primary_status
+            per_min: 1.0
+
+  - id: worker
+    name: Background Job Workers (Webhooks / Pages)
+    svc: jobs
+    hosts: [worker-1, worker-2]
+    desc: >
+      Processes queued background jobs for webhook delivery and GitHub Pages site builds.
+      During the incident, job processing is paused to reduce risk while MySQL topology is inconsistent,
+      then later resumed to drain backlog, causing some TTL-based drops.
+    to: []
+    logs:
+      queue_depth:
+        desc: Periodic metric of queue depth and oldest job age.
+        lvl: INFO
+        msg: "queue depth kind={kind} depth={depth} oldest_age_s={oldest_age_s}"
+        vars:
+          kind: {k: ch, v: [webhook, pages]}
+        state_vars:
+          n:
+            depth: {k: i, v: [0, 10000]}
+            oldest_age_s: {k: i, v: [0, 300]}
+          f:
+            depth: {k: i, v: [0, 6000000]}
+            oldest_age_s: {k: i, v: [0, 200000]}
+      jobs_paused:
+        desc: One-shot marker that a job category was paused.
+        lvl: WARN
+        msg: "jobs paused kind={kind} reason={reason} queue_depth={queue_depth}"
+        vars:
+          kind: {k: ch, v: [webhook, pages]}
+          reason: {k: ch, v: [db_consistency, incident_mitigation]}
+          queue_depth: {k: i, v: [10000, 6000000]}
+      jobs_resumed:
+        desc: One-shot marker that a job category was resumed.
+        lvl: INFO
+        msg: "jobs resumed kind={kind} concurrency={concurrency}"
+        vars:
+          kind: {k: ch, v: [webhook, pages]}
+          concurrency: {k: i, v: [10, 200]}
+      job_processed:
+        desc: Per-job summary for successfully processed jobs (sampled via modeled RPM).
+        lvl: INFO
+        msg: "job processed kind={kind} outcome={outcome} dur_ms={dur_ms}"
+        vars:
+          kind: {k: ch, v: [webhook, pages]}
+          outcome: {k: ch, v: [sent, built]}
+          dur_ms: {k: i, v: [50, 20000]}
+      job_dropped_ttl:
+        desc: Per-job summary for webhook jobs dropped due to TTL expiration.
+        lvl: WARN
+        msg: "job dropped kind=webhook reason=ttl_expired age_s={age_s}"
+        vars:
+          age_s: {k: i, v: [3600, 200000]}
+      ttl_config_update:
+        desc: One-shot indicating the webhook TTL was increased.
+        lvl: INFO
+        msg: "hook ttl updated old_s={old_s} new_s={new_s}"
+        vars:
+          old_s: {k: i, v: [3600, 7200]}
+          new_s: {k: i, v: [7200, 43200]}
+    beh:
+      n:
+        desc: Periodic queue metrics; processing logs are emitted via flows.
+        emit:
+          - id: queue_depth
+            per_min: 1.0
+      f:
+        desc: Queue metrics increase in frequency during the incident to track backlog growth.
+        emit:
+          - id: queue_depth
+            per_min: 2.0
+
+  - id: sre_control_plane
+    name: Monitoring / Incident Control Plane
+    svc: sre-ctl
+    hosts: [sre-ctl-1]
+    desc: >
+      Aggregates alerting signals, records incident control actions (deploy lock, status changes),
+      and is the source of operator queries to Orchestrator during triage.
+    to:
+      - dst: orchestrator
+        proto: https
+        desc: Used by responders to query Orchestrator topology.
+    logs:
+      status_heartbeat:
+        desc: Periodic record of current public status state.
+        lvl: INFO
+        msg: "status heartbeat current={status}"
+        vars:
+          status: {k: ch, v: [green, yellow, red]}
+      alert_flood:
+        desc: Alert burst during degraded operation.
+        lvl: WARN
+        msg: "alerts firing service={service} count_5m={count_5m}"
+        vars:
+          service: {k: ch, v: [api, mysql, worker, network]}
+          count_5m: {k: i, v: [20, 800]}
+      deploy_lock:
+        desc: One-shot indicating deployments were locked to avoid further changes.
+        lvl: INFO
+        msg: "deployments locked by {actor} reason={reason}"
+        vars:
+          actor: {k: ch, v: [first_responder, incident_coordinator]}
+          reason: {k: ch, v: [stability, change_freeze]}
+      status_change:
+        desc: One-shot indicating status escalation.
+        lvl: INFO
+        msg: "status set to {status} by {actor}"
+        vars:
+          status: {k: ch, v: [yellow, red]}
+          actor: {k: ch, v: [first_responder, incident_coordinator]}
+      orch_query:
+        desc: Operator query to Orchestrator API during triage.
+        lvl: INFO
+        msg: "query orchestrator topology cluster={cluster} result={result}"
+        vars:
+          cluster: {k: ch, v: [meta, auth, issues]}
+          result: {k: ch, v: [ok, timeout]}
+    beh:
+      n:
+        desc: Normal operations produce periodic status heartbeat and low-rate alerts.
+        emit:
+          - id: status_heartbeat
+            per_min: 1.0
+            scope: global
+          - id: alert_flood
+            per_min: 0.2
+            scope: global
+      f:
+        desc: During the incident, alert flood becomes prominent and status remains degraded.
+        emit:
+          - id: status_heartbeat
+            per_min: 1.0
+            scope: global
+          - id: alert_flood
+            per_min: 6.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge, api]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal user traffic is served from US East MySQL primaries/replicas with low latency.
+      Background jobs for webhooks and Pages run continuously and queues remain small.
+    req:
+      - id: user_read_east
+        desc: User read request served from an East replica.
+        rpm: 280.0
+        path: [edge, api, mysql_east]
+        emit: [edge.req_received, api.req_start, api.req_end_ok]
+        latency_ms: [[2, 6], [1, 4], [30, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_write_east
+        desc: User write request served by an East primary.
+        rpm: 120.0
+        path: [edge, api, mysql_east]
+        emit: [edge.req_received, api.req_start, api.req_end_ok]
+        latency_ms: [[2, 6], [1, 4], [60, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: webhook_delivery
+        desc: Background webhook deliveries (sampled job completions).
+        rpm: 60.0
+        path: [worker]
+        emit: [worker.job_processed]
+        latency_ms: [[200, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: pages_build
+        desc: Background Pages builds (sampled job completions).
+        rpm: 10.0
+        path: [worker]
+        emit: [worker.job_processed]
+        latency_ms: [[1000, 7000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      After a network partition and Orchestrator-driven cross-region failover, the API tier primarily reads/writes to West,
+      introducing cross-country latency and write timeouts. Later, East primaries return but replicas lag behind, causing stale reads.
+      Webhook/Pages processing is paused, then resumed to drain backlog, creating TTL-based drops.
+    req:
+      - id: user_read_west
+        desc: User reads served from West replicas (cross-country from the primary API tier).
+        rpm: 280.0
+        path: [edge, api, mysql_west]
+        emit: [edge.req_received, api.req_start, api.req_end_ok]
+        latency_ms: [[2, 6], [1, 4], [40, 150]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_read_east_replica_lagged
+        desc: User reads served from East replicas that are behind, returning stale data.
+        rpm: 280.0
+        path: [edge, api, mysql_east]
+        emit: [edge.req_received, api.req_start, api.req_end_stale]
+        latency_ms: [[2, 6], [1, 4], [35, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_read_east_replica_fresh
+        desc: User reads served from East replicas that are mostly caught up (post scale-out).
+        rpm: 280.0
+        path: [edge, api, mysql_east]
+        emit: [edge.req_received, api.req_start, api.req_end_ok]
+        latency_ms: [[2, 6], [1, 4], [30, 110]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_write_west_ok
+        desc: User writes succeed to West primaries but are slow due to distance.
+        rpm: 90.0
+        path: [edge, api, mysql_west]
+        emit: [edge.req_received, api.req_start, api.req_end_ok]
+        latency_ms: [[2, 6], [1, 4], [80, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_write_west_timeout
+        desc: User writes to West primaries hit timeouts and exhaust API retries, returning 503.
+        rpm: 30.0
+        path: [api, mysql_west]
+        emit: [api.req_start, api.req_end_err]
+        latency_ms: [[1, 5], [1000, 7000]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.5
+          emit_per_retry: [api.db_retry]
+          backoff_ms: [[100, 400], [200, 800]]
+        trace: true
+      - id: user_write_east_ok
+        desc: User writes served by East primaries after controlled restoration/failback.
+        rpm: 120.0
+        path: [edge, api, mysql_east]
+        emit: [edge.req_received, api.req_start, api.req_end_ok]
+        latency_ms: [[2, 6], [1, 4], [60, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: webhook_delivery
+        desc: Background webhook deliveries (may be paused/resumed during incident).
+        rpm: 60.0
+        path: [worker]
+        emit: [worker.job_processed]
+        latency_ms: [[300, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: pages_build
+        desc: Background Pages builds (may be paused/resumed during incident).
+        rpm: 10.0
+        path: [worker]
+        emit: [worker.job_processed]
+        latency_ms: [[1500, 12000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: webhook_ttl_drop
+        desc: Backlogged webhook jobs dropped due to internal TTL expiration during backlog drain.
+        rpm: 20.0
+        path: [worker]
+        emit: [worker.job_dropped_ttl]
+        latency_ms: [[5, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: orch_api_get_topology
+        desc: Responders query Orchestrator and observe west-only topologies.
+        rpm: 2.0
+        path: [sre_control_plane, orchestrator]
+        emit: [sre_control_plane.orch_query, orchestrator.api_get_topology]
+        latency_ms: [[5, 30], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    The 24h+ real incident is time-compressed into a 48-minute scenario while preserving causal order:
+    partition → cross-region promotion → mitigation (pause jobs) → restore/failback → replica lag/inconsistent reads → backlog drain with TTL drops.
+  - |
+    Only three representative MySQL clusters are modeled (meta/auth/issues) to keep topology/failover logs interpretable.
+  - |
+    User request traffic is approximated as 400 rpm total (280 reads, 120 writes). Most request flows emit 3 logs per request;
+    the write-timeout flow emits 2 per-request logs plus retry markers to keep retries attributable to the API tier.
+  - |
+    Failure introduces a separate 30 rpm write-timeout flow with retries to ensure visible 503s without making all traffic fail.
+  - |
+    Worker queue depth metrics in failure are allowed to start near normal and grow large later (domain widened) to avoid implying an immediate backlog at failure onset.
+  - |
+    Normal-phase logs/min estimate: ~1.2k–1.3k (dominant from user request flows); failure-phase logs/min similar with additional alerts/restore/lag telemetry.
+  - |
+    Total estimated logs over 48 minutes: ~58k–73k (within the 20k–100k target), with key diagnostics
+    (leader change, promotions, alert flood, job pause, restore progress, replica lag, stale reads, TTL drops) expected to appear multiple times.
+```

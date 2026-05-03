@@ -1,0 +1,437 @@
+```yaml
+sys:
+  id: kartotherian_maps_migration
+  desc: >
+    Kartotherian serves map rendering requests for maps.wikimedia.org (tiles and composed map views).
+    Requests come from the CDN (ATS) to an LVS VIP which load-balances to a pool of Kartotherian backends.
+    During a migration, the pool temporarily mixes bare-metal hosts and Kubernetes worker nodes.
+    The incident models Kubernetes backends being pooled while missing the LVS loopback/VIP configuration, and a later bare-metal capacity reduction that triggers overload and timeouts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ats_edge
+    name: ATS Edge Cache
+    svc: ats
+    hosts: [ats1001.eqiad.wmnet, ats1002.eqiad.wmnet]
+    desc: >
+      CDN layer that forwards user map requests to the Kartotherian LVS VIP and returns responses to clients.
+      Maintains backend connection pools; failed origin connection attempts may be discarded and not immediately visible to users.
+    to:
+      - dst: lvs_lb
+        proto: tcp
+        desc: "Forwards HTTPS requests to the Kartotherian LVS VIP."
+    logs:
+      ats_txn_200:
+        desc: "Successful origin transaction returned to the client."
+        lvl: INFO
+        msg: "txn={txn} {method} {url} status=200 pool=bm dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          txn: {k: hex, v: 16}
+          method: {k: ch, v: [GET]}
+          url: {k: str, v: "https://maps.wikimedia.org/* (tile/render request)"}
+          dur_ms: {k: i, v: [15, 2500]}
+          bytes: {k: i, v: [800, 20000]}
+      ats_txn_fail_k8s:
+        desc: "Client-visible origin failure when ATS cannot obtain a usable connection and an attempt goes to a Kubernetes backend."
+        lvl: WARN
+        msg: "txn={txn} {method} {url} status={status} pool=k8s err={err} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          txn: {k: hex, v: 16}
+          method: {k: ch, v: [GET]}
+          url: {k: str, v: "https://maps.wikimedia.org/* (tile/render request)"}
+          status: {k: ch, v: [502, 503]}
+          err: {k: ch, v: [connect_timeout, tls_handshake_timeout]}
+          dur_ms: {k: i, v: [300, 8000]}
+          bytes: {k: i, v: [0, 1500]}
+      ats_txn_fail_bm:
+        desc: "Origin timeout/overload when LVS selects a bare-metal backend under pressure."
+        lvl: WARN
+        msg: "txn={txn} {method} {url} status={status} pool=bm err={err} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          txn: {k: hex, v: 16}
+          method: {k: ch, v: [GET]}
+          url: {k: str, v: "https://maps.wikimedia.org/* (tile/render request)"}
+          status: {k: ch, v: [503, 504]}
+          err: {k: ch, v: [origin_timeout, origin_busy]}
+          dur_ms: {k: i, v: [1500, 25000]}
+          bytes: {k: i, v: [0, 2500]}
+      ats_origin_pool_connect_fail:
+        desc: "Origin connection attempt failure that is discarded (connection not admitted to the active pool)."
+        lvl: INFO
+        msg: "origin_pool connect_fail vip={vip} pool=k8s backend={backend} err={err} timeout_ms={timeout_ms}"
+        vars:
+          vip: {k: ch, v: [kartotherian-ssl_443]}
+          backend: {k: ch, v: [k8s-worker01.eqiad.wmnet, k8s-worker02.eqiad.wmnet, k8s-worker03.eqiad.wmnet, k8s-worker04.eqiad.wmnet]}
+          err: {k: ch, v: [connect_timeout, no_response]}
+          timeout_ms: {k: i, v: [250, 2500]}
+    beh:
+      n:
+        desc: "ATS background logging not modeled in normal state."
+        emit: []
+      f:
+        desc: "During the incident, ATS repeatedly attempts (and discards) failed origin connections toward the k8s pool."
+        emit:
+          - id: ats_origin_pool_connect_fail
+            per_min: 0.6
+            scope: per_host
+
+  - id: lvs_lb
+    name: LVS Load Balancer (Kartotherian VIP)
+    svc: lvs-kartotherian
+    hosts: [lvs1019.eqiad.wmnet]
+    desc: >
+      LVS VIP that dispatches incoming connections to pooled Kartotherian backends (bare-metal and Kubernetes workers).
+      Dispatch decisions are logged here to show which backend pool is being exercised.
+    to:
+      - dst: kartotherian_bm
+        proto: tcp
+        desc: "Forwards connections to bare-metal Kartotherian backends."
+      - dst: kartotherian_k8s
+        proto: tcp
+        desc: "Forwards connections to Kubernetes workers (real servers)."
+      - dst: ats_edge
+        proto: tcp
+        desc: "Returns responses back on the established connection to ATS."
+    logs:
+      lvs_dispatch_bm:
+        desc: "LVS dispatch to a bare-metal real server."
+        lvl: INFO
+        msg: "vip={vip} dispatch real={real} pool=bm conn_ms={conn_ms}"
+        vars:
+          vip: {k: ch, v: [kartotherian-ssl_443]}
+          real: {k: ch, v: [maps1005.eqiad.wmnet, maps1006.eqiad.wmnet, maps1007.eqiad.wmnet, maps1010.eqiad.wmnet]}
+          conn_ms: {k: i, v: [0, 15]}
+      lvs_dispatch_k8s:
+        desc: "LVS dispatch to a Kubernetes worker real server."
+        lvl: INFO
+        msg: "vip={vip} dispatch real={real} pool=k8s conn_ms={conn_ms}"
+        vars:
+          vip: {k: ch, v: [kartotherian-ssl_443]}
+          real: {k: ch, v: [k8s-worker01.eqiad.wmnet, k8s-worker02.eqiad.wmnet, k8s-worker03.eqiad.wmnet, k8s-worker04.eqiad.wmnet]}
+          conn_ms: {k: i, v: [0, 15]}
+      lvs_conntrack_gc:
+        desc: "Periodic LVS conntrack/cleanup marker (low-value background noise)."
+        lvl: INFO
+        msg: "conntrack_gc scanned={scanned} freed={freed}"
+        vars:
+          scanned: {k: i, v: [1000, 8000]}
+          freed: {k: i, v: [0, 800]}
+    beh:
+      n:
+        desc: "Occasional conntrack cleanup logs."
+        emit:
+          - id: lvs_conntrack_gc
+            per_min: 0.15
+            scope: global
+      f:
+        desc: "Conntrack cleanup continues during failure (may increase slightly under pressure)."
+        emit:
+          - id: lvs_conntrack_gc
+            per_min: 0.25
+            scope: global
+
+  - id: kartotherian_bm
+    name: Kartotherian (Bare Metal)
+    svc: kartotherian
+    hosts: [maps1005.eqiad.wmnet, maps1006.eqiad.wmnet, maps1007.eqiad.wmnet, maps1010.eqiad.wmnet]
+    desc: >
+      Bare-metal Kartotherian servers that normally handle the majority of production map rendering traffic.
+      Under reduced capacity, they can overload and start timing out, causing LVS health-check failures and ATS 5xx.
+    to:
+      - dst: lvs_lb
+        proto: tcp
+        desc: "Sends responses back via LVS/established connections."
+    logs:
+      krt_access_200:
+        desc: "Successful render of a tile/render request."
+        lvl: INFO
+        msg: "req={req} layer={layer} z={z} x={x} y={y} status=200 dur_ms={dur_ms}"
+        vars:
+          req: {k: hex, v: 16}
+          layer: {k: ch, v: [osm-intl, wikivoyage, hillshade]}
+          z: {k: i, v: [0, 18]}
+          x: {k: i, v: [0, 262144]}
+          y: {k: i, v: [0, 262144]}
+          dur_ms: {k: i, v: [10, 3000]}
+      krt_render_timeout:
+        desc: "Render timed out or was abandoned under load."
+        lvl: WARN
+        msg: "req={req} layer={layer} z={z} x={x} y={y} timeout_ms={timeout_ms} waited_ms={waited_ms}"
+        vars:
+          req: {k: hex, v: 16}
+          layer: {k: ch, v: [osm-intl, wikivoyage, hillshade]}
+          z: {k: i, v: [0, 18]}
+          x: {k: i, v: [0, 262144]}
+          y: {k: i, v: [0, 262144]}
+          timeout_ms: {k: i, v: [3000, 15000]}
+          waited_ms: {k: i, v: [3000, 25000]}
+      krt_worker_queue:
+        desc: "Periodic worker/queue gauge indicating load and drops."
+        lvl: WARN
+        msg: "workers_active={active} queue_depth={queue} drops_1m={drops}"
+        vars:
+          active: {k: i, v: [10, 300]}
+          queue: {k: i, v: [0, 800]}
+          drops: {k: i, v: [0, 400]}
+      krt_restart:
+        desc: "Service restart marker on a host."
+        lvl: INFO
+        msg: "kartotherian restarted reason={reason}"
+        vars:
+          reason: {k: ch, v: [rolling_restart]}
+    beh:
+      n:
+        desc: "Light periodic queue metrics; normal operation shows low drops."
+        emit:
+          - id: krt_worker_queue
+            per_min: 0.6
+            scope: per_host
+      f:
+        desc: "Queue metrics remain present and trend worse under overload."
+        emit:
+          - id: krt_worker_queue
+            per_min: 1.4
+            scope: per_host
+
+  - id: kartotherian_k8s
+    name: Kartotherian (Kubernetes Workers)
+    svc: kartotherian
+    hosts: [k8s-worker01.eqiad.wmnet, k8s-worker02.eqiad.wmnet, k8s-worker03.eqiad.wmnet, k8s-worker04.eqiad.wmnet]
+    desc: >
+      Kubernetes worker nodes intended to run Kartotherian during the migration.
+      In the incident, they are pooled at LVS but cannot successfully complete connections due to missing LVS loopback/VIP configuration.
+    to:
+      - dst: lvs_lb
+        proto: tcp
+        desc: "Would respond via LVS on established connections (not working correctly in this incident)."
+    logs:
+      vip_presence_check:
+        desc: "Periodic local check showing whether the LVS VIP address is present on the node."
+        lvl: WARN
+        msg: "vip_check vip={vip} present_on_lo={present} svc={svc}"
+        vars:
+          vip: {k: ch, v: [kartotherian-ssl_443]}
+          svc: {k: ch, v: [kartotherian]}
+        state_vars:
+          n:
+            present: {k: ch, v: ["true"]}
+          f:
+            present: {k: ch, v: ["false"]}
+    beh:
+      n:
+        desc: "No incident-relevant Kubernetes worker logs are emitted in normal state."
+        emit: []
+      f:
+        desc: "Once pooled, nodes emit periodic VIP presence check failures consistent with the misconfiguration."
+        emit:
+          - id: vip_presence_check
+            per_min: 0.4
+            scope: per_host
+
+  - id: prometheus
+    name: Prometheus / StatsD-derived Service Metrics
+    svc: monitoring
+    hosts: [prometheus01.eqiad.wmnet]
+    desc: >
+      Periodically records service-level request-rate summaries used for dashboards.
+      Key diagnostic is that Kubernetes capacity is present but shows zero request rate.
+    to: []
+    logs:
+      scrape_summary:
+        desc: "Per-minute service summary for request rates by backend pool."
+        lvl: INFO
+        msg: "kartotherian_rps bm_rps={bm_rps} k8s_targets={k8s_targets} k8s_rps={k8s_rps} sample_window_s={win_s}"
+        vars:
+          bm_rps: {k: f, v: [3.0, 22.0]}
+          win_s: {k: i, v: [30, 60]}
+        state_vars:
+          n:
+            k8s_targets: {k: i, v: [0, 0]}
+            k8s_rps: {k: f, v: [0.0, 0.0]}
+          f:
+            k8s_targets: {k: i, v: [4, 4]}
+            k8s_rps: {k: f, v: [0.0, 0.0]}
+    beh:
+      n:
+        desc: "Periodic metrics snapshots."
+        emit:
+          - id: scrape_summary
+            per_min: 1.0
+            scope: global
+      f:
+        desc: "Periodic metrics snapshots continue; k8s targets appear but show zero traffic."
+        emit:
+          - id: scrape_summary
+            per_min: 1.0
+            scope: global
+
+  - id: pybal
+    name: PyBal Backend Health Manager
+    svc: pybal
+    hosts: [lvs1019.eqiad.wmnet]
+    desc: >
+      Health-check and pooling controller for LVS services.
+      Emits CRITICAL messages when servers are marked down while still pooled.
+    to:
+      - dst: kartotherian_bm
+        proto: tcp
+        desc: "Health checks to bare-metal backends."
+      - dst: kartotherian_k8s
+        proto: tcp
+        desc: "Health checks to Kubernetes workers."
+    logs:
+      pybal_backend_down:
+        desc: "Backend health check failure; backend remains pooled."
+        lvl: CRITICAL
+        msg: "service={service} server={server} state=down reason={reason} pooled=yes"
+        vars:
+          service: {k: ch, v: [kartotherian-ssl_443, kartotherian-k8s-ssl_6543]}
+          server: {k: ch, v: [maps1005.eqiad.wmnet, maps1006.eqiad.wmnet, maps1007.eqiad.wmnet, maps1010.eqiad.wmnet, k8s-worker01.eqiad.wmnet, k8s-worker02.eqiad.wmnet, k8s-worker03.eqiad.wmnet, k8s-worker04.eqiad.wmnet]}
+          reason: {k: ch, v: [healthcheck_timeout, no_response]}
+    beh:
+      n:
+        desc: "Mostly quiet in normal operation; occasional transient down marks."
+        emit:
+          - id: pybal_backend_down
+            per_min: 0.03
+            scope: global
+      f:
+        desc: "Elevated backend-down messages during the incident."
+        emit:
+          - id: pybal_backend_down
+            per_min: 1.0
+            scope: global
+
+  - id: alertmanager
+    name: Alerting Pipeline
+    svc: monitoring
+    hosts: [alert01.eqiad.wmnet]
+    desc: >
+      Emits alert state transitions reflecting sustained backend health failures and elevated 5xx from ATS.
+      Used as a high-signal timeline marker once the outage starts.
+    to: []
+    logs:
+      alert_firing:
+        desc: "Alert enters firing state."
+        lvl: WARN
+        msg: "ALERT name={name} severity={severity} source={source} status=firing"
+        vars:
+          name: {k: ch, v: [ATSBackendErrorsHigh, PyBalBackendsHealthCritical]}
+          severity: {k: ch, v: [page, critical]}
+          source: {k: ch, v: [ats_edge, pybal]}
+    beh:
+      n:
+        desc: "Rare background alert noise."
+        emit:
+          - id: alert_firing
+            per_min: 0.02
+            scope: global
+      f:
+        desc: "Alerts may fire during outage windows; suppressed early by scenario controls."
+        emit:
+          - id: alert_firing
+            per_min: 0.25
+            scope: global
+
+  - id: ops_console
+    name: SRE Operator Console (SAL-like)
+    svc: ops
+    hosts: [ops01.eqiad.wmnet]
+    desc: >
+      Operational actions (pool/depool, deploy, restart) recorded as discrete markers.
+      These are used as precise timeline anchors for the incident.
+    to:
+      - dst: pybal
+        proto: https
+        desc: "Issues pooling/depooling changes via tooling."
+    logs:
+      ops_change:
+        desc: "Operator action marker."
+        lvl: INFO
+        msg: "user={user} action={action} service={service} details={details}"
+        vars:
+          user: {k: ch, v: [elukey]}
+          action: {k: ch, v: [pool_in, pool_out, deploy, roll_restart]}
+          service: {k: ch, v: [kartotherian]}
+          details: {k: str, v: "freeform short description (hosts/counts)"}
+    beh:
+      n:
+        desc: "No background operator logs."
+        emit: []
+      f:
+        desc: "No background operator logs; only one-shot actions."
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: "Normal map-render traffic is served by bare-metal Kartotherian via LVS; low error rate."
+    req:
+      - id: map_tile_render_bm
+        desc: "Typical map tile/render request served successfully by a bare-metal backend."
+        rpm: 600.0
+        path: [ats_edge, lvs_lb, kartotherian_bm, lvs_lb, ats_edge]
+        emit: [lvs_lb.lvs_dispatch_bm, kartotherian_bm.krt_access_200, ats_edge.ats_txn_200]
+        latency_ms: [[1, 4], [20, 140], [25, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: >
+      During failure, Kubernetes backends are pooled but cannot complete connections; ATS often discards failed origin connection attempts.
+      Later, bare-metal capacity is reduced, pushing remaining bare-metal backends into overload and timeouts (client-visible 5xx).
+    req:
+      - id: map_tile_ok_bm
+        desc: "Map request served by a bare-metal backend (slower under pressure)."
+        rpm: 580.0
+        path: [ats_edge, lvs_lb, kartotherian_bm, lvs_lb, ats_edge]
+        emit: [lvs_lb.lvs_dispatch_bm, kartotherian_bm.krt_access_200, ats_edge.ats_txn_200]
+        latency_ms: [[1, 5], [25, 250], [40, 500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: map_tile_k8s_connect_fail
+        desc: "Client-visible request failure when ATS must open new origin connections and LVS selects a broken k8s backend."
+        rpm: 2.0
+        path: [ats_edge, lvs_lb, kartotherian_k8s, lvs_lb, ats_edge]
+        emit: [lvs_lb.lvs_dispatch_k8s, ats_edge.ats_txn_fail_k8s]
+        latency_ms: [[1, 5], [400, 6000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: map_tile_bm_overload_timeout
+        desc: "Bare-metal backend is overloaded; render work times out and ATS returns 503/504."
+        rpm: 20.0
+        path: [ats_edge, lvs_lb, kartotherian_bm, lvs_lb, ats_edge]
+        emit: [lvs_lb.lvs_dispatch_bm, kartotherian_bm.krt_render_timeout, ats_edge.ats_txn_fail_bm]
+        latency_ms: [[1, 6], [3000, 15000], [6000, 22000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Time is compressed: the real multi-hour timeline is modeled as a 36-minute scenario while preserving causal ordering."
+  - "Traffic volume is scaled to ~600 rpm to keep total logs within 20k–100k while maintaining clear phase changes."
+  - "ATS connection-pool masking is modeled by: (a) early suppression of client-visible k8s failures (map_tile_k8s_connect_fail) and (b) explicit ATS background logs for discarded origin connection failures (ats_origin_pool_connect_fail)."
+  - "Prometheus scrape_summary stands in for the Grafana dashboard signal: k8s targets exist but k8s_rps stays 0 throughout failure."
+  - "kartotherian_k8s.vip_presence_check provides host-side evidence of missing LVS loopback/VIP configuration without modeling Kubernetes internals."
+  - "PyBal health-check failures are modeled as background CRITICAL logs; server identity (bm vs k8s) is carried in the 'server' field."
+  - "Estimated total logs: normal ~18 min * 600 rpm * 3 logs ≈ 32k; failure flows ≈ 29–31k (dominated by bm successes plus an outage window); plus background (Prometheus, PyBal, ATS origin-pool failures, alerts, LVS GC, queue metrics, vip checks) ≈ 0.5–2k; total ≈ 62k–66k."
+```

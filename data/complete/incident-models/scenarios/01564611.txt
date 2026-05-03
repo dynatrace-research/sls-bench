@@ -1,0 +1,247 @@
+```yaml
+scenario:
+  id: rds_multiaz_failover_replication_crash
+  title: Multi-AZ failover causes brief API outage, replica replication crashes, and prolonged rebuild
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The API normally serves reads from MySQL read replicas and writes to an RDS Multi-AZ primary.
+    An automatic Multi-AZ failover cuts DB connectivity briefly, producing a burst of API 5xx responses.
+    After connectivity returns, replicas crash replication with duplicate-key errors; operators shift reads to the primary and start a snapshot-based rebuild.
+    Later investigation finds a small (seconds) data gap around failover and ties it to innodb_flush_log_at_trx_commit being set to 2.
+
+  trigger_desc: |
+    AWS RDS performs an automatic Multi-AZ failover for the API MySQL primary, temporarily cutting networking and moving the endpoint to the standby.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 15}
+      f: {start_min: 15, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        The API serves steady traffic. SELECT-heavy requests are routed to the replica pool, while transactional writes go to the primary.
+        Replica status logs show low lag and SQL thread running. Primary CPU metrics remain stable.
+      flows: [api_read_replicas_n, api_write_master_n]
+      manifestation:
+        - api_service.http_access_ok
+        - api_service.db_query
+        - rds_replicas.replication_status
+        - rds_primary.metric_cpu
+
+    f:
+      desc: |
+        Failure begins with a Multi-AZ failover that cuts off DB connectivity, producing elevated 5xx errors for a short window.
+        Once the endpoint is switched, the API resumes serving traffic, but replicas report replication stopped; at the stop point they log duplicate-key errors.
+        Operators shift reads away from replicas to the primary and start snapshot-based replica rebuild; the primary runs hotter and API
+        latencies increase. Snapshot progress remains slow, and later investigation confirms a small transaction gap around the failover window.
+
+      events:
+        - order: 1
+          at_min: 15
+          component: rds_controlplane
+          event: |
+            Multi-AZ failover starts; API requests cannot establish DB connections and begin returning 502s.
+          why: |
+            During failover cutover, networking to the old primary is stopped and the RDS endpoint is not yet serving from the standby.
+            This is directly observable via API DB connection errors and API 5xx access logs, plus the RDS failover start marker.
+          flows: [api_db_conn_fail_f]
+          rate_multipliers:
+            api_db_conn_fail_f: 2.0
+            api_read_replicas_f: 0.0
+            api_read_master_f: 0.0
+            api_write_master_f: 0.0
+            rds_replicas.replication_status: 0.0
+            rds_controlplane.snapshot_progress: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: rds_controlplane.failover_start
+              count: 1
+              hosts: [rds-ctrl-1]
+            - ref: monitoring.alert_5xx
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - rds_controlplane.failover_start
+            - api_service.db_connect_error
+            - api_service.http_access_5xx
+            - rds_primary.mysql_aborted_conn
+            - monitoring.alert_5xx
+
+        - order: 2
+          at_min: 17
+          component: rds_controlplane
+          event: |
+            Failover completes and the endpoint serves from the new primary; replicas hit a stop point and log duplicate-key errors as their SQL threads stop.
+          why: |
+            Once the standby is promoted, application connections succeed again. With some transactions missing on the new primary but present in binlogs,
+            replicas can later encounter collisions (duplicate primary keys) when applying subsequent events, stopping the SQL thread; this is observable in
+            the one-time replica error logs at the stop point and in ongoing replication status showing SQL not running and lag increasing.
+          flows: [api_read_replicas_f, api_write_master_f]
+          rate_multipliers:
+            api_db_conn_fail_f: 0.0
+            api_read_replicas_f: 2.0
+            api_read_master_f: 0.0
+            api_write_master_f: 2.0
+            rds_primary.mysql_aborted_conn: 0.0
+            rds_replicas.replication_status: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: rds_controlplane.failover_complete
+              count: 1
+              hosts: [rds-ctrl-1]
+            - ref: rds_replicas.replication_error
+              count: 5
+              hosts: [db-replica-1, db-replica-2, db-replica-3, db-replica-4, db-replica-5]
+            - ref: monitoring.alert_replication
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - rds_controlplane.failover_complete
+            - rds_replicas.replication_error
+            - rds_replicas.replication_status
+            - monitoring.alert_replication
+
+        - order: 3
+          at_min: 18
+          component: sre_console
+          event: |
+            Operators remove replicas from service and shift reads to the primary; replica rebuild via snapshot is started and snapshot progress becomes visible.
+          why: |
+            With replication stopped, replicas can serve stale/incorrect results, so reads are routed to the primary. This increases primary load and
+            read latencies; snapshot progress indicates the rebuild process is running (observable via ops action markers and RDS snapshot logs).
+          flows: [api_read_master_f, api_write_master_f]
+          rate_multipliers:
+            api_read_replicas_f: 0.0
+            api_read_master_f: 2.0
+            rds_controlplane.snapshot_progress: 1.0
+          latency_multipliers:
+            api_read_master_f: {p50: 1.6, p95: 2.0}
+            api_write_master_f: {p50: 1.3, p95: 1.7}
+          one_shots:
+            - ref: sre_console.action_shift_reads
+              count: 1
+              hosts: [sre-1]
+            - ref: sre_console.action_start_rebuild
+              count: 1
+              hosts: [sre-1]
+            - ref: rds_controlplane.snapshot_start
+              count: 1
+              hosts: [rds-ctrl-1]
+            - ref: monitoring.alert_cpu
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - sre_console.action_shift_reads
+            - rds_primary.metric_cpu
+            - rds_controlplane.snapshot_start
+            - rds_controlplane.snapshot_progress
+            - monitoring.alert_cpu
+
+        - order: 4
+          at_min: 35
+          component: sre_console
+          event: |
+            After escalation, AWS support indicates the snapshot is a full snapshot due to host replacement after failover, implying a multi-hour rebuild.
+          why: |
+            RDS host replacement after failover can cause the next snapshot to be treated as the first snapshot on the new host, forcing a full copy.
+            This is not directly visible from application logs; it is observed via the operator support note.
+          flows: [api_read_master_f, api_write_master_f]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: sre_console.action_open_support
+              count: 1
+              hosts: [sre-1]
+            - ref: sre_console.action_support_note
+              count: 1
+              hosts: [sre-1]
+          manifestation:
+            - sre_console.action_support_note
+            - rds_controlplane.snapshot_progress
+            - api_service.db_query
+
+        - order: 5
+          at_min: 50
+          component: sre_console
+          event: |
+            Investigation correlating traces/binlog to DB state finds a 5-second data gap around failover; operators confirm innodb_flush_log_at_trx_commit was 2 and change it to 1.
+          why: |
+            With innodb_flush_log_at_trx_commit=2, committed transactions may not be flushed to disk immediately and can be missing after a crash/failover,
+            while sync_binlog=1 can still flush binlog entries. Variable values are directly observable from operator checks; the disk-flush timing is not.
+          flows: [api_read_master_f, api_write_master_f]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: sre_console.action_data_gap
+              count: 1
+              hosts: [sre-1]
+            - ref: sre_console.action_check_variables
+              count: 1
+              hosts: [sre-1]
+            - ref: sre_console.action_set_variable
+              count: 1
+              hosts: [sre-1]
+          manifestation:
+            - sre_console.action_data_gap
+            - sre_console.action_check_variables
+            - sre_console.action_set_variable
+
+      steady:
+        - component: rds_replicas
+          condition: |
+            Replica SQL threads remain stopped and lag continues to climb while rebuild is in progress; replicas cannot safely serve reads.
+          user_impact: |
+            Users are served from the primary only; stale reads from replicas are avoided, but capacity is reduced and latency is higher.
+          manifestation:
+            - rds_replicas.replication_status
+        - component: rds_controlplane
+          condition: |
+            Snapshot-based rebuild continues with slow progress, extending the time the system runs without replicas.
+          user_impact: |
+            Extended degraded-mode operation (reads on primary) and delayed restoration of normal read capacity.
+          manifestation:
+            - rds_controlplane.snapshot_progress
+        - component: api_service
+          condition: |
+            API is operational but runs with elevated read latency due to reads being served by the primary under higher load.
+          user_impact: |
+            Increased response times; the earlier failover window manifested as a burst of 5xx errors.
+          manifestation:
+            - api_service.http_access_ok
+            - rds_primary.metric_cpu
+
+      feedback_loops:
+        - id: read_shift_load_loop
+          desc: |
+            Removing replicas from service forces reads onto the primary, raising CPU and query latency.
+            Higher primary load can slow snapshot creation, prolonging the period without replicas and sustaining elevated load.
+
+      flows: [api_db_conn_fail_f, api_read_replicas_f, api_read_master_f, api_write_master_f]
+      manifestation:
+        - rds_controlplane.failover_start
+        - rds_controlplane.failover_complete
+        - api_service.http_access_5xx
+        - rds_replicas.replication_status
+        - rds_controlplane.snapshot_progress
+        - sre_console.action_check_variables
+
+  assumptions:
+    - >-
+      Timeline is compressed into 60 minutes; the snapshot/rebuild does not complete within the scenario, but prolonged snapshot_progress plus the AWS support note capture the operational impact.
+    - >-
+      Replica duplicate-key errors are modeled as one-time stop-point logs (five one-shots at minute 17) rather than continuous background ERRORs; ongoing failure is reflected via replication_status (sql_running=No, high lag).
+    - >-
+      To keep total volume stable even under conservative estimators, failure-state flow baselines are split (half-rate) and then amplified via event multipliers (2.0) to represent the active workload during each failure sub-interval.
+    - >-
+      Piecewise volume estimate (order-of-magnitude): normal 0-15m ≈ 15k logs; failure 15-17m ≈ 2k logs (connection failures);
+      failure 17-18m ≈ 1k logs (traffic returns plus replica status + 5 one-shot replica errors); failure 18-60m ≈ 42k-50k logs
+      (reads+writes on primary plus metrics/snapshot/replica status); one-shots ≈ 15. Total ≈ 60k-75k (target 20k-100k).
+    - >-
+      Visibility rationale: failover one-shots + API db_connect_error/http_access_5xx identify the cutover window; minute-17 one-shot
+      replication_error plus ongoing replication_status identifies replication break; snapshot_progress shows prolonged rebuild; ops variable check/set
+      anchors the durability misconfiguration (innodb_flush 2->1) and ties to the data-gap finding.
+```

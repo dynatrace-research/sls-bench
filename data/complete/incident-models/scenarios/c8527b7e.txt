@@ -1,0 +1,198 @@
+```yaml
+scenario:
+  id: canary_timeout_blocks_public_ip_updates
+  title: Canary timeout gates public IP programming for newly created resources
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system programs public IP mappings for new or live-migrated resources by running a canary validation before
+    applying updates to shared L2 edge load balancers. A large batch of updates to a rarely used configuration triggers
+    a canary timeout, causing address updates to queue behind the stuck canary gate. New instances/VPNs/L4 load balancers
+    created or migrated during the incident are unreachable via public IP, health checks fail, and guest egress probes fail.
+
+  trigger_desc: |
+    A large configuration update batch for a rarely used L2/LB configuration is submitted to the network control plane,
+    which must pass canary validation before further public IP address changes can be propagated.
+
+  time:
+    total_minutes: 45
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 45}
+
+  phases:
+    n:
+      desc: |
+        Resource creation/migration requests submit public IP programming to the network control plane.
+        Canary validation succeeds quickly and the edge dataplane applies mappings promptly, keeping public reachability
+        and egress healthy. Queue depth metrics remain low and dataplane drop counters are near zero.
+      flows: [create_resource_ok, health_check_ok, egress_probe_ok]
+      manifestation:
+        - net_control_plane.ncp_queue_status_normal
+        - resource_manager.rm_create_ready
+        - health_checker.hc_ok
+        - l2lb_edge.l2lb_stats
+
+    f:
+      desc: |
+        A batch update to a rarely used configuration hits an inefficient canary code path and times out. From the first
+        minute of failure, public-IP programming updates queue behind the canary gate, so new/migrated resources do not get
+        a usable public IP mapping. Edge devices drop inbound packets for those public IPs and health checks fail; guest
+        egress probes also fail. Engineers mitigate by restarting programming workers in stages, allowing partial draining
+        and partial recovery, but the scenario ends while a meaningful fraction of updates are still blocked.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: net_control_plane
+          event: |
+            A large update batch for the rarely used configuration is accepted; canary validation begins timing out and
+            subsequent public-IP updates queue behind the stuck testing phase, blocking new/migrated resource reachability.
+          why: |
+            The batch exercises an inefficient canary validation code path; the timeout prevents changes from proceeding past
+            the testing gate, so later public-address changes accumulate in the queue. Canary timeouts and rising backlog are
+            directly observable in canary and queue logs; the inefficient code path itself is inferred.
+          flows: [create_resource_blocked, health_check_fail, inbound_public_drop, egress_probe_fail]
+          rate_multipliers:
+            create_resource_recovered: 0.0
+            health_check_ok_in_failure: 0.0
+            egress_probe_ok_in_failure: 0.0
+            net_control_plane.ncp_queue_status_timeout: 1.0
+            net_control_plane.ncp_queue_status_draining: 0.0
+          latency_multipliers:
+            create_resource_blocked: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: net_control_plane.ncp_config_batch_received
+              count: 1
+              hosts: [ncp-1]
+            - ref: net_control_plane.ncp_queue_snapshot_high
+              count: 1
+              hosts: [ncp-1]
+          manifestation:
+            - net_control_plane.ncp_config_batch_received
+            - canary_tester.canary_timeout
+            - net_control_plane.ncp_queue_status_timeout
+            - resource_manager.rm_create_timeout
+            - l2lb_edge.l2lb_drop_nomap
+
+        - order: 2
+          at_min: 26
+          component: net_control_plane
+          event: |
+            Engineers restart the programming worker for a single zone, and a portion of queued updates begin to
+            pass canary and get applied to the edge, producing partial recovery while other zones remain blocked.
+          why: |
+            Restarting the worker clears the stuck processing state and allows batched processing that avoids repeatedly
+            hitting the slow path, so some updates start completing. The action is directly observable via restart logs and
+            the shift from "timing_out" toward some "draining" queue metrics; recovery is partial because other zones are not yet restarted.
+          flows: [create_resource_blocked, create_resource_recovered, health_check_fail, health_check_ok_in_failure]
+          rate_multipliers:
+            create_resource_blocked: 0.7
+            create_resource_recovered: 0.3
+            health_check_fail: 0.7
+            health_check_ok_in_failure: 0.3
+            inbound_public_drop: 0.7
+            egress_probe_fail: 0.7
+            egress_probe_ok_in_failure: 0.3
+            net_control_plane.ncp_queue_status_timeout: 0.7
+            net_control_plane.ncp_queue_status_draining: 0.3
+          latency_multipliers:
+            create_resource_recovered: {p50: 1.8, p95: 1.5}
+          one_shots:
+            - ref: net_control_plane.ncp_worker_restart
+              count: 1
+              hosts: [ncp-1]
+          manifestation:
+            - net_control_plane.ncp_worker_restart
+            - net_control_plane.ncp_queue_status_draining
+            - canary_tester.canary_pass
+            - l2lb_edge.l2lb_program_apply
+
+        - order: 3
+          at_min: 38
+          component: net_control_plane
+          event: |
+            Additional zones' workers are restarted and backlog drains further; most new/migrated resources start becoming
+            reachable, but a significant fraction still time out as the queue continues to clear.
+          why: |
+            Additional worker restarts expand the mitigation to more zones, increasing the share of updates that complete and
+            reducing (but not eliminating) the blocked fraction. This is directly observable via restart markers, increased successful
+            programming logs, and a higher fraction of "draining" queue metrics.
+          flows: [create_resource_blocked, create_resource_recovered, health_check_fail, health_check_ok_in_failure]
+          rate_multipliers:
+            create_resource_blocked: 0.4
+            create_resource_recovered: 0.6
+            health_check_fail: 0.4
+            health_check_ok_in_failure: 0.6
+            inbound_public_drop: 0.4
+            egress_probe_fail: 0.4
+            egress_probe_ok_in_failure: 0.6
+            net_control_plane.ncp_queue_status_timeout: 0.4
+            net_control_plane.ncp_queue_status_draining: 0.6
+          latency_multipliers:
+            create_resource_recovered: {p50: 1.3, p95: 1.2}
+          one_shots:
+            - ref: net_control_plane.ncp_worker_restart
+              count: 2
+              hosts: [ncp-1, ncp-2]
+            - ref: net_control_plane.ncp_queue_snapshot_draining
+              count: 1
+              hosts: [ncp-2]
+          manifestation:
+            - net_control_plane.ncp_worker_restart
+            - net_control_plane.ncp_queue_snapshot_draining
+            - resource_manager.rm_create_ready
+            - health_checker.hc_ok
+
+      steady:
+        - component: net_control_plane
+          condition: |
+            The public-IP update queue remains non-empty and some updates are still gated behind slow/timeout-prone canary validation.
+          user_impact: |
+            A subset of newly created or live-migrated resources still cannot get public IP reachability within expected time.
+          manifestation:
+            - net_control_plane.ncp_queue_status_timeout
+            - net_control_plane.ncp_queue_status_draining
+            - canary_tester.canary_timeout
+
+        - component: l2lb_edge
+          condition: |
+            Some public IPs for newly created/migrated resources remain unmapped or pending, causing continued inbound drops.
+          user_impact: |
+            Users see intermittent inability to reach new instances/VPNs/L4 load balancers via public IP; health checks fail for affected endpoints.
+          manifestation:
+            - l2lb_edge.l2lb_drop_nomap
+            - health_checker.hc_fail
+            - l2lb_edge.l2lb_stats
+
+      feedback_loops:
+        - id: canary_gate_queueing
+          desc: |
+            Canary timeout prevents propagation, so each new public-IP change increases queue depth. Higher queue depth delays
+            subsequent changes, keeping more resources in a pending/unmapped state and sustaining inbound drops and health-check failures.
+
+      flows:
+        - create_resource_blocked
+        - create_resource_recovered
+        - health_check_fail
+        - health_check_ok_in_failure
+        - inbound_public_drop
+        - egress_probe_fail
+        - egress_probe_ok_in_failure
+      manifestation:
+        - net_control_plane.ncp_queue_status_timeout
+        - resource_manager.rm_pending_network
+        - canary_tester.canary_timeout
+        - resource_manager.rm_create_timeout
+        - l2lb_edge.l2lb_drop_nomap
+        - health_checker.hc_fail
+
+  assumptions:
+    - "Real incident lasted ~2h; this scenario compresses to 45 minutes while preserving causal ordering and observability."
+    - "Normal-phase volume estimate: ~1125 logs/min (create_resource_ok + health_check_ok + egress_probe_ok + low-rate metrics), ~20k logs over 18 minutes."
+    - "Failure-phase piecewise breakdown (approx): minutes 18-26 (8m) full blockage ~1215 logs/min; minutes 26-38 (12m) partial recovery ~1190 logs/min; minutes 38-45 (7m) broader partial recovery ~1160 logs/min."
+    - "One-shots per event: event1=2 (batch received + high queue snapshot), event2=1 (worker restart), event3=3 (2 restarts + draining snapshot)."
+    - "Total estimated logs: ~52k across the scenario (normal + failure), within the 20k-100k target."
+    - "Visibility rationale: canary_timeout appears per blocked create/migrate request; ncp_queue_status_* emits once per minute and shifts from timing_out to draining; l2lb_drop_nomap is frequent via health_check_fail and inbound_public_drop during blocked intervals."
+```

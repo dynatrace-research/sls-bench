@@ -1,0 +1,225 @@
+```yaml
+scenario:
+  id: incident_2022_11_18_heroku_h10_poison_pubsub_welcome
+  title: Crash-loop downtime from poison Pub/Sub welcome message and uncaught goroutine panic
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The incident app normally serves interactive HTTP traffic and consumes Pub/Sub work with near-zero backlog.
+    A rare welcome-message Pub/Sub delivery triggers an unhandled panic inside a goroutine created by the Pub/Sub client,
+    crashing the Heroku dyno and causing intermittent H10/503 downtime. Large panic output causes Logplex to drop and later
+    rate-limit logs, slowing diagnosis. Responders mitigate by purging suspect subscriptions and disabling non-critical
+    async-producing features, restoring stability but leaving best-effort async behavior degraded.
+
+  trigger_desc: |
+    A poison message in the inc-welcome-sub subscription is delivered and processed by a handler that panics in a
+    child goroutine without a recover(), causing the whole Go process to exit and Heroku to report H10 "App crashed".
+
+  time:
+    total_minutes: 56
+    phases:
+      n: {start_min: 0, end_min: 24}
+      f: {start_min: 24, end_min: 56}
+
+  phases:
+    n:
+      desc: |
+        The monolith is stable: interactive requests succeed and the async worker consumes Pub/Sub normally.
+        Monitoring shows the welcome-message subscription has near-zero unacked backlog.
+      flows: [web_interaction_ok, pubsub_consume_ok]
+      manifestation:
+        - heroku_runtime.router_200
+        - incident_app.http_200
+        - monitoring.pubsub_welcome_backlog_ok
+        - incident_app.health_tick
+
+    f:
+      desc: |
+        The app enters a crash loop: a welcome-message Pub/Sub delivery repeatedly triggers an unhandled panic,
+        crashing the dyno. Heroku restarts the dyno (dyno_start logs), but after repeated crashes it applies crash-loop cooloff so
+        restart attempts become less frequent and down windows stretch, increasing H10/503 responses. Crash forensics are
+        hindered because the panic emits a large amount of output (many goroutines), causing Logplex to drop and later
+        rate-limit logs. Responders later purge subscriptions with unacked messages from the incident window and disable
+        non-critical async features, stopping the crash loop but leaving degraded behavior (dropped/disabled welcome messaging and nudges).
+
+      events:
+        - order: 1
+          at_min: 24
+          component: incident_app
+          event: |
+            The first poison welcome-message delivery is processed and the dyno begins crash-looping; HTTP traffic starts returning H10/503 intermittently.
+            Monitoring shows sustained unacked backlog on the welcome subscription, and Logplex begins dropping panic output.
+          why: |
+            The Pub/Sub client Receive() runs handler callbacks in child goroutines; the handler panics without a local recover(),
+            so the Go process exits and Heroku marks the dyno as crashed. The full panic stack dump is often missing because Logplex
+            drops buffered stdout/stderr when output spikes. (Partially observable: crash + backlog are visible; missing stacktrace is inferred from Logplex warnings.)
+          flows: [pubsub_welcome_consume_panics, web_interaction_h10, web_interaction_ok_degraded]
+          rate_multipliers:
+            monitoring.pubsub_welcome_backlog_ok: 0.0
+            monitoring.pubsub_welcome_backlog_elevated: 1.0
+            incident_app.health_tick: 0.2
+            heroku_runtime.dyno_start: 1.0
+            heroku_runtime.logplex_dropped: 2.0
+            heroku_runtime.log_rate_limited: 0.0
+            web_interaction_h10: 1.2
+            web_interaction_ok_degraded: 0.8
+          latency_multipliers:
+            web_interaction_ok_degraded: {p50: 1.0, p95: 1.2}
+          one_shots: []
+          manifestation:
+            - incident_app.panic_runtime
+            - heroku_runtime.dyno_exit
+            - heroku_runtime.router_h10
+            - monitoring.pubsub_welcome_backlog_elevated
+            - heroku_runtime.logplex_dropped
+
+        - order: 2
+          at_min: 26
+          component: ops_console
+          event: |
+            Responders manually reboot the dyno to avoid waiting for automatic crash-loop restart delays.
+          why: |
+            Heroku crash-loop restart policy can introduce long cooloff periods after repeated exits; manual reboot is a common operational workaround.
+            This action is directly observable via the operator action log.
+          flows: [web_interaction_h10, pubsub_welcome_consume_panics]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_console.manual_dyno_reboot
+              count: 1
+              hosts: [oncall-laptop-1]
+          manifestation:
+            - ops_console.manual_dyno_reboot
+            - heroku_runtime.router_h10
+
+        - order: 3
+          at_min: 31
+          component: heroku_runtime
+          event: |
+            After repeated exits, Heroku applies crash-loop cooloff: restart attempts become less frequent, the dyno stays down longer between starts,
+            and the poison-message crash still occurs whenever the process comes back up.
+            Logplex rate limiting becomes clearly visible.
+          why: |
+            Repeated process exits trigger platform cooloff before restart attempts. With longer down windows, the same incoming traffic produces more H10s,
+            while crash-causing Pub/Sub deliveries (panic + dyno_exit) become less frequent because the process is started less often. (Directly observable via the cooloff marker
+            plus the reduced frequency of dyno_start and panic/dyno_exit markers.)
+          flows: [web_interaction_h10, web_interaction_ok_degraded, pubsub_welcome_consume_panics]
+          rate_multipliers:
+            pubsub_welcome_consume_panics: 0.4
+            web_interaction_h10: 1.6
+            web_interaction_ok_degraded: 0.7
+            heroku_runtime.dyno_start: 0.4
+            heroku_runtime.logplex_dropped: 6.0
+            heroku_runtime.log_rate_limited: 5.0
+            incident_app.health_tick: 0.1
+          latency_multipliers:
+            web_interaction_ok_degraded: {p50: 1.1, p95: 1.6}
+          one_shots:
+            - ref: heroku_runtime.crash_loop_backoff
+              count: 1
+              hosts: [dyno-manager-1]
+          manifestation:
+            - heroku_runtime.crash_loop_backoff
+            - heroku_runtime.router_h10
+            - heroku_runtime.log_rate_limited
+            - incident_app.panic_runtime
+            - heroku_runtime.dyno_start
+
+        - order: 4
+          at_min: 53
+          component: ops_console
+          event: |
+            Responders purge Pub/Sub subscriptions with unacked messages from the incident window and disable non-critical async features;
+            the crash loop stops and HTTP availability improves, but welcome messaging remains degraded.
+          why: |
+            Removing the poison message prevents further panic-triggering deliveries. Disabling non-critical producers reduces risk and load
+            while validating stability. Purge/flag changes are directly observable via operator logs; improvement is observable via reduced H10s and stable heartbeats.
+          flows: [web_interaction_ok_degraded, web_interaction_h10, pubsub_consume_ok_f]
+          rate_multipliers:
+            pubsub_welcome_consume_panics: 0.0
+            web_interaction_h10: 0.1
+            web_interaction_ok_degraded: 1.2
+            pubsub_consume_ok_f: 1.3
+            monitoring.pubsub_welcome_backlog_elevated: 0.0
+            monitoring.pubsub_welcome_backlog_ok: 1.0
+            heroku_runtime.dyno_start: 0.0
+            heroku_runtime.logplex_dropped: 0.2
+            heroku_runtime.log_rate_limited: 0.2
+            incident_app.health_tick: 1.0
+          latency_multipliers:
+            web_interaction_ok_degraded: {p50: 0.9, p95: 0.9}
+          one_shots:
+            - ref: ops_console.purge_subscription
+              count: 2
+              hosts: [oncall-laptop-1]
+            - ref: ops_console.disable_feature
+              count: 2
+              hosts: [oncall-laptop-1]
+          manifestation:
+            - ops_console.purge_subscription
+            - ops_console.disable_feature
+            - monitoring.pubsub_welcome_backlog_ok
+            - heroku_runtime.router_200
+            - incident_app.health_tick
+
+      steady:
+        - component: incident_app
+          condition: |
+            The dyno remains up after the welcome subscription is purged, but the underlying handler bug is not yet fixed;
+            some best-effort async behaviors are disabled/dropped as a mitigation.
+          user_impact: |
+            Core interactive actions mostly succeed again, but some best-effort async behaviors are missing (e.g., no welcome message,
+            reduced/disabled nudges) and some queued async events were lost due to purging.
+          manifestation:
+            - incident_app.health_tick
+            - heroku_runtime.router_200
+            - monitoring.pubsub_welcome_backlog_ok
+        - component: heroku_runtime
+          condition: |
+            Router H10 errors largely subside after the purge, with only low Logplex noise remaining.
+          user_impact: |
+            Customers see substantially improved availability compared to the crash-loop period.
+          manifestation:
+            - heroku_runtime.router_200
+            - heroku_runtime.logplex_dropped
+            - heroku_runtime.log_rate_limited
+
+      feedback_loops:
+        - id: pubsub_redelivery_crash_loop
+          desc: |
+            The poison message is never acked because the process exits mid-handler, so Pub/Sub redelivers it with backoff.
+            Each delivery triggers another crash; Heroku restarts eventually deliver the message again, sustaining downtime and log loss.
+
+      flows: [web_interaction_ok_degraded, web_interaction_h10, pubsub_welcome_consume_panics, pubsub_consume_ok_f]
+      manifestation:
+        - heroku_runtime.router_h10
+        - heroku_runtime.dyno_exit
+        - heroku_runtime.dyno_start
+        - incident_app.panic_runtime
+        - heroku_runtime.logplex_dropped
+        - monitoring.pubsub_welcome_backlog_elevated
+        - ops_console.purge_subscription
+
+  assumptions:
+    - |-
+      Time is modeled relative to an incident window with extra pre-incident baseline for contrast: 24 minutes normal, then 32 minutes of failure behavior.
+    - |-
+      Downtime is represented as a mix of successful requests and H10/503 router errors (not a complete traffic stop), matching
+      "13 minutes of downtime over 32 minutes" as intermittent unavailability rather than a total outage.
+    - |-
+      Failure-phase piecewise rates (approx, effective after multipliers):
+      - mins 24-31 (7 min): web_ok ~350*0.8=280 rpm (2 logs/req), web_h10 ~150*1.2=180 rpm (1 log/req),
+        welcome_crash_cycles ~2.5 rpm (~4 logs/cycle: deliver+welcome_received+panic+dyno_exit), dyno_start background ~2.0/min, monitoring elevated 1/min, heartbeats heavily reduced.
+      - mins 31-53 (22 min): cooloff active: welcome_crash_cycles ~2.5*0.4=1.0 rpm, dyno_start background ~2.0*0.4=0.8/min,
+        web_h10 ~150*1.6=240 rpm, web_ok ~350*0.7=245 rpm, Logplex drop + rate-limit warnings frequent.
+      - mins 53-56 (3 min): crash cycles suppressed to 0, dyno_start suppressed to ~0, web_h10 drops to ~15 rpm, web_ok rises to ~420 rpm, backlog signal returns to normal.
+    - |-
+      One-shots: 1 manual reboot at min 26; 1 crash-loop backoff marker at min 31; 2 subscription purges + 2 feature disables at min 53.
+    - |-
+      Visibility rationale: Heroku router H10 logs are high-volume and reliably present during down windows; crash cycles produce correlated pubsub delivery + panic + dyno_exit logs (until purged),
+      and the crash-loop backoff marker pins the cooloff change; dyno_start background logs corroborate restart attempts and their reduction under cooloff; Pub/Sub backlog metrics are emitted externally
+      by monitoring even while the dyno is down; Logplex dropped/rate-limited warnings provide evidence for missing panic stacktraces; operator purge/flag actions are explicit one-shots at the mitigation point.
+    - |-
+      Total estimated log volume over 56 minutes is ~50k–65k (dominated by router+app request logs), within the 20k–100k target.
+```

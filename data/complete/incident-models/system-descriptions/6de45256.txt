@@ -1,0 +1,616 @@
+```yaml
+sys:
+  id: cloud_https_load_balancer
+  desc: >
+    A managed HTTP(S) load balancer that serves client traffic from Google Frontend (GFE) proxy
+    servers and is configured by a control-plane "configuration master".
+    Customers and internal deploy tooling submit configuration changes that are read from a distributed
+    file system and pushed to all GFEs.
+    During this incident, a bad mastership transition caused a rollback to an out-of-date configuration,
+    leading to missing configs for recently modified load balancers and a configuration garbage-collection
+    storm on GFEs that triggered health check failures and restarts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: deploy_manager
+    name: App Deploy Manager
+    svc: deploy-manager
+    hosts: [deploy-01, deploy-02]
+    desc: >
+      Internal deployment tooling that submits load balancer configuration changes (e.g., for App Engine Flex apps)
+      and reports deployment outcomes.
+    to:
+      - dst: config_master
+        proto: https
+        desc: Submits LB config change requests to the control-plane API.
+    logs:
+      deploy_start_ok:
+        desc: Start of a deployment that requires LB config changes.
+        lvl: INFO
+        msg: "deploy start app={app} env={env} change_id={change_id}"
+        vars:
+          app: {k: ch, v: [payments, storefront, api]}
+          env: {k: ch, v: [prod, staging]}
+          change_id: {k: uuid, v: null}
+      deploy_done_ok:
+        desc: Deployment finished successfully.
+        lvl: INFO
+        msg: "deploy success app={app} change_id={change_id} duration_ms={duration_ms}"
+        vars:
+          app: {k: ch, v: [payments, storefront, api]}
+          change_id: {k: uuid, v: null}
+          duration_ms: {k: i, v: [2000, 45000]}
+      deploy_start_paused:
+        desc: Start of a deployment attempt during a config-change freeze.
+        lvl: INFO
+        msg: "deploy start app={app} env={env} change_id={change_id}"
+        vars:
+          app: {k: ch, v: [payments, storefront, api]}
+          env: {k: ch, v: [prod, staging]}
+          change_id: {k: uuid, v: null}
+      deploy_done_paused:
+        desc: Deployment failed because LB config changes were paused.
+        lvl: ERROR
+        msg: "deploy failed app={app} change_id={change_id} reason=lb_config_updates_paused"
+        vars:
+          app: {k: ch, v: [payments, storefront, api]}
+          change_id: {k: uuid, v: null}
+    beh:
+      n:
+        desc: Normal deployment service noise (very low).
+        emit: []
+      f:
+        desc: Same as normal; deployment logs are primarily request-driven.
+        emit: []
+
+  - id: config_master
+    name: LB Configuration Master
+    svc: lb-config-master
+    hosts: [cm-01, cm-02, cm-03]
+    desc: >
+      Control-plane master/replica service that reads configuration from the distributed file system and pushes it to GFEs.
+      It uses a canary test phase and may revert to a last-known-good configuration on failure.
+      It also responds to deploy tooling with accept/reject outcomes.
+    to:
+      - dst: gfs
+        proto: gfs
+        desc: Reads versioned LB configuration snapshots.
+      - dst: gfe
+        proto: grpc
+        desc: Pushes configuration snapshots to GFE proxy servers.
+      - dst: deploy_manager
+        proto: https
+        desc: Returns acceptance/rejection responses for deploy-driven config changes.
+    logs:
+      heartbeat:
+        desc: Periodic master/replica health log.
+        lvl: INFO
+        msg: "master heartbeat host={host} role={role} leader={leader}"
+        vars:
+          host: {k: ch, v: [cm-01, cm-02, cm-03]}
+          role: {k: ch, v: [leader, follower]}
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+      gfs_read_fail:
+        desc: Failure reading configuration snapshots from the distributed file system.
+        lvl: ERROR
+        msg: "gfs read failed leader={leader} cfg_path={cfg_path} err={err} since_s={since_s}"
+        vars:
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+          cfg_path: {k: str, v: "gfs:///lb-config/snapshots/<ver>.json"}
+          err: {k: ch, v: [io_timeout, permission_denied, stale_handle]}
+          since_s: {k: i, v: [1, 1800]}
+      pause_state:
+        desc: Periodic log indicating config updates are paused.
+        lvl: WARN
+        msg: "config updates paused=true reason={reason}"
+        vars:
+          reason: {k: ch, v: [incident_investigation, safety_freeze]}
+      push_start:
+        desc: Start of a configuration push cycle (includes canary stage).
+        lvl: INFO
+        msg: "config push start push_id={push_id} leader={leader} cfg_version={cfg_version} cfg_age_h={cfg_age_h} stage=canary"
+        vars:
+          push_id: {k: uuid, v: null}
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+        state_vars:
+          n:
+            cfg_version: {k: i, v: [120, 140]}
+            cfg_age_h: {k: f, v: [0.0, 2.0]}
+          f:
+            cfg_version: {k: i, v: [100, 130]}
+            cfg_age_h: {k: f, v: [8.0, 48.0]}
+      canary_result:
+        desc: Result of canary validation for a config push.
+        lvl: WARN
+        msg: "config canary result push_id={push_id} leader={leader} result={result} failed_checks={failed_checks}"
+        vars:
+          push_id: {k: uuid, v: null}
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+          failed_checks: {k: i, v: [0, 10]}
+        state_vars:
+          n:
+            result: {k: ch, v: [pass]}
+          f:
+            result: {k: ch, v: [fail]}
+      push_complete:
+        desc: Completion of the push cycle (global apply or revert).
+        lvl: INFO
+        msg: "config push complete push_id={push_id} leader={leader} action={action} global_version={cfg_version}"
+        vars:
+          push_id: {k: uuid, v: null}
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+        state_vars:
+          n:
+            action: {k: ch, v: [apply]}
+            cfg_version: {k: i, v: [120, 140]}
+          f:
+            action: {k: ch, v: [revert_to_known_good]}
+            cfg_version: {k: i, v: [100, 130]}
+      deploy_change_accepted:
+        desc: Control-plane accepted a deploy-driven LB config change.
+        lvl: INFO
+        msg: "deploy change accepted change_id={change_id} leader={leader}"
+        vars:
+          change_id: {k: uuid, v: null}
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+      deploy_change_rejected_paused:
+        desc: Control-plane rejected a deploy-driven change due to update pause.
+        lvl: WARN
+        msg: "deploy change rejected change_id={change_id} reason=updates_paused leader={leader}"
+        vars:
+          change_id: {k: uuid, v: null}
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+      leader_elected:
+        desc: Action marker for leadership/mastership change.
+        lvl: INFO
+        msg: "leader elected new_leader={leader} prev_leader={prev_leader}"
+        vars:
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+          prev_leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+      rollback_to_known_good:
+        desc: Action marker for reverting to a known-good configuration version.
+        lvl: WARN
+        msg: "rollback initiated leader={leader} revert_to_version={revert_to_version} observed_latest_readable={latest_readable_version}"
+        vars:
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+          revert_to_version: {k: i, v: [100, 130]}
+          latest_readable_version: {k: i, v: [100, 130]}
+      ops_switch_master:
+        desc: Operator action marker for switching to a different master server.
+        lvl: INFO
+        msg: "ops switched config master from={from_leader} to={to_leader}"
+        vars:
+          from_leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+          to_leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+      ops_force_config_push:
+        desc: Operator action marker for a one-time forced push/reload of a fresh configuration snapshot.
+        lvl: INFO
+        msg: "ops forced config push leader={leader} cfg_version={cfg_version} cfg_age_h={cfg_age_h} stage=global"
+        vars:
+          leader: {k: ch, v: [cm-01, cm-02, cm-03]}
+          cfg_version: {k: i, v: [120, 140]}
+          cfg_age_h: {k: f, v: [0.0, 2.0]}
+      ops_pause_updates:
+        desc: Operator action marker for pausing all LB configuration updates.
+        lvl: WARN
+        msg: "ops paused config updates=true duration_expected_h={duration_expected_h}"
+        vars:
+          duration_expected_h: {k: f, v: [1.0, 6.0]}
+    beh:
+      n:
+        desc: Normal control-plane background activity.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+          - id: gfs_read_fail
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: During failure, a leader with broken GFS access repeatedly logs read failures; updates-pause logs are event-controlled.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+          - id: gfs_read_fail
+            per_min: 2.0
+            scope: per_host
+          - id: pause_state
+            per_min: 0.5
+            scope: per_host
+
+  - id: gfs
+    name: Distributed File System
+    svc: gfs
+    hosts: [gfs-01]
+    desc: Distributed storage holding versioned load balancer configuration snapshots.
+    to: []
+    logs:
+      rpc_warn:
+        desc: Low-rate storage RPC warning.
+        lvl: WARN
+        msg: "storage rpc warn client={client} op={op} latency_ms={latency_ms}"
+        vars:
+          client: {k: ch, v: [lb-config-master]}
+          op: {k: ch, v: [read, list]}
+          latency_ms: {k: i, v: [20, 2000]}
+    beh:
+      n:
+        desc: Background warning noise.
+        emit:
+          - id: rpc_warn
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Similar noise; primary observability of GFS access loss is in the master's client logs.
+        emit:
+          - id: rpc_warn
+            per_min: 0.05
+            scope: global
+
+  - id: gfe
+    name: Google Frontend (GFE) Proxy Pool
+    svc: gfe
+    hosts: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]
+    desc: >
+      Frontend proxy servers that terminate client connections and route requests based on the current LB configuration.
+      They load new configuration snapshots pushed by the config master.
+      Large configuration deletions can trigger heavy garbage collection, which can degrade health checks and cause restarts.
+    to:
+      - dst: config_master
+        proto: grpc
+        desc: Sends acknowledgements/telemetry about config apply back to the control plane.
+    logs:
+      access_200:
+        desc: Successful client request served by the load balancer.
+        lvl: INFO
+        msg: "http access server={server} lb_id={lb_id} vip={vip} method={method} uri={uri} status=200 latency_ms={latency_ms} bytes_out={bytes_out}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          lb_id: {k: ch, v: [lb-az1, lb-az2, lb-az3]}
+          vip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/", "/api", "/login", "/healthz"]}
+          bytes_out: {k: i, v: [200, 40000]}
+        state_vars:
+          n:
+            latency_ms: {k: i, v: [8, 140]}
+          f:
+            latency_ms: {k: i, v: [10, 320]}
+      access_502_restart:
+        desc: Failed request due to frontend restart/instability.
+        lvl: INFO
+        msg: "http access server={server} lb_id={lb_id} vip={vip} method={method} uri={uri} status=502 latency_ms={latency_ms} error=frontend_restarting"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          lb_id: {k: ch, v: [lb-az1, lb-az2, lb-az3]}
+          vip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/", "/api", "/login", "/healthz"]}
+          latency_ms: {k: i, v: [5, 800]}
+      proxy_error_restart:
+        desc: Error detail emitted for 502s related to restarts/health-check watchdog.
+        lvl: ERROR
+        msg: "proxy error server={server} lb_id={lb_id} status=502 reason=process_restarting restart_reason={restart_reason}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          lb_id: {k: ch, v: [lb-az1, lb-az2, lb-az3]}
+          restart_reason: {k: ch, v: [healthcheck_failed, watchdog]}
+      access_502_config:
+        desc: Failed request because the required LB configuration is missing after rollback.
+        lvl: INFO
+        msg: "http access server={server} lb_id={lb_id} vip={vip} method={method} uri={uri} status=502 latency_ms={latency_ms} error=config_not_found"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          lb_id: {k: ch, v: [lb-new-7f, lb-new-a3]}
+          vip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/", "/api", "/login", "/healthz"]}
+          latency_ms: {k: i, v: [2, 120]}
+      proxy_error_config:
+        desc: Error detail emitted when a recently modified LB's config is not present.
+        lvl: ERROR
+        msg: "proxy error server={server} lb_id={lb_id} status=502 reason=config_missing active_cfg_version={active_cfg_version}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          lb_id: {k: ch, v: [lb-new-7f, lb-new-a3]}
+          active_cfg_version: {k: i, v: [100, 130]}
+      config_apply:
+        desc: GFE applied a pushed configuration snapshot.
+        lvl: INFO
+        msg: "config applied server={server} cfg_version={cfg_version} cfg_age_h={cfg_age_h} entries={entries}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          entries: {k: i, v: [200, 12000]}
+        state_vars:
+          n:
+            cfg_version: {k: i, v: [120, 140]}
+            cfg_age_h: {k: f, v: [0.0, 2.0]}
+          f:
+            cfg_version: {k: i, v: [100, 130]}
+            cfg_age_h: {k: f, v: [8.0, 48.0]}
+      config_apply_forced:
+        desc: Action-marker-style log for applying a fresh configuration during an emergency forced reload.
+        lvl: INFO
+        msg: "config applied server={server} cfg_version={cfg_version} cfg_age_h={cfg_age_h} entries={entries} source=forced_reload"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          cfg_version: {k: i, v: [120, 140]}
+          cfg_age_h: {k: f, v: [0.0, 2.0]}
+          entries: {k: i, v: [3000, 12000]}
+      gc_stats:
+        desc: Periodic garbage-collection metric log (elevated when many configurations are deleted).
+        lvl: WARN
+        msg: "gc stats server={server} deleted_cfg={deleted_cfg} gc_cpu_pct={gc_cpu_pct} heap_mb={heap_mb}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+        state_vars:
+          n:
+            deleted_cfg: {k: i, v: [0, 30]}
+            gc_cpu_pct: {k: i, v: [0, 15]}
+            heap_mb: {k: i, v: [600, 1600]}
+          f:
+            deleted_cfg: {k: i, v: [500, 6000]}
+            gc_cpu_pct: {k: i, v: [20, 95]}
+            heap_mb: {k: i, v: [900, 4200]}
+      process_restart:
+        desc: Supervisor log indicating the GFE process restarted.
+        lvl: ERROR
+        msg: "process restart server={server} reason={reason} downtime_ms={downtime_ms}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          reason: {k: ch, v: [healthcheck_failed, watchdog]}
+          downtime_ms: {k: i, v: [10000, 90000]}
+      cpu_sample:
+        desc: Periodic CPU utilization sample.
+        lvl: INFO
+        msg: "cpu sample server={server} cpu_pct={cpu_pct}"
+        vars:
+          server: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          cpu_pct: {k: i, v: [5, 98]}
+      bulk_config_reload:
+        desc: Action marker for a bulk config reload triggered by control-plane rollback.
+        lvl: WARN
+        msg: "bulk config reload initiated target_version={cfg_version} impacted_cfg_deleted={deleted_cfg}"
+        vars:
+          cfg_version: {k: i, v: [100, 130]}
+          deleted_cfg: {k: i, v: [500, 6000]}
+    beh:
+      n:
+        desc: Normal GFE background metrics and low GC.
+        emit:
+          - id: cpu_sample
+            per_min: 1.0
+            scope: per_host
+          - id: gc_stats
+            per_min: 0.4
+            scope: per_host
+      f:
+        desc: Failure baseline keeps normal periodic metrics; GC/restarts are event-amplified when the stale rollback triggers deletions.
+        emit:
+          - id: cpu_sample
+            per_min: 1.0
+            scope: per_host
+          - id: gc_stats
+            per_min: 0.4
+            scope: per_host
+          - id: process_restart
+            per_min: 0.02
+            scope: per_host
+
+  - id: health_checker
+    name: GFE Health Checker
+    svc: gfe-health
+    hosts: [hc-01, hc-02]
+    desc: >
+      Health checking component that monitors GFE instances. Under heavy GC the GFE may fail checks,
+      be marked unhealthy, and restart.
+    to:
+      - dst: gfe
+        proto: tcp
+        desc: Performs periodic health checks against each GFE instance.
+    logs:
+      hc_failed:
+        desc: Health check failed for a GFE instance.
+        lvl: WARN
+        msg: "health check failed target={target} check={check} err={err} consecutive_failures={consecutive_failures}"
+        vars:
+          target: {k: ch, v: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]}
+          check: {k: ch, v: [gfe_proxy_health]}
+          err: {k: ch, v: [timeout, connection_refused]}
+          consecutive_failures: {k: i, v: [1, 20]}
+    beh:
+      n:
+        desc: Occasional transient health check failures.
+        emit:
+          - id: hc_failed
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Failure baseline remains near-normal; check failures are event-amplified during GC pressure.
+        emit:
+          - id: hc_failed
+            per_min: 0.05
+            scope: global
+
+  - id: monitoring
+    name: Monitoring & Paging
+    svc: monitoring
+    hosts: [mon-01]
+    desc: Sends alerts/pages when error rates or health check failures exceed thresholds.
+    to: []
+    logs:
+      page_sent:
+        desc: Paging action marker for incident response.
+        lvl: CRITICAL
+        msg: "page sent policy={policy} signal={signal} value={value} incident_key={incident_key}"
+        vars:
+          policy: {k: ch, v: [lb_error_rate, gfe_health]}
+          signal: {k: ch, v: [http_502_rate, health_check_fail_rate]}
+          value: {k: f, v: [0.1, 1.0]}
+          incident_key: {k: str, v: "INC-<7digits>"}
+    beh:
+      n:
+        desc: No periodic emissions in this model; paging is event-driven.
+        emit: []
+      f:
+        desc: No periodic emissions in this model; paging is event-driven.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal client traffic and routine configuration updates/deployments.
+    req:
+      - id: client_https_request_ok_n
+        desc: Successful client HTTPS request served by a stable load balancer.
+        rpm: 700.0
+        path: [gfe]
+        emit: [gfe.access_200]
+        latency_ms: [[20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: lb_config_push_cycle_n
+        desc: Routine configuration push cycle (canary then global) under normal conditions.
+        rpm: 0.5
+        path: [config_master, gfe, config_master]
+        emit: [config_master.push_start, config_master.canary_result, gfe.config_apply, config_master.push_complete]
+        latency_ms: [[30, 120], [50, 250], [200, 1200], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: app_flex_deploy_success_n
+        desc: Deployment that requires an LB config change and completes successfully.
+        rpm: 1.5
+        path: [deploy_manager, config_master, deploy_manager]
+        emit: [deploy_manager.deploy_start_ok, config_master.deploy_change_accepted, deploy_manager.deploy_done_ok]
+        latency_ms: [[10, 80], [30, 250], [2000, 45000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Failure includes stale configuration push, later GFE GC/restarts, and later a config-update freeze affecting deployments.
+    req:
+      - id: client_https_request_stable_ok_f
+        desc: Client request on stable load balancers that still succeeds (possibly with elevated latency).
+        rpm: 525.0
+        path: [gfe]
+        emit: [gfe.access_200]
+        latency_ms: [[25, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: client_https_request_stable_502_restart_f
+        desc: Intermittent 502s on stable load balancers due to GFE health-check failures and restarts.
+        rpm: 145.0
+        path: [gfe]
+        emit: [gfe.access_502_restart, gfe.proxy_error_restart]
+        latency_ms: [[10, 500], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: client_https_request_recent_502_config_f
+        desc: 502s for recently modified load balancers whose config entries are missing after rollback to a stale config.
+        rpm: 30.0
+        path: [gfe]
+        emit: [gfe.access_502_config, gfe.proxy_error_config]
+        latency_ms: [[5, 80], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: lb_config_push_cycle_f
+        desc: Configuration push cycles while the system is in the stale-config failure mode.
+        rpm: 0.5
+        path: [config_master, gfe, config_master]
+        emit: [config_master.push_start, config_master.canary_result, gfe.config_apply, config_master.push_complete]
+        latency_ms: [[40, 250], [50, 300], [300, 3000], [20, 150]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: app_flex_deploy_success_f
+        desc: Deployments that still succeed before updates are paused.
+        rpm: 1.5
+        path: [deploy_manager, config_master, deploy_manager]
+        emit: [deploy_manager.deploy_start_ok, config_master.deploy_change_accepted, deploy_manager.deploy_done_ok]
+        latency_ms: [[10, 80], [40, 350], [2000, 45000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: app_flex_deploy_fail_paused_f
+        desc: Deployment attempts fail because LB configuration changes are paused after the incident.
+        rpm: 1.0
+        path: [deploy_manager, config_master, deploy_manager]
+        emit: [deploy_manager.deploy_start_paused, config_master.deploy_change_rejected_paused, deploy_manager.deploy_done_paused]
+        latency_ms: [[10, 80], [20, 200], [50, 500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Names and architecture are simplified: GFE proxies represent the HTTP(S) LB data plane; config_master represents the config update master/replicas.
+  - |
+    The post-mortem's ~25% 502 rate is modeled as a mixture of (a) intermittent restart-driven 502s on stable LBs and (b) 100% 502s for a small "recently modified"
+    LB subset with missing config entries after rollback.
+  - |
+    To keep restart-attributed 502 volume plausible, GFE restarts during the GC storm are modeled as relatively frequent and with longer downtime windows (10s–90s),
+    and the restart background rate is strongly event-amplified only during the GC interval.
+  - |
+    Failure-onset cleanliness: GFE GC/health-check/restart background signals are kept near normal in beh.f and are suppressed at failure start via event-1 multipliers,
+    then amplified starting at the later GC event so they do not appear before the narrative says they begin.
+  - |
+    Semantic-carrier binding fix: cfg_version is state-dependent for config_master.push_* and gfe.config_apply so that stale-rollback failure mode emits only older versions (100–130),
+    while fresh forced-reload markers emit only newer versions (120–140).
+  - |
+    Configuration push is modeled as a low-rate flow plus explicit one-shot markers for leadership change, rollback, master switch, and update pause so key control-plane actions are guaranteed visible.
+    A one-time "forced config push" is modeled as one-shots (config_master.ops_force_config_push + gfe.config_apply_forced) to represent mitigation while regular push cycles remain paused.
+  - |
+    Normal traffic is ~700 rpm with one access log per success; failure traffic remains ~700 rpm with additional error-detail logs on 502s.
+  - |
+    Normal-phase background logs/min estimate: ~12/min (mostly per-host GFE cpu/gc and config_master heartbeats).
+    Scenario total estimated logs over 40 minutes: ~33k–37k (client access logs dominate), within the 20k–100k requirement.
+  - |
+    Key diagnostic signals likely visible: elevated config_master.gfs_read_fail during failure; event-amplified gfe.gc_stats and health_checker.hc_failed; many gfe.process_restart during the GC interval;
+    missing-config 502 evidence (gfe.access_502_config + gfe.proxy_error_config); and explicit one-shot action markers including config_master.ops_force_config_push and gfe.config_apply_forced at mitigation time.
+```

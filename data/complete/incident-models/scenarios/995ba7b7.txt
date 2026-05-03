@@ -1,0 +1,191 @@
+```yaml
+scenario:
+  id: tq_long_downtime_campaign_log_channel_stall
+  title: Campaign logging channel backpressure stalls nodes during cluster startup
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The Tranquillity cluster normally runs with a stable login rate and routine background monitoring.
+    During a hotfix deployment, the cluster is restarted and must advance all nodes through startup stages (-4..0).
+    As nodes load sovereignty campaigns at stage -1, a high volume of developer logging on the "campaign" channel becomes backpressured, causing nodes to block, miss heartbeats, and drop out.
+    Polaris remains stuck waiting at stage -1 and the login gateway rejects players with maintenance responses for the remainder of the modeled window.
+
+  trigger_desc: |
+    Operations deploys a sovereignty hotfix and initiates a cluster startup; campaign-related startup work emits heavy logging on a channel that becomes backpressured on Tranquillity.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        The cluster is online and accepting players. Login requests are routed through the gateway to worker nodes,
+        and Polaris emits a steady "cluster ready" marker. The log collector shows normal ingestion and rare backpressure.
+      flows: [player_login_ok]
+      manifestation:
+        - login_gateway.login_ok
+        - game_node.session_created
+        - polaris_master.cluster_ready
+        - log_collector.ingest_stats
+
+    f:
+      desc: |
+        After the deployment, the cluster attempts to start but cannot complete stage -1 across all nodes.
+        Campaign-related startup work triggers a surge of campaign-channel logs. The log collector applies backpressure,
+        worker nodes block in logging, and Polaris observes stalled progress and later dead nodes, preventing stage 0 readiness.
+        Players attempting to connect are rejected due to maintenance mode.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: ops_console
+          event: |
+            The hotfix deploy completes and Ops initiates startup; stage reports increase and campaign-channel logs begin to surge.
+            Polaris starts reporting that startup is waiting at stage -1 with a non-zero stuck node count.
+          why: |
+            Campaign loading during stage -1 emits developer logs to the "campaign" channel; on Tranquillity this channel experiences
+            collector backpressure, causing synchronous logging to block and delaying node startup progress (directly visible via
+            logger_backpressure and log_collector.queue_high).
+          flows: [node_stage_report, campaign_log_line, player_login_maintenance]
+          rate_multipliers:
+            node_stage_report: 1.8
+            campaign_log_line: 4.0
+            game_node.logger_backpressure: 4.0
+            log_collector.queue_high: 3.0
+            polaris_master.startup_waiting: 1.5
+            polaris_master.node_dead_detected: 0.0
+            game_node.process_exit: 0.0
+          latency_multipliers:
+            node_stage_report: {p50: 1.5, p95: 4.0}
+          one_shots:
+            - ref: deployment_tool.deploy_complete
+              count: 1
+              hosts: [deploy-01]
+            - ref: ops_console.cmd_startup
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - polaris_master.startup_waiting
+            - game_node.logger_backpressure
+            - log_collector.queue_high
+            - login_gateway.login_maintenance
+
+        - order: 2
+          at_min: 26
+          component: ops_console
+          event: |
+            Ops requests a full reboot and retries startup. Campaign-channel logging remains heavy and Polaris reports more nodes
+            as stuck at stage -1; the collector backpressure warnings become more frequent.
+          why: |
+            The reboot restarts the same startup workload and campaign logging; the backpressured channel continues to block nodes.
+            This is visible as increased logger_backpressure and queue_high frequency while DB slow-query noise stays secondary.
+          flows: [node_stage_report, campaign_log_line, player_login_maintenance]
+          rate_multipliers:
+            node_stage_report: 2.3
+            campaign_log_line: 6.0
+            game_node.logger_backpressure: 6.0
+            log_collector.queue_high: 5.0
+            polaris_master.startup_waiting: 2.0
+          latency_multipliers:
+            node_stage_report: {p50: 2.0, p95: 6.0}
+          one_shots:
+            - ref: ops_console.cmd_reboot
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - polaris_master.startup_waiting
+            - log_collector.queue_high
+            - game_node.logger_backpressure
+
+        - order: 3
+          at_min: 33
+          component: ops_console
+          event: |
+            Ops runs a live-console "load_campaigns" across all nodes to reproduce the issue. Campaign-channel logging spikes further,
+            nodes begin timing out and dropping, and Polaris starts emitting dead-node detections and remaps.
+          why: |
+            The live command amplifies campaign-channel logging volume; when the collector backpressures, nodes block longer, miss heartbeats,
+            and are marked dead by Polaris (observable via node_dead_detected alongside sustained backpressure signals).
+          flows: [node_stage_report, campaign_log_line, player_login_maintenance]
+          rate_multipliers:
+            node_stage_report: 1.2
+            campaign_log_line: 18.0
+            game_node.logger_backpressure: 15.0
+            game_node.process_exit: 4.0
+            log_collector.queue_high: 12.0
+            polaris_master.startup_waiting: 2.5
+            polaris_master.node_dead_detected: 6.0
+          latency_multipliers:
+            node_stage_report: {p50: 2.5, p95: 10.0}
+          one_shots:
+            - ref: ops_console.cmd_load_campaigns
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - polaris_master.node_dead_detected
+            - game_node.process_exit
+            - log_collector.queue_high
+            - game_node.logger_backpressure
+
+      steady:
+        - component: polaris_master
+          condition: |
+            Polaris remains in "startup waiting" at stage -1 because not all nodes can complete initialization; intermittent node deaths
+            force remapping and prevent the cluster from reaching stage 0.
+          user_impact: |
+            The cluster cannot open; player connections are rejected due to maintenance mode.
+          manifestation:
+            - polaris_master.startup_waiting
+            - polaris_master.node_dead_detected
+        - component: log_collector
+          condition: |
+            The campaign logging channel stays under backpressure with elevated queue depth, correlating with node stalls.
+          user_impact: |
+            Operators have reduced confidence in logs and see delayed/blocked startup progress.
+          manifestation:
+            - log_collector.queue_high
+            - log_collector.ingest_stats
+        - component: game_node
+          condition: |
+            Nodes experience frequent logging backpressure and occasional exits after missed deadlines/heartbeats during campaign-related work.
+          user_impact: |
+            Even if some nodes start, the cluster as a whole remains unavailable and unstable.
+          manifestation:
+            - game_node.logger_backpressure
+            - game_node.process_exit
+
+      feedback_loops:
+        - id: backpressure_to_dead_nodes
+          desc: |
+            Campaign-channel log volume increases collector backpressure; synchronous logging blocks worker threads,
+            which delays startup and heartbeats. Polaris marks nodes dead, causing remaps and additional work on surviving nodes,
+            which in turn can generate more campaign-related processing and logging pressure.
+
+      flows: [node_stage_report, campaign_log_line, player_login_maintenance]
+      manifestation:
+        - polaris_master.startup_waiting
+        - log_collector.queue_high
+        - game_node.logger_backpressure
+        - login_gateway.login_maintenance
+
+  assumptions:
+    - |
+        This scenario models the incident window up to the point where node deaths and log-channel backpressure are clearly established;
+        the later mitigation (removing campaign logging) and recovery are intentionally not modeled so the scenario ends in failure.
+    - |
+        Failure-phase piecewise volume estimate (20 minutes total), mapped to ingest_stats.eps (events/sec):
+          - mins 20–26 (6m, after Event 1): ~700 logs/min ≈ 12 eps (elevated stage reports + campaign logs + backpressure) plus background.
+          - mins 26–33 (7m, after Event 2): ~950 logs/min ≈ 16 eps as retries increase stage reports and campaign logging.
+          - mins 33–40 (7m, after Event 3): ~1600–1700 logs/min ≈ 27–28 eps due to a campaign logging spike plus node-exit/dead-node signals.
+        Dead-node detections and process exits are explicitly suppressed from mins 20–33 via multipliers=0.0 so they first appear after Event 3, matching the narrative.
+    - |
+        One-shots: 4 total (deploy_complete at min 20; cmd_startup at min 20; cmd_reboot at min 26; cmd_load_campaigns at min 33).
+    - |
+        Total estimated logs over 40 minutes: normal ~11k–13k and failure ~20k–25k, totaling ~31k–38k (within 20k–100k).
+        Visibility rationale: queue_high, logger_backpressure, startup_waiting, and (post-Event-3) node_dead_detected/process_exit are rate-backed
+        and appear repeatedly once their multipliers take effect; ingest_stats.eps now matches the modeled overall emission order-of-magnitude.
+```

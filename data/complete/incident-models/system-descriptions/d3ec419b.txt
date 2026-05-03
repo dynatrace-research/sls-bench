@@ -1,0 +1,750 @@
+```yaml
+sys:
+  id: roblox_hashistack_consul_outage
+  desc: >
+    An on-prem microservices platform where backend services rely on a central Consul cluster for service discovery,
+    health checks, and KV coordination, plus Vault for secrets and Nomad for scheduling. Clients reach the platform
+    through an edge gateway that routes requests to a representative game backend service. During the incident, a
+    Consul watcher streaming feature under extreme read+write churn caused severe internal stalls and KV write latency,
+    and a separate Raft log store pathology later caused intermittent slow leaders, prolonging instability and blocking
+    return-to-service actions.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_gateway
+    name: Edge Gateway
+    svc: edge-gw
+    hosts: [edge-1, edge-2]
+    desc: Terminates client HTTPS and routes requests to backend services. Serves a maintenance response when upstreams are unavailable.
+    to:
+      - dst: game_service
+        proto: https
+        desc: Forwards client API calls to the game backend service.
+    logs:
+      req_in:
+        desc: Client request received at the edge.
+        lvl: INFO
+        msg: "req {req_id} {method} {route} from {client_ip}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/api/join, /api/session]}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+      resp_ok:
+        desc: Successful response sent to client.
+        lvl: INFO
+        msg: "resp {req_id} status={status} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: [200, 302]}
+          dur_ms: {k: i, v: [10, 800]}
+      resp_err:
+        desc: Error/maintenance response sent to client.
+        lvl: WARN
+        msg: "resp {req_id} status={status} dur_ms={dur_ms} reason={reason}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: [503, 504]}
+          dur_ms: {k: i, v: [10, 6000]}
+          reason: {k: ch, v: [maintenance, upstream_timeout, upstream_unhealthy]}
+      upstream_err:
+        desc: Edge observed an upstream failure while proxying.
+        lvl: WARN
+        msg: "upstream error {req_id} svc={svc} err={err} after_ms={after_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          svc: {k: ch, v: [game-service]}
+          err: {k: ch, v: [timeout, connect_refused, no_endpoints]}
+          after_ms: {k: i, v: [50, 5000]}
+    beh:
+      n:
+        desc: Edge is mostly quiet outside of request logs.
+        emit: []
+      f:
+        desc: Edge is mostly quiet outside of request logs.
+        emit: []
+
+  - id: game_service
+    name: Game Backend Service
+    svc: game-service
+    hosts: [gs-1, gs-2, gs-3]
+    desc: Representative backend service that uses Consul for discovery/health checks and Vault for secrets-based auth.
+    to:
+      - dst: consul_cluster
+        proto: grpc
+        desc: Service discovery lookups and health check KV writes.
+      - dst: vault
+        proto: https
+        desc: Fetches secrets/tokens needed to handle requests.
+      - dst: edge_gateway
+        proto: https
+        desc: Returns responses through the edge gateway (modeled as a logical hop for path connectivity).
+    logs:
+      handle_start:
+        desc: Start handling an API request.
+        lvl: DEBUG
+        msg: "handle {req_id} op={op} user={user_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: [join, session]}
+          user_id: {k: i, v: [100000, 999999]}
+      consul_lookup_ok:
+        desc: Service discovery lookup succeeded.
+        lvl: DEBUG
+        msg: "consul lookup ok {req_id} service={service} endpoint={endpoint} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          service: {k: ch, v: [matchmaker, session-svc]}
+          endpoint: {k: str, v: "ip:port"}
+          dur_ms: {k: i, v: [1, 200]}
+      consul_lookup_fail:
+        desc: Service discovery lookup failed or timed out.
+        lvl: ERROR
+        msg: "consul lookup failed {req_id} service={service} err={err} waited_ms={waited_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          service: {k: ch, v: [matchmaker, session-svc]}
+          err: {k: ch, v: [deadline_exceeded, no_leader, rpc_unavailable]}
+          waited_ms: {k: i, v: [200, 6000]}
+      vault_call:
+        desc: Client-side call to Vault initiated (internal auth step).
+        lvl: DEBUG
+        msg: "vault call {req_id} path={path}"
+        vars:
+          req_id: {k: hex, v: 16}
+          path: {k: ch, v: [secret/data/game/auth, secret/data/game/session]}
+      vault_auth_fail:
+        desc: Vault auth step failed.
+        lvl: ERROR
+        msg: "vault auth failed {req_id} err={err} waited_ms={waited_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          err: {k: ch, v: [vault_500, vault_timeout]}
+          waited_ms: {k: i, v: [200, 6000]}
+      done_ok:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: "done {req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 1200]}
+      done_err:
+        desc: Request failed due to dependency issues.
+        lvl: WARN
+        msg: "done {req_id} status={status} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: [503, 504]}
+          dur_ms: {k: i, v: [200, 7000]}
+      health_put:
+        desc: Periodic healthcheck/KV write attempt to Consul.
+        lvl: INFO
+        msg: "healthcheck update svc={svc} inst={inst_id} ttl_s={ttl_s}"
+        vars:
+          svc: {k: ch, v: [game-service]}
+          inst_id: {k: hex, v: 8}
+          ttl_s: {k: i, v: [30, 120]}
+      health_put_ok:
+        desc: Healthcheck/KV write succeeded.
+        lvl: DEBUG
+        msg: "healthcheck update committed svc={svc} inst={inst_id} dur_ms={dur_ms}"
+        vars:
+          svc: {k: ch, v: [game-service]}
+          inst_id: {k: hex, v: 8}
+          dur_ms: {k: i, v: [5, 400]}
+      health_put_timeout:
+        desc: Healthcheck/KV write timed out.
+        lvl: WARN
+        msg: "healthcheck update timed out svc={svc} inst={inst_id} waited_ms={waited_ms}"
+        vars:
+          svc: {k: ch, v: [game-service]}
+          inst_id: {k: hex, v: 8}
+          waited_ms: {k: i, v: [500, 6000]}
+      retrying:
+        desc: Retry marker for dependency operations (attempts 2..N).
+        lvl: DEBUG
+        msg: "retrying op={op} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          op: {k: ch, v: [health_put, vault_call]}
+          attempt: {k: i, v: [2, 4]}
+          backoff_ms: {k: i, v: [50, 1500]}
+      heartbeat:
+        desc: Instance heartbeat (background noise).
+        lvl: INFO
+        msg: "heartbeat svc={svc} inst={inst_id}"
+        vars:
+          svc: {k: ch, v: [game-service]}
+          inst_id: {k: hex, v: 8}
+    beh:
+      n:
+        desc: Light background heartbeat from a few instances.
+        emit:
+          - id: heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Heartbeat continues during the outage from remaining instances.
+        emit:
+          - id: heartbeat
+            per_min: 0.5
+            scope: per_host
+
+  - id: consul_cluster
+    name: Consul Cluster
+    svc: consul
+    hosts: [consul-v1, consul-v2, consul-v3, consul-v4, consul-v5, consul-r1, consul-r2, consul-r3, consul-r4, consul-r5]
+    desc: Central service discovery/KV/health-check cluster using Raft; voters elect a leader and replicate state. During failure, watcher delivery stalls and later Raft log store overhead impair write performance and leadership stability.
+    to:
+      - dst: game_service
+        proto: grpc
+        desc: Serves discovery and KV operations for services (modeled as a logical return edge for flow paths).
+      - dst: vault
+        proto: grpc
+        desc: Serves Vault storage operations (modeled as a logical return edge for flow paths).
+      - dst: nomad
+        proto: grpc
+        desc: Serves Nomad session/lock coordination (modeled as a logical return edge for flow paths).
+    logs:
+      kv_metric_ok:
+        desc: Periodic performance metric showing healthy KV apply and Raft commit latencies.
+        lvl: INFO
+        msg: "kv_apply p50_ms={p50_ms} p95_ms={p95_ms} raft_commit_p50_ms={raft_p50_ms}"
+        vars:
+          p50_ms: {k: i, v: [10, 300]}
+          p95_ms: {k: i, v: [30, 800]}
+          raft_p50_ms: {k: i, v: [5, 200]}
+      kv_metric_bad:
+        desc: Periodic performance metric showing degraded KV apply and Raft commit latencies.
+        lvl: WARN
+        msg: "kv_apply p50_ms={p50_ms} p95_ms={p95_ms} raft_commit_p50_ms={raft_p50_ms}"
+        vars:
+          p50_ms: {k: i, v: [800, 3500]}
+          p95_ms: {k: i, v: [1500, 8000]}
+          raft_p50_ms: {k: i, v: [500, 4000]}
+      watch_delivery_stall:
+        desc: Watch/update delivery is lagging behind, indicating the server is struggling to keep up with watch fanout under load.
+        lvl: WARN
+        msg: "watch delivery lag mode={mode} dispatch_ms={dispatch_ms} active_watches={active_watches}"
+        vars:
+          mode: {k: ch, v: [stream, longpoll]}
+          dispatch_ms: {k: i, v: [50, 5000]}
+          active_watches: {k: i, v: [1000, 60000]}
+      raft_leader_change:
+        desc: Leader election event (normal occasionally; elevated during instability).
+        lvl: INFO
+        msg: "raft leader elected node={node} term={term}"
+        vars:
+          node: {k: ch, v: [consul-v1, consul-v2, consul-v3, consul-v4, consul-v5]}
+          term: {k: i, v: [1000, 2000]}
+      raft_append_slow:
+        desc: Slow Raft log append/replication on the leader, often coinciding with TCP backpressure.
+        lvl: WARN
+        msg: "raft append slow leader={node} append_ms={append_ms} tcp_zero_window={zero_win_pct}"
+        vars:
+          node: {k: ch, v: [consul-v1, consul-v2, consul-v3, consul-v4, consul-v5]}
+          append_ms: {k: i, v: [200, 5000]}
+          zero_win_pct: {k: i, v: [0, 100]}
+      raft_log_store_pressure:
+        desc: Raft log store shows high space/metadata overhead, correlating with higher write amplification and slower appends.
+        lvl: WARN
+        msg: "raft log store pressure db={db} file_gb={file_gb} free_pages_k={free_k} meta_write_kb={meta_kb}"
+        vars:
+          db: {k: ch, v: [raft-log.store]}
+          file_gb: {k: f, v: [0.5, 8.0]}
+          free_k: {k: i, v: [10, 1500]}
+          meta_kb: {k: i, v: [64, 12000]}
+    beh:
+      n:
+        desc: Healthy periodic metrics; leader changes are infrequent.
+        emit:
+          - id: kv_metric_ok
+            per_min: 1.0
+            scope: per_host
+          - id: raft_leader_change
+            per_min: 0.08
+            scope: global
+      f:
+        desc: Failure baseline includes degraded latency metrics, watch delivery stalls, and elevated leader churn; some symptoms are activated or suppressed by scenario events.
+        emit:
+          - id: kv_metric_ok
+            per_min: 1.0
+            scope: per_host
+          - id: kv_metric_bad
+            per_min: 1.0
+            scope: per_host
+          - id: watch_delivery_stall
+            per_min: 0.7
+            scope: per_host
+          - id: raft_leader_change
+            per_min: 0.6
+            scope: global
+          - id: raft_append_slow
+            per_min: 0.2
+            scope: per_host
+          - id: raft_log_store_pressure
+            per_min: 0.1
+            scope: per_host
+
+  - id: vault
+    name: Vault
+    svc: vault
+    hosts: [vault-1, vault-2]
+    desc: Secrets service whose storage backend uses Consul; when Consul is slow/unavailable, Vault requests time out or error.
+    to:
+      - dst: consul_cluster
+        proto: grpc
+        desc: Uses Consul for storage operations.
+      - dst: game_service
+        proto: https
+        desc: Returns secrets to requesting services (modeled as a logical return edge for flow paths).
+    logs:
+      req:
+        desc: Vault request received.
+        lvl: INFO
+        msg: "vault req {req_id} op={op} path={path}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: [read]}
+          path: {k: ch, v: [secret/data/game/auth, secret/data/game/session]}
+      resp_ok:
+        desc: Vault request succeeded.
+        lvl: INFO
+        msg: "vault resp {req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 800]}
+      storage_latency:
+        desc: Consul storage operation took longer than expected.
+        lvl: WARN
+        msg: "consul storage slow op={op} waited_ms={waited_ms}"
+        vars:
+          op: {k: ch, v: [get, put]}
+          waited_ms: {k: i, v: [200, 6000]}
+      resp_fail:
+        desc: Vault request failed due to backend/storage issues.
+        lvl: ERROR
+        msg: "vault resp {req_id} status={status} err={err} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: [500, 503, 504]}
+          err: {k: ch, v: [storage_timeout, no_consul_leader]}
+          dur_ms: {k: i, v: [200, 8000]}
+      heartbeat:
+        desc: Vault periodic status log.
+        lvl: INFO
+        msg: "vault heartbeat sealed={sealed}"
+        vars:
+          sealed: {k: ch, v: [false]}
+    beh:
+      n:
+        desc: Low-rate status logging.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Low-rate status logging.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+
+  - id: nomad
+    name: Nomad Scheduler
+    svc: nomad
+    hosts: [nomad-1, nomad-2]
+    desc: Schedules jobs and relies on Consul for service registration and session locks; impaired when Consul is unhealthy.
+    to:
+      - dst: consul_cluster
+        proto: grpc
+        desc: Uses Consul sessions/locks for coordination.
+    logs:
+      eval_start:
+        desc: Nomad begins evaluating a scheduling request.
+        lvl: INFO
+        msg: "eval {eval_id} job={job} action={action}"
+        vars:
+          eval_id: {k: hex, v: 12}
+          job: {k: ch, v: [cache, core-services]}
+          action: {k: ch, v: [plan, run]}
+      eval_ok:
+        desc: Nomad evaluation succeeded.
+        lvl: INFO
+        msg: "eval done {eval_id} result=ok dur_ms={dur_ms}"
+        vars:
+          eval_id: {k: hex, v: 12}
+          dur_ms: {k: i, v: [20, 1200]}
+      consul_lock_fail:
+        desc: Nomad failed to acquire/renew a Consul lock/session.
+        lvl: WARN
+        msg: "consul session lock failed job={job} err={err} waited_ms={waited_ms}"
+        vars:
+          job: {k: ch, v: [cache, core-services]}
+          err: {k: ch, v: [no_leader, deadline_exceeded]}
+          waited_ms: {k: i, v: [200, 6000]}
+      heartbeat:
+        desc: Nomad periodic status log.
+        lvl: INFO
+        msg: "nomad heartbeat schedulers={schedulers}"
+        vars:
+          schedulers: {k: i, v: [1, 3]}
+    beh:
+      n:
+        desc: Low-rate status logging.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Low-rate status logging.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+
+  - id: telemetry_collector
+    name: Telemetry Collector
+    svc: telemetry
+    hosts: [tel-1]
+    desc: Monitoring/alerting pipeline that, in this incident, depends on Consul-based discovery; when Consul is unhealthy, visibility degrades.
+    to:
+      - dst: consul_cluster
+        proto: http
+        desc: Uses Consul for target discovery.
+    logs:
+      scrape_ok:
+        desc: Successful scrape of a target.
+        lvl: INFO
+        msg: "scrape target={target} samples={samples} dur_ms={dur_ms}"
+        vars:
+          target: {k: ch, v: [edge-gw, game-service, vault, nomad, consul]}
+          samples: {k: i, v: [50, 5000]}
+          dur_ms: {k: i, v: [5, 2000]}
+      discovery_fail:
+        desc: Target discovery refresh failed due to Consul issues.
+        lvl: ERROR
+        msg: "service discovery refresh failed backend=consul err={err}"
+        vars:
+          err: {k: ch, v: [deadline_exceeded, no_leader, connection_refused]}
+      alert_gap:
+        desc: Alert delivery delays due to backlog or missing scrapes.
+        lvl: WARN
+        msg: "alert delivery delayed backlog={backlog} reason={reason}"
+        vars:
+          backlog: {k: i, v: [0, 5000]}
+          reason: {k: ch, v: [scrape_failures, discovery_downstream]}
+    beh:
+      n:
+        desc: Regular scraping with rare alert backlog.
+        emit:
+          - id: scrape_ok
+            per_min: 2.0
+            scope: global
+          - id: alert_gap
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Discovery failures become common and alert delivery can lag.
+        emit:
+          - id: scrape_ok
+            per_min: 0.5
+            scope: global
+          - id: discovery_fail
+            per_min: 2.0
+            scope: global
+          - id: alert_gap
+            per_min: 0.5
+            scope: global
+
+  - id: ops_control
+    name: Operations Control Plane
+    svc: ops
+    hosts: [ops-1]
+    desc: Human/operator actions recorded as discrete markers (feature toggles, iptables blocks, snapshot restores, leader stepdowns).
+    to:
+      - dst: consul_cluster
+        proto: ssh
+        desc: Applies operational changes to Consul nodes and related configs.
+    logs:
+      streaming_enable:
+        desc: Streaming feature enabled for Consul watchers via config rollout.
+        lvl: INFO
+        msg: "config push {change_id} component=consul key=consul.streaming value=enabled"
+        vars:
+          change_id: {k: hex, v: 10}
+      streaming_disable:
+        desc: Streaming feature disabled for Consul watchers via config rollout.
+        lvl: INFO
+        msg: "config push {change_id} component=consul key=consul.streaming value=disabled"
+        vars:
+          change_id: {k: hex, v: 10}
+      iptables_block:
+        desc: iptables rules applied to block traffic to Consul.
+        lvl: INFO
+        msg: "iptables add on consul: {rule}"
+        vars:
+          rule: {k: ch, v: ["DROP tcp/8300", "DROP tcp/8500"]}
+      iptables_unblock:
+        desc: iptables rules removed to allow traffic to Consul.
+        lvl: INFO
+        msg: "iptables remove on consul: {rule}"
+        vars:
+          rule: {k: ch, v: ["DROP tcp/8300", "DROP tcp/8500"]}
+      consul_snapshot_restore:
+        desc: Snapshot restore operation executed on Consul.
+        lvl: INFO
+        msg: "consul snapshot restore snapshot={snapshot_id} result={result}"
+        vars:
+          snapshot_id: {k: hex, v: 12}
+          result: {k: ch, v: [ok, failed]}
+      leader_stepdown:
+        desc: Operator forces a leader to step down to avoid a slow leader.
+        lvl: WARN
+        msg: "force raft leader stepdown node={node} reason={reason}"
+        vars:
+          node: {k: ch, v: [consul-v1, consul-v2, consul-v3, consul-v4, consul-v5]}
+          reason: {k: ch, v: [slow_append, suspected_disk_stall]}
+    beh:
+      n:
+        desc: No periodic emissions; only emits via one-shot operational actions.
+        emit: []
+      f:
+        desc: No periodic emissions; only emits via one-shot operational actions.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operations include player API calls and steady internal health-check writes to Consul, with Vault and Nomad
+      functioning normally.
+    req:
+      - id: player_login
+        desc: Player joins/starts a session; backend discovers dependencies via Consul and authenticates via Vault.
+        rpm: 120.0
+        path: [edge_gateway, game_service, consul_cluster, game_service, vault, consul_cluster, vault, game_service, edge_gateway]
+        emit:
+          - edge_gateway.req_in
+          - game_service.handle_start
+          - game_service.consul_lookup_ok
+          - vault.req
+          - vault.resp_ok
+          - game_service.done_ok
+          - edge_gateway.resp_ok
+        latency_ms:
+          - [1, 10]
+          - [1, 20]
+          - [2, 80]
+          - [5, 120]
+          - [5, 200]
+          - [10, 400]
+          - [1, 10]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: healthcheck_kv_put_ok
+        desc: Periodic service health/TTL updates written to Consul KV.
+        rpm: 300.0
+        path: [game_service, consul_cluster]
+        emit:
+          - game_service.health_put
+          - game_service.health_put_ok
+        latency_ms:
+          - [1, 10]
+          - [5, 200]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: nomad_schedule_ok
+        desc: Nomad evaluates a small scheduling action (background orchestration).
+        rpm: 20.0
+        path: [nomad]
+        emit:
+          - nomad.eval_start
+          - nomad.eval_ok
+        latency_ms:
+          - [1, 10]
+          - [20, 800]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Consul becomes a bottleneck and single point of failure; discovery and health-check writes slow or time out, Vault
+      storage operations fail, and Nomad cannot reliably coordinate. After streaming is disabled, many internal operations
+      begin succeeding again, but later slow Raft leaders reintroduce stalls.
+    req:
+      - id: maintenance_page
+        desc: Clients are served a maintenance/503 response without reaching backends.
+        rpm: 90.0
+        path: [edge_gateway]
+        emit:
+          - edge_gateway.req_in
+          - edge_gateway.resp_err
+        latency_ms:
+          - [1, 10]
+          - [5, 80]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: player_login_fail
+        desc: Player join attempts reach the backend but fail due to Consul discovery timeouts, returning 5xx.
+        rpm: 60.0
+        path: [edge_gateway, game_service, consul_cluster, game_service, edge_gateway]
+        emit:
+          - edge_gateway.req_in
+          - game_service.handle_start
+          - game_service.consul_lookup_fail
+          - game_service.done_err
+          - edge_gateway.resp_err
+        latency_ms:
+          - [1, 10]
+          - [1, 20]
+          - [500, 5000]
+          - [10, 200]
+          - [1, 10]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: healthcheck_kv_put_timeout
+        desc: Health/TTL updates to Consul KV block and time out; the client retries.
+        rpm: 280.0
+        path: [game_service, consul_cluster]
+        emit:
+          - game_service.health_put
+          - game_service.health_put_timeout
+        latency_ms:
+          - [1, 10]
+          - [1200, 6000]
+        retry:
+          max_attempts: 4
+          expected_attempts: 1.6
+          emit_per_retry:
+            - game_service.retrying
+          backoff_ms:
+            - [100, 300]
+            - [200, 600]
+            - [400, 1200]
+        trace: false
+      - id: healthcheck_kv_put_ok_recover
+        desc: After mitigation, a majority of health/TTL updates commit successfully again.
+        rpm: 240.0
+        path: [game_service, consul_cluster]
+        emit:
+          - game_service.health_put
+          - game_service.health_put_ok
+        latency_ms:
+          - [1, 10]
+          - [10, 350]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: vault_read_secret_fail
+        desc: Backend calls Vault for auth material; Vault experiences Consul storage slowness and returns errors/timeouts; client retries.
+        rpm: 40.0
+        path: [game_service, vault, consul_cluster, vault, game_service]
+        emit:
+          - game_service.vault_call
+          - vault.req
+          - vault.storage_latency
+          - vault.resp_fail
+          - game_service.vault_auth_fail
+        latency_ms:
+          - [1, 10]
+          - [1, 30]
+          - [200, 4000]
+          - [10, 200]
+          - [10, 200]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.3
+          emit_per_retry:
+            - game_service.retrying
+          backoff_ms:
+            - [150, 500]
+            - [300, 1200]
+        trace: false
+      - id: vault_read_secret_ok
+        desc: After mitigation, many Vault reads succeed without storage timeouts.
+        rpm: 30.0
+        path: [game_service, vault, game_service]
+        emit:
+          - game_service.vault_call
+          - vault.req
+          - vault.resp_ok
+        latency_ms:
+          - [1, 10]
+          - [1, 30]
+          - [10, 600]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: nomad_schedule_fail
+        desc: Nomad scheduling attempts fail to acquire/renew Consul sessions/locks.
+        rpm: 10.0
+        path: [nomad, consul_cluster, nomad]
+        emit:
+          - nomad.eval_start
+          - nomad.consul_lock_fail
+        latency_ms:
+          - [1, 10]
+          - [200, 6000]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Names and topology are simplified: many Roblox services are represented by edge_gateway and one game_service;
+    Consul/Vault/Nomad roles match the post-mortem.
+  - |
+    The incident is compressed from 73 hours into a 30-minute scenario while preserving the causal core:
+    (1) watcher streaming under high read+write churn causing server-side stalls and high KV latency, then
+    (2) intermittent slow-leader instability tied to Raft log store overhead later attributed to a BoltDB freelist pathology.
+  - |
+    Consul does not log per-request for high-RPM operations in this model; instead, periodic metrics and internal warnings
+    are the primary observability signals, matching typical production logging practice.
+  - |
+    Consul KV/Raft latency metrics are modeled as two templates (kv_metric_ok vs kv_metric_bad) that are treated as
+    mutually exclusive in the scenario via rate multipliers; at any given time only one is intended to be active.
+  - |
+    Approx normal log volume is ~1.5k logs/min (player_login ~840/min, healthcheck writes ~600/min, plus light background).
+    Approx failure log volume averages ~1.1k–1.6k logs/min depending on mitigation stage. Estimated total over 30 minutes is
+    ~38k–45k logs (target 20k..100k).
+  - |
+    Visibility anchors: consul_cluster.kv_metric_bad and consul_cluster.watch_delivery_stall appear frequently during early failure;
+    ops_control one-shots mark iptables/snapshot/streaming-toggle actions; post-mitigation healthcheck_kv_put_ok_recover and
+    vault_read_secret_ok show partial recovery; later consul_cluster.raft_log_store_pressure, consul_cluster.raft_append_slow,
+    and elevated consul_cluster.raft_leader_change make the remaining slow-leader condition diagnosable; telemetry_collector.discovery_fail
+    demonstrates the circular observability dependency.
+```

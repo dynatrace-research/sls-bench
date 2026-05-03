@@ -1,0 +1,437 @@
+```yaml
+sys:
+  id: telemetry_ingest_brownout_oom_2019
+  desc: >
+    A telemetry ingest service receives customer batch uploads over HTTPS via an AWS Application Load Balancer (ALB)
+    and forwards them to a fleet of ingest worker processes. A separate SLO monitor evaluates ingest response codes
+    and raises a burn alert when error rate exceeds budget. A blackbox prober sends synthetic ingest requests to
+    validate end-to-end behavior. The modeled incident is a slow memory leak in ingest workers that leads to near-
+    simultaneous OOM crashes and periodic brownouts with intermittent 502/504 responses at ingest.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: aws_alb
+    name: AWS Application Load Balancer
+    svc: alb
+    hosts: [alb-1]
+    desc: >
+      Front door for customer telemetry ingest. Routes requests to ingest workers and emits access logs with
+      backend reachability and timeout outcomes.
+    to:
+      - dst: ingest_worker
+        proto: https
+        desc: Routes ingest HTTP requests to a healthy ingest worker in the target group.
+      - dst: slo_monitor
+        proto: kinesis
+        desc: Streams ALB access log events to the SLO evaluation pipeline.
+    logs:
+      alb_access_202:
+        desc: Successful ingest response served via a healthy backend.
+        lvl: INFO
+        msg: "ALB access req_id={req_id} client_ip={client_ip} method=POST route=/1/batch status=202 target={target} duration_ms={duration_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          target: {k: ch, v: [ingest-1, ingest-2, ingest-3]}
+          duration_ms: {k: i, v: [10, 800]}
+      alb_access_502_unreachable:
+        desc: Request failed because no backend could be reached (connection refused/reset/no healthy targets).
+        lvl: WARN
+        msg: "ALB access req_id={req_id} client_ip={client_ip} method=POST route=/1/batch status=502 error=backend_unreachable target=- duration_ms={duration_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          duration_ms: {k: i, v: [1, 200]}
+      alb_access_504_timeout:
+        desc: Request failed because backend did not respond before the ALB timeout.
+        lvl: WARN
+        msg: "ALB access req_id={req_id} client_ip={client_ip} method=POST route=/1/batch status=504 error=backend_processing_timeout target={target} duration_ms={duration_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          target: {k: ch, v: [ingest-1, ingest-2, ingest-3]}
+          duration_ms: {k: i, v: [1000, 8000]}
+    beh:
+      n:
+        desc: ALB itself does not emit periodic logs in this model; access logs are request-driven.
+        emit: []
+      f:
+        desc: ALB itself does not emit periodic logs in this model; access logs are request-driven.
+        emit: []
+
+  - id: ingest_worker
+    name: Ingest worker
+    svc: ingest-worker
+    hosts: [ingest-1, ingest-2, ingest-3]
+    desc: >
+      Handles /1/batch requests and enqueues telemetry for downstream processing. Emits per-request logs and
+      periodic process/memory samples. Under failure, a memory leak increases RSS and triggers OOM/panic restarts.
+    to:
+      - dst: aws_alb
+        proto: https
+        desc: Returns HTTP responses upstream to the load balancer after processing.
+      - dst: worker_telemetry_agent
+        proto: tcp
+        desc: Local sidecar/agent reads worker stats and emits periodic metamonitoring summaries.
+    logs:
+      req_start:
+        desc: Request accepted by worker and begins parsing/validation.
+        lvl: INFO
+        msg: "ingest req_start req_id={req_id} route=/1/batch content_bytes={content_bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          content_bytes: {k: i, v: [500, 50000]}
+      req_done_202:
+        desc: Worker completed ingest and returned 202 Accepted.
+        lvl: INFO
+        msg: "ingest req_done req_id={req_id} status=202 bytes_ingested={bytes_ingested} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          bytes_ingested: {k: i, v: [500, 50000]}
+          dur_ms: {k: i, v: [5, 1500]}
+      mem_sample:
+        desc: Periodic memory sample for the worker process.
+        lvl: INFO
+        msg: "proc mem_sample rss_mb={rss_mb} heap_mb={heap_mb} gc_pause_ms={gc_pause_ms}"
+        vars: {}
+        state_vars:
+          n:
+            rss_mb: {k: i, v: [350, 900]}
+            heap_mb: {k: i, v: [200, 700]}
+            gc_pause_ms: {k: i, v: [0, 80]}
+          f:
+            rss_mb: {k: i, v: [1400, 3400]}
+            heap_mb: {k: i, v: [900, 2600]}
+            gc_pause_ms: {k: i, v: [20, 500]}
+      oom_panic:
+        desc: Worker terminates due to out-of-memory / runtime panic.
+        lvl: CRITICAL
+        msg: "runtime out of memory rss_mb={rss_mb} pid={pid} exit=137"
+        vars:
+          rss_mb: {k: i, v: [2200, 3400]}
+          pid: {k: i, v: [1000, 45000]}
+      startup:
+        desc: Worker process start after a crash/restart.
+        lvl: INFO
+        msg: "ingest-worker starting version={version} pid={pid}"
+        vars:
+          version: {k: ch, v: ["1.14.3"]}
+          pid: {k: i, v: [1000, 45000]}
+    beh:
+      n:
+        desc: Workers are stable; memory remains within a steady band and OOM/panic is absent.
+        emit:
+          - id: mem_sample
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Memory leak/pressure increases RSS; periodic samples show higher usage and workers occasionally crash/restart.
+        emit:
+          - id: mem_sample
+            per_min: 1.0
+            scope: per_host
+          - id: oom_panic
+            per_min: 0.05
+            scope: per_host
+          - id: startup
+            per_min: 0.05
+            scope: per_host
+
+  - id: worker_telemetry_agent
+    name: Worker metamonitoring agent
+    svc: worker-telemetry-agent
+    hosts: [ingest-1, ingest-2, ingest-3]
+    desc: >
+      Emits periodic summaries of HTTP status served by the ingest worker, used by engineers for debugging.
+      During synchronized crashes it may be absent, which can hide backend-side evidence.
+    to:
+      - dst: slo_monitor
+        proto: https
+        desc: Ships metamonitoring summaries to the observability backend.
+    logs:
+      http_status_report:
+        desc: Per-minute status summary from the worker side.
+        lvl: INFO
+        msg: "metamon http_status window_s=60 served_202={served_202} served_5xx={served_5xx}"
+        vars:
+          served_202: {k: i, v: [100, 800]}
+          served_5xx: {k: i, v: [0, 40]}
+    beh:
+      n:
+        desc: Agent reports regularly and usually observes few or no 5xx from the worker itself.
+        emit:
+          - id: http_status_report
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Agent would normally still report, but may be missing during crash waves (modeled via scenario multipliers).
+        emit:
+          - id: http_status_report
+            per_min: 1.0
+            scope: per_host
+
+  - id: slo_monitor
+    name: Ingest SLO monitor
+    svc: slo-monitor
+    hosts: [obs-1]
+    desc: >
+      Evaluates ALB access logs to compute ingest error rate and burn rate, then emits alert and diagnostic summaries.
+      This is the primary early detector in the incident.
+    to: []
+    logs:
+      ingest_slo_eval:
+        desc: Periodic SLO evaluation snapshot.
+        lvl: INFO
+        msg: "slo_eval slo=ingest window_s=60 requests={requests} errors={errors} error_rate_pct={error_rate_pct} burn_rate={burn_rate}"
+        vars: {}
+        state_vars:
+          n:
+            requests: {k: i, v: [360, 440]}
+            errors: {k: i, v: [0, 2]}
+            error_rate_pct: {k: f, v: [0.0, 0.3]}
+            burn_rate: {k: f, v: [0.0, 0.7]}
+          f:
+            requests: {k: i, v: [360, 440]}
+            errors: {k: i, v: [4, 14]}
+            error_rate_pct: {k: f, v: [1.0, 3.5]}
+            burn_rate: {k: f, v: [2.0, 25.0]}
+      slo_burn_alert:
+        desc: Burn alert emitted when ingest error rate threatens the budget.
+        lvl: WARN
+        msg: "ALERT slo_burn slo=ingest error_rate_pct={error_rate_pct} burn_rate={burn_rate} paging={paging}"
+        vars:
+          error_rate_pct: {k: f, v: [1.0, 3.5]}
+          burn_rate: {k: f, v: [2.0, 25.0]}
+          paging: {k: ch, v: [false]}
+      slo_bubbleup_summary:
+        desc: Diagnostic breakdown for where errors concentrate (or do not).
+        lvl: INFO
+        msg: "bubbleup slo=ingest dimension=worker distribution={worker_distribution}; dimension=client distribution={client_distribution}"
+        vars:
+          worker_distribution: {k: ch, v: [even]}
+          client_distribution: {k: ch, v: [even]}
+    beh:
+      n:
+        desc: Continuously evaluates ingest SLO with low baseline error rate.
+        emit:
+          - id: ingest_slo_eval
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Continues evaluating SLO, reporting elevated error rate during brownout.
+        emit:
+          - id: ingest_slo_eval
+            per_min: 1.0
+            scope: global
+
+  - id: blackbox_prober
+    name: End-to-end blackbox prober
+    svc: e2e-prober
+    hosts: [probe-1]
+    desc: >
+      Sends synthetic ingest requests to validate end-to-end behavior. Because it runs at low rate, intermittent
+      1–3% failures can be missed or appear as transient blips.
+    to:
+      - dst: aws_alb
+        proto: https
+        desc: Sends synthetic ingest requests through the same ALB endpoint as customers.
+    logs:
+      probe_ok:
+        desc: Synthetic ingest succeeded.
+        lvl: INFO
+        msg: "probe ingest result=ok status=202 dur_ms={dur_ms}"
+        vars:
+          dur_ms: {k: i, v: [20, 800]}
+      probe_timeout:
+        desc: Synthetic ingest failed with timeout.
+        lvl: WARN
+        msg: "probe ingest result=error status=504 dur_ms={dur_ms}"
+        vars:
+          dur_ms: {k: i, v: [1000, 8000]}
+      blackbox_alert_fired:
+        desc: Blackbox alert fired due to consecutive probe failures.
+        lvl: WARN
+        msg: "ALERT blackbox_ingest consecutive_failures={consecutive_failures} window_min={window_min}"
+        vars:
+          consecutive_failures: {k: i, v: [2, 3]}
+          window_min: {k: i, v: [1, 5]}
+    beh:
+      n:
+        desc: No periodic background logs; probe results are modeled as request flows.
+        emit: []
+      f:
+        desc: No periodic background logs; probe results are modeled as request flows.
+        emit: []
+
+  - id: chatops
+    name: ChatOps / incident coordination
+    svc: chatops
+    hosts: [chat-1]
+    desc: >
+      Captures notable operational actions and human investigation markers that help anchor the timeline.
+    to: []
+    logs:
+      alert_seen:
+        desc: An engineer notices a non-paging alert in chat.
+        lvl: INFO
+        msg: "chatops alert_seen source=slo_burn channel=#alerts acknowledged_by={who}"
+        vars:
+          who: {k: ch, v: [eng_eu, eng_us_oncall]}
+      aws_ticket_opened:
+        desc: Support ticket created with cloud provider.
+        lvl: INFO
+        msg: "chatops aws_support_ticket_opened case_id={case_id} topic=alb_backend_unreachable"
+        vars:
+          case_id: {k: str, v: "AWS-CASE-######"}
+      hypothesis_note_alb_networking:
+        desc: Investigation note reflecting a load-balancer/networking hypothesis.
+        lvl: INFO
+        msg: "chatops investigation_note hypothesis={hypothesis}"
+        vars:
+          hypothesis: {k: ch, v: [alb_networking]}
+      hypothesis_note_backend_restarts_oom:
+        desc: Investigation note reflecting a backend restart/OOM hypothesis.
+        lvl: INFO
+        msg: "chatops investigation_note hypothesis={hypothesis}"
+        vars:
+          hypothesis: {k: ch, v: [backend_restarts_oom]}
+    beh:
+      n:
+        desc: No background emissions; only discrete markers during the incident.
+        emit: []
+      f:
+        desc: No background emissions; only discrete markers during the incident.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal ingest traffic is mostly successful, with steady latencies and stable worker memory.
+    req:
+      - id: telemetry_ingest_accepted_n
+        desc: Customer telemetry batch ingest accepted and processed normally.
+        rpm: 400.0
+        path: [aws_alb, ingest_worker, aws_alb]
+        emit: [ingest_worker.req_done_202, aws_alb.alb_access_202]
+        latency_ms: [[40, 120], [10, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: blackbox_probe_ok_n
+        desc: Synthetic ingest probe succeeds (low rate) through the same ALB and worker fleet as customers.
+        rpm: 5.0
+        path: [blackbox_prober, aws_alb, ingest_worker, aws_alb]
+        emit: [blackbox_prober.probe_ok]
+        latency_ms: [[30, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      In failure, ingest workers are memory-pressured and periodically crash/restart. Most requests still succeed,
+      but a small fraction fail as 502 (backend unreachable during synchronized restarts) or 504 (backend timeout
+      while processing under pressure).
+    req:
+      - id: telemetry_ingest_success_f
+        desc: Ingest accepted during brownout; latency is higher due to GC/memory pressure.
+        rpm: 388.0
+        path: [aws_alb, ingest_worker, aws_alb]
+        emit: [ingest_worker.req_done_202, aws_alb.alb_access_202]
+        latency_ms: [[90, 300], [15, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: telemetry_ingest_unreachable_502_f
+        desc: Ingest failed because ALB could not reach a healthy backend (connection errors / no healthy targets).
+        rpm: 6.0
+        path: [aws_alb]
+        emit: [aws_alb.alb_access_502_unreachable]
+        latency_ms: [[5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: telemetry_ingest_timeout_504_f
+        desc: Ingest reached a backend but timed out before completion; worker may only log request start.
+        rpm: 6.0
+        path: [aws_alb, ingest_worker, aws_alb]
+        emit: [ingest_worker.req_start, aws_alb.alb_access_504_timeout]
+        latency_ms: [[20, 80], [2500, 7000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: blackbox_probe_ok_f
+        desc: Synthetic ingest probe succeeds (still mostly successful) through the same ALB and worker fleet as customers.
+        rpm: 4.9
+        path: [blackbox_prober, aws_alb, ingest_worker, aws_alb]
+        emit: [blackbox_prober.probe_ok]
+        latency_ms: [[50, 500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: blackbox_probe_timeout_f
+        desc: Synthetic ingest probe times out (rare) while traversing the same ALB and worker fleet as customers.
+        rpm: 0.1
+        path: [blackbox_prober, aws_alb, ingest_worker, aws_alb]
+        emit: [blackbox_prober.probe_timeout]
+        latency_ms: [[2500, 8000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    This model focuses on one brownout episode rather than all four 20-minute periods mentioned in the report; the
+    memory leak is represented via elevated rss_mb/heap_mb/gc_pause_ms in mem_sample (state-dependent domains) plus periodic
+    oom_panic/startup logs, not by explicitly modeling the hours-long ramp.
+  - >
+    Customer-visible symptoms are captured via ALB access logs with intermittent 502 (backend unreachable) and 504
+    (backend processing timeout) while most ingests remain 202; failure-state flow rates are set so 502+504 are
+    ~3% of ingest attempts by default.
+  - >
+    Blackbox probe request paths explicitly traverse the ALB and worker fleet (coarse path), while emitting only prober-side
+    result logs to keep probe observability distinct from ALB access logging.
+  - >
+    SLO evaluation snapshot counts are sized to the modeled ingest volume (~400 requests per 60s) to avoid internal
+    contradictions between SLO telemetry and request-flow traffic assumptions.
+  - >
+    The confusion from missing backend-side evidence is modeled by allowing the worker_telemetry_agent.http_status_report
+    to be suppressed to zero during failure via scenario multipliers.
+  - >
+    ChatOps hypothesis notes are split into two fixed-value log templates so scenario events cannot emit a contradictory
+    hypothesis marker relative to the narrative at that minute.
+  - >
+    Path connectivity includes an explicit ingest_worker -> aws_alb return edge so per-request logging order
+    (worker completion before ALB access log) is traversable.
+  - >
+    Normal-phase rough volume: ~400 rpm * 2 logs/request ≈ 800 logs/min + background (~7/min) + probes (~5/min) ≈ 812/min.
+  - >
+    Total estimated logs over a 50-minute scenario: normal (~20k) + failure (~20k) + background/one-shots (~1k) ≈ 41k,
+    within the 20k–100k target while keeping key failure signals likely visible (ALB 502/504, worker OOM restarts, SLO eval/alert).
+```

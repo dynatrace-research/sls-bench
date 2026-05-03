@@ -1,0 +1,380 @@
+```yaml
+sys:
+  id: hosted_package_repo
+  desc: >
+    A hosted package repository serving metadata and package artifacts over HTTPS.
+    Requests arrive through a load balancer and are handled by a small pool of frontend
+    application servers. Frontends perform DNS lookups (via the datacenter resolver) to
+    reach internal upstreams; during extreme scheduled automation spikes, DNS connectivity
+    becomes a bottleneck and causes widespread request timeouts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: external_monitor
+    name: External Monitoring
+    svc: monitor
+    hosts: [mon-1]
+    desc: >
+      External uptime checker that probes the repository and pages on-call when checks fail.
+
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Probes repository endpoints through the public load balancer.
+
+    logs:
+      check_ok:
+        desc: A successful probe result.
+        lvl: INFO
+        msg: "check ok url={url} status={status} latency_ms={latency_ms}"
+        vars:
+          url: {k: ch, v: ["https://repo.example.com/health", "https://repo.example.com/repodata/index.json"]}
+          status: {k: ch, v: ["200", "204"]}
+          latency_ms: {k: i, v: [20, 800]}
+      check_fail:
+        desc: A failed probe result (timeout or non-2xx response).
+        lvl: ERROR
+        msg: "check failed url={url} error={error} latency_ms={latency_ms}"
+        vars:
+          url: {k: ch, v: ["https://repo.example.com/health", "https://repo.example.com/repodata/index.json"]}
+          error: {k: ch, v: ["timeout", "http_503", "http_504", "connection_reset"]}
+          latency_ms: {k: i, v: [200, 8000]}
+      page_sent:
+        desc: Monitor pages the on-call team for the repository.
+        lvl: CRITICAL
+        msg: "paging oncall service={service} incident={incident_id}"
+        vars:
+          service: {k: ch, v: ["hosted-package-repo"]}
+          incident_id: {k: hex, v: 12}
+
+    beh:
+      n:
+        desc: Monitoring runs continuously but only emits logs via probe flows.
+        emit: []
+      f:
+        desc: Monitoring runs continuously but only emits logs via probe flows; paging is modeled as a one-shot.
+        emit: []
+
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: edge-lb
+    hosts: [lb-1, lb-2]
+    desc: >
+      Public-facing load balancer routing requests to frontend app servers and emitting access and stats logs.
+
+    to:
+      - dst: app_frontend
+        proto: http
+        desc: Proxies HTTP requests to the frontend application pool.
+
+    logs:
+      access_2xx:
+        desc: Access log entry for successful responses.
+        lvl: INFO
+        msg: "access method={method} uri={uri} status={status} bytes={bytes} rt_ms={rt_ms} backend={backend_host} upstream_ms={upstream_ms}"
+        vars:
+          method: {k: ch, v: ["GET", "HEAD"]}
+          uri: {k: str, v: "repo_request_path"}
+          status: {k: ch, v: ["200", "206", "304"]}
+          bytes: {k: i, v: [0, 8000000]}
+          rt_ms: {k: i, v: [5, 12000]}
+          backend_host: {k: ch, v: ["fe-1", "fe-2", "fe-3"]}
+          upstream_ms: {k: i, v: [2, 12000]}
+      access_5xx:
+        desc: Access log entry for upstream timeouts/unavailable responses.
+        lvl: INFO
+        msg: "access method={method} uri={uri} status={status} bytes={bytes} rt_ms={rt_ms} backend={backend_host} upstream_ms={upstream_ms}"
+        vars:
+          method: {k: ch, v: ["GET", "HEAD"]}
+          uri: {k: str, v: "repo_request_path"}
+          status: {k: ch, v: ["503", "504"]}
+          bytes: {k: i, v: [0, 3000]}
+          rt_ms: {k: i, v: [200, 20000]}
+          backend_host: {k: ch, v: ["fe-1", "fe-2", "fe-3"]}
+          upstream_ms: {k: i, v: [200, 20000]}
+      lb_stats:
+        desc: Periodic load balancer stats snapshot; normal has low queueing and near-zero 5xx, spikes show elevated values.
+        lvl: INFO
+        msg: "stats active_conns={active_conns} backend_q={backend_q} five_xx_1m={five_xx_1m}"
+        vars: {}
+        state_vars:
+          n:
+            active_conns: {k: i, v: [50, 1500]}
+            backend_q: {k: i, v: [0, 80]}
+            five_xx_1m: {k: i, v: [0, 5]}
+          f:
+            active_conns: {k: i, v: [800, 12000]}
+            backend_q: {k: i, v: [200, 8000]}
+            five_xx_1m: {k: i, v: [20, 6000]}
+
+    beh:
+      n:
+        desc: Emits periodic stats; most traffic is healthy.
+        emit:
+          - id: lb_stats
+            per_min: 1
+            scope: per_host
+      f:
+        desc: Emits periodic stats during the spike; queues and 5xx counts rise.
+        emit:
+          - id: lb_stats
+            per_min: 1
+            scope: per_host
+
+  - id: app_frontend
+    name: Frontend Application Servers
+    svc: repo-frontend
+    hosts: [fe-1, fe-2, fe-3]
+    desc: >
+      Serves repository endpoints and package artifacts. For some requests it performs DNS lookups
+      (e.g., resolving internal upstream endpoints). Under extreme spikes, DNS connectivity stalls,
+      tying up workers and causing slow responses and upstream timeouts.
+
+    to:
+      - dst: dns_resolver
+        proto: tcp
+        desc: Uses the datacenter DNS resolver for lookups over TCP during high-load conditions.
+
+    logs:
+      app_metrics:
+        desc: Periodic snapshot of frontend load and DNS performance.
+        lvl: INFO
+        msg: "metrics inflight={inflight} busy_pct={busy_pct} dns_avg_ms={dns_avg_ms} dns_timeouts_1m={dns_timeouts_1m} rss_mb={rss_mb}"
+        vars:
+          rss_mb: {k: i, v: [200, 2400]}
+        state_vars:
+          n:
+            inflight: {k: i, v: [0, 300]}
+            busy_pct: {k: i, v: [5, 75]}
+            dns_avg_ms: {k: i, v: [1, 25]}
+            dns_timeouts_1m: {k: i, v: [0, 2]}
+          f:
+            inflight: {k: i, v: [400, 6000]}
+            busy_pct: {k: i, v: [70, 100]}
+            dns_avg_ms: {k: i, v: [50, 4000]}
+            dns_timeouts_1m: {k: i, v: [20, 200]}
+      dns_timeout:
+        desc: A worker times out or stalls while connecting to the DNS resolver for a lookup.
+        lvl: WARN
+        msg: "resolver timeout resolver={resolver_ip} timeout_ms={timeout_ms} inflight={inflight}"
+        vars:
+          resolver_ip: {k: ip, v: "10.0.0.53/32"}
+          timeout_ms: {k: i, v: [300, 3000]}
+        state_vars:
+          n:
+            inflight: {k: i, v: [0, 300]}
+          f:
+            inflight: {k: i, v: [400, 6000]}
+
+    beh:
+      n:
+        desc: Regular metrics with genuinely rare DNS warnings.
+        emit:
+          - id: app_metrics
+            per_min: 6
+            scope: per_host
+          - id: dns_timeout
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Metrics show high inflight/busy and degraded DNS performance; DNS timeout warnings become frequent.
+        emit:
+          - id: app_metrics
+            per_min: 6
+            scope: per_host
+          - id: dns_timeout
+            per_min: 30
+            scope: per_host
+
+  - id: dns_resolver
+    name: Datacenter DNS Resolver
+    svc: dc-dns
+    hosts: [dns-1]
+    desc: >
+      Shared DNS resolver used by the frontend tier. Under high connection volume it exhibits elevated
+      response latency and TCP connection errors, contributing to frontend stalls.
+
+    to: []
+
+    logs:
+      dns_stats:
+        desc: Periodic resolver snapshot; shows load and error counts.
+        lvl: INFO
+        msg: "dns stats qps={qps} tcp_conn_errors_1m={tcp_conn_errors_1m} avg_resp_ms={avg_resp_ms}"
+        vars: {}
+        state_vars:
+          n:
+            qps: {k: i, v: [200, 1500]}
+            tcp_conn_errors_1m: {k: i, v: [0, 20]}
+            avg_resp_ms: {k: i, v: [1, 15]}
+          f:
+            qps: {k: i, v: [2000, 12000]}
+            tcp_conn_errors_1m: {k: i, v: [50, 2500]}
+            avg_resp_ms: {k: i, v: [20, 2500]}
+
+    beh:
+      n:
+        desc: Emits low-rate resolver stats.
+        emit:
+          - id: dns_stats
+            per_min: 1
+            scope: per_host
+      f:
+        desc: Emits resolver stats during the spike; error counters and latency are elevated.
+        emit:
+          - id: dns_stats
+            per_min: 1
+            scope: per_host
+
+  - id: oncall_ops
+    name: On-Call Operations
+    svc: ops
+    hosts: [ops-1]
+    desc: >
+      Operator actions and diagnostics during the incident (load balancer changes, capacity shifts, and sampling via strace).
+
+    to:
+      - dst: edge_lb
+        proto: http
+        desc: Updates load balancer configuration (weights/capacity).
+      - dst: app_frontend
+        proto: tcp
+        desc: Runs ad-hoc diagnostics on frontend hosts (e.g., strace).
+
+    logs:
+      lb_weight_change:
+        desc: Operator changes backend weight for a frontend host.
+        lvl: INFO
+        msg: "changed lb backend weight host={backend_host} weight={weight}"
+        vars:
+          backend_host: {k: ch, v: ["fe-1", "fe-2", "fe-3"]}
+          weight: {k: i, v: [50, 500]}
+      shift_capacity:
+        desc: Operator shifts capacity from worker tier to frontend tier.
+        lvl: INFO
+        msg: "shifted capacity from worker tier to frontend add_instances={add_instances}"
+        vars:
+          add_instances: {k: i, v: [1, 4]}
+      strace_sample:
+        desc: Operator samples a process and observes it blocked on DNS connect().
+        lvl: INFO
+        msg: "strace pid={pid} observed connect({resolver_ip}:53) blocked_ms={blocked_ms}"
+        vars:
+          pid: {k: i, v: [1000, 45000]}
+          resolver_ip: {k: ip, v: "10.0.0.53/32"}
+          blocked_ms: {k: i, v: [200, 8000]}
+
+    beh:
+      n:
+        desc: No background logs; ops logs are modeled as one-shot actions.
+        emit: []
+      f:
+        desc: No background logs; ops logs are modeled as one-shot actions.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal repository traffic with successful responses and healthy monitoring checks.
+    req:
+      - id: fetch_package_n
+        desc: Client fetches package metadata/artifact successfully.
+        rpm: 800
+        path: [edge_lb, app_frontend]
+        emit: [edge_lb.access_2xx]
+        latency_ms: [[15, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: monitor_check_n
+        desc: External monitor probes repository endpoint successfully.
+        rpm: 6
+        path: [external_monitor, edge_lb, app_frontend]
+        emit: [external_monitor.check_ok]
+        latency_ms: [[30, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Scheduled automation causes a 6x traffic spike; DNS connectivity stalls in the frontend tier and many requests time out.
+    req:
+      - id: fetch_package_ok_f
+        desc: Request succeeds but with elevated latency due to contention and slow DNS.
+        rpm: 2400
+        path: [edge_lb, app_frontend]
+        emit: [edge_lb.access_2xx]
+        latency_ms: [[60, 500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: fetch_package_fail_f
+        desc: Request times out or fails due to backend stall (DNS/connect delay), resulting in 503/504.
+        rpm: 2400
+        path: [edge_lb, app_frontend]
+        emit: [edge_lb.access_5xx]
+        latency_ms: [[600, 10000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: monitor_check_f
+        desc: External monitor probes repository endpoint and observes failures/timeouts.
+        rpm: 6
+        path: [external_monitor, edge_lb, app_frontend]
+        emit: [external_monitor.check_fail]
+        latency_ms: [[500, 8000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    This model focuses on a single outage during an extreme scheduled traffic spike after additional frontend capacity existed,
+    where the limiting factor shifted to DNS connectivity (frontends blocked on connect() to the datacenter resolver).
+  - >
+    To align with the observed connect() stalls and resolver connection-error counters, the frontend-to-resolver dependency is modeled
+    as TCP. (Real DNS may use UDP in many cases; this incident model intentionally emphasizes the connect()-style failure mode.)
+  - >
+    Load balancer "max connections" tuning and the later DNS-cache rollout are out of scope for this specific scenario; we model
+    the incident that ends while still failing (before the DNS cache mitigation).
+  - >
+    app_frontend.app_metrics.dns_timeouts_1m is modeled as a per-host rolling 1-minute count of resolver timeouts/stalls and is kept
+    consistent with the (rare) WARN emission rate in normal and the frequent WARNs in failure.
+  - >
+    Frontends do not emit per-request access logs to keep log volume realistic; per-request visibility comes primarily from the
+    load balancer access logs, while DNS symptoms are visible via periodic metrics and elevated WARNs.
+  - >
+    Paths are modeled as coarse logical traversals and omit explicit return hops to satisfy graph connectivity while keeping the
+    main request family (monitor->LB->frontend; client->LB->frontend) clear.
+  - >
+    edge_lb.access_5xx rt_ms/upstream_ms domains are extended to 20000ms to cover failure-phase p95 latency hints after event
+    latency multipliers (up to ~18000ms implied p95), avoiding inconsistent generation/clamping.
+  - >
+    Estimated normal-phase logs/min: ~827 (800 LB access + ~18 app metrics + ~0.2 app DNS warns + ~2 LB stats + ~1 DNS stats + ~6 monitor checks).
+  - >
+    Estimated total logs over a 24-minute scenario: ~69k (dominant contributor is LB access logs during spike), within the 20k–100k target.
+  - >
+    Key diagnostic anchors expected to appear: edge_lb.access_5xx (customer impact), edge_lb.lb_stats (queue/5xx shift),
+    app_frontend.app_metrics and app_frontend.dns_timeout (DNS stall evidence), dns_resolver.dns_stats (corroborating resolver stress),
+    and oncall_ops.strace_sample (confirmatory sampling).
+```

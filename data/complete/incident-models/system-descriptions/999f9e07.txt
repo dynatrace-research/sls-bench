@@ -1,0 +1,883 @@
+```yaml
+sys:
+  id: elastic_cloud_useast1_2019
+  desc: >
+    A regional Elastic Cloud control plane and data plane used to route customer traffic to Elasticsearch and Kibana deployments.
+    A ZooKeeper coordination ensemble stores service discovery and system state used by proxies and the customer console API.
+    Proxies route external traffic based on per-deployment virtual hostnames and rely on a ZooKeeper observer layer to reduce load on the main ensemble.
+    Kibana instances use an internal TLS proxy sidecar to reach Elasticsearch through the proxy layer.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: lb_edge
+    name: Edge Load Balancer
+    svc: aws-alb
+    hosts: [alb-1]
+    desc: Regional load balancer distributing external HTTPS traffic to the proxy fleet and console API.
+    to:
+      - dst: proxy_router
+        proto: https
+        desc: Forwards cluster and Kibana traffic to proxy instances.
+      - dst: control_plane_api
+        proto: https
+        desc: Forwards console UI/API traffic to the control plane API.
+    logs:
+      lb_metrics:
+        desc: Periodic ALB metrics summary used to detect elevated 5xx and latency; in failure it represents the degraded interval.
+        lvl: INFO
+        msg: "lb_metrics mode={mode} region={region} req_rps={req_rps} http_5xx_rate={http_5xx_rate} target_reset_rate={target_reset_rate} p95_ms={p95_ms}"
+        vars:
+          region: {k: ch, v: [us-east-1]}
+        state_vars:
+          n:
+            mode: {k: ch, v: [normal]}
+            req_rps: {k: i, v: [3, 14]}
+            http_5xx_rate: {k: f, v: [0.0, 0.02]}
+            target_reset_rate: {k: f, v: [0.0, 0.01]}
+            p95_ms: {k: i, v: [20, 250]}
+          f:
+            mode: {k: ch, v: [degraded]}
+            req_rps: {k: i, v: [0, 35]}
+            http_5xx_rate: {k: f, v: [0.05, 0.6]}
+            target_reset_rate: {k: f, v: [0.0, 0.3]}
+            p95_ms: {k: i, v: [120, 3000]}
+
+      lb_metrics_recovered:
+        desc: Periodic ALB metrics summary for the post-stabilization interval where 5xx/latency return near baseline.
+        lvl: INFO
+        msg: "lb_metrics mode=recovered region={region} req_rps={req_rps} http_5xx_rate={http_5xx_rate} target_reset_rate={target_reset_rate} p95_ms={p95_ms}"
+        vars:
+          region: {k: ch, v: [us-east-1]}
+          req_rps: {k: i, v: [6, 35]}
+          http_5xx_rate: {k: f, v: [0.0, 0.03]}
+          target_reset_rate: {k: f, v: [0.0, 0.02]}
+          p95_ms: {k: i, v: [20, 400]}
+    beh:
+      n:
+        desc: Emits a low-rate metric line to establish baseline error rate and latency.
+        emit:
+          - id: lb_metrics
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Emits degraded metrics during the outage window and (when enabled) recovered metrics after stabilization.
+        emit:
+          - id: lb_metrics
+            per_min: 1.0
+            scope: global
+          - id: lb_metrics_recovered
+            per_min: 1.0
+            scope: global
+
+  - id: zk_ensemble
+    name: Coordination ZooKeeper Ensemble
+    svc: zookeeper
+    hosts: [zk-1, zk-2, zk-3]
+    desc: Three-node ZooKeeper ensemble holding system state and service discovery for the region.
+    to: []
+    logs:
+      zk_health:
+        desc: Periodic health snapshot of ZooKeeper node load and connection counts.
+        lvl: INFO
+        msg: "zk_health node={node} role={role} state={state} outstanding={outstanding} cpu_pct={cpu_pct} client_conns={client_conns}"
+        vars:
+          node: {k: ch, v: [zk-1, zk-2, zk-3]}
+          role: {k: ch, v: [leader, follower]}
+        state_vars:
+          n:
+            state: {k: ch, v: [ok]}
+            outstanding: {k: i, v: [0, 300]}
+            cpu_pct: {k: i, v: [5, 40]}
+            client_conns: {k: i, v: [200, 1200]}
+          f:
+            state: {k: ch, v: [degraded]}
+            outstanding: {k: i, v: [500, 5000]}
+            cpu_pct: {k: i, v: [40, 100]}
+            client_conns: {k: i, v: [1000, 5000]}
+
+      zk_client_conn_fail:
+        desc: Client connection failures seen by ZooKeeper during instability.
+        lvl: WARN
+        msg: "client_connection_failed node={node} client={client} reason={reason}"
+        vars:
+          node: {k: ch, v: [zk-1, zk-2, zk-3]}
+          client: {k: ch, v: [proxy, control_plane, allocator_tls]}
+          reason: {k: ch, v: [session_expired, connection_refused, read_timeout]}
+
+      zk_quorum_lost:
+        desc: Quorum loss marker emitted while the ensemble cannot maintain quorum.
+        lvl: ERROR
+        msg: "quorum_lost term={term} connected_peers={connected_peers} needed={needed}"
+        vars:
+          term: {k: i, v: [1000, 2000]}
+          connected_peers: {k: i, v: [0, 1]}
+          needed: {k: i, v: [2, 2]}
+
+      zk_leader_election:
+        desc: Leader election started.
+        lvl: INFO
+        msg: "leader_election term={term} candidate={candidate} prev_leader={prev_leader}"
+        vars:
+          term: {k: i, v: [1000, 2000]}
+          candidate: {k: ch, v: [zk-1, zk-2, zk-3]}
+          prev_leader: {k: ch, v: [zk-1, zk-2, zk-3]}
+
+      zk_leader_shutdown:
+        desc: Leader shutdown after being overwhelmed by client connections.
+        lvl: ERROR
+        msg: "leader_shutdown node={node} reason=overwhelmed open_conns={open_conns} outstanding={outstanding}"
+        vars:
+          node: {k: ch, v: [zk-1, zk-2, zk-3]}
+          open_conns: {k: i, v: [2000, 8000]}
+          outstanding: {k: i, v: [3000, 15000]}
+
+      zk_quorum_established:
+        desc: Quorum re-established marker.
+        lvl: INFO
+        msg: "quorum_established term={term} leader={leader} followers={followers}"
+        vars:
+          term: {k: i, v: [1000, 2000]}
+          leader: {k: ch, v: [zk-1, zk-2, zk-3]}
+          followers: {k: i, v: [1, 2]}
+
+      kernel_softlock:
+        desc: Kernel softlock/OOPS symptom on a ZooKeeper host during container namespace entry.
+        lvl: CRITICAL
+        msg: "kernel_softlock host={host} task={task} duration_s={duration_s}"
+        vars:
+          host: {k: ch, v: [zk-1, zk-2, zk-3]}
+          task: {k: ch, v: [runc, containerd]}
+          duration_s: {k: i, v: [60, 600]}
+
+      host_reboot:
+        desc: Host reboot marker used to recover from unresponsiveness.
+        lvl: WARN
+        msg: "host_reboot initiated host={host} reason={reason}"
+        vars:
+          host: {k: ch, v: [zk-1, zk-2, zk-3]}
+          reason: {k: ch, v: [softlock, unresponsive]}
+    beh:
+      n:
+        desc: ZooKeeper runs stable with modest load and consistent client connections.
+        emit:
+          - id: zk_health
+            per_min: 1.0
+      f:
+        desc: ZooKeeper shows elevated load, connection churn, and periodic quorum loss markers.
+        emit:
+          - id: zk_health
+            per_min: 2.0
+          - id: zk_client_conn_fail
+            per_min: 3.0
+          - id: zk_quorum_lost
+            per_min: 0.25
+            scope: global
+
+  - id: zk_observer
+    name: Proxy ZooKeeper Observer Layer
+    svc: zookeeper-observer
+    hosts: [zkobs-1, zkobs-2]
+    desc: Observer nodes used by proxies to fetch cluster routing state without hitting the main ensemble.
+    to:
+      - dst: zk_ensemble
+        proto: tcp
+        desc: Syncs state from the coordination ensemble leader.
+    logs:
+      observer_health:
+        desc: Periodic observer connectivity and lag snapshot.
+        lvl: INFO
+        msg: "observer_health node={node} connected={connected} sync_lag_ms={sync_lag_ms} init_limit={init_limit}"
+        vars:
+          node: {k: ch, v: [zkobs-1, zkobs-2]}
+        state_vars:
+          n:
+            connected: {k: ch, v: ["true"]}
+            sync_lag_ms: {k: i, v: [0, 200]}
+            init_limit: {k: i, v: [5, 8]}
+          f:
+            connected: {k: ch, v: ["true", "false"]}
+            sync_lag_ms: {k: i, v: [200, 5000]}
+            init_limit: {k: i, v: [5, 20]}
+
+      observer_sync_timeout:
+        desc: Observer cannot sync to leader within the expected window.
+        lvl: WARN
+        msg: "observer_sync_timeout node={node} waited_ms={waited_ms} leader={leader}"
+        vars:
+          node: {k: ch, v: [zkobs-1, zkobs-2]}
+          waited_ms: {k: i, v: [500, 10000]}
+          leader: {k: ch, v: [zk-1, zk-2, zk-3]}
+
+      initlimit_changed:
+        desc: Configuration change applied to increase initLimit and reduce observer flapping.
+        lvl: INFO
+        msg: "config_changed node={node} key=initLimit old={old} new={new}"
+        vars:
+          node: {k: ch, v: [zkobs-1, zkobs-2]}
+          old: {k: i, v: [5, 8]}
+          new: {k: i, v: [10, 20]}
+    beh:
+      n:
+        desc: Observers remain connected with low sync lag.
+        emit:
+          - id: observer_health
+            per_min: 1.0
+      f:
+        desc: Observers show elevated lag and may time out while ZooKeeper/proxy load is unstable.
+        emit:
+          - id: observer_health
+            per_min: 1.2
+          - id: observer_sync_timeout
+            per_min: 0.8
+
+  - id: proxy_router
+    name: Proxy / Routing Fleet
+    svc: cloud-proxy
+    hosts: [proxy-1, proxy-2, proxy-3]
+    desc: Routes incoming traffic to Elasticsearch and Kibana based on deployment virtual hostnames; depends on observer state for routes.
+    to:
+      - dst: zk_observer
+        proto: tcp
+        desc: Reads routing metadata and watches from the observer layer.
+      - dst: kibana_instance
+        proto: https
+        desc: Forwards Kibana traffic to allocator-hosted Kibana instances.
+      - dst: tls_proxy
+        proto: https
+        desc: Returns responses to internal TLS-proxy clients over established connections.
+    logs:
+      proxy_es_access_ok:
+        desc: Access log for one proxy handling attempt of an external Elasticsearch request.
+        lvl: INFO
+        msg: "proxy_access service=es vhost={vhost} status=200 attempt={attempt} dur_ms={dur_ms} route_src={route_src} trace={trace_id}"
+        vars:
+          vhost: {k: str, v: "dep-{hex8}.us-east-1.aws.example.com"}
+          dur_ms: {k: i, v: [5, 3000]}
+          route_src: {k: ch, v: [cache, observer]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 1]}
+
+      proxy_es_access_err:
+        desc: Access log for one proxy handling attempt of an external Elasticsearch request that fails (routing or upstream failure).
+        lvl: WARN
+        msg: "proxy_access service=es vhost={vhost} status={status} attempt={attempt} err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          vhost: {k: str, v: "dep-{hex8}.us-east-1.aws.example.com"}
+          status: {k: ch, v: ["502", "503", "504"]}
+          err: {k: ch, v: [route_unavailable, upstream_timeout, connect_reset, observer_unstable, upstream_503]}
+          dur_ms: {k: i, v: [20, 10000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 3]}
+
+      proxy_kb_access_ok:
+        desc: Access log for an external Kibana request after the Kibana instance returned a successful response.
+        lvl: INFO
+        msg: "proxy_access service=kibana vhost={vhost} status=200 attempt={attempt} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          vhost: {k: str, v: "dep-{hex8}.us-east-1.aws.example.com"}
+          dur_ms: {k: i, v: [10, 8000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 1]}
+
+      proxy_kb_access_err_route:
+        desc: Access log for an external Kibana request that fails at the proxy before reaching Kibana (routing/observer instability).
+        lvl: WARN
+        msg: "proxy_access service=kibana vhost={vhost} status={status} attempt={attempt} err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          vhost: {k: str, v: "dep-{hex8}.us-east-1.aws.example.com"}
+          status: {k: ch, v: ["502", "503", "504"]}
+          err: {k: ch, v: [route_unavailable, observer_unstable, connect_reset]}
+          dur_ms: {k: i, v: [20, 15000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 1]}
+
+      proxy_kb_access_err_upstream:
+        desc: Access log for an external Kibana request where Kibana responds with an error or times out (upstream failure).
+        lvl: WARN
+        msg: "proxy_access service=kibana vhost={vhost} status={status} attempt={attempt} err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          vhost: {k: str, v: "dep-{hex8}.us-east-1.aws.example.com"}
+          status: {k: ch, v: ["502", "503", "504"]}
+          err: {k: ch, v: [upstream_timeout, upstream_503, kibana_unhealthy, connect_reset]}
+          dur_ms: {k: i, v: [20, 15000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 1]}
+
+      route_lookup_retry:
+        desc: Retry marker when the proxy retries route lookup against the observer.
+        lvl: INFO
+        msg: "route_lookup_retry vhost={vhost} attempt={attempt} reason={reason} backoff_ms={backoff_ms} trace={trace_id}"
+        vars:
+          vhost: {k: str, v: "dep-{hex8}.us-east-1.aws.example.com"}
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: [observer_disconnect, sync_timeout, session_expired]}
+          backoff_ms: {k: i, v: [30, 700]}
+          trace_id: {k: hex, v: 32}
+
+      zk_session_reset:
+        desc: Proxy's ZooKeeper session resets while talking to the observer layer.
+        lvl: WARN
+        msg: "zk_session_reset proxy={proxy} observer={observer} reason={reason}"
+        vars:
+          proxy: {k: ch, v: [proxy-1, proxy-2, proxy-3]}
+          observer: {k: ch, v: [zkobs-1, zkobs-2]}
+          reason: {k: ch, v: [session_expired, connection_loss]}
+
+      proxy_cpu:
+        desc: Periodic proxy process utilization snapshot.
+        lvl: INFO
+        msg: "proxy_cpu proxy={proxy} cpu_pct={cpu_pct} active_conns={active_conns}"
+        vars:
+          proxy: {k: ch, v: [proxy-1, proxy-2, proxy-3]}
+        state_vars:
+          n:
+            cpu_pct: {k: i, v: [5, 40]}
+            active_conns: {k: i, v: [100, 4000]}
+          f:
+            cpu_pct: {k: i, v: [30, 100]}
+            active_conns: {k: i, v: [2000, 20000]}
+
+      autoscale_add:
+        desc: Marker for scaling out proxy instances.
+        lvl: INFO
+        msg: "autoscale action=add_instances count={count} new_total={new_total}"
+        vars:
+          count: {k: i, v: [1, 5]}
+          new_total: {k: i, v: [3, 12]}
+
+      traffic_shed_enabled:
+        desc: Marker that client traffic was intentionally shed/blocked to reduce coordination load.
+        lvl: WARN
+        msg: "traffic_shed enabled reason={reason}"
+        vars:
+          reason: {k: ch, v: [coordination_unstable]}
+
+      traffic_shed_disabled:
+        desc: Marker that client traffic shedding was removed.
+        lvl: INFO
+        msg: "traffic_shed disabled"
+        vars: {}
+    beh:
+      n:
+        desc: Proxies are lightly loaded and maintain stable observer sessions.
+        emit:
+          - id: proxy_cpu
+            per_min: 0.6
+          - id: zk_session_reset
+            per_min: 0.02
+      f:
+        desc: Proxies experience elevated CPU and frequent observer session resets during instability.
+        emit:
+          - id: proxy_cpu
+            per_min: 1.0
+          - id: zk_session_reset
+            per_min: 1.0
+
+  - id: control_plane_api
+    name: Control Plane API (Console Backend)
+    svc: cloud-control-plane
+    hosts: [cp-1, cp-2]
+    desc: Serves customer console operations and reads deployment state from the coordination layer.
+    to:
+      - dst: zk_ensemble
+        proto: tcp
+        desc: Reads and watches deployment state.
+    logs:
+      console_access_ok:
+        desc: Console API attempt that succeeds after reading ZooKeeper.
+        lvl: INFO
+        msg: "console_api op=list_deployments status=200 attempt={attempt} dur_ms={dur_ms} zk_reads={zk_reads} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [30, 4000]}
+          zk_reads: {k: i, v: [1, 5]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 1]}
+
+      console_access_err:
+        desc: Console API attempt that fails due to ZooKeeper instability/unavailability.
+        lvl: WARN
+        msg: "console_api op=list_deployments status={status} attempt={attempt} err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          status: {k: ch, v: ["503", "504"]}
+          err: {k: ch, v: [zk_timeout, zk_unavailable]}
+          dur_ms: {k: i, v: [500, 15000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            attempt: {k: i, v: [1, 1]}
+          f:
+            attempt: {k: i, v: [1, 2]}
+
+      state_read_retry:
+        desc: Retry marker for ZooKeeper read attempts during console operations.
+        lvl: INFO
+        msg: "zk_read_retry op=list_deployments attempt={attempt} backoff_ms={backoff_ms} trace={trace_id}"
+        vars:
+          attempt: {k: i, v: [2, 2]}
+          backoff_ms: {k: i, v: [50, 500]}
+          trace_id: {k: hex, v: 32}
+
+      api_health:
+        desc: Periodic API health snapshot for console backend.
+        lvl: INFO
+        msg: "api_health state={state} inflight={inflight} p95_ms={p95_ms}"
+        vars: {}
+        state_vars:
+          n:
+            state: {k: ch, v: [ok]}
+            inflight: {k: i, v: [0, 120]}
+            p95_ms: {k: i, v: [20, 300]}
+          f:
+            state: {k: ch, v: [degraded]}
+            inflight: {k: i, v: [100, 500]}
+            p95_ms: {k: i, v: [300, 5000]}
+    beh:
+      n:
+        desc: API stays healthy with low queueing.
+        emit:
+          - id: api_health
+            per_min: 1.0
+            scope: global
+      f:
+        desc: API remains up but shows degraded latency and queueing due to ZooKeeper dependency.
+        emit:
+          - id: api_health
+            per_min: 1.2
+            scope: global
+
+  - id: kibana_instance
+    name: Kibana Instances (Allocator Layer)
+    svc: kibana
+    hosts: [kb-1, kb-2, kb-3, kb-4]
+    desc: Customer Kibana instances; use an internal TLS proxy sidecar for secure internal connectivity to Elasticsearch via the proxy layer.
+    to:
+      - dst: tls_proxy
+        proto: tcp
+        desc: Sends internal requests via localhost TLS proxy sidecar.
+      - dst: proxy_router
+        proto: https
+        desc: Returns responses to the external proxy over established connections for user UI/API requests (modeled as a return hop for access logging).
+    logs:
+      kibana_ui_ok:
+        desc: Kibana served a user request successfully.
+        lvl: INFO
+        msg: "kibana_ui status=200 path={path} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          path: {k: ch, v: ["/app/kibana", "/api/status"]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [10, 300]}
+          f:
+            dur_ms: {k: i, v: [50, 8000]}
+
+      kibana_ui_err:
+        desc: Kibana could not serve a user request due to inability to reach Elasticsearch.
+        lvl: WARN
+        msg: "kibana_ui status={status} path={path} err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          status: {k: ch, v: ["503", "504"]}
+          path: {k: ch, v: ["/app/kibana", "/api/status"]}
+          err: {k: ch, v: [es_unreachable, timeout]}
+          dur_ms: {k: i, v: [100, 15000]}
+          trace_id: {k: hex, v: 32}
+
+      es_call_start:
+        desc: Start of an internal Kibana call to Elasticsearch.
+        lvl: DEBUG
+        msg: "es_call_start target=elasticsearch endpoint={endpoint} trace={trace_id}"
+        vars:
+          endpoint: {k: ch, v: ["/_cluster/health", "/_search"]}
+          trace_id: {k: hex, v: 32}
+
+      es_call_ok:
+        desc: Completion marker for a successful internal Elasticsearch call attempt.
+        lvl: INFO
+        msg: "es_call_done outcome=ok dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [20, 3000]}
+          trace_id: {k: hex, v: 32}
+
+      es_call_err:
+        desc: Completion marker for a failed internal Elasticsearch call attempt (upstream unavailable/timeout).
+        lvl: WARN
+        msg: "es_call_done outcome=error err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          err: {k: ch, v: [proxy_unavailable, timeout]}
+          dur_ms: {k: i, v: [200, 15000]}
+          trace_id: {k: hex, v: 32}
+
+      es_call_err_conntrack:
+        desc: Completion marker for a failed internal Elasticsearch call attempt due to socket/conntrack pressure.
+        lvl: WARN
+        msg: "es_call_done outcome=error err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          err: {k: ch, v: [conntrack_full, socket_leak]}
+          dur_ms: {k: i, v: [500, 15000]}
+          trace_id: {k: hex, v: 32}
+
+      es_call_retry:
+        desc: Retry marker for internal Elasticsearch calls.
+        lvl: INFO
+        msg: "es_call_retry attempt={attempt} backoff_ms={backoff_ms} trace={trace_id}"
+        vars:
+          attempt: {k: i, v: [2, 2]}
+          backoff_ms: {k: i, v: [100, 1000]}
+          trace_id: {k: hex, v: 32}
+
+      kibana_health:
+        desc: Periodic Kibana process health snapshot.
+        lvl: INFO
+        msg: "kibana_health state={state} event_loop_lag_ms={lag} heap_pct={heap_pct}"
+        vars: {}
+        state_vars:
+          n:
+            state: {k: ch, v: [ok]}
+            lag: {k: i, v: [0, 80]}
+            heap_pct: {k: i, v: [10, 60]}
+          f:
+            state: {k: ch, v: [degraded]}
+            lag: {k: i, v: [100, 2000]}
+            heap_pct: {k: i, v: [40, 95]}
+
+      open_sockets_metric:
+        desc: Periodic socket/conntrack usage snapshot; generally bounded unless a leak/pressure scenario appears.
+        lvl: INFO
+        msg: "kibana_sockets open={open} fd_limit={fd_limit} conntrack_used_pct={conntrack_used_pct}"
+        vars:
+          fd_limit: {k: i, v: [65535, 65535]}
+        state_vars:
+          n:
+            open: {k: i, v: [50, 2000]}
+            conntrack_used_pct: {k: i, v: [1, 40]}
+          f:
+            open: {k: i, v: [100, 8000]}
+            conntrack_used_pct: {k: i, v: [1, 60]}
+
+      open_sockets_pressure:
+        desc: High-pressure socket/conntrack snapshot used when Kibana leaks sockets and conntrack approaches exhaustion.
+        lvl: WARN
+        msg: "kibana_sockets_pressure open={open} fd_limit={fd_limit} conntrack_used_pct={conntrack_used_pct}"
+        vars:
+          open: {k: i, v: [8000, 50000]}
+          fd_limit: {k: i, v: [65535, 65535]}
+          conntrack_used_pct: {k: i, v: [60, 100]}
+    beh:
+      n:
+        desc: Kibana stays healthy; socket usage remains bounded.
+        emit:
+          - id: kibana_health
+            per_min: 0.5
+          - id: open_sockets_metric
+            per_min: 0.2
+      f:
+        desc: Kibana shows degraded event loop/heap; severe socket/conntrack pressure is modeled as a separately activated signal.
+        emit:
+          - id: kibana_health
+            per_min: 0.8
+          - id: open_sockets_metric
+            per_min: 0.3
+          - id: open_sockets_pressure
+            per_min: 0.8
+
+  - id: tls_proxy
+    name: Internal TLS Proxy Sidecar
+    svc: allocator-tls-proxy
+    hosts: [kb-1, kb-2, kb-3, kb-4]
+    desc: Sidecar container used by Kibana to securely reach the proxy layer; under extended upstream unavailability it can become strained.
+    to:
+      - dst: proxy_router
+        proto: https
+        desc: Forwards internal Kibana-to-ES requests to the proxy layer.
+      - dst: kibana_instance
+        proto: tcp
+        desc: Returns responses to the local Kibana process (same host).
+    logs:
+      forward_ok:
+        desc: Successful forward of a request through the TLS proxy.
+        lvl: INFO
+        msg: "tls_proxy_forward outcome=ok upstream=proxy dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [5, 2000]}
+          trace_id: {k: hex, v: 32}
+
+      forward_err:
+        desc: Forwarding error due to upstream proxy unavailability/timeout.
+        lvl: WARN
+        msg: "tls_proxy_forward outcome=error err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          err: {k: ch, v: [proxy_connect_failed, upstream_timeout]}
+          dur_ms: {k: i, v: [50, 15000]}
+          trace_id: {k: hex, v: 32}
+
+      forward_err_conntrack:
+        desc: Forwarding error due to host/container conntrack exhaustion.
+        lvl: WARN
+        msg: "tls_proxy_forward outcome=error err={err} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          err: {k: ch, v: [conntrack_full]}
+          dur_ms: {k: i, v: [200, 15000]}
+          trace_id: {k: hex, v: 32}
+
+      conntrack_metric:
+        desc: Periodic conntrack and connection count snapshot for the sidecar (moderate load).
+        lvl: INFO
+        msg: "tls_proxy_conntrack open_conns={open_conns} nf_conntrack_used_pct={used_pct} cpu_pct={cpu_pct}"
+        vars: {}
+        state_vars:
+          n:
+            open_conns: {k: i, v: [100, 3000]}
+            used_pct: {k: i, v: [1, 40]}
+            cpu_pct: {k: i, v: [5, 40]}
+          f:
+            open_conns: {k: i, v: [200, 10000]}
+            used_pct: {k: i, v: [1, 60]}
+            cpu_pct: {k: i, v: [10, 80]}
+
+      conntrack_pressure:
+        desc: High-pressure conntrack snapshot used when open connections and nf_conntrack utilization are near exhaustion.
+        lvl: WARN
+        msg: "tls_proxy_conntrack_pressure open_conns={open_conns} nf_conntrack_used_pct={used_pct} cpu_pct={cpu_pct}"
+        vars:
+          open_conns: {k: i, v: [10000, 60000]}
+          used_pct: {k: i, v: [60, 100]}
+          cpu_pct: {k: i, v: [50, 100]}
+    beh:
+      n:
+        desc: Sidecar remains stable with low conntrack utilization.
+        emit:
+          - id: conntrack_metric
+            per_min: 0.3
+      f:
+        desc: Sidecar experiences higher connection churn; severe conntrack pressure is modeled as a separately activated signal.
+        emit:
+          - id: conntrack_metric
+            per_min: 0.4
+          - id: conntrack_pressure
+            per_min: 0.8
+
+tracing:
+  on: true
+  origins: [proxy_router, control_plane_api, kibana_instance]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: External traffic is routed by the proxy fleet using observer-cached routes; console reads state from ZooKeeper; Kibana uses a TLS sidecar for internal calls.
+    req:
+      - id: es_search_ok
+        desc: External Elasticsearch request routed successfully by the proxy.
+        rpm: 250.0
+        path: [proxy_router]
+        emit: [proxy_router.proxy_es_access_ok]
+        latency_ms: [[25, 90]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: kibana_ui_ok
+        desc: External Kibana UI request routed successfully and served by Kibana (proxy logs after upstream completes).
+        rpm: 80.0
+        path: [proxy_router, kibana_instance, proxy_router]
+        emit: [kibana_instance.kibana_ui_ok, proxy_router.proxy_kb_access_ok]
+        latency_ms: [[30, 140], [20, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: console_list_deployments_ok
+        desc: Console lists deployments successfully (control plane reads from ZooKeeper).
+        rpm: 20.0
+        path: [control_plane_api, zk_ensemble]
+        emit: [control_plane_api.console_access_ok]
+        latency_ms: [[60, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: kibana_es_call_ok
+        desc: Kibana makes internal calls to Elasticsearch via TLS sidecar and proxy layer (return path included to place completion logs).
+        rpm: 80.0
+        path: [kibana_instance, tls_proxy, proxy_router, tls_proxy, kibana_instance]
+        emit: [kibana_instance.es_call_start, tls_proxy.forward_ok, kibana_instance.es_call_ok]
+        latency_ms: [[1, 5], [15, 80], [25, 140]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.2
+          emit_per_retry: [kibana_instance.es_call_retry]
+          backoff_ms: [[150, 800]]
+        trace: true
+
+  f:
+    desc: Coordination instability breaks route discovery and control-plane reads; later, a reconnect storm overloads proxies/observers; after proxy recovery, a subset of Kibana hosts develop socket/conntrack pressure and forwarding failures.
+    req:
+      - id: es_search_503_route_unavailable
+        desc: External Elasticsearch request attempt fails at the proxy due to missing/unstable route info from the observer/coordination layer.
+        rpm: 220.0
+        path: [proxy_router]
+        emit: [proxy_router.proxy_es_access_err]
+        latency_ms: [[60, 700]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [proxy_router.route_lookup_retry]
+          backoff_ms: [[80, 350], [120, 650]]
+        trace: true
+
+      - id: es_search_200_after_recovery
+        desc: External Elasticsearch request succeeds after proxy/observer stabilization (suppressed early in failure).
+        rpm: 250.0
+        path: [proxy_router]
+        emit: [proxy_router.proxy_es_access_ok]
+        latency_ms: [[35, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: console_list_deployments_timeout
+        desc: Console request attempt times out or errors due to ZooKeeper unavailability.
+        rpm: 18.0
+        path: [control_plane_api, zk_ensemble]
+        emit: [control_plane_api.console_access_err]
+        latency_ms: [[1200, 9000]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.3
+          emit_per_retry: [control_plane_api.state_read_retry]
+          backoff_ms: [[120, 600]]
+        trace: true
+
+      - id: console_list_deployments_ok_after_restore
+        desc: Console request succeeds after coordination stabilizes (suppressed early in failure).
+        rpm: 20.0
+        path: [control_plane_api, zk_ensemble]
+        emit: [control_plane_api.console_access_ok]
+        latency_ms: [[180, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: kibana_ui_proxy_fail
+        desc: External Kibana request fails at proxy during proxy layer unavailability.
+        rpm: 80.0
+        path: [proxy_router]
+        emit: [proxy_router.proxy_kb_access_err_route]
+        latency_ms: [[80, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: kibana_ui_503_kibana_unhealthy
+        desc: External Kibana request reaches Kibana, but Kibana responds 503/504 because it cannot reach Elasticsearch (proxy logs after upstream completes).
+        rpm: 50.0
+        path: [proxy_router, kibana_instance, proxy_router]
+        emit: [kibana_instance.kibana_ui_err, proxy_router.proxy_kb_access_err_upstream]
+        latency_ms: [[300, 4000], [50, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: kibana_es_call_fail_proxy
+        desc: Kibana internal call fails because proxy layer is unavailable.
+        rpm: 80.0
+        path: [kibana_instance, tls_proxy, proxy_router, tls_proxy, kibana_instance]
+        emit: [kibana_instance.es_call_start, tls_proxy.forward_err, kibana_instance.es_call_err]
+        latency_ms: [[1, 10], [150, 2500], [300, 7000]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.2
+          emit_per_retry: [kibana_instance.es_call_retry]
+          backoff_ms: [[200, 900]]
+        trace: true
+
+      - id: kibana_es_call_fail_conntrack
+        desc: Kibana internal call fails due to sidecar/host conntrack and socket exhaustion after prolonged failures (suppressed early in failure).
+        rpm: 80.0
+        path: [kibana_instance, tls_proxy, proxy_router, tls_proxy, kibana_instance]
+        emit: [kibana_instance.es_call_start, tls_proxy.forward_err_conntrack, kibana_instance.es_call_err_conntrack]
+        latency_ms: [[1, 10], [200, 6000], [500, 12000]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.2
+          emit_per_retry: [kibana_instance.es_call_retry]
+          backoff_ms: [[250, 1000]]
+        trace: true
+
+assumptions:
+  - |
+    Host counts are reduced to a minimal incident-sufficient fleet: 3 ZooKeeper nodes, 2 observer nodes, 3 proxies, 2 control-plane API hosts, and 4 Kibana/TLS-sidecar hosts.
+  - |
+    Elasticsearch nodes themselves are not modeled; proxy access logs represent the outcome of routing attempts for Elasticsearch and Kibana traffic.
+  - |
+    Proxy and console access logs are modeled as per-attempt logs when retries are enabled (i.e., multiple attempt logs can exist for one higher-level client operation); retry marker logs are emitted only on attempts 2..N.
+  - |
+    The runc/kernel softlock issue is modeled as discrete CRITICAL one-shots on ZooKeeper hosts, representing operator debugging interactions that can render hosts unresponsive.
+  - |
+    Late-stage Kibana conntrack/socket exhaustion is modeled with distinct background metric logs (kibana_instance.open_sockets_pressure, tls_proxy.conntrack_pressure) that are suppressed early in failure and enabled only in the late failure event; baseline socket/conntrack metrics remain moderate through most of failure.
+  - |
+    Kibana proxy-access errors are split into two templates: proxy_kb_access_err_route (request fails before reaching Kibana due to routing/observer instability) and proxy_kb_access_err_upstream (request reached Kibana and failed/timed out upstream), to keep error semantics consistent with the emitted chain.
+  - |
+    Success-log attempt fields are constrained to attempt=1 for flows configured with max_attempts=1, avoiding contradictory attempt values.
+  - |
+    Flow paths include return hops only where needed to preserve chronological ordering for completion-bearing logs (e.g., Kibana logs before proxy access logs for Kibana UI); a Kibana->proxy_router edge models the response direction for those return hops.
+  - |
+    Two ALB metric templates are used in failure: lb_metrics (degraded) and lb_metrics_recovered (near-baseline). Scenario events swap which one is emitted so the post-stabilization drop can be reflected without widening the degraded value ranges.
+  - |
+    lb_edge.lb_metrics.req_rps is modeled to align with the modeled external request rates (sum of external flow RPM / 60) with headroom; event-time multipliers model the observed reconnection surge by temporarily increasing successful Elasticsearch request volume after proxy scaling.
+  - |
+    Quorum-loss semantics are enforced by constraining zk_ensemble.zk_quorum_lost.connected_peers to be strictly less than needed (needed is fixed at 2 for a 3-node ensemble).
+  - |
+    To avoid self-contradictory high-pressure evidence, kibana_instance open-socket logs model fd_limit as a fixed high value (65535), ensuring open <= fd_limit for all emitted combinations.
+  - |
+    Volume estimate: normal phase ~17.5k logs (25m) and failure phase ~34k logs (30m), totaling ~52k logs (within the 20k–100k target).
+  - |
+    Diagnostic visibility is ensured via: lb_edge.lb_metrics / lb_metrics_recovered (global), zk_ensemble.zk_quorum_lost + zk_client_conn_fail (coordination failure),
+    proxy_router.proxy_es_access_err + route_lookup_retry (routing failure with retries), zk_observer.observer_sync_timeout + initlimit_changed (observer instability and mitigation),
+    and late-only kibana_instance.open_sockets_pressure + tls_proxy.conntrack_pressure (extended Kibana degradation evidence).
+```

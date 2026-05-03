@@ -1,0 +1,950 @@
+```yaml
+sys:
+  id: merchant_identity_outage_20170316
+  desc: >
+    An API serving stack that supports merchant login and payment processing. Requests enter
+    through an API gateway and a product API service, which depends on Multipass for merchant
+    authentication. Multipass stores session/identity state in Redis using optimistic transactions
+    and triggers SMS delivery for two-factor authentication (2FA). A change in an adjacent identity
+    service (Roster) coincides with a buggy high-retry/no-backoff Redis transaction loop in Multipass,
+    overloading Redis and causing widespread timeouts; after core recovery, a surge of logins overwhelms
+    SMS vendor capacity.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_gateway
+    name: API Gateway
+    svc: api-gateway
+    hosts: [gw-1, gw-2]
+    desc: >
+      Front door for public API traffic. Logs request ingress and egress responses and emits a periodic
+      upstream error-rate metric.
+    to:
+      - dst: product_api
+        proto: https
+        desc: Routes API requests to the product API service.
+
+    logs:
+      gw_req_login:
+        desc: Ingress log for login requests.
+        lvl: INFO
+        msg: "ingress POST /v2/login rid={rid} ip={client_ip} trace={trace_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          client_ip: {k: ip, v: "10.0.0.0/8"}
+          trace_id: {k: hex, v: 32}
+
+      gw_resp_login_200:
+        desc: Successful login response log.
+        lvl: INFO
+        msg: "egress 200 /v2/login rid={rid} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [60, 400]}
+          f:
+            dur_ms: {k: i, v: [80, 650]}
+
+      gw_resp_login_503:
+        desc: Failed login response due to upstream issues.
+        lvl: WARN
+        msg: "egress 503 /v2/login rid={rid} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          dur_ms: {k: i, v: [2000, 9000]}
+          trace_id: {k: hex, v: 32}
+
+      gw_req_charge:
+        desc: Ingress log for charge requests.
+        lvl: INFO
+        msg: "ingress POST /v2/charge rid={rid} merchant={merchant_id} trace={trace_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          merchant_id: {k: ch, v: [m_1001, m_1002, m_1003, m_1004]}
+          trace_id: {k: hex, v: 32}
+
+      gw_resp_charge_200:
+        desc: Successful charge response log.
+        lvl: INFO
+        msg: "egress 200 /v2/charge rid={rid} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [80, 500]}
+          f:
+            dur_ms: {k: i, v: [90, 700]}
+
+      gw_resp_charge_503:
+        desc: Failed charge response due to upstream issues.
+        lvl: WARN
+        msg: "egress 503 /v2/charge rid={rid} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          dur_ms: {k: i, v: [2500, 10000]}
+          trace_id: {k: hex, v: 32}
+
+      upstream_5xx_metric:
+        desc: Rolling upstream error-rate summary (lower range; used after core recovery).
+        lvl: INFO
+        msg: "upstream_5xx_rate={rate_perc}% window_s=60"
+        vars: {}
+        state_vars:
+          n:
+            rate_perc: {k: i, v: [0, 2]}
+          f:
+            rate_perc: {k: i, v: [0, 8]}
+
+      upstream_5xx_metric_high:
+        desc: Rolling upstream error-rate summary during major incident impact (higher range).
+        lvl: INFO
+        msg: "upstream_5xx_rate={rate_perc}% window_s=60 mode=incident"
+        vars:
+          rate_perc: {k: i, v: [10, 80]}
+
+    beh:
+      n:
+        desc: Mostly healthy upstreams with low 5xx rates.
+        emit:
+          - id: upstream_5xx_metric
+            per_min: 1.0
+      f:
+        desc: During failure, the metric stream switches between high and low modes via scenario controls.
+        emit:
+          - id: upstream_5xx_metric
+            per_min: 1.0
+          - id: upstream_5xx_metric_high
+            per_min: 1.0
+
+  - id: product_api
+    name: Product API Service
+    svc: product-api
+    hosts: [prod-1, prod-2]
+    desc: >
+      Handles business endpoints (login and charge). Delegates authentication to Multipass and
+      surfaces upstream failures as 503s.
+    to:
+      - dst: multipass_auth
+        proto: grpc
+        desc: Performs merchant authentication for most requests.
+      - dst: api_gateway
+        proto: https
+        desc: Returns responses back to the API gateway.
+
+    logs:
+      login_start_no2fa:
+        desc: Start of a non-2FA login request.
+        lvl: INFO
+        msg: "login start rid={rid} merchant={merchant_id} 2fa=false"
+        vars:
+          rid: {k: uuid, v: null}
+          merchant_id: {k: ch, v: [m_1001, m_1002, m_1003, m_1004]}
+
+      login_ok_no2fa:
+        desc: Successful non-2FA login completion.
+        lvl: INFO
+        msg: "login ok rid={rid} user={user_id} dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          user_id: {k: ch, v: [u_2001, u_2002, u_2003, u_2004]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [40, 250]}
+          f:
+            dur_ms: {k: i, v: [50, 320]}
+
+      login_start_2fa:
+        desc: Start of a 2FA login request.
+        lvl: INFO
+        msg: "login start rid={rid} merchant={merchant_id} 2fa=true"
+        vars:
+          rid: {k: uuid, v: null}
+          merchant_id: {k: ch, v: [m_1001, m_1002, m_1003, m_1004]}
+
+      login_ok_2fa:
+        desc: Successful 2FA login completion after SMS send.
+        lvl: INFO
+        msg: "login ok rid={rid} user={user_id} 2fa=sent dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          user_id: {k: ch, v: [u_2001, u_2002, u_2003, u_2004]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [120, 900]}
+          f:
+            dur_ms: {k: i, v: [150, 1100]}
+
+      login_fail_upstream_timeout:
+        desc: Login failure due to Multipass timing out.
+        lvl: ERROR
+        msg: "login failed rid={rid} cause=auth_timeout dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          dur_ms: {k: i, v: [2000, 9000]}
+
+      login_fail_2fa_delivery:
+        desc: Login failure because 2FA SMS could not be delivered.
+        lvl: WARN
+        msg: "login failed rid={rid} cause=2fa_delivery status={status}"
+        vars:
+          rid: {k: uuid, v: null}
+          status: {k: i, v: [503, 503]}
+
+      charge_start:
+        desc: Start of a charge request.
+        lvl: INFO
+        msg: "charge start rid={rid} merchant={merchant_id} amount_cents={amount_cents}"
+        vars:
+          rid: {k: uuid, v: null}
+          merchant_id: {k: ch, v: [m_1001, m_1002, m_1003, m_1004]}
+          amount_cents: {k: i, v: [100, 15000]}
+
+      charge_ok:
+        desc: Successful charge completion.
+        lvl: INFO
+        msg: "charge ok rid={rid} auth={auth_code} dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          auth_code: {k: hex, v: 8}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [60, 350]}
+          f:
+            dur_ms: {k: i, v: [70, 450]}
+
+      charge_fail_upstream_timeout:
+        desc: Charge failure due to Multipass timing out.
+        lvl: ERROR
+        msg: "charge failed rid={rid} cause=auth_timeout dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          dur_ms: {k: i, v: [2500, 10000]}
+
+      worker_metric:
+        desc: Periodic worker-pool gauge.
+        lvl: INFO
+        msg: "workers busy={busy} total={total} queue={queue}"
+        vars:
+          total: {k: i, v: [200, 200]}
+          busy: {k: i, v: [10, 190]}
+          queue: {k: i, v: [0, 500]}
+
+    beh:
+      n:
+        desc: Routine worker metrics.
+        emit:
+          - id: worker_metric
+            per_min: 0.5
+      f:
+        desc: Worker queue grows when upstream authentication is slow/unavailable.
+        emit:
+          - id: worker_metric
+            per_min: 0.8
+
+  - id: multipass_auth
+    name: Multipass Authentication Service
+    svc: multipass
+    hosts: [mp-wc-1, mp-ec-1, mp-jp-1]
+    desc: >
+      Authenticates merchants for core product requests. Uses Redis with optimistic transactions
+      for session/identity state and can generate 2FA challenges that require SMS delivery.
+    to:
+      - dst: multipass_redis
+        proto: redis
+        desc: Reads/writes session and identity state with optimistic transactions.
+      - dst: roster_identity
+        proto: grpc
+        desc: Consults identity data as an upstream dependency.
+      - dst: sms_gateway
+        proto: https
+        desc: Sends 2FA codes via an external SMS gateway.
+      - dst: product_api
+        proto: grpc
+        desc: Returns auth decisions back to the product API service.
+
+    logs:
+      auth_start:
+        desc: Start handling an auth request.
+        lvl: INFO
+        msg: "auth start rid={rid} merchant={merchant_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          merchant_id: {k: ch, v: [m_1001, m_1002, m_1003, m_1004]}
+
+      redis_txn_begin:
+        desc: Begins a Redis optimistic transaction for session/identity state.
+        lvl: DEBUG
+        msg: "redis txn begin rid={rid} key={key}"
+        vars:
+          rid: {k: uuid, v: null}
+          key: {k: str, v: "redis key like sess:m_1001 or acct:m_1001"}
+
+      redis_txn_commit:
+        desc: Commit of a Redis optimistic transaction.
+        lvl: DEBUG
+        msg: "redis txn commit rid={rid} dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [5, 40]}
+          f:
+            dur_ms: {k: i, v: [10, 120]}
+
+      auth_ok:
+        desc: Auth succeeded.
+        lvl: INFO
+        msg: "auth ok rid={rid} principal={principal} dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          principal: {k: ch, v: [merchant, employee, device]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [15, 120]}
+          f:
+            dur_ms: {k: i, v: [25, 200]}
+
+      auth_timeout:
+        desc: Auth handling timed out waiting on Redis/transaction completion.
+        lvl: ERROR
+        msg: "auth timeout rid={rid} timeout_ms={timeout_ms} waited_ms={waited_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          timeout_ms: {k: i, v: [2500, 5000]}
+          waited_ms: {k: i, v: [2500, 9000]}
+
+      redis_txn_retry:
+        desc: A retry attempt of the Redis optimistic transaction due to conflicts/timeouts.
+        lvl: WARN
+        msg: "redis txn retry rid={rid} attempt={attempt} err={err}"
+        vars:
+          rid: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 500]}
+          err: {k: ch, v: [WATCH_CONFLICT, TIMEOUT]}
+
+      timeout_metric:
+        desc: Per-minute auth timeout/conflict counters (lower range; used after core recovery).
+        lvl: INFO
+        msg: "auth_timeouts_1m={count} redis_conflicts_1m={conflicts}"
+        vars: {}
+        state_vars:
+          n:
+            count: {k: i, v: [0, 3]}
+            conflicts: {k: i, v: [0, 30]}
+          f:
+            count: {k: i, v: [0, 15]}
+            conflicts: {k: i, v: [0, 120]}
+
+      timeout_metric_high:
+        desc: Per-minute auth timeout/conflict counters during retry storm (higher range).
+        lvl: INFO
+        msg: "auth_timeouts_1m={count} redis_conflicts_1m={conflicts} mode=incident"
+        vars:
+          count: {k: i, v: [80, 700]}
+          conflicts: {k: i, v: [400, 4000]}
+
+      redis_ops_metric:
+        desc: Per-minute Redis activity estimates from the client perspective (lower range).
+        lvl: INFO
+        msg: "redis_ops_1m={ops} redis_slowlog_1m={slow}"
+        vars: {}
+        state_vars:
+          n:
+            ops: {k: i, v: [2000, 9000]}
+            slow: {k: i, v: [0, 5]}
+          f:
+            ops: {k: i, v: [4000, 20000]}
+            slow: {k: i, v: [0, 30]}
+
+      redis_ops_metric_high:
+        desc: Per-minute Redis activity estimates during retry storm (higher range).
+        lvl: INFO
+        msg: "redis_ops_1m={ops} redis_slowlog_1m={slow} mode=incident"
+        vars:
+          ops: {k: i, v: [20000, 90000]}
+          slow: {k: i, v: [50, 500]}
+
+      restart:
+        desc: Service restart marker.
+        lvl: WARN
+        msg: "service restart requested by {who} build={build}"
+        vars:
+          who: {k: ch, v: [oncall]}
+          build: {k: ch, v: [mp-2017.03.16.1, mp-2017.03.16.2]}
+
+      deploy_fix:
+        desc: Deployment marker for the retry/backoff fix.
+        lvl: INFO
+        msg: "deploy build={build} change=cap_redis_retries backoff_ms={backoff_ms}"
+        vars:
+          build: {k: ch, v: [mp-2017.03.16.2]}
+          backoff_ms: {k: i, v: [10, 200]}
+
+    beh:
+      n:
+        desc: Low auth timeouts and low Redis conflict rates; occasional individual retries.
+        emit:
+          - id: timeout_metric
+            per_min: 1.0
+          - id: redis_ops_metric
+            per_min: 1.0
+          - id: redis_txn_retry
+            per_min: 0.2
+      f:
+        desc: Failure-state includes both low- and high-mode metrics; scenario controls switch which are emitted.
+        emit:
+          - id: timeout_metric
+            per_min: 1.0
+          - id: timeout_metric_high
+            per_min: 1.0
+          - id: redis_ops_metric
+            per_min: 1.0
+          - id: redis_ops_metric_high
+            per_min: 1.0
+          - id: redis_txn_retry
+            per_min: 70.0
+
+  - id: multipass_redis
+    name: Multipass Redis Cluster
+    svc: redis
+    hosts: [redis-1, redis-2]
+    desc: >
+      Redis backing store for Multipass sessions/identity state. Emits periodic stats and slowlog
+      entries when command latency exceeds thresholds.
+    to:
+      - dst: multipass_auth
+        proto: redis
+        desc: Responds to Multipass client connections and requests.
+
+    logs:
+      info_stats:
+        desc: Periodic snapshot of Redis load and resource usage.
+        lvl: INFO
+        msg: "stats ops={ops} connected_clients={clients} used_cpu={cpu_pct}% used_mem_mb={mem_mb}"
+        vars: {}
+        state_vars:
+          n:
+            ops: {k: i, v: [20000, 80000]}
+            clients: {k: i, v: [50, 400]}
+            cpu_pct: {k: i, v: [5, 35]}
+            mem_mb: {k: i, v: [2000, 6000]}
+          f:
+            ops: {k: i, v: [20000, 450000]}
+            clients: {k: i, v: [100, 1500]}
+            cpu_pct: {k: i, v: [10, 99]}
+            mem_mb: {k: i, v: [3000, 8000]}
+
+      slowlog_entry:
+        desc: Slow command log entry.
+        lvl: WARN
+        msg: "SLOWLOG cmd={cmd} dur_us={dur_us} key={key}"
+        vars:
+          cmd: {k: ch, v: [EVAL, GET, SET, WATCH, MULTI, EXEC]}
+          key: {k: str, v: "redis key like sess:m_1002"}
+        state_vars:
+          n:
+            dur_us: {k: i, v: [5000, 20000]}
+          f:
+            dur_us: {k: i, v: [20000, 300000]}
+
+      cpu_saturation_warn:
+        desc: Redis CPU saturation warning marker.
+        lvl: ERROR
+        msg: "redis cpu saturation cpu_pct={cpu_pct}% event=latency_spike"
+        vars:
+          cpu_pct: {k: i, v: [70, 99]}
+
+      monitor_attached:
+        desc: MONITOR client attached (diagnostic action).
+        lvl: INFO
+        msg: "client MONITOR attached addr={client_ip}"
+        vars:
+          client_ip: {k: ip, v: "10.0.0.0/8"}
+
+    beh:
+      n:
+        desc: Normal Redis stats and occasional slowlog entries.
+        emit:
+          - id: info_stats
+            per_min: 1.0
+          - id: slowlog_entry
+            per_min: 0.1
+          - id: cpu_saturation_warn
+            per_min: 0.0
+      f:
+        desc: Redis under heavy load with frequent slowlog entries and CPU saturation warnings until mitigated.
+        emit:
+          - id: info_stats
+            per_min: 1.0
+          - id: slowlog_entry
+            per_min: 6.0
+          - id: cpu_saturation_warn
+            per_min: 0.5
+
+  - id: roster_identity
+    name: Roster Identity Service
+    svc: roster
+    hosts: [roster-wc-1, roster-ec-1]
+    desc: >
+      Customer identity service deployed active-active across datacenters. A one-datacenter rollout
+      happens near incident start but Roster remains generally available.
+    to: []
+
+    logs:
+      deploy_started:
+        desc: Deployment start marker (one datacenter rollout).
+        lvl: INFO
+        msg: "deploy started build={build} dc={dc} strategy=one_dc"
+        vars:
+          build: {k: ch, v: [roster-2017.03.16.7]}
+          dc: {k: ch, v: [wc]}
+
+      rollback_completed:
+        desc: Rollback completion marker.
+        lvl: WARN
+        msg: "rollback completed build={build} dc={dc}"
+        vars:
+          build: {k: ch, v: [roster-2017.03.16.6]}
+          dc: {k: ch, v: [wc]}
+
+      health_metric:
+        desc: Health and error counters for Roster traffic.
+        lvl: INFO
+        msg: "health ok req_1m={req} err_1m={err}"
+        vars: {}
+        state_vars:
+          n:
+            req: {k: i, v: [5000, 20000]}
+            err: {k: i, v: [0, 20]}
+          f:
+            req: {k: i, v: [5000, 20000]}
+            err: {k: i, v: [0, 50]}
+
+    beh:
+      n:
+        desc: Roster is healthy.
+        emit:
+          - id: health_metric
+            per_min: 1.0
+      f:
+        desc: Roster remains mostly healthy and continues serving from other datacenters.
+        emit:
+          - id: health_metric
+            per_min: 1.0
+
+  - id: sms_gateway
+    name: SMS Gateway
+    svc: sms-gateway
+    hosts: [sms-1]
+    desc: >
+      Sends outbound SMS messages for 2FA. During recovery, a surge of logins can exceed vendor
+      capacity, resulting in throttling and a growing internal queue.
+    to:
+      - dst: product_api
+        proto: https
+        desc: Returns SMS send outcomes back to the login flow.
+
+    logs:
+      sms_send_req:
+        desc: Request to send a 2FA SMS.
+        lvl: INFO
+        msg: "sms send req rid={rid} to={msisdn} pool={pool_id}"
+        vars:
+          rid: {k: uuid, v: null}
+          msisdn: {k: str, v: "E.164 phone number like +14155550123"}
+          pool_id: {k: ch, v: [pool-a]}
+
+      sms_send_ok:
+        desc: SMS successfully accepted by vendor.
+        lvl: INFO
+        msg: "sms sent rid={rid} vendor_id={vendor_id} dur_ms={dur_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          vendor_id: {k: hex, v: 12}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [200, 1200]}
+          f:
+            dur_ms: {k: i, v: [300, 2000]}
+
+      sms_send_throttled:
+        desc: SMS vendor throttled the request.
+        lvl: WARN
+        msg: "sms send failed rid={rid} http=429 retry_after_s={retry_after_s}"
+        vars:
+          rid: {k: uuid, v: null}
+          retry_after_s: {k: i, v: [1, 30]}
+
+      vendor_throttle_metric:
+        desc: Per-minute throttling and queue depth.
+        lvl: INFO
+        msg: "vendor_throttles_1m={count} queue_depth={queue_depth}"
+        vars: {}
+        state_vars:
+          n:
+            count: {k: i, v: [0, 5]}
+            queue_depth: {k: i, v: [0, 20]}
+          f:
+            count: {k: i, v: [5, 12]}
+            queue_depth: {k: i, v: [30, 300]}
+
+      pool_add_numbers:
+        desc: Operational action to add numbers to outbound pool.
+        lvl: INFO
+        msg: "sms pool update action=add_numbers pool={pool_id} added={added}"
+        vars:
+          pool_id: {k: ch, v: [pool-a]}
+          added: {k: i, v: [10, 100]}
+
+      pool_rebalance_complete:
+        desc: Operational action indicating pool rebalancing complete.
+        lvl: INFO
+        msg: "sms pool update action=rebalance_complete pool={pool_id} active_numbers={active_numbers}"
+        vars:
+          pool_id: {k: ch, v: [pool-a]}
+          active_numbers: {k: i, v: [50, 300]}
+
+    beh:
+      n:
+        desc: Typically low throttling and near-empty queues.
+        emit:
+          - id: vendor_throttle_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Throttling spikes only after core recovery; scenario controls suppress it earlier.
+        emit:
+          - id: vendor_throttle_metric
+            per_min: 1.0
+            scope: global
+
+  - id: synthetic_monitor
+    name: External Synthetic Monitor
+    svc: null
+    hosts: [extmon-1]
+    desc: >
+      External monitor that checks the public API for availability and opens an alert on sustained
+      failures.
+    to: []
+
+    logs:
+      check_ok:
+        desc: Successful synthetic check.
+        lvl: INFO
+        msg: "synthetic check ok target=api duration_ms={dur_ms}"
+        vars: {}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [80, 250]}
+          f:
+            dur_ms: {k: i, v: [90, 300]}
+
+      check_fail:
+        desc: Failed synthetic check.
+        lvl: ERROR
+        msg: "synthetic check fail target=api err={err} duration_ms={dur_ms}"
+        vars:
+          err: {k: ch, v: [timeout, conn_refused, http_5xx]}
+          dur_ms: {k: i, v: [2000, 8000]}
+
+      alert_opened:
+        desc: Alert opened marker.
+        lvl: CRITICAL
+        msg: "ALERT opened id={alert_id} target=api severity=critical"
+        vars:
+          alert_id: {k: ch, v: [ALERT-2791]}
+
+    beh:
+      n:
+        desc: Monitor is healthy and sees the API as up.
+        emit:
+          - id: check_ok
+            per_min: 1.0
+            scope: global
+          - id: check_fail
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Monitor sees the API as down during the core outage; later checks go green again.
+        emit:
+          - id: check_ok
+            per_min: 1.0
+            scope: global
+          - id: check_fail
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [api_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal steady traffic for payments and logins. Multipass completes quickly, Redis shows low slowlog
+      volume, and SMS vendor throttling is rare.
+    req:
+      - id: payment_charge_ok
+        desc: Successful payment charge with Multipass auth.
+        rpm: 80.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_charge
+          - product_api.charge_start
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.redis_txn_commit
+          - multipass_auth.auth_ok
+          - product_api.charge_ok
+          - api_gateway.gw_resp_charge_200
+        latency_ms:
+          - [0, 1]
+          - [5, 20]
+          - [5, 20]
+          - [5, 25]
+          - [10, 40]
+          - [5, 25]
+          - [10, 60]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: merchant_login_ok_no2fa
+        desc: Successful merchant login without 2FA.
+        rpm: 45.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_login
+          - product_api.login_start_no2fa
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.redis_txn_commit
+          - multipass_auth.auth_ok
+          - product_api.login_ok_no2fa
+          - api_gateway.gw_resp_login_200
+        latency_ms:
+          - [0, 1]
+          - [5, 20]
+          - [5, 20]
+          - [5, 25]
+          - [10, 40]
+          - [5, 25]
+          - [10, 80]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: merchant_login_2fa_ok
+        desc: Successful merchant login requiring 2FA SMS.
+        rpm: 10.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, sms_gateway, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_login
+          - product_api.login_start_2fa
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.redis_txn_commit
+          - multipass_auth.auth_ok
+          - sms_gateway.sms_send_req
+          - sms_gateway.sms_send_ok
+          - product_api.login_ok_2fa
+          - api_gateway.gw_resp_login_200
+        latency_ms:
+          - [0, 1]
+          - [5, 25]
+          - [5, 25]
+          - [5, 30]
+          - [10, 60]
+          - [5, 30]
+          - [10, 80]
+          - [150, 1200]
+          - [10, 80]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      Failure begins with a retry storm inside Multipass that overloads Redis and causes auth timeouts, cascading into 503s
+      for login and payments. A later Multipass deploy caps retries and adds backoff, restoring core traffic. After core
+      recovery, login surges cause SMS throttling and 2FA delivery failures.
+    req:
+      - id: payment_charge_timeout
+        desc: Payment charge fails due to Multipass auth timeouts during Redis overload.
+        rpm: 65.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_charge
+          - product_api.charge_start
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.auth_timeout
+          - product_api.charge_fail_upstream_timeout
+          - api_gateway.gw_resp_charge_503
+        latency_ms:
+          - [0, 1]
+          - [10, 80]
+          - [10, 80]
+          - [10, 150]
+          - [2500, 8000]
+          - [10, 80]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: merchant_login_timeout
+        desc: Login fails due to Multipass auth timeouts during Redis overload.
+        rpm: 30.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_login
+          - product_api.login_start_no2fa
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.auth_timeout
+          - product_api.login_fail_upstream_timeout
+          - api_gateway.gw_resp_login_503
+        latency_ms:
+          - [0, 1]
+          - [10, 80]
+          - [10, 80]
+          - [10, 150]
+          - [2500, 8000]
+          - [10, 80]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: payment_charge_ok_after_fix
+        desc: Payment charge succeeds after Multipass deploy caps retries and adds backoff.
+        rpm: 80.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_charge
+          - product_api.charge_start
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.redis_txn_commit
+          - multipass_auth.auth_ok
+          - product_api.charge_ok
+          - api_gateway.gw_resp_charge_200
+        latency_ms:
+          - [0, 1]
+          - [8, 40]
+          - [8, 40]
+          - [8, 50]
+          - [15, 80]
+          - [8, 45]
+          - [10, 70]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: merchant_login_ok_after_fix
+        desc: Non-2FA login succeeds after the Multipass fix.
+        rpm: 45.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_login
+          - product_api.login_start_no2fa
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.redis_txn_commit
+          - multipass_auth.auth_ok
+          - product_api.login_ok_no2fa
+          - api_gateway.gw_resp_login_200
+        latency_ms:
+          - [0, 1]
+          - [8, 40]
+          - [8, 40]
+          - [8, 50]
+          - [15, 80]
+          - [8, 45]
+          - [10, 90]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: merchant_login_2fa_sms_throttled
+        desc: 2FA login fails because SMS delivery is throttled after core recovery.
+        rpm: 12.0
+        path: [api_gateway, product_api, multipass_auth, multipass_redis, multipass_auth, sms_gateway, product_api, api_gateway]
+        emit:
+          - api_gateway.gw_req_login
+          - product_api.login_start_2fa
+          - multipass_auth.auth_start
+          - multipass_auth.redis_txn_begin
+          - multipass_auth.redis_txn_commit
+          - multipass_auth.auth_ok
+          - sms_gateway.sms_send_req
+          - sms_gateway.sms_send_throttled
+          - product_api.login_fail_2fa_delivery
+          - api_gateway.gw_resp_login_503
+        latency_ms:
+          - [0, 1]
+          - [8, 50]
+          - [8, 50]
+          - [8, 60]
+          - [15, 120]
+          - [8, 60]
+          - [10, 80]
+          - [200, 1500]
+          - [10, 80]
+          - [0, 1]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - >-
+    The real incident lasted hours; the model compresses it into a 60-minute scenario while preserving ordering: adjacent Roster rollout,
+    Multipass Redis retry storm and widespread timeouts, then core recovery, then residual 2FA SMS delivery degradation.
+  - >-
+    To keep retry semantics simple and log volume practical, the Redis retry storm is modeled primarily via Multipass background signals
+    (redis_txn_retry plus high-mode timeout/ops metrics) rather than as per-request retry emission.
+  - >-
+    sms_gateway.vendor_throttle_metric ranges are constrained to be realizable from the modeled 2FA SMS attempt rate (merchant_login_2fa_sms_throttled rpm),
+    treating the metric as "throttled sends observed in the last minute" rather than including unmodeled internal requeue/retry behavior.
+  - >-
+    Normal-phase volume estimate is ~1.1k logs/min (mostly per-request gateway/product/auth logs); total scenario volume is estimated ~60k–75k logs
+    under the scenario multipliers, and remains <100k even under conservative "all failure flows active" estimation.
+  - >-
+    Diagnostic visibility comes from: Multipass high-mode timeout/ops metrics and redis_txn_retry spikes, Redis slowlog/CPU warnings,
+    synthetic monitor fail/ok transitions, gateway 503 responses during core outage, and later SMS 429 throttling plus vendor throttle metrics.
+```

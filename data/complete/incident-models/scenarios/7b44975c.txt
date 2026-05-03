@@ -1,0 +1,282 @@
+```yaml
+scenario:
+  id: m365_wan_router_ip_change_outage
+  title: WAN router IP change triggers WAN-wide forwarding impairment and intermittent Microsoft 365 timeouts
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Microsoft 365 traffic normally flows through an edge gateway that resolves internal DNS and connects to backends over a WAN.
+    A planned WAN router IP address change triggers WAN-wide adjacency/forwarding table recomputation, temporarily preventing correct packet forwarding.
+    Users experience high latency and timeouts (504) and some DNS timeouts (503), and even the service status portal intermittently fails with 504.
+    As the WAN partially self-recovers, automated WAN health/traffic-engineering pauses during instability, leaving residual packet loss and intermittent failures.
+
+  trigger_desc: |
+    An operator executes a router IP change command that behaves differently across devices and causes the router to send messages to all other WAN routers,
+    triggering WAN-wide adjacency and forwarding-table recomputation.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        The edge gateway serves Microsoft 365 requests with low latency. For each request it performs internal DNS resolution and reaches the backend over stable WAN paths.
+        Synthetic WAN probes from the automation controller report healthy RTT. Router and automation background telemetry are steady and low-noise.
+      flows: [m365_http_ok, status_portal_ok, wan_probe_ok]
+      manifestation:
+        - m365_edge_gateway.resp_200_m365
+        - dns_resolver.dns_answer_ok
+        - wan_automation_controller.probe_result_ok
+        - wan_router_fleet.router_heartbeat
+
+    f:
+      desc: |
+        A WAN router configuration change triggers WAN-wide routing adjacency/forwarding-table recomputation.
+        During recomputation, forwarding becomes unreliable and causes packet loss and long latency for traffic traversing the WAN, including DNS lookups and edge-to-backend connections.
+        User impact occurs in noticeable surges (modeled here as a spike shortly after the trigger), and later the WAN begins to partially recover on its own.
+        Automated WAN health and traffic engineering then pause due to the instability, prolonging residual packet loss and intermittent 504/503 responses through the end of this scenario.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: wan_router_fleet
+          event: |
+            A planned router IP address change command is executed, and routers begin WAN-wide adjacency/forwarding-table recomputation, immediately degrading forwarding.
+          why: |
+            The command triggers control-plane messages to peers, causing widespread recomputation; during this interval, routers cannot forward packets reliably.
+            The command execution is directly observable (router one-shot log); the WAN-wide forwarding impairment is inferred from elevated drop and convergence metrics plus edge/DNS timeouts.
+          flows: [m365_http_504, m365_dns_timeout_503, status_portal_504, wan_probe_lossy]
+          rate_multipliers:
+            m365_http_504: 1.2
+            m365_dns_timeout_503: 1.3
+            status_portal_504: 1.0
+            wan_probe_lossy: 1.0
+            wan_router_fleet.fwd_drop_metric: 2.5
+            wan_router_fleet.routing_recompute_metric: 2.0
+          latency_multipliers:
+            m365_http_slow_success: {p50: 1.8, p95: 2.2}
+            m365_http_504: {p50: 2.0, p95: 2.5}
+            m365_dns_timeout_503: {p50: 1.6, p95: 2.0}
+            status_portal_ok_degraded: {p50: 1.6, p95: 2.0}
+            status_portal_504: {p50: 2.0, p95: 2.5}
+            wan_probe_lossy: {p50: 2.0, p95: 2.5}
+          one_shots:
+            - ref: wan_router_fleet.config_cmd_ip_change
+              count: 1
+              hosts: [wan-rtr-01]
+            - ref: wan_router_fleet.adjacency_recompute_start
+              count: 1
+              hosts: [wan-rtr-01]
+          manifestation:
+            - wan_router_fleet.adjacency_recompute_start
+            - wan_router_fleet.fwd_drop_metric
+            - m365_edge_gateway.resp_504_m365
+            - dns_resolver.dns_timeout
+
+        - order: 2
+          at_min: 23
+          component: m365_edge_gateway
+          event: |
+            A prominent impact surge occurs: gateway timeouts and status portal 504s spike while probes show frequent failures.
+          why: |
+            As forwarding instability peaks, more attempts hit connection/read timeouts; this is directly visible via higher 504 responses and
+            higher WAN loss metrics. The "wave" shape is modeled as a short-lived multiplier increase.
+          flows: [m365_http_504, status_portal_504, wan_probe_lossy]
+          rate_multipliers:
+            m365_http_504: 1.7
+            m365_dns_timeout_503: 1.6
+            status_portal_504: 3.0
+            wan_probe_lossy: 1.4
+            wan_router_fleet.fwd_drop_metric: 3.2
+          latency_multipliers:
+            m365_http_slow_success: {p50: 2.4, p95: 3.0}
+            m365_http_504: {p50: 3.0, p95: 3.5}
+            m365_dns_timeout_503: {p50: 2.0, p95: 2.8}
+            status_portal_ok_degraded: {p50: 2.0, p95: 2.8}
+            status_portal_504: {p50: 3.0, p95: 3.5}
+            wan_probe_lossy: {p50: 2.8, p95: 3.2}
+          one_shots: []
+          manifestation:
+            - m365_edge_gateway.upstream_timeout
+            - m365_edge_gateway.resp_504_status
+            - wan_automation_controller.probe_result_fail
+            - wan_router_fleet.fwd_drop_metric
+
+        - order: 3
+          at_min: 26
+          component: wan_router_fleet
+          event: |
+            The WAN begins partially self-recovering: loss and timeouts ease, and a larger share of requests succeed but remain slow.
+          why: |
+            As routing reconverges, more packets are forwarded successfully, reducing outright timeouts. This is visible as reduced 504/503 rates and lower loss metrics,
+            while elevated end-to-end latency remains due to still-suboptimal paths.
+          flows: [m365_http_slow_success, m365_http_504, m365_dns_timeout_503, status_portal_ok_degraded, status_portal_504]
+          rate_multipliers:
+            m365_http_slow_success: 1.2
+            m365_http_504: 0.8
+            m365_dns_timeout_503: 0.7
+            status_portal_ok_degraded: 1.1
+            status_portal_504: 1.2
+            wan_probe_lossy: 1.0
+            wan_router_fleet.fwd_drop_metric: 2.0
+            wan_router_fleet.routing_recompute_metric: 1.4
+          latency_multipliers:
+            m365_http_slow_success: {p50: 1.5, p95: 1.8}
+            m365_http_504: {p50: 1.8, p95: 2.1}
+            m365_dns_timeout_503: {p50: 1.3, p95: 1.6}
+            status_portal_ok_degraded: {p50: 1.4, p95: 1.7}
+            status_portal_504: {p50: 1.8, p95: 2.1}
+            wan_probe_lossy: {p50: 1.6, p95: 1.9}
+          one_shots: []
+          manifestation:
+            - m365_edge_gateway.resp_200_m365
+            - m365_edge_gateway.resp_504_m365
+            - wan_router_fleet.routing_recompute_metric
+
+        - order: 4
+          at_min: 34
+          component: wan_automation_controller
+          event: |
+            Automated WAN health and traffic-engineering systems pause due to the ongoing instability, and residual packet loss persists on some paths.
+          why: |
+            Automation subsystems rely on stable control-plane/telemetry and may stop acting when the network is too degraded. This pause is directly observable via an
+            automation-paused marker and suppression of periodic automation ticks; the prolonged residual loss is inferred from continued router drop metrics and intermittent 504/503s.
+          flows: [m365_http_504, m365_dns_timeout_503, wan_probe_lossy]
+          rate_multipliers:
+            wan_automation_controller.te_optimizer_tick: 0.0
+            wan_automation_controller.device_health_scan: 0.0
+            m365_http_504: 0.9
+            m365_dns_timeout_503: 0.8
+            wan_probe_lossy: 1.1
+            wan_router_fleet.fwd_drop_metric: 2.3
+          latency_multipliers:
+            m365_http_slow_success: {p50: 1.6, p95: 1.9}
+            m365_http_504: {p50: 1.9, p95: 2.2}
+            m365_dns_timeout_503: {p50: 1.4, p95: 1.8}
+            wan_probe_lossy: {p50: 1.8, p95: 2.3}
+          one_shots:
+            - ref: wan_automation_controller.automation_paused
+              count: 1
+              hosts: [wan-auto-01]
+          manifestation:
+            - wan_automation_controller.automation_paused
+            - wan_router_fleet.fwd_drop_metric
+            - m365_edge_gateway.resp_504_m365
+
+        - order: 5
+          at_min: 38
+          component: wan_automation_controller
+          event: |
+            Operators manually restart WAN automation subsystems, reducing but not eliminating intermittent packet loss and gateway timeouts by scenario end.
+          why: |
+            Restarting automation resumes traffic-engineering and device-health actions, improving path selection and removing some bad paths; however, full mitigation is not
+            completed within the modeled window, so residual failures remain visible.
+          flows: [m365_http_slow_success, m365_http_504, m365_dns_timeout_503, status_portal_ok_degraded, status_portal_504, wan_probe_lossy]
+          rate_multipliers:
+            wan_automation_controller.te_optimizer_tick: 1.0
+            wan_automation_controller.device_health_scan: 1.0
+            m365_http_slow_success: 1.1
+            m365_http_504: 0.6
+            m365_dns_timeout_503: 0.5
+            status_portal_504: 0.8
+            wan_probe_lossy: 0.9
+            wan_router_fleet.fwd_drop_metric: 1.6
+            wan_router_fleet.routing_recompute_metric: 1.1
+          latency_multipliers:
+            m365_http_slow_success: {p50: 1.2, p95: 1.4}
+            m365_http_504: {p50: 1.4, p95: 1.6}
+            m365_dns_timeout_503: {p50: 1.2, p95: 1.4}
+            status_portal_ok_degraded: {p50: 1.2, p95: 1.4}
+            status_portal_504: {p50: 1.4, p95: 1.6}
+            wan_probe_lossy: {p50: 1.3, p95: 1.6}
+          one_shots:
+            - ref: wan_automation_controller.automation_manual_restart
+              count: 2
+              hosts: [wan-auto-01]
+          manifestation:
+            - wan_automation_controller.automation_manual_restart
+            - wan_automation_controller.te_optimizer_tick
+            - m365_edge_gateway.resp_504_m365
+            - wan_router_fleet.fwd_drop_metric
+
+      steady:
+        - component: wan_router_fleet
+          condition: |
+            WAN forwarding remains impaired on a subset of paths, with elevated packet loss/queueing compared to normal.
+          user_impact: |
+            Users intermittently see slow page loads and occasional timeouts depending on route and region.
+          manifestation:
+            - wan_router_fleet.fwd_drop_metric
+            - wan_router_fleet.routing_recompute_metric
+
+        - component: m365_edge_gateway
+          condition: |
+            The edge gateway continues to return a reduced but non-zero rate of 504 and 503 responses due to lingering WAN loss and DNS timeouts.
+          user_impact: |
+            Microsoft 365 access is unstable: many requests succeed slowly, but some fail with 504/503.
+          manifestation:
+            - m365_edge_gateway.resp_504_m365
+            - m365_edge_gateway.resp_503_m365
+            - dns_resolver.dns_timeout
+
+        - component: status_portal_app
+          condition: |
+            The service status portal intermittently fails behind the same WAN/edge dependency chain.
+          user_impact: |
+            Users may be unable to reliably load the status portal during the incident, seeing occasional 504 errors.
+          manifestation:
+            - m365_edge_gateway.resp_504_status
+
+      feedback_loops:
+        - id: retry_amplifies_instability
+          desc: |
+            As the edge gateway retries upstream selection during WAN loss, additional connection attempts and retransmissions increase load and variability,
+            which can exacerbate queueing and make convergence appear "bursty" (waves of higher timeouts).
+
+        - id: automation_pause_prolongs_loss
+          desc: |
+            When WAN automation pauses, unhealthy-path elimination and traffic engineering stop adapting, allowing residual loss to persist longer than
+            the initial routing recomputation would have on its own.
+
+      flows:
+        - m365_http_slow_success
+        - m365_http_504
+        - m365_dns_timeout_503
+        - status_portal_ok_degraded
+        - status_portal_504
+        - wan_probe_lossy
+      manifestation:
+        - wan_router_fleet.fwd_drop_metric
+        - m365_edge_gateway.upstream_timeout
+        - m365_edge_gateway.resp_504_m365
+        - dns_resolver.dns_timeout
+        - wan_automation_controller.automation_paused
+
+  assumptions:
+    - |
+      Timeline is compressed from the real ~5h incident into a 40-minute executable scenario while preserving order:
+      trigger → wave peak → partial self-recovery → automation pause → manual restart with residual impact.
+    - |
+      "Waves peaking every ~30 minutes" are represented as a single modeled surge (event at minute 23) to keep the event set small
+      while maintaining the diagnostic signature of bursty timeouts.
+    - |
+      Piecewise failure breakdown (minutes):
+      - 20-23 trigger degradation
+      - 23-26 surge peak
+      - 26-34 partial recovery
+      - 34-38 automation paused / residual loss
+      - 38-40 partial relief but still failing
+    - |
+      Approx effective log volume (order-of-magnitude):
+      * Normal (0-20): ~1150 logs/min → ~23k logs.
+      * Failure (20-40): baseline ~1400–1450 logs/min, with multipliers causing ~1300–2100 logs/min depending on segment → ~26k–42k logs.
+      * One-shots: router IP-change + recompute start (2), automation paused (1), automation restart (2).
+      * Total expected: ~52k–68k logs (within 20k–100k).
+    - |
+      Visibility rationale: router fwd_drop_metric/routing_recompute_metric appear many times per host during failure; gateway resp_504/resp_503 and dns_timeout
+      appear frequently in failure request flows; automation pause/restart are guaranteed via one-shots.
+```

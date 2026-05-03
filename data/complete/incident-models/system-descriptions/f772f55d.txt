@@ -1,0 +1,490 @@
+```yaml
+sys:
+  id: payments_api_db_failover_incident
+  desc: >
+    A public payments API processes write-heavy POST requests and persists them to a sharded, replicated database via a shard router/proxy.
+    Each shard relies on an automated leader election protocol to maintain a primary; without a primary, writes stall and time out.
+    In this incident model, two distinct failover/election failure modes occur on the same shard: first an election bug triggered by stalled peers after a primary crash,
+    then a CPU-starvation failure caused by a rollback of the election protocol interacting with a shard configuration setting.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_service
+    name: Payments API Service
+    svc: payments-api
+    hosts: [api-1, api-2, api-3, api-4]
+    desc: >
+      Handles client API requests and issues write RPCs to the shard router.
+      Retries upstream timeouts for a subset of idempotent write operations, which can amplify load during database degradation.
+    to:
+      - dst: db_router
+        proto: grpc
+        desc: Sends write RPCs to the shard router/proxy.
+      - dst: monitoring
+        proto: https
+        desc: Emits application health signals consumed by alerting.
+    logs:
+      req_start:
+        desc: Request accepted and routed to the write handler.
+        lvl: INFO
+        msg: "req_start request_id={request_id} method={method} endpoint={endpoint} acct={acct} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          method: {k: ch, v: [POST]}
+          endpoint: {k: ch, v: [/v1/charges, /v1/payment_intents]}
+          acct: {k: str, v: "acct_[A-Za-z0-9]{14}"}
+          trace_id: {k: hex, v: 32}
+
+      db_retry:
+        desc: API-layer retry of the upstream write after a timeout/overload signal.
+        lvl: WARN
+        msg: "db_retry request_id={request_id} attempt={attempt} reason={reason} backoff_ms={backoff_ms}"
+        vars:
+          request_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: [upstream_timeout, upstream_overloaded]}
+          backoff_ms: {k: i, v: [50, 900]}
+
+      req_ok:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: "req_ok request_id={request_id} status={status} dur_ms={dur_ms} writes={writes}"
+        vars:
+          request_id: {k: uuid, v: null}
+          status: {k: i, v: [200, 201]}
+          dur_ms: {k: i, v: [15, 1400]}
+          writes: {k: i, v: [1, 3]}
+
+      req_err:
+        desc: Request completed with an upstream-related error.
+        lvl: ERROR
+        msg: "req_err request_id={request_id} status={status} err={err} dur_ms={dur_ms} attempts={attempts}"
+        vars:
+          request_id: {k: uuid, v: null}
+          status: {k: i, v: [503, 504]}
+          err: {k: ch, v: [db_timeout, db_unavailable, worker_saturation]}
+          dur_ms: {k: i, v: [400, 8000]}
+          attempts: {k: i, v: [1, 3]}
+
+      worker_pool_stats:
+        desc: Periodic worker pool utilization and queue depth for the API process under healthy load.
+        lvl: INFO
+        msg: "worker_pool busy_pct={busy_pct} queue_depth={queue_depth} inflight={inflight} p95_handler_ms={p95_handler_ms}"
+        vars:
+          busy_pct: {k: f, v: [10.0, 65.0]}
+          queue_depth: {k: i, v: [0, 80]}
+          inflight: {k: i, v: [20, 280]}
+          p95_handler_ms: {k: i, v: [40, 320]}
+
+      worker_pool_stats_degraded:
+        desc: Periodic worker pool utilization and queue depth when handlers block on upstream timeouts/retries.
+        lvl: WARN
+        msg: "worker_pool_degraded busy_pct={busy_pct} queue_depth={queue_depth} inflight={inflight} p95_handler_ms={p95_handler_ms}"
+        vars:
+          busy_pct: {k: f, v: [70.0, 100.0]}
+          queue_depth: {k: i, v: [120, 2000]}
+          inflight: {k: i, v: [300, 3200]}
+          p95_handler_ms: {k: i, v: [400, 7000]}
+    beh:
+      n:
+        desc: Normal operation shows moderate utilization and small queues.
+        emit:
+          - id: worker_pool_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the incident, API worker utilization alternates between degraded (during outages) and near-normal (during recovered intervals).
+        emit:
+          - id: worker_pool_stats
+            per_min: 1.0
+            scope: per_host
+          - id: worker_pool_stats_degraded
+            per_min: 1.0
+            scope: per_host
+
+  - id: db_router
+    name: Shard Router / Proxy
+    svc: shard-router
+    hosts: [router-1, router-2]
+    desc: >
+      Routes API writes to the correct database shard and forwards to the current primary.
+      When the shard has no primary or is CPU-starved, the proxy experiences timeouts and connection pool pressure.
+    to:
+      - dst: db_cluster
+        proto: tcp
+        desc: Maintains connections to shard nodes and forwards write commands.
+      - dst: api_service
+        proto: grpc
+        desc: Returns upstream results to the API service over the existing RPC.
+    logs:
+      db_write_ok:
+        desc: Upstream write forwarded and acknowledged by the shard.
+        lvl: INFO
+        msg: "db_write_ok request_id={request_id} shard={shard} node={node} dur_ms={dur_ms}"
+        vars:
+          request_id: {k: uuid, v: null}
+          shard: {k: ch, v: [shard-07]}
+          node: {k: ch, v: [db-1, db-2, db-3]}
+          dur_ms: {k: i, v: [5, 1200]}
+
+      db_write_timeout:
+        desc: Upstream write attempt timed out waiting for a shard response.
+        lvl: ERROR
+        msg: "db_write_timeout request_id={request_id} shard={shard} timeout_ms={timeout_ms} last_node={node}"
+        vars:
+          request_id: {k: uuid, v: null}
+          shard: {k: ch, v: [shard-07]}
+          timeout_ms: {k: i, v: [200, 2500]}
+          node: {k: ch, v: [db-1, db-2, db-3]}
+
+      conn_pool_stats:
+        desc: Periodic connection pool snapshot for the shard under healthy conditions.
+        lvl: INFO
+        msg: "conn_pool shard={shard} in_use={in_use} pending={pending} timeouts_1m={timeouts_1m}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          in_use: {k: i, v: [10, 140]}
+          pending: {k: i, v: [0, 25]}
+          timeouts_1m: {k: i, v: [0, 5]}
+
+      conn_pool_stats_degraded:
+        desc: Periodic connection pool snapshot when upstream timeouts accumulate.
+        lvl: WARN
+        msg: "conn_pool_degraded shard={shard} in_use={in_use} pending={pending} timeouts_1m={timeouts_1m}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          in_use: {k: i, v: [80, 500]}
+          pending: {k: i, v: [30, 900]}
+          timeouts_1m: {k: i, v: [10, 400]}
+
+      conn_reset_warn:
+        desc: Occasional connection reset or refused connection during pool maintenance.
+        lvl: WARN
+        msg: "conn_reset shard={shard} node={node} err={err}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          node: {k: ch, v: [db-1, db-2, db-3]}
+          err: {k: ch, v: [connection_reset, connection_refused]}
+    beh:
+      n:
+        desc: Low-rate pool snapshots and occasional resets.
+        emit:
+          - id: conn_pool_stats
+            per_min: 0.5
+            scope: per_host
+          - id: conn_reset_warn
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: During outages, connection pool pressure spikes; during recovered intervals it returns near baseline.
+        emit:
+          - id: conn_pool_stats
+            per_min: 0.5
+            scope: per_host
+          - id: conn_pool_stats_degraded
+            per_min: 0.8
+            scope: per_host
+          - id: conn_reset_warn
+            per_min: 0.08
+            scope: per_host
+
+  - id: db_cluster
+    name: Database Shard Cluster
+    svc: shard-db
+    hosts: [db-1, db-2, db-3]
+    desc: >
+      A replicated shard with automated leader election. Normal operation maintains a single primary and low replication lag.
+      In the first degradation window, the primary fails while two peers are stalled, triggering an election fault in the newer protocol (v2) and leaving the shard without a primary.
+      In the second window, a rollback to the older protocol (v1) interacts with an election-related configuration setting, causing CPU starvation and renewed shard unavailability.
+    to:
+      - dst: monitoring
+        proto: https
+        desc: Exposes health and metrics endpoints for alerting.
+      - dst: db_router
+        proto: tcp
+        desc: Returns write acknowledgements/timeouts back to the shard router connections.
+    logs:
+      node_metrics:
+        desc: Periodic node-level metrics (CPU/load/replication lag) when the shard is operating normally or recovering.
+        lvl: INFO
+        msg: "node_metrics shard={shard} role={role} cpu_pct={cpu_pct} load1={load1} repl_lag_s={repl_lag_s}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+        state_vars:
+          n:
+            role: {k: ch, v: [primary, replica]}
+            cpu_pct: {k: f, v: [5.0, 55.0]}
+            load1: {k: f, v: [0.2, 8.0]}
+            repl_lag_s: {k: i, v: [0, 5]}
+          f:
+            role: {k: ch, v: [primary, replica, unknown]}
+            cpu_pct: {k: f, v: [5.0, 75.0]}
+            load1: {k: f, v: [0.2, 16.0]}
+            repl_lag_s: {k: i, v: [0, 120]}
+
+      node_metrics_hot:
+        desc: Periodic node-level metrics when CPU starvation is present.
+        lvl: WARN
+        msg: "node_metrics_hot shard={shard} cpu_pct={cpu_pct} load1={load1} repl_lag_s={repl_lag_s}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          cpu_pct: {k: f, v: [80.0, 100.0]}
+          load1: {k: f, v: [16.0, 64.0]}
+          repl_lag_s: {k: i, v: [50, 900]}
+
+      repl_lag_metric_stale:
+        desc: Node replication-lag metric stream is stale/missing (node appears healthy to active checks but lag telemetry is absent).
+        lvl: WARN
+        msg: "repl_lag_metric_stale shard={shard} node={node} last_report_s={last_report_s}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          node: {k: ch, v: [db-2, db-3]}
+          last_report_s: {k: i, v: [600, 6000]}
+
+      primary_failed:
+        desc: The current primary becomes unavailable.
+        lvl: ERROR
+        msg: "primary_failed shard={shard} host={host} cause={cause}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          host: {k: ch, v: [db-1, db-2, db-3]}
+          cause: {k: ch, v: [process_crash, host_reboot, kernel_panic]}
+
+      election_failed_stalled:
+        desc: Election attempt fails under the newer protocol (v2) when multiple peers are stalled.
+        lvl: ERROR
+        msg: "election_failed shard={shard} proto=v2 reason={reason} term={term}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          reason: {k: ch, v: [stalled_peers, no_primary]}
+          term: {k: i, v: [1000, 1400]}
+
+      election_failed_cpu:
+        desc: Election attempt fails under the rolled-back protocol (v1) while the shard is CPU-starved.
+        lvl: ERROR
+        msg: "election_failed shard={shard} proto=v1 reason={reason} term={term}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          reason: {k: ch, v: [cpu_starvation, lease_expired]}
+          term: {k: i, v: [1400, 1800]}
+
+      election_succeeded:
+        desc: A primary is successfully elected and stabilized.
+        lvl: INFO
+        msg: "election_succeeded shard={shard} new_primary={new_primary} term={term}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          new_primary: {k: ch, v: [db-1, db-2, db-3]}
+          term: {k: i, v: [1000, 1800]}
+
+      proto_active:
+        desc: Node reports which election protocol version is active after a rollout.
+        lvl: INFO
+        msg: "election_proto_active shard={shard} proto={proto}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          proto: {k: ch, v: [v1, v2]}
+
+      config_applied:
+        desc: Node reports application of an election-related configuration change.
+        lvl: INFO
+        msg: "config_applied shard={shard} key={key} from={from} to={to}"
+        vars:
+          shard: {k: ch, v: [shard-07]}
+          key: {k: ch, v: [peer_probe_threads]}
+          from: {k: i, v: [8, 8]}
+          to: {k: i, v: [2, 2]}
+    beh:
+      n:
+        desc: Stable leadership with low lag; no election issues expected.
+        emit:
+          - id: node_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: repl_lag_metric_stale
+            per_min: 0.15
+            scope: global
+      f:
+        desc: During the incident, election-failure modes and CPU starvation appear in different windows; missing lag telemetry is present only before node restarts.
+        emit:
+          - id: node_metrics
+            per_min: 1.5
+            scope: per_host
+          - id: node_metrics_hot
+            per_min: 1.0
+            scope: per_host
+          - id: repl_lag_metric_stale
+            per_min: 0.3
+            scope: global
+          - id: election_failed_stalled
+            per_min: 1.2
+            scope: per_host
+          - id: election_failed_cpu
+            per_min: 1.2
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring / Alerting
+    svc: alerting
+    hosts: [mon-1]
+    desc: >
+      Consumes metrics and health signals and emits alerts when shards are unavailable or when API error rates spike.
+      Alerts and acknowledgements are modeled as one-shot logs during incident response.
+    to: []
+    logs:
+      alert_fired:
+        desc: Alert fired for shard unavailability/election failure and elevated API errors.
+        lvl: CRITICAL
+        msg: "alert_fired alert={alert} shard={shard} severity={severity}"
+        vars:
+          alert: {k: ch, v: [ShardNoPrimary, ApiWriteErrorsHigh]}
+          shard: {k: ch, v: [shard-07]}
+          severity: {k: ch, v: [page]}
+
+      pager_ack:
+        desc: On-call acknowledges the page and starts incident response.
+        lvl: INFO
+        msg: "pager_ack incident={incident} by={by}"
+        vars:
+          incident: {k: str, v: "inc_[0-9]{6}"}
+          by: {k: ch, v: [oncall-db, oncall-api]}
+    beh:
+      n:
+        desc: Alerting is quiet in normal operation (routine notifications omitted).
+        emit: []
+      f:
+        desc: Alerts are emitted via one-shots in the scenario.
+        emit: []
+
+  - id: operator_tool
+    name: Operator Deployment Tooling
+    svc: ops-tool
+    hosts: [ops-1]
+    desc: >
+      Used by operators to roll out protocol/config changes and restart shard nodes during remediation.
+      These actions are captured as one-shot logs.
+    to:
+      - dst: db_cluster
+        proto: ssh
+        desc: Applies config/protocol changes and restarts nodes.
+    logs:
+      proto_rollback:
+        desc: Operator rolls back the election protocol version for the cluster/shard.
+        lvl: WARN
+        msg: "proto_rollback cluster={cluster} shard={shard} from={from} to={to}"
+        vars:
+          cluster: {k: ch, v: [payments-writes]}
+          shard: {k: ch, v: [shard-07]}
+          from: {k: ch, v: [v2]}
+          to: {k: ch, v: [v1]}
+
+      config_push:
+        desc: Operator pushes an election-related configuration update.
+        lvl: INFO
+        msg: "config_push cluster={cluster} shard={shard} key={key} from={from} to={to}"
+        vars:
+          cluster: {k: ch, v: [payments-writes]}
+          shard: {k: ch, v: [shard-07]}
+          key: {k: ch, v: [peer_probe_threads]}
+          from: {k: i, v: [8, 8]}
+          to: {k: i, v: [2, 2]}
+
+      restart_node:
+        desc: Operator restarts a database node to force election/cleanup.
+        lvl: WARN
+        msg: "restart_node host={host} shard={shard} reason={reason}"
+        vars:
+          host: {k: ch, v: [db-1, db-2, db-3]}
+          shard: {k: ch, v: [shard-07]}
+          reason: {k: ch, v: [force_election, clear_cpu_starvation]}
+    beh:
+      n:
+        desc: No operator actions expected during normal operation.
+        emit: []
+      f:
+        desc: No periodic operator emissions; actions are one-shot during events.
+        emit: []
+
+tracing:
+  on: true
+  origins: [api_service]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal write traffic is served quickly with rare retries.
+    req:
+      - id: api_post_write_ok
+        desc: Successful POST write request that completes with a 2xx response.
+        rpm: 220.0
+        path: [api_service, db_router, db_cluster, db_router, api_service]
+        emit: [api_service.req_start, db_router.db_write_ok, api_service.req_ok]
+        latency_ms: [[2, 6], [15, 90], [25, 220]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.05
+          emit_per_retry: [api_service.db_retry]
+          backoff_ms: [[60, 180], [120, 350]]
+        trace: true
+
+  f:
+    desc: The incident window includes two severe outage periods and recovered intervals between/after; traffic is modeled with distinct failure and recovered flows.
+    req:
+      - id: api_post_write_timeout
+        desc: POST write that fails due to upstream shard timeout/unavailability after retries.
+        rpm: 190.0
+        path: [api_service, db_router, db_cluster, db_router, api_service]
+        emit: [api_service.req_start, db_router.db_write_timeout, api_service.req_err]
+        latency_ms: [[3, 10], [650, 2200], [1200, 7500]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.4
+          emit_per_retry: [api_service.db_retry]
+          backoff_ms: [[150, 700], [250, 950]]
+        trace: true
+
+      - id: api_post_write_slow_ok
+        desc: POST write that succeeds but is slow due to shard stress/instability.
+        rpm: 35.0
+        path: [api_service, db_router, db_cluster, db_router, api_service]
+        emit: [api_service.req_start, db_router.db_write_ok, api_service.req_ok]
+        latency_ms: [[3, 10], [150, 1100], [300, 1800]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.3
+          emit_per_retry: [api_service.db_retry]
+          backoff_ms: [[120, 500], [220, 850]]
+        trace: true
+
+      - id: api_post_write_recovered_ok
+        desc: Recovered write traffic during the incident timeline (after successful election/config fix).
+        rpm: 220.0
+        path: [api_service, db_router, db_cluster, db_router, api_service]
+        emit: [api_service.req_start, db_router.db_write_ok, api_service.req_ok]
+        latency_ms: [[2, 6], [20, 120], [30, 260]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.05
+          emit_per_retry: [api_service.db_retry]
+          backoff_ms: [[60, 200], [120, 400]]
+        trace: true
+
+assumptions:
+  - |
+    The post-mortem is simplified to a single widely-used shard (shard-07) whose write unavailability cascades into elevated API 5xx for POST writes.
+  - |
+    Two distinct database failure mechanisms are modeled: (1) an election fault in protocol v2 that manifests only with multiple stalled peers after a primary failure,
+    and (2) CPU starvation under protocol v1 after a rollback interacts with a shard configuration setting; the protocol change itself is represented via one-shot logs.
+  - |
+    The “stalled nodes stopped emitting replication lag metrics but passed active checks” precursor is modeled as a low-rate repl_lag_metric_stale warning that is present before restarts and is suppressed after node restarts.
+  - |
+    Recovered intervals occur within the scenario’s failure phase (due to the two-phase constraint); this is made observable by switching failure-state background logs
+    (normal vs degraded worker/connection snapshots) and by enabling the api_post_write_recovered_ok flow while disabling timeout flows.
+  - |
+    Per-request database-node internal logs are omitted to keep volume realistic; shard health is observable via background election_* and metrics logs plus router timeouts.
+  - |
+    Rates are scaled down to keep a single generated log file within volume targets while preserving ordering and relative behaviors.
+    Normal-phase expected logs/min: ~220 rpm * ~3.05 logs/req ≈ 670 logs/min plus ~8-10 background logs/min.
+    Total expected log volume over a ~60-minute scenario is ~45k-80k depending on retry intensity (within the 20k-100k target).
+```

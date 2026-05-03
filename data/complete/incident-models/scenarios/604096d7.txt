@@ -1,0 +1,234 @@
+```yaml
+scenario:
+  id: rds_clogs_cache_refresh_crash_loops
+  title: RDS CPU stall triggers cache-refresh thundering herd and API OOM crash loops
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system serves a high-volume /v1/bounce endpoint, usually satisfied from an in-process TTL cache with occasional
+    DB refreshes against MySQL RDS. A write-heavy disk-usage cron workload and already-high baseline DB utilization
+    increase query latency enough that many handlers concurrently refresh expired cache keys, driving a thundering herd
+    of DB queries. Elevated timeouts and gateway retries amplify load; API servers accumulate goroutines/memory and
+    enter OOM crash loops that clear caches and further shift reads to RDS, producing a sustained partial API outage.
+
+  trigger_desc: |
+    A disk-usage stats run begins writing heavily to RDS while the database is already running at elevated baseline CPU.
+    The added write load raises read latencies, increasing cache expirations and concurrent refreshes.
+
+  time:
+    total_minutes: 44
+    phases:
+      n: {start_min: 0, end_min: 22}
+      f: {start_min: 22, end_min: 44}
+
+  phases:
+    n:
+      desc: |
+        Requests to /v1/bounce are mostly cache hits with low latency. A smaller fraction of requests see cache expiry
+        and refresh from RDS quickly; runtime memory and goroutine counts remain stable. Disk-usage writes occur at a low
+        background rate and do not noticeably affect DB performance.
+      flows:
+        - api_get_bounce_cache_hit
+        - api_get_bounce_cache_miss
+        - disk_usage_write_stmt
+      manifestation:
+        - rds_mysql.rds_metrics
+        - api_server.api_mem_stats
+        - api_gateway.gw_out
+
+    f:
+      desc: |
+        Disk-usage writes briefly increase RDS load, slowing reads enough that cache refresh attempts overlap and
+        multiply. Gateway retries increase total upstream work, while cache refresh concurrency drives large numbers of
+        in-flight goroutines for the same keys. As memory rises, API servers OOM and restart, clearing their caches and
+        pushing even more refresh traffic to RDS. A manual scale-down reduces some load but does not fully resolve the
+        stalled DB + crash-loop condition before the scenario ends.
+
+      events:
+        - order: 1
+          at_min: 22
+          component: disk_usage_worker
+          event: |
+            Disk-usage writes spike, increasing write contention on RDS and raising read latencies for cache refreshes.
+          why: |
+            The disk-usage cron workload performs many write statements; with RDS already moderately utilized, the added
+            writes reduce DB headroom and increase query latency. Directly observable via increased disk-usage write
+            traffic and elevated RDS metrics.
+          flows:
+            - disk_usage_write_stmt_f
+            - api_get_bounce_cache_miss_f
+          rate_multipliers:
+            disk_usage_write_stmt_f: 30.0
+            api_get_bounce_refresh_storm_f: 0.0
+            api_get_bounce_db_timeout_f: 0.0
+            rds_mysql.rds_metrics_hot: 0.0
+            api_server.api_oom: 0.0
+            api_server.api_startup: 0.0
+          latency_multipliers:
+            api_get_bounce_cache_miss_f: {p50: 1.3, p95: 1.4}
+          one_shots: []
+          manifestation:
+            - disk_usage_worker.du_write_stmt
+            - rds_mysql.rds_metrics
+            - api_server.api_cache_refresh_start
+
+        - order: 2
+          at_min: 27
+          component: api_server
+          event: |
+            The disk-usage run completes, but cache refresh concurrency escalates into a herd; RDS reaches a near-stalled hot state and more
+            requests time out and get retried by the gateway.
+          why: |
+            With slower DB responses, more cache entries expire before refresh completes, so more handlers decide to
+            refresh simultaneously. Retries amplify the number of in-flight operations. Observable via high
+            refreshers_inflight, hot RDS metrics, and increased gateway retry markers.
+          flows:
+            - api_get_bounce_refresh_storm_f
+            - api_get_bounce_db_timeout_f
+            - api_get_bounce_cache_miss_f
+          rate_multipliers:
+            disk_usage_write_stmt_f: 1.0
+            api_get_bounce_refresh_storm_f: 1.0
+            api_get_bounce_db_timeout_f: 1.0
+            rds_mysql.rds_metrics_hot: 1.0
+            api_get_bounce_cache_hit_f: 0.9
+            api_get_bounce_cache_miss_f: 1.5
+          latency_multipliers:
+            api_get_bounce_cache_miss_f: {p50: 2.4, p95: 3.0}
+            api_get_bounce_refresh_storm_f: {p50: 2.8, p95: 3.2}
+            api_get_bounce_db_timeout_f: {p50: 1.2, p95: 1.1}
+          one_shots: []
+          manifestation:
+            - rds_mysql.rds_metrics_hot
+            - api_server.api_cache_refresh_start
+            - api_gateway.gw_retry
+
+        - order: 3
+          at_min: 32
+          component: api_server
+          event: |
+            API servers begin OOM crash loops; restarts clear caches and shift more traffic to RDS, keeping cache-miss/refresh traffic high and worsening timeouts.
+          why: |
+            The refresh herd creates many goroutines and large in-flight state, pushing memory past limits and
+            crashing the process. Restarts clear in-process caches, increasing cache misses and DB refresh demand;
+            the additional refresh work offsets any brief relief from crashed processes, so DB-backed request latencies
+            remain highly elevated. Observable via API OOM/startup logs plus sustained high refreshers_inflight and retries.
+          flows:
+            - api_get_bounce_db_timeout_f
+            - api_get_bounce_cache_miss_f
+          rate_multipliers:
+            api_server.api_oom: 1.0
+            api_server.api_startup: 1.0
+            api_get_bounce_cache_hit_f: 0.7
+            api_get_bounce_cache_miss_f: 1.8
+            api_get_bounce_db_timeout_f: 1.9
+            api_get_bounce_refresh_storm_f: 1.4
+          latency_multipliers:
+            api_get_bounce_cache_miss_f: {p50: 2.6, p95: 3.3}
+            api_get_bounce_refresh_storm_f: {p50: 3.1, p95: 3.6}
+          one_shots: []
+          manifestation:
+            - api_server.api_oom
+            - api_server.api_startup
+            - api_gateway.gw_out
+
+        - order: 4
+          at_min: 38
+          component: autoscaler_controller
+          event: |
+            On-call reduces API capacity to shed load and reduce retry pressure, partially relieving request volume but leaving the system degraded.
+          why: |
+            With reduced upstream capacity, some client retries drop and total in-flight work decreases. This reduces
+            (but does not eliminate) cache refresh pressure on RDS; the database remains hot and intermittent timeouts continue.
+            Observable via an autoscaler action marker and reduced request rates.
+          flows:
+            - api_get_bounce_cache_hit_f
+            - api_get_bounce_cache_miss_f
+            - api_get_bounce_db_timeout_f
+          rate_multipliers:
+            api_get_bounce_cache_hit_f: 0.75
+            api_get_bounce_cache_miss_f: 0.75
+            api_get_bounce_refresh_storm_f: 0.65
+            api_get_bounce_db_timeout_f: 0.75
+          latency_multipliers:
+            api_get_bounce_cache_miss_f: {p50: 0.85, p95: 0.9}
+            api_get_bounce_refresh_storm_f: {p50: 0.85, p95: 0.9}
+          one_shots:
+            - ref: autoscaler_controller.asg_scale_action
+              count: 1
+              hosts: [asgctl-1]
+          manifestation:
+            - autoscaler_controller.asg_scale_action
+            - api_gateway.gw_retry
+            - rds_mysql.rds_metrics_hot
+
+      steady:
+        - component: rds_mysql
+          condition: |
+            RDS remains in a hot, near-stalled state with high CPU and elevated connection pressure.
+          user_impact: |
+            Many /v1/bounce requests experience high latency or time out, contributing to partial API outage.
+          manifestation:
+            - rds_mysql.rds_metrics_hot
+            - rds_mysql.rds_metrics
+
+        - component: api_server
+          condition: |
+            API servers continue to exhibit high goroutine/memory pressure with intermittent OOMs and restarts, keeping caches cold.
+          user_impact: |
+            Clients receive intermittent 502/503/504 responses and elevated latency; successful responses are slower than normal.
+          manifestation:
+            - api_server.api_mem_stats
+            - api_server.api_oom
+            - api_server.api_startup
+
+        - component: api_gateway
+          condition: |
+            Gateway retries remain common due to upstream timeouts/5xx and contribute to sustained request amplification.
+          user_impact: |
+            End-to-end latency increases and error rates remain elevated for clients.
+          manifestation:
+            - api_gateway.gw_retry
+            - api_gateway.gw_out
+
+      feedback_loops:
+        - id: cache_expiry_refresh_herd_loop
+          desc: |
+            Slower DB responses cause more cache entries to expire and more concurrent refresh attempts, which further
+            increases DB load and latency, inducing even more refresh attempts.
+
+        - id: crash_loop_clears_cache_loop
+          desc: |
+            OOM crashes restart API servers and clear in-process caches, increasing cache miss rates and DB query volume,
+            which further stresses RDS and worsens the conditions leading to OOM.
+
+      flows:
+        - api_get_bounce_cache_hit_f
+        - api_get_bounce_cache_miss_f
+        - api_get_bounce_refresh_storm_f
+        - api_get_bounce_db_timeout_f
+        - disk_usage_write_stmt_f
+      manifestation:
+        - api_server.api_cache_refresh_start
+        - api_gateway.gw_retry
+        - rds_mysql.rds_metrics_hot
+        - api_server.api_oom
+
+  assumptions:
+    - "The scenario models the Oct 4/Oct 11 partial-outage dynamics but stops before full recovery; per spec, the scenario ends still in failure/degraded state."
+    - "The postmortem's periodic disk-usage job is simplified to a short failure-onset spike (event 1) that returns to baseline at event 2; the refresh herd sustains the outage afterward."
+    - "Crash-loop coherence repair: api_server.api_startup failure background rate is aligned to api_server.api_oom so startup markers do not outnumber OOM crashes by a large factor."
+    - "Quantitative repair for realizability: refreshers_inflight and goroutine ranges were reduced to hundreds–tens-of-thousands and failure latencies were extended (up to ~180s in api_db_query) so in-flight concurrency implied by RPM×latency is coherent."
+    - "The autoscaler action marker used in event 4 is constrained in the system model to always represent a scale-down (to < from), so the event narrative and emitted one-shot cannot diverge."
+    - |
+      Piecewise rough volume (expected, adjusted to remain <100k):
+      - Normal (0-22m): ~918 logs/min => ~20k logs.
+      - Failure 22-27m (event1 active; storm/timeouts/hot+OOM suppressed; disk-usage spike): ~1.8k logs/min => ~9k logs.
+      - Failure 27-32m (event2; storm+timeouts+hot enabled; still no OOM/startups): ~3.2k logs/min => ~16k logs.
+      - Failure 32-38m (event3; OOM/startups enabled; storm/timeouts elevated): ~4.1k logs/min => ~24k logs.
+      - Failure 38-44m (event4; scale-down reduces request rates; OOM/startups still present): ~2.0k logs/min => ~12k logs.
+      Total expected volume ~81k–90k logs (bounded within 20k–100k target).
+    - "One-shots: exactly 1 autoscaler capacity-change marker at minute 38."
+    - "Visibility rationale: rds_metrics (once/min) and rds_metrics_hot (once/min once enabled) anchor DB stress; api_cache_refresh_start and gw_retry rise sharply at the onset of the herd; api_oom/api_startup appear repeatedly after event3, marking the crash-loop phase."
+```

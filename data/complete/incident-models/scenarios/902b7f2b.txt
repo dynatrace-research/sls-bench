@@ -1,0 +1,264 @@
+```yaml
+scenario:
+  id: incident_2013_09_17_impbus_crash_from_data_delta
+  title: Rare delete delta triggers near-simultaneous global impbus crash; direct restored first; exchange supply ramped later
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally serves direct tag traffic and participates in exchange auctions through an impbus backend.
+    A rare internal DB delete delta is validated and distributed without waiting for deferred effects, triggering a near-simultaneous global impbus crash that initially halts ad serving.
+    Engineers restart servers and generate/load known-good snapshots, restoring direct traffic capacity first in one data center (AMS1).
+    A patched impbus build is then deployed worldwide; direct traffic returns to full service while exchange supply is re-enabled more gradually, leaving residual exchange degradation at scenario end.
+
+  trigger_desc: |
+    A rare in-memory object delete is committed in the internal DB, approved immediately by validation (no wait window),
+    and pushed to impbus nodes worldwide, where it triggers a latent memory bug.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Gateways in all data centers forward direct tag and exchange auction requests to impbus. Impbus processes auctions
+        quickly and the gateway returns 200 responses. Pool health metrics show mostly healthy backends.
+      flows: [direct_ad_serving_ok, exchange_auction_ok]
+      manifestation: [ad_gateway.pool_health, ad_gateway.resp_200, impbus.auction_direct_ok]
+
+    f:
+      desc: |
+        A validated delta containing a rare delete is distributed globally. The impbus processes crash in a tight window,
+        causing gateways to return 503 for nearly all traffic at first. Teams restart servers and build/load snapshots to
+        return to a known-good dataset, prioritizing direct traffic. A patched impbus build is then deployed; direct
+        returns to full service and exchange supply is cautiously ramped back, leaving some ongoing exchange degradation.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: data_distributor
+          event: |
+            A rare delete delta is published and accepted immediately, is applied by impbus nodes, and a near-simultaneous
+            crash wave causes ad serving to halt globally (direct and exchange both fail).
+          why: |
+            The delta’s dangerous effect is latent and not blocked by validation because no waiting window is required; once
+            the buggy reclamation path executes in production, many impbus instances crash together. The rollout and crash
+            onset are directly observable via distributor/validator logs, the initial impbus crash wave marker, and a surge
+            of gateway upstream failures and 503 responses.
+          flows: [direct_ad_serving_503, exchange_auction_503]
+          rate_multipliers:
+            direct_ad_serving_ok_f: 0.0
+            exchange_auction_ok_f: 0.0
+            direct_ad_serving_503: 35.0
+            exchange_auction_503: 24.0
+            impbus.crash: 20.0
+            impbus.restart: 10.0
+            monitor.alert_down: 6.0
+            monitor.alert_partial: 0.0
+            ad_gateway.pool_health: 3.0
+            data_distributor.snapshot_progress: 0.0
+            validation_engine.val_crash: 0.0
+            deploy_orchestrator.queue_sat: 0.0
+          latency_multipliers:
+            direct_ad_serving_503: {p50: 1.8, p95: 3.0}
+            exchange_auction_503: {p50: 1.8, p95: 3.2}
+          one_shots:
+            - ref: internal_db.commit_change
+              count: 1
+              hosts: [db-1]
+            - ref: data_distributor.delta_publish
+              count: 1
+              hosts: [dd-1]
+            - ref: validation_engine.candidate_pass
+              count: 1
+              hosts: [val-1]
+            - ref: impbus.delta_applied
+              count: 6
+              hosts: [imp-ams1, imp-iad1, imp-sjc1, imp-fra1, imp-sin1, imp-syd1]
+            - ref: impbus.crash_wave
+              count: 6
+              hosts: [imp-ams1, imp-iad1, imp-sjc1, imp-fra1, imp-sin1, imp-syd1]
+          manifestation: [impbus.crash_wave, ad_gateway.upstream_connect_fail, ad_gateway.resp_503, monitor.alert_down]
+
+        - order: 2
+          at_min: 23
+          component: impbus
+          event: |
+            Teams begin restarting impbus fleets and preparing new snapshots; some instances enter a crash/restart loop and
+            the validation tier starts showing delayed crashes, but overall availability remains very low.
+          why: |
+            Restarts temporarily restore processes, but the same in-memory dataset still contains the triggering change in
+            most locations, so reclaimed objects continue to trip the latent defect. This is directly observable via ongoing
+            impbus crash/restart logs, persistent gateway upstream failures, and validator crash corroboration.
+          flows: [direct_ad_serving_503, exchange_auction_503]
+          rate_multipliers:
+            direct_ad_serving_ok_f: 0.01
+            exchange_auction_ok_f: 0.01
+            direct_ad_serving_503: 32.0
+            exchange_auction_503: 22.0
+            impbus.crash: 12.0
+            impbus.restart: 12.0
+            monitor.alert_down: 5.0
+            monitor.alert_partial: 0.0
+            ad_gateway.pool_health: 3.0
+            data_distributor.snapshot_progress: 2.0
+            validation_engine.val_crash: 8.0
+          latency_multipliers:
+            direct_ad_serving_503: {p50: 1.6, p95: 2.7}
+            exchange_auction_503: {p50: 1.6, p95: 2.9}
+          one_shots: []
+          manifestation: [impbus.crash, impbus.restart, validation_engine.val_crash, ad_gateway.resp_503]
+
+        - order: 3
+          at_min: 36
+          component: data_distributor
+          event: |
+            A known-good snapshot becomes available in AMS1 and is loaded on the local impbus pool, restoring roughly half
+            of AMS1 direct-serving capacity; globally this shows up as a modest but real increase in direct 200s while most
+            other data centers still return 503 for direct traffic. Exchange supply remains mostly unavailable.
+          why: |
+            Replacing the in-memory dataset with a snapshot that does not include the triggering delete avoids the crash path
+            on restored AMS1 nodes. This is directly observable via snapshot logs and an AMS1 partial-recovery alert, while
+            exchange traffic continues to fail at high rates and crash-loop evidence persists elsewhere.
+          flows: [direct_ad_serving_ok_f, direct_ad_serving_503, exchange_auction_503]
+          rate_multipliers:
+            direct_ad_serving_ok_f: 0.08
+            direct_ad_serving_503: 30.0
+            exchange_auction_ok_f: 0.02
+            exchange_auction_503: 22.0
+            impbus.crash: 8.0
+            impbus.restart: 8.0
+            monitor.alert_down: 3.0
+            monitor.alert_partial: 6.0
+            ad_gateway.pool_health: 2.0
+            data_distributor.snapshot_progress: 6.0
+            validation_engine.val_crash: 6.0
+          latency_multipliers:
+            direct_ad_serving_503: {p50: 1.3, p95: 2.2}
+            exchange_auction_503: {p50: 1.4, p95: 2.5}
+          one_shots:
+            - ref: data_distributor.snapshot_ready_ams1
+              count: 1
+              hosts: [dd-1]
+            - ref: impbus.snapshot_loaded_ams1
+              count: 1
+              hosts: [imp-ams1]
+          manifestation: [data_distributor.snapshot_ready_ams1, impbus.snapshot_loaded_ams1, monitor.alert_partial, ad_gateway.resp_200]
+
+        - order: 4
+          at_min: 44
+          component: deploy_orchestrator
+          event: |
+            A patched impbus build begins rolling out globally; an initial simultaneous deploy attempt saturates the deploy
+            system and teams switch to rolling batches, slowing how quickly capacity returns.
+          why: |
+            The fix reduces future crashes on updated nodes, but limited deploy throughput constrains the speed of recovery.
+            This is directly observable via deploy queue saturation and only gradual improvements in success/503 ratios.
+          flows: [direct_ad_serving_ok_f, direct_ad_serving_503, exchange_auction_ok_f, exchange_auction_503]
+          rate_multipliers:
+            direct_ad_serving_ok_f: 0.70
+            direct_ad_serving_503: 10.0
+            exchange_auction_ok_f: 0.15
+            exchange_auction_503: 15.0
+            impbus.crash: 5.0
+            impbus.restart: 5.0
+            monitor.alert_down: 2.0
+            monitor.alert_partial: 4.0
+            ad_gateway.pool_health: 1.5
+            data_distributor.snapshot_progress: 2.0
+            validation_engine.val_crash: 4.0
+            deploy_orchestrator.queue_sat: 10.0
+          latency_multipliers:
+            direct_ad_serving_ok_f: {p50: 1.1, p95: 1.4}
+            exchange_auction_ok_f: {p50: 1.1, p95: 1.5}
+            direct_ad_serving_503: {p50: 1.2, p95: 2.0}
+            exchange_auction_503: {p50: 1.2, p95: 2.2}
+          one_shots:
+            - ref: deploy_orchestrator.deploy_start
+              count: 1
+              hosts: [deploy-1]
+            - ref: deploy_orchestrator.rolling_switch
+              count: 1
+              hosts: [deploy-1]
+          manifestation: [deploy_orchestrator.queue_sat, deploy_orchestrator.rolling_switch, ad_gateway.resp_503]
+
+        - order: 5
+          at_min: 48
+          component: deploy_orchestrator
+          event: |
+            The patched deployment completes for direct-serving capacity worldwide; direct traffic returns to full volume
+            while exchange supply is re-enabled gradually and remains partially degraded.
+          why: |
+            With most impbus nodes updated, crash frequency drops and direct tags can be fully served again. Exchange supply
+            is ramped back cautiously to protect stability, so missed auctions persist longer. This is directly observable
+            via a deploy completion marker, a visible drop in 503s for direct traffic, and an operator-visible supply ramp marker.
+          flows: [direct_ad_serving_ok_f, direct_ad_serving_503, exchange_auction_ok_f, exchange_auction_503]
+          rate_multipliers:
+            direct_ad_serving_ok_f: 1.0
+            direct_ad_serving_503: 0.2
+            exchange_auction_ok_f: 0.70
+            exchange_auction_503: 6.0
+            impbus.crash: 0.5
+            impbus.restart: 0.5
+            monitor.alert_down: 0.0
+            monitor.alert_partial: 0.0
+            ad_gateway.pool_health: 1.0
+            data_distributor.snapshot_progress: 0.5
+            validation_engine.val_crash: 0.0
+            deploy_orchestrator.queue_sat: 0.0
+          latency_multipliers:
+            direct_ad_serving_ok_f: {p50: 1.0, p95: 1.1}
+            exchange_auction_ok_f: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: deploy_orchestrator.deploy_complete
+              count: 1
+              hosts: [deploy-1]
+            - ref: monitor.supply_ramp
+              count: 1
+              hosts: [mon-1]
+          manifestation: [deploy_orchestrator.deploy_complete, monitor.supply_ramp, ad_gateway.resp_200, ad_gateway.resp_503]
+
+      steady:
+        - component: ad_gateway
+          condition: |
+            Direct requests are again served normally with stable 200 responses, while exchange auction participation is still
+            partially degraded during a cautious supply ramp.
+          user_impact: |
+            Most pages using direct tags no longer show broken/missing ad slots; exchange supply sources still see reduced fill
+            and some missed auctions (typically not end-user visible).
+          manifestation: [ad_gateway.resp_200, ad_gateway.resp_503, ad_gateway.pool_health]
+
+        - component: impbus
+          condition: |
+            Crash/restart activity is greatly reduced after the patched build is deployed, but a small residual crash rate may
+            remain during stabilization and ongoing snapshot/traffic adjustments.
+          user_impact: |
+            Backend stability is mostly restored, enabling full direct service and partial exchange recovery.
+          manifestation: [impbus.crash, impbus.restart]
+
+      feedback_loops:
+        - id: crash_restart_thundering_herd
+          desc: |
+            Early in the incident, impbus crashes trigger restarts and reconnect storms from gateways, increasing connection churn
+            and timeouts and reducing effective capacity.
+        - id: recovery_prioritization_tradeoff
+          desc: |
+            Restoring direct traffic first improves end-user experience fastest, but exchange supply re-enable is delayed and ramped,
+            prolonging missed-auction symptoms even after direct is fully restored.
+
+      flows: [direct_ad_serving_ok_f, direct_ad_serving_503, exchange_auction_ok_f, exchange_auction_503]
+      manifestation: [impbus.crash, ad_gateway.resp_503, deploy_orchestrator.queue_sat, deploy_orchestrator.deploy_complete]
+
+  assumptions:
+    - "Repair: deploy_orchestrator.deploy_complete.duration_min was widened to include short durations so the log can be time-consistent with the compressed deploy window (start ~min 44, complete ~min 48)."
+    - "The real incident lasted ~2.5 hours; this scenario compresses it to 50 minutes while preserving the key beats: data change rollout → near-simultaneous global crash/halt → restarts/snapshot generation → AMS1 direct-first restoration → deploy bottleneck → direct fully restored and exchange ramp begins."
+    - "Traffic is downscaled to keep log volume practical: direct ~160 rpm and exchange ~240 rpm in normal (≈400 rpm total)."
+    - "503 response durations can exceed multiple seconds during the initial halt; the resp_503 dur_ms domain is sized accordingly (up to 10s) to match the failure latency multipliers."
+    - "AMS1-first recovery is represented as only a small global increase in direct successes at Event 3 (direct_ad_serving_ok_f multiplier 0.08 ≈ one-DC-half-capacity effect), while direct 503 rates remain high globally."
+    - "Piecewise failure-phase breakdown (approx): 20-23 (3m) global halt with heavy 503s and crash wave; 23-36 (13m) crash/restart loop while snapshots begin; 36-44 (8m) AMS1 snapshot restores ~half of AMS1 direct capacity (modest global improvement); 44-48 (4m) deploy bottleneck slows rollout; 48-50 (2m) direct fully restored and exchange supply ramp begins but remains degraded."
+    - "One-shots per event: E1=15 (commit_change=1, delta_publish=1, candidate_pass=1, delta_applied=6, crash_wave=6); E2=0; E3=2; E4=2; E5=2."
+    - "Total log estimate: normal ~24k logs; failure flows ~35k logs plus background alerts/crash-loop/snapshot progress (~0.5k) and one-shots (<<1k), totaling ~59k–61k logs (within 20k–100k). Key signals (503 surge, crash wave/loop, snapshot load, deploy saturation/completion, supply ramp) are rate-backed or one-shot and should be visible in a single generated log."
+```

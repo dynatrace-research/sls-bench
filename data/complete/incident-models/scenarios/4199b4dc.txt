@@ -1,0 +1,248 @@
+```yaml
+scenario:
+  id: use1_az1_power_loss_control_plane_backlog
+  title: AZ power loss triggers control-plane read-only mode and ELB queue storm
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The region normally serves EC2/EBS control-plane writes through a replicated metadata store and processes ELB traffic shifts via a shared regional queue.
+    A severe utility power event in one Availability Zone causes rack power loss and the metadata store's primary to drop, forcing guarded read-only mode in other AZs.
+    EC2/EBS API calls that require writes fail until operators can safely promote a new primary, while ELB recovery later triggers a bug that floods the control-plane queue.
+    Customer impact includes regional EC2/EBS API errors, delayed ELB traffic shifts/DNS updates, and intermittent connection failures for clients that use a single DNS-returned IP.
+
+  trigger_desc: |
+    A voltage spike and repeated utility power loss in AZ use1-az1 prevent automatic generator transfer; UPS depletion leads to rack power loss and abrupt shutdown of AZ-local systems.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Control-plane requests (RunInstances, AttachVolume) commit metadata through the multi-AZ datastore.
+        ELB management requests complete quickly and routine traffic-shift tasks keep DNS records accurate.
+        Clients query DNS and connect successfully to ELB endpoints across AZs.
+      flows: [ec2_run_instances_n, ebs_attach_volume_n, elb_register_targets_n, elb_shift_traffic_n, elb_client_request_n]
+      manifestation:
+        - metadata_store.replication_health
+        - control_plane_api.api_response_ok
+        - elb_control_plane.queue_metric
+        - dns_service.record_update
+        - elb_edge.connect_ok
+
+    f:
+      desc: |
+        The incident begins with AZ1 power instability leading to rack power loss. Loss of the AZ1 metadata primary forces replicas in other AZs into a guarded read-only mode, causing EC2/EBS write APIs to fail region-wide.
+        As the AZ begins to recover, ELB endpoints and control-plane state changes trigger a rare scaling-evaluation bug, creating a surge of queue tasks and delaying time-sensitive traffic shifts.
+        Operators later perform a safe promotion of a new metadata primary, restoring EC2/EBS control-plane writes, but ELB queue backlog and delayed DNS removals continue to cause intermittent client connection failures and delayed recovery actions.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: dc_power_az1
+          event: |
+            Utility power is lost and generator transfer is unstable; UPS begins discharging and racks start dropping in use1-az1.
+            The metadata store loses its primary and the remaining replicas enter a guarded read-only safety mode, causing regional EC2/EBS write APIs to fail.
+          why: |
+            Power loss abruptly shuts down AZ-local infrastructure. The replicated metadata store prioritizes safety after primary loss by rejecting writes until a safe promotion can be verified
+            (directly observable via write-rejected logs; the electrical cause is external but visible via facility alarms).
+          flows:
+            - ec2_run_instances_f_readonly
+            - ebs_attach_volume_f_readonly
+            - elb_shift_traffic_f
+            - elb_client_request_f_fail
+          rate_multipliers:
+            ec2_run_instances_f_ok: 0.0
+            ebs_attach_volume_f_ok: 0.0
+            ec2_run_instances_f_readonly: 1.3
+            ebs_attach_volume_f_readonly: 1.3
+            elb_client_request_f_fail: 2.0
+            dc_power_az1.ups_metric: 2.5
+            elb_control_plane.bug_scale_trigger: 0.0
+            ebs_recovery.recovery_progress: 0.0
+            ebs_recovery.volume_state_impaired: 0.0
+            ebs_recovery.volume_recovered: 0.0
+          latency_multipliers:
+            elb_shift_traffic_f: {p50: 1.3, p95: 1.8}
+          one_shots:
+            - ref: dc_power_az1.utility_event
+              count: 1
+              hosts: [use1-az1-facility]
+            - ref: dc_power_az1.gen_sync_fail
+              count: 3
+              hosts: [use1-az1-facility]
+            - ref: dc_power_az1.rack_power_loss
+              count: 1
+              hosts: [use1-az1-facility]
+            - ref: metadata_store.leader_change
+              count: 2
+              hosts: [meta-az2, meta-az3]
+          manifestation:
+            - dc_power_az1.utility_event
+            - dc_power_az1.rack_power_loss
+            - metadata_store.write_rejected_readonly
+            - control_plane_api.api_response_err
+
+        - order: 2
+          at_min: 35
+          component: elb_control_plane
+          event: |
+            As power returns and many ELB nodes reappear, a rare recovered-state bug triggers unexpected scaling evaluations.
+            The ELB control plane floods the shared regional queue, queue depth/age rises, and traffic-shift and registration actions take much longer to complete.
+            EBS recovery workers also begin processing a backlog of volumes, with some volumes opened in an impaired (I/O paused) state.
+          why: |
+            Recovered ELBs re-register in a state that causes the control plane to enqueue extra scaling work. Because a single shared queue backs the region, the inflow exceeds processing capacity, producing backlog
+            (directly observable via queue metrics and bug-trigger logs). As storage servers/workers restart, volumes with in-flight writes require recovery (observable via recovery metrics and impaired-volume logs).
+          flows:
+            - elb_register_targets_f
+            - elb_shift_traffic_f
+            - elb_client_request_f_fail
+          rate_multipliers:
+            elb_register_targets_f: 1.6
+            elb_shift_traffic_f: 1.2
+            elb_client_request_f_fail: 3.0
+            elb_control_plane.queue_metric: 2.5
+            elb_control_plane.bug_scale_trigger: 10.0
+            ebs_recovery.recovery_progress: 2.0
+            ebs_recovery.volume_state_impaired: 2.0
+            ebs_recovery.volume_recovered: 1.0
+          latency_multipliers:
+            elb_register_targets_f: {p50: 4.0, p95: 6.0}
+            elb_shift_traffic_f: {p50: 5.0, p95: 7.0}
+          one_shots: []
+          manifestation:
+            - elb_control_plane.bug_scale_trigger
+            - elb_control_plane.queue_metric
+            - ebs_recovery.volume_state_impaired
+
+        - order: 3
+          at_min: 42
+          component: metadata_store
+          event: |
+            Operators complete a safe promotion of a non-AZ1 replica to primary, restoring write capability for EC2/EBS control-plane APIs.
+            Read-only write rejections drop sharply, though the broader ELB queue backlog remains.
+          why: |
+            Automatic promotion is blocked by safety checks after abrupt shutdown sequences; manual validation enables promotion (promotion is directly observable via leader-change log; the prior need for manual judgment is partially external to logs).
+          flows:
+            - ec2_run_instances_f_ok
+            - ebs_attach_volume_f_ok
+            - ec2_run_instances_f_readonly
+            - ebs_attach_volume_f_readonly
+          rate_multipliers:
+            ec2_run_instances_f_ok: 1.0
+            ebs_attach_volume_f_ok: 1.0
+            ec2_run_instances_f_readonly: 0.2
+            ebs_attach_volume_f_readonly: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: metadata_store.leader_change
+              count: 1
+              hosts: [meta-az2]
+          manifestation:
+            - metadata_store.leader_change
+            - control_plane_api.api_response_ok
+            - control_plane_api.api_response_err
+
+        - order: 4
+          at_min: 52
+          component: elb_control_plane
+          event: |
+            Operators apply an emergency mitigation to reduce scaling task pressure on the shared queue.
+            Queue depth remains elevated but stops worsening as quickly; delayed traffic shifts and some DNS removals continue through the end of the scenario.
+          why: |
+            Rate limiting and disabling an automatic scaling evaluation path reduces inflow of non-critical work, partially freeing capacity for traffic-shift tasks
+            (observable via operator action marker and gradually improving queue metrics; not a full recovery because the backlog is already large).
+          flows:
+            - elb_shift_traffic_f
+            - elb_register_targets_f
+            - elb_client_request_f_fail
+          rate_multipliers:
+            elb_control_plane.bug_scale_trigger: 2.0
+            elb_control_plane.queue_metric: 1.8
+            elb_client_request_f_fail: 1.3
+            ebs_recovery.volume_recovered: 1.4
+          latency_multipliers:
+            elb_register_targets_f: {p50: 2.5, p95: 4.0}
+            elb_shift_traffic_f: {p50: 3.0, p95: 5.0}
+          one_shots:
+            - ref: elb_control_plane.operator_action
+              count: 1
+              hosts: [elbcp-1]
+          manifestation:
+            - elb_control_plane.operator_action
+            - elb_control_plane.queue_metric
+            - dns_service.record_update
+
+      steady:
+        - component: elb_control_plane
+          condition: |
+            The ELB control plane remains backlogged on a shared regional queue; traffic-shift and registration tasks complete slowly.
+          user_impact: |
+            Customers see slow/long-running ELB modifications and delayed removal of failed AZ endpoints from DNS, extending recovery efforts.
+          manifestation:
+            - elb_control_plane.queue_metric
+            - elb_control_plane.task_processed
+        - component: elb_edge
+          condition: |
+            Some clients continue to attempt connections to dead/removed-late endpoints associated with the impacted AZ.
+          user_impact: |
+            A small subset of clients (especially single-IP/non-retrying) experience connection failures until they re-query DNS and receive only healthy endpoints.
+          manifestation:
+            - elb_edge.connect_fail
+            - dns_service.dns_query
+        - component: ebs_recovery
+          condition: |
+            Many volumes return in impaired (I/O paused) state and are processed through a recovery backlog.
+          user_impact: |
+            Attach/detach actions for impacted volumes can fail or stall until recovery completes; workloads may wait to resume I/O.
+          manifestation:
+            - ebs_recovery.volume_state_impaired
+            - ebs_recovery.recovery_progress
+
+      feedback_loops:
+        - id: elb_queue_backlog_loop
+          desc: |
+            Delayed traffic shifts keep failed endpoints in DNS longer, causing more customer retries and additional ELB management actions.
+            Those actions enqueue more tasks onto the same shared queue, sustaining high depth and long processing latency.
+
+      flows:
+        - ec2_run_instances_f_readonly
+        - ec2_run_instances_f_ok
+        - ebs_attach_volume_f_readonly
+        - ebs_attach_volume_f_ok
+        - elb_register_targets_f
+        - elb_shift_traffic_f
+        - elb_client_request_f_ok
+        - elb_client_request_f_fail
+      manifestation:
+        - dc_power_az1.ups_metric
+        - metadata_store.replication_health
+        - metadata_store.write_rejected_readonly
+        - control_plane_api.api_response_err
+        - elb_control_plane.queue_metric
+        - elb_control_plane.bug_scale_trigger
+        - ebs_recovery.recovery_progress
+
+  assumptions:
+    - >-
+      Timeline compression: the real-world multi-hour recovery is compressed to 35 minutes of failure while keeping ordering
+      (power loss → read-only safety → partial restore triggers ELB bug/queue storm → manual promotion restores EC2/EBS writes → mitigation reduces ELB inflow).
+    - >-
+      Normal phase (0–25m): ~790–820 logs/min (~19.8k–20.5k logs) from ~310 rpm of flows plus light queue/replication/UPS metrics.
+    - |-
+      Failure phase (25–60m) piecewise estimate:
+      - 25–35m (10m): write APIs mostly fail; ELB shifts are slower; EBS recovery suppressed (workers down) via multipliers; ~900–1150 logs/min (~9k–11.5k).
+      - 35–42m (7m): ELB bug activates; queue metrics and long task processing dominate; EBS recovery begins; ~1100–1500 logs/min (~7.5k–10.5k).
+      - 42–52m (10m): EC2/EBS writes mostly restored; ELB still backed up; EBS recovery continues; ~1150–1600 logs/min (~11.5k–16k).
+      - 52–60m (8m): mitigation reduces ELB inflow but backlog remains; ~1050–1500 logs/min (~8.5k–12k).
+      Total scenario estimate: ~56k–76k logs (target range satisfied).
+    - >-
+      One-shot counts by event: event1=8 (power alarms and leader changes), event2=0, event3=1 (promotion marker), event4=1 (operator action).
+    - >-
+      Visibility rationale: even if client-facing connect failures are rare, the incident is diagnosable via frequent read-only control-plane errors (api_response_err and write_rejected_readonly),
+      persistent queue metrics, and bug-trigger logs that spike after recovery begins; EBS recovery metrics provide corroborating recovery/backlog signals.
+```

@@ -1,0 +1,184 @@
+```yaml
+scenario:
+  id: dns_servfail_stale_root_zone_oct4_2023
+  title: SERVFAIL spike from expired DNSSEC signatures in stale root zone (static_zone ZONEMD parse failure)
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system is a recursive DNS resolver that uses an embedded static_zone app to serve a locally cached copy of the DNS root zone.
+    New root zone versions are distributed internally, but static_zone fails to parse root zone presentation format containing the new ZONEMD RR type, so some nodes keep an older in-memory root zone.
+    When DNSSEC signatures in that stale root zone expire, DNSSEC validation begins failing and a larger fraction of client queries are answered with SERVFAIL.
+    An attempted mitigation deploys an override tag to bypass static_zone, but peer-forwarded queries do not carry the tag, leaving a persistent elevated SERVFAIL rate.
+
+  trigger_desc: |
+    DNSSEC signatures expire in the stale in-memory root zone still being served by static_zone because newer root zone versions (with ZONEMD) have not been adopted.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 30}
+      f: {start_min: 30, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        The resolver answers most queries successfully and exports steady per-minute metrics (SERVFAIL roughly a few percent).
+        Root zone versions continue to be distributed internally and static_zone periodically reports status; occasional parse errors for new root zone
+        versions containing ZONEMD are present but do not cause visible user impact in this window.
+      flows: [dns_query_noerror_static, dns_query_noerror_root_fallback, dns_query_servfail_baseline]
+      manifestation:
+        - recursor_edge.stats_minute
+        - recursor_edge.response_ok
+        - static_zone.zone_status_metric
+        - root_zone_pipeline.root_zone_published
+
+    f:
+      desc: |
+        At failure start, DNSSEC signatures in the stale root zone expire on nodes still using that in-memory copy, causing DNSSEC validation errors and higher SERVFAIL rates.
+        A short time later, the observed SERVFAIL stream grows as more resolutions encounter the invalid trust material and forwarded queries continue to hit static_zone without mitigation tags.
+        Operators attempt to mitigate by pushing an override rule that tags direct requests to bypass static_zone and use root-server fallback, but forwarding omits the tag so a residual SERVFAIL stream persists.
+
+      events:
+        - order: 1
+          at_min: 30
+          component: static_zone
+          event: |
+            DNSSEC signatures in the in-memory stale root zone expire on impacted nodes; DNSSEC validation begins failing and more queries return SERVFAIL.
+          why: |
+            static_zone is still serving an older root zone because newer versions containing ZONEMD cannot be parsed in presentation format.
+            Once signatures expire, resolver-side DNSSEC validation failures become directly observable via per-query validation-failure logs and increased SERVFAIL in resolver metrics.
+          flows: [dns_query_servfail_dnssec_direct, dns_query_servfail_dnssec_forwarded]
+          rate_multipliers:
+            dns_query_noerror_root_fallback_tagged: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: static_zone.signature_expired
+              count: 1
+              hosts: [ash01]
+            - ref: static_zone.signature_expired
+              count: 1
+              hosts: [fra01]
+            - ref: static_zone.signature_expired
+              count: 1
+              hosts: [sin01]
+          manifestation:
+            - static_zone.signature_expired
+            - recursor_edge.dnssec_validate_failed
+            - recursor_edge.response_servfail
+            - recursor_edge.stats_minute
+
+        - order: 2
+          at_min: 39
+          component: recursor_edge
+          event: |
+            The SERVFAIL stream increases further as more query paths require DNSSEC validation against the expired root-zone material; forwarded queries continue to contribute without carrying mitigation tags.
+          why: |
+            With expired root-zone signatures on some nodes, additional cache-miss resolutions and forwarded queries encounter the invalid trust material.
+            This is visible as more resolver-side dnssec validation failure logs and a higher SERVFAIL percentage in the per-minute resolver stats.
+          flows: [dns_query_servfail_dnssec_direct, dns_query_servfail_dnssec_forwarded]
+          rate_multipliers:
+            dns_query_noerror_static: 0.98
+            dns_query_servfail_dnssec_direct: 1.15
+            dns_query_servfail_dnssec_forwarded: 1.2
+          latency_multipliers:
+            dns_query_servfail_dnssec_direct: {p50: 1.05, p95: 1.2}
+            dns_query_servfail_dnssec_forwarded: {p50: 1.05, p95: 1.25}
+          one_shots: []
+          manifestation:
+            - recursor_edge.stats_minute
+            - static_zone.zone_status_metric
+            - recursor_edge.dnssec_validate_failed
+
+        - order: 3
+          at_min: 55
+          component: override_service
+          event: |
+            An override rule is deployed to tag direct requests to bypass static_zone; some traffic shifts to direct root-server queries,
+            but peer-forwarded queries still omit the tag and continue to fail DNSSEC validation using the stale root zone.
+          why: |
+            The bypass is implemented as a request tag checked inside static_zone; direct requests with the tag are forced to use root-server fallback.
+            However, cache-driven peer forwarding omits the tag (observable via forwarded_tags=none), so the bypass does not apply uniformly and failures persist.
+          flows: [dns_query_noerror_root_fallback_tagged, dns_query_servfail_dnssec_forwarded]
+          rate_multipliers:
+            dns_query_noerror_root_fallback_tagged: 1.0
+            dns_query_noerror_static: 0.82
+            dns_query_servfail_dnssec_direct: 0.65
+            dns_query_servfail_dnssec_forwarded: 1.25
+          latency_multipliers:
+            dns_query_noerror_root_fallback_tagged: {p50: 2.0, p95: 2.5}
+          one_shots:
+            - ref: override_service.override_rule_deployed
+              count: 1
+              hosts: [cfg01]
+            - ref: recursor_edge.override_config_applied
+              count: 1
+              hosts: [ash01]
+            - ref: recursor_edge.override_config_applied
+              count: 1
+              hosts: [fra01]
+            - ref: recursor_edge.override_config_applied
+              count: 1
+              hosts: [sin01]
+            - ref: recursor_edge.override_config_applied
+              count: 1
+              hosts: [syd01]
+          manifestation:
+            - override_service.override_rule_deployed
+            - recursor_edge.override_config_applied
+            - static_zone.bypass_due_to_tag
+            - recursor_edge.root_query
+            - dns_root_servers.root_response
+            - recursor_edge.response_servfail
+
+      steady:
+        - component: static_zone
+          condition: |
+            Some resolver nodes continue serving a stale in-memory root zone whose signatures are expired because new root zones with ZONEMD are not being adopted.
+          user_impact: |
+            A non-trivial fraction of valid DNS queries still encounter broken DNSSEC validation depending on which nodes handle the request.
+          manifestation:
+            - static_zone.zone_status_metric
+            - static_zone.static_answer
+        - component: recursor_edge
+          condition: |
+            Resolver DNSSEC validation failures persist, and even after an override tag is deployed, peer-forwarded queries lack the tag and still rely on static_zone, sustaining elevated SERVFAIL.
+          user_impact: |
+            Users see intermittent SERVFAILs; some queries succeed via root-server fallback while others fail depending on routing/forwarding.
+          manifestation:
+            - recursor_edge.peer_forward
+            - recursor_edge.dnssec_validate_failed
+            - recursor_edge.response_servfail
+            - recursor_edge.stats_minute
+
+      feedback_loops:
+        - id: tag_loss_on_forwarding
+          desc: |
+            The mitigation depends on a per-request tag; forwarding requests to peers omits the tag, so the bypass does not apply uniformly and failures persist.
+        - id: stale_root_hidden_until_expiry
+          desc: |
+            Serving a long-lived in-memory root zone hides the inability to adopt new root zone versions until DNSSEC signatures expire, after which failures become immediate.
+
+      flows:
+        - dns_query_noerror_static
+        - dns_query_servfail_dnssec_direct
+        - dns_query_servfail_dnssec_forwarded
+        - dns_query_noerror_root_fallback_tagged
+      manifestation:
+        - recursor_edge.stats_minute
+        - static_zone.zone_parse_error
+        - static_zone.zone_status_metric
+        - recursor_edge.dnssec_validate_failed
+        - recursor_edge.response_servfail
+
+  assumptions:
+    - "The 4-hour real incident timeline is compressed into a 60-minute scenario window while preserving causal ordering (signature expiry → SERVFAIL rise → mitigation attempt)."
+    - |
+        Failure-phase piecewise breakdown (effective, approximate):
+          - min 30-39 (9 min): no tagged bypass; ~1430 flow-logs/min + ~6 background/min; one-shots = 3 signature_expired.
+          - min 39-55 (16 min): SERVFAIL flows amplified; ~1445 flow-logs/min + ~6 background/min.
+          - min 55-60 (5 min): override deployed; more root-server fallback but forwarded SERVFAIL persists; ~1381 flow-logs/min + ~6 background/min; one-shots = 1 deploy + 4 host applies.
+    - "Visibility rationale: elevated SERVFAIL is visible via recursor_edge.stats_minute and recursor_edge.response_servfail; DNSSEC-specific failure cause is visible via recursor_edge.dnssec_validate_failed; root-cause indicators are visible via static_zone.zone_parse_error (ZONEMD) and static_zone.zone_status_metric (very old age, expired signatures)."
+    - "Total estimated log volume: ~85.9k logs across 60 minutes (dominated by sampled per-query flow logs), within the 20k..100k target."
+    - "The scenario ends while still in failure (before the later full mitigation that disabled static_zone preloading in the real incident)."
+```

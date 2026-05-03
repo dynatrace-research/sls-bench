@@ -1,0 +1,182 @@
+```yaml
+scenario:
+  id: filestore_global_read_throttle_2022_09_13
+  title: Global read-only API outage due to internal overload and global throttling
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The Filestore control plane normally serves read-only queries (ListInstances, GetOperation) and mutate requests
+    that create long-running operations. An internal project-management service malfunctions and floods the read-only
+    APIs, pushing Filestore over a global read quota and causing system-wide 429s on read-only calls. Mutate operations
+    still return operations, but customers cannot poll operation status, degrading usability and observability.
+
+  trigger_desc: |
+    An internal service that scans many GCP projects enters an abnormal rapid reconcile loop, issuing excessive
+    ListInstances calls and causing the Filestore global read quota gate to throttle all read-only requests.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Customer console/gcloud/API read-only calls succeed with low latency, and operation polling returns status from
+        the operations manager. Mutate calls (e.g., CreateInstance) pass the global quota gate and return 202 with an
+        operation id. The internal project-management sweeper runs at low rate and stays below the global read limit.
+      flows: [list_instances_ok, get_operation_ok, create_instance_mutate, internal_project_sync_ok]
+      manifestation:
+        - filestore_api.access_list_instances_ok
+        - filestore_api.access_get_operation_ok
+        - global_quota.quota_metrics
+        - monitoring.synthetic_check_ok
+
+    f:
+      desc: |
+        A sudden spike in internal read-only traffic pushes the system above a global read quota, and the throttling
+        gate rejects read-only API calls with 429 across all customers. Operation polling (GetOperation) is also read-only,
+        so customers cannot check the progress of otherwise-successful mutate operations. Engineers detect the issue via
+        monitoring and begin mitigation by pausing the internal service, reducing one major load source but leaving throttling still effectively
+        denying read-only requests by the end of this scenario slice.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: internal_project_manager
+          event: |
+            The internal project-management service enters a rapid reconcile loop, sharply increasing ListInstances traffic.
+            Global read throttling is enforced and read-only calls start returning 429.
+          why: |
+            Filestore enforces a global read request limit; the internal service's abnormal request flood pushes observed read demand
+            above the limit, causing the throttling gate to reject read-only requests. The internal service malfunction is directly
+            observable via its marker log; the global throttling is directly observable via quota metrics, throttle-gate warnings,
+            and API 429 access logs.
+          flows: [internal_project_sync_429, list_instances_429, get_operation_429, create_instance_mutate]
+          rate_multipliers: {}
+          latency_multipliers:
+            create_instance_mutate: {p50: 1.5, p95: 2.0}
+          one_shots:
+            - ref: internal_project_manager.rapid_reconcile_entered
+              count: 1
+              hosts: [proj-mgr-1]
+          manifestation:
+            - internal_project_manager.rapid_reconcile_entered
+            - global_quota.throttle_gate_open
+            - filestore_api.access_list_instances_429
+            - filestore_api.access_get_operation_429
+
+        - order: 2
+          at_min: 27
+          component: monitoring
+          event: |
+            Monitoring pages on-call for sustained global read throttling and synthetic read-only probe failures.
+          why: |
+            Synthetic ListInstances checks observe 429s and quota metrics remain over limit, triggering the alert rule.
+            This is directly observable through the synthetic check failures and the alert marker.
+          flows: [list_instances_429, internal_project_sync_429]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.alert_throttle_high
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - monitoring.alert_throttle_high
+            - monitoring.synthetic_check_fail_429
+            - global_quota.quota_metrics
+
+        - order: 3
+          at_min: 45
+          component: internal_project_manager
+          event: |
+            Engineers begin mitigation by pausing the internal project-management service, reducing internal read-only request volume.
+            Global throttling remains active and customer read-only calls continue to be denied (still observed as 429s).
+          why: |
+            Pausing the internal source reduces the internal contribution to global read pressure (directly observable via the internal
+            source's operator-action log and reduced internal sweep activity). However, the global read gate remains active and continues
+            rejecting read-only calls, which remains directly observable via persistent 429 access logs and ongoing synthetic failures.
+          flows: [internal_project_sync_429, list_instances_429, get_operation_429]
+          rate_multipliers:
+            internal_project_sync_429: 0.3
+            internal_project_manager.sweep_cycle: 0.3
+            global_quota.throttle_gate_open: 0.6
+          latency_multipliers:
+            create_instance_mutate: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: internal_project_manager.pause_internal_service
+              count: 1
+              hosts: [proj-mgr-1]
+          manifestation:
+            - internal_project_manager.pause_internal_service
+            - global_quota.quota_metrics
+            - filestore_api.access_list_instances_429
+
+      steady:
+        - component: global_quota
+          condition: |
+            Global read throttling remains active; read-only requests are still denied at the global gate (near-total throttling).
+          user_impact: |
+            Customers in all locations experience read-only Filestore control-plane calls failing (e.g., listing instances and polling operations).
+          manifestation:
+            - global_quota.throttle_gate_open
+            - global_quota.quota_metrics
+
+        - component: filestore_api
+          condition: |
+            Read-only API methods return 429 quickly, while mutate methods continue to return 202 with operation ids.
+          user_impact: |
+            Console/gcloud/API cannot perform read-only inventory queries; operation status polling fails, reducing visibility into ongoing mutate work.
+          manifestation:
+            - filestore_api.access_list_instances_429
+            - filestore_api.access_get_operation_429
+            - filestore_api.access_create_instance_accepted
+
+        - component: monitoring
+          condition: |
+            Synthetic read-only probes keep failing with 429, reflecting ongoing customer impact.
+          user_impact: |
+            Operators continue to observe the issue via synthetic failures while customers remain throttled.
+          manifestation:
+            - monitoring.synthetic_check_fail_429
+
+      feedback_loops:
+        - id: overload_throttle_retry_loop
+          desc: |
+            As throttling rejects read-only calls, clients and internal automation tend to repeat inventory/polling calls,
+            sustaining elevated observed read traffic and keeping the global throttle gate open.
+
+      flows: [list_instances_429, get_operation_429, create_instance_mutate, internal_project_sync_429]
+      manifestation:
+        - filestore_api.access_list_instances_429
+        - filestore_api.access_get_operation_429
+        - global_quota.quota_metrics
+        - global_quota.throttle_gate_open
+        - monitoring.synthetic_check_fail_429
+
+  assumptions:
+    - |
+      The real incident lasted hours and ended in full mitigation; this scenario compresses it to a 50-minute slice and ends
+      while still failing to satisfy the "end in failure" requirement.
+    - |
+      quota_metrics is treated as an aggregated/rolling summary that may include additional unmodeled read-only RPCs and does not necessarily
+      drop immediately when one load source is reduced; this keeps the metric consistent with the modeled high 429 volume without requiring
+      hidden coupling at per-request granularity.
+    - |
+      Piecewise failure breakdown (30 minutes total failure):
+      - Minutes 20-44 (25 min): internal_project_sync_429 at 1500 rpm; customer list/get traffic continues; global_quota quota_metrics at 1/min and
+        throttle_gate_open at 1/min; internal_project_manager sweep_cycle at 6/min per host.
+      - Minutes 45-49 (5 min): internal_project_sync_429 reduced to ~450 rpm (multiplier 0.3); internal_project_manager sweep_cycle reduced to
+        ~1.8/min per host (multiplier 0.3); throttle_gate_open reduced to ~0.6/min; read-only 429s persist.
+      One-shots: rapid_reconcile_entered (1), alert_throttle_high (1), pause_internal_service (1).
+    - |
+      Coherency note: after mitigation, the internal sweep summary rate (~3.6 sweep logs/min total across 2 hosts) with api_calls 110-150
+      supports roughly 396-540 calls/min, which is consistent with the reduced internal request flow (~450 rpm).
+    - |
+      Rough volume check (including the mitigation reduction after minute 45):
+      - Normal (20 min): ~810 flow-logs/min => ~16.2k flow logs; plus ~160 background logs => ~16.36k.
+      - Failure (25 min at ~2060 logs/min + 5 min at ~1000 logs/min): ~56.5k logs; plus 3 one-shots => ~56.5k.
+      Total ~72.9k logs, ensuring high likelihood of seeing API 429s, quota metrics, synthetic failures, and the operator/alert one-shots.
+```

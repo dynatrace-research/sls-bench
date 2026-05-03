@@ -1,0 +1,212 @@
+```yaml
+scenario:
+  id: wan_low_priority_capacity_reduction_rollout_rollback
+  title: Low-priority WAN capacity reduction during control plane rollout and partial rollback
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A WAN backbone normally carries both high-priority user-facing traffic and lower-priority batch/streaming/transfer traffic.
+    A control plane configuration rollout expands and unintentionally reduces low-priority capacity, producing elevated drop/queue telemetry and
+    degrading low-priority Cloud Storage bulk operations, transfers, and some cross-region BigQuery Storage reads.
+    Operators pause the rollout and attempt a rollback, but degraded capacity slows and partially blocks configuration application.
+    Individual HTTP 500s remain extremely rare, while latency/throughput degradation and loss telemetry are the dominant symptoms.
+
+  trigger_desc: |
+    A staged control plane configuration rollout expands to additional WAN regions/domains, introducing a configuration
+    that reduces capacity available to low-priority classified traffic.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        The backbone operates with ample low-priority capacity. High-priority GCS metadata reads are fast and stable.
+        Low-priority bulk GCS object operations and transfer jobs traverse the WAN with low loss and modest latency.
+        BigQuery Storage reads are generally stable. Network telemetry summaries show near-100% low-priority capacity and negligible loss,
+        and aggregate low-priority 5xx metrics remain near zero.
+      flows: [gcs_high_pri_metadata_get, gcs_low_pri_bulk_ops, transfer_low_pri_success, bigquery_storage_read]
+      manifestation:
+        [net_telemetry.capacity_summary, backbone_edge.qos_stats, gcs_api.http5xx_metric, gcs_api.req_ok, gcs_storage.backend_op_ok, bq_storage_api.rpc_latency_metric]
+
+    f:
+      desc: |
+        A new WAN control plane configuration reduces low-priority capacity and increases queueing/drops in parts of the backbone.
+        High-priority user-facing traffic remains largely healthy, but low-priority bulk object operations, transfers, and cross-region reads see elevated latency
+        and reduced throughput; very rare timeouts can surface as HTTP 500.
+        Operators attempt to pause the rollout and then roll back globally; however, degraded capacity also slows and partially prevents configuration
+        propagation, prolonging the condition. A later mitigation improves capacity and reduces downstream pain, but does not fully return to baseline within
+        the modeled window.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: rollout_controller
+          event: |
+            The rollout expands and the problematic control plane configuration begins applying, reducing low-priority WAN capacity and increasing latency for low-priority workloads.
+          why: |
+            The new configuration changes control-plane/QoS behavior such that low-priority traffic receives less available capacity.
+            This is directly observable through WAN telemetry moving from baseline to a degraded (mild) state and downstream low-priority request latency changes; the exact config intent is only visible via rollout/control-plane logs.
+          flows: [gcs_low_pri_bulk_ops, transfer_low_pri_ok, transfer_low_pri_500, bigquery_storage_read, gcs_high_pri_metadata_get]
+          rate_multipliers:
+            sdn_controller.controller_disconnected: 0.0
+            transfer_service.worker_backpressure: 0.0
+            backbone_edge.qos_stats_mild: 1.0
+            backbone_edge.qos_stats_severe: 0.0
+            net_telemetry.capacity_summary_mild: 1.0
+            net_telemetry.capacity_summary_severe: 0.0
+          latency_multipliers:
+            gcs_low_pri_bulk_ops: {p50: 1.2, p95: 1.5}
+            transfer_low_pri_ok: {p50: 1.2, p95: 1.4}
+            transfer_low_pri_500: {p50: 1.1, p95: 1.3}
+            bigquery_storage_read: {p50: 1.3, p95: 1.6}
+            gcs_high_pri_metadata_get: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: rollout_controller.rollout_started
+              count: 1
+              hosts: [rc-1]
+            - ref: sdn_controller.apply_partial
+              count: 1
+              hosts: [sdn-a]
+          manifestation: [rollout_controller.rollout_started, sdn_controller.apply_partial, net_telemetry.capacity_summary_mild, backbone_edge.qos_stats_mild]
+
+        - order: 2
+          at_min: 30
+          component: rollout_controller
+          event: |
+            Engineers pause the rollout to stop new actions, but in-progress changes continue and low-priority capacity degrades further, pushing telemetry into a severe drop/queueing state.
+          why: |
+            Pausing prevents additional rollout steps, but partially applied changes remain active and continue converging on some nodes,
+            further reducing effective low-priority capacity. This is directly observable via severe low-priority drops/queues and transfer worker backpressure.
+          flows: [gcs_low_pri_bulk_ops, transfer_low_pri_ok, transfer_low_pri_500, bigquery_storage_read]
+          rate_multipliers:
+            sdn_controller.controller_disconnected: 1.0
+            transfer_service.worker_backpressure: 1.0
+            transfer_low_pri_ok: 0.8
+            backbone_edge.qos_stats_mild: 0.0
+            backbone_edge.qos_stats_severe: 1.0
+            net_telemetry.capacity_summary_mild: 0.0
+            net_telemetry.capacity_summary_severe: 1.0
+          latency_multipliers:
+            gcs_low_pri_bulk_ops: {p50: 1.8, p95: 2.6}
+            transfer_low_pri_ok: {p50: 1.6, p95: 2.2}
+            transfer_low_pri_500: {p50: 1.4, p95: 1.8}
+            bigquery_storage_read: {p50: 1.8, p95: 2.5}
+          one_shots:
+            - ref: rollout_controller.rollout_paused
+              count: 1
+              hosts: [rc-1]
+          manifestation: [rollout_controller.rollout_paused, backbone_edge.qos_stats_severe, net_telemetry.capacity_summary_severe, transfer_service.worker_backpressure]
+
+        - order: 3
+          at_min: 38
+          component: sdn_controller
+          event: |
+            A global rollback configuration push is attempted, but it applies only partially across WAN nodes, leaving low-priority capacity in the severe degraded state.
+          why: |
+            Reduced network performance slows control propagation and causes some nodes/controllers to be unreachable, leading to partial
+            application. This is directly observable in the control plane's partial-apply log and controller-unreachable warnings, while data-plane telemetry stays severely degraded.
+          flows: [gcs_low_pri_bulk_ops, transfer_low_pri_ok, transfer_low_pri_500, bigquery_storage_read]
+          rate_multipliers:
+            sdn_controller.controller_disconnected: 2.0
+            backbone_edge.qos_stats_mild: 0.0
+            backbone_edge.qos_stats_severe: 1.0
+            net_telemetry.capacity_summary_mild: 0.0
+            net_telemetry.capacity_summary_severe: 1.0
+          latency_multipliers:
+            gcs_low_pri_bulk_ops: {p50: 1.9, p95: 2.8}
+            transfer_low_pri_ok: {p50: 1.7, p95: 2.3}
+            transfer_low_pri_500: {p50: 1.5, p95: 1.9}
+            bigquery_storage_read: {p50: 1.9, p95: 2.6}
+          one_shots:
+            - ref: rollout_controller.rollback_initiated
+              count: 1
+              hosts: [rc-1]
+            - ref: sdn_controller.apply_partial
+              count: 1
+              hosts: [sdn-b]
+          manifestation: [rollout_controller.rollback_initiated, sdn_controller.apply_partial, sdn_controller.controller_disconnected, net_telemetry.capacity_summary_severe]
+
+        - order: 4
+          at_min: 45
+          component: sdn_controller
+          event: |
+            An alternate mitigation successfully applies the corrected configuration broadly, improving low-priority capacity from severe to mild degradation and reducing backpressure, though residual impact remains.
+          why: |
+            Once the corrected config converges on most nodes, low-priority queues drain and drop rates fall; dependent services see fewer WAN-induced slowdowns/timeouts.
+            This is observable through an "applied" marker plus telemetry shifting back to a milder degraded range; the system does not fully return to baseline within the modeled window.
+          flows: [gcs_low_pri_bulk_ops, transfer_low_pri_ok, transfer_low_pri_500, bigquery_storage_read]
+          rate_multipliers:
+            sdn_controller.controller_disconnected: 0.5
+            transfer_service.worker_backpressure: 0.6
+            transfer_low_pri_ok: 1.0
+            transfer_low_pri_500: 0.4
+            backbone_edge.qos_stats_mild: 1.0
+            backbone_edge.qos_stats_severe: 0.0
+            net_telemetry.capacity_summary_mild: 1.0
+            net_telemetry.capacity_summary_severe: 0.0
+          latency_multipliers:
+            gcs_low_pri_bulk_ops: {p50: 1.2, p95: 1.6}
+            transfer_low_pri_ok: {p50: 1.2, p95: 1.6}
+            transfer_low_pri_500: {p50: 1.2, p95: 1.5}
+            bigquery_storage_read: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: sdn_controller.apply_ok
+              count: 1
+              hosts: [sdn-a]
+          manifestation: [sdn_controller.apply_ok, backbone_edge.qos_stats_mild, net_telemetry.capacity_summary_mild, transfer_service.worker_backpressure]
+
+      steady:
+        - component: backbone_edge
+          condition: |
+            Low-priority traffic remains in a mildly degraded capacity state with intermittent drop/queueing in some regions.
+          user_impact: |
+            Batch/streaming/transfer operations may still be slow, while high-priority user-facing requests are mostly stable.
+          manifestation: [backbone_edge.qos_stats_mild, net_telemetry.capacity_summary_mild]
+        - component: gcs_api
+          condition: |
+            Low-priority operations continue to see elevated latency; aggregate low-priority 5xx rates are above baseline, while individual HTTP 500s remain extremely rare.
+          user_impact: |
+            Some customers see elevated latency and occasional HTTP 500 for import/export/transfer workloads to buckets in affected regions.
+          manifestation: [gcs_api.http5xx_metric, gcs_api.req_ok]
+        - component: bq_storage_api
+          condition: |
+            Cross-region/low-priority Storage API reads remain slower than baseline.
+          user_impact: |
+            BigQuery workloads using Storage APIs (e.g., cross-region access) may observe elevated latency.
+          manifestation: [bq_storage_api.rpc_latency_metric, bq_storage_api.read_ok]
+
+      feedback_loops:
+        - id: degraded_capacity_slows_mitigation
+          desc: |
+            The same low-priority capacity reduction that hurts batch/transfer traffic also reduces effective bandwidth/reachability for
+            control-plane actions and status convergence, making rollback pushes more likely to be partial and slower to complete.
+
+      flows: [gcs_high_pri_metadata_get, gcs_low_pri_bulk_ops, transfer_low_pri_ok, transfer_low_pri_500, bigquery_storage_read]
+      manifestation:
+        [backbone_edge.qos_stats_mild, backbone_edge.qos_stats_severe, net_telemetry.capacity_summary_mild, net_telemetry.capacity_summary_severe, sdn_controller.controller_heartbeat, transfer_service.worker_backpressure, gcs_api.http5xx_metric]
+
+  assumptions:
+    - |-
+      This scenario represents a compressed slice of the real incident centered on the rollout expands → pause → partial rollback → majority mitigated progression.
+    - |-
+      Failure-phase piecewise breakdown (approx):
+      - 25–30 (5 min): initial degradation; telemetry shifts to mild degraded ranges; low-priority latency rises.
+      - 30–38 (8 min): worst period; telemetry shifts to severe ranges; backpressure appears.
+      - 38–45 (7 min): rollback attempt partial; severe telemetry persists.
+      - 45–50 (5 min): mitigation reduces severity back to mild degraded ranges, but does not return to baseline before scenario end.
+    - |-
+      Approx effective log rates (order-of-magnitude):
+      - Normal: ~1,840 logs/min (dominated by gcs_low_pri_bulk_ops and gcs_high_pri_metadata_get).
+      - Failure: ~1,845–1,870 logs/min (WAN telemetry plus bulk-operation/transfer logs dominate; per-request 500 logs are intentionally extremely rare).
+    - |-
+      One-shots: 5 total (rollout_started, rollout_paused, rollback_initiated, apply_partial x2, apply_ok).
+    - |-
+      Visibility rationale: persistent WAN telemetry is always emitted, and event controls switch between mild vs severe telemetry templates so worsening/improvement is visible in values (not just counts). Rollout/rollback one-shots and sdn_controller.apply_partial/apply_ok mark mitigation progression; gcs_api.http5xx_metric provides visibility into very rare 500s without requiring frequent per-request 500 logs.
+    - |-
+      Total log count estimate: ~92k over 50 minutes (within 20k–100k).
+```

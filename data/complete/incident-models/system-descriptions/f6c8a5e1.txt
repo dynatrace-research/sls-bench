@@ -1,0 +1,562 @@
+```yaml
+sys:
+  id: telemetry_observability_platform
+  desc: >
+    A hosted observability product that ingests customer events and serves query results to a UI/API.
+    Ingest (Shepherd) and query/storage (Retriever) depend on a shared schema cache backed by a main MySQL metadata database.
+    Retriever also writes per-dataset "last seen/last written" stamps to MySQL to keep the schema cache warm for ingest.
+    In this incident, stamp-writer behavior and cache warmth interacted with MySQL contention, leading to a full outage and a recovery that left a minor UI freshness inconsistency.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_gateway
+    name: API Gateway
+    svc: edge-gw
+    hosts: [gw-1, gw-2]
+    desc: Terminates client HTTPS and routes ingest and query requests to internal services. Enforces an ingest circuit-breaker during emergencies.
+    to:
+      - dst: shepherd_ingest
+        proto: https
+        desc: Routes ingest requests to the ingest service.
+      - dst: retriever_engine
+        proto: https
+        desc: Routes query requests to the query engine.
+    logs:
+      access_ingest_202:
+        desc: Ingest response access log emitted after the upstream ingest request completes successfully.
+        lvl: INFO
+        msg: "ingest accepted status=202 req_id={req_id} dur_ms={dur_ms} client_ip={client_ip} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 400]}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          trace_id: {k: hex, v: 32}
+      access_query_200:
+        desc: Query response access log emitted after the upstream query request completes successfully.
+        lvl: INFO
+        msg: "query ok status=200 req_id={req_id} dur_ms={dur_ms} client_ip={client_ip} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 1200]}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          trace_id: {k: hex, v: 32}
+      access_upstream_500:
+        desc: Response access log emitted after an upstream failure causes a 500 to be returned.
+        lvl: WARN
+        msg: "request failed status=500 route={route} upstream={upstream} req_id={req_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          route: {k: ch, v: [ingest, query]}
+          upstream: {k: ch, v: [shepherd, retriever]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [50, 15000]}
+          trace_id: {k: hex, v: 32}
+      access_circuit_503:
+        desc: Ingest request rejected by circuit-breaker to protect dependencies.
+        lvl: WARN
+        msg: "ingest rejected status=503 circuit_breaker=open req_id={req_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [1, 40]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: Edge emits no periodic logs in normal operation beyond request logs.
+        emit: []
+      f:
+        desc: Edge emits no periodic logs in failure beyond request logs.
+        emit: []
+
+  - id: shepherd_ingest
+    name: Shepherd Ingest
+    svc: shepherd
+    hosts: [shepherd-1, shepherd-2, shepherd-3]
+    desc: Accepts ingest payloads, resolves schema/dataset metadata via the schema cache and MySQL, and forwards accepted events to Retriever storage.
+    to:
+      - dst: schema_cache
+        proto: grpc
+        desc: Looks up dataset/schema metadata; falls back to MySQL on cache miss.
+      - dst: retriever_engine
+        proto: grpc
+        desc: Writes accepted events to storage.
+      - dst: api_gateway
+        proto: https
+        desc: Returns final request outcome to the gateway for client response logging.
+    logs:
+      ingest_accepted:
+        desc: Ingest request accepted after schema resolution.
+        lvl: INFO
+        msg: "ingest accepted req_id={req_id} dataset={dataset} events={events} schema_cache={schema_cache} schema_attempts={schema_attempts} schema_lookup_ms={schema_lookup_ms} total_ms={total_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dataset: {k: ch, v: [payments, checkout, auth]}
+          events: {k: i, v: [1, 500]}
+          schema_cache: {k: ch, v: [hit, miss]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            schema_attempts: {k: i, v: [1, 1]}
+            schema_lookup_ms: {k: i, v: [2, 60]}
+            total_ms: {k: i, v: [10, 250]}
+          f:
+            schema_attempts: {k: i, v: [1, 3]}
+            schema_lookup_ms: {k: i, v: [50, 8000]}
+            total_ms: {k: i, v: [150, 15000]}
+      ingest_failed_db:
+        desc: Ingest failed because schema resolution or required metadata could not be obtained from MySQL.
+        lvl: ERROR
+        msg: "ingest failed req_id={req_id} dataset={dataset} err={err} schema_attempts={schema_attempts} waited_ms={waited_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dataset: {k: ch, v: [payments, checkout, auth]}
+          err: {k: ch, v: [db_conn_exhausted, lock_wait_timeout, db_unavailable]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            schema_attempts: {k: i, v: [1, 1]}
+            waited_ms: {k: i, v: [0, 50]}
+          f:
+            schema_attempts: {k: i, v: [1, 3]}
+            waited_ms: {k: i, v: [200, 15000]}
+      slo_burn:
+        desc: Periodic SLO/latency indicator for ingest.
+        lvl: INFO
+        msg: "ingest slo burn_rate_1h={burn_rate_1h} p95_ms={p95_ms}"
+        vars: {}
+        state_vars:
+          n:
+            burn_rate_1h: {k: f, v: [0.0, 0.4]}
+            p95_ms: {k: i, v: [60, 250]}
+          f:
+            burn_rate_1h: {k: f, v: [2.0, 25.0]}
+            p95_ms: {k: i, v: [500, 15000]}
+    beh:
+      n:
+        desc: Emits a low-rate SLO indicator for ingest performance.
+        emit:
+          - id: slo_burn
+            per_min: 0.5
+            scope: global
+      f:
+        desc: During the incident window, ingest SLO burn signals are emitted more frequently and at worse values.
+        emit:
+          - id: slo_burn
+            per_min: 1.0
+            scope: global
+
+  - id: retriever_engine
+    name: Retriever Query/Storage Engine
+    svc: retriever
+    hosts: [retriever-1, retriever-2, retriever-3, retriever-4]
+    desc: Serves queries and performs periodic schema-stamp writes to MySQL so the schema cache knows what schemas to keep warm.
+    to:
+      - dst: schema_cache
+        proto: grpc
+        desc: Reads schema metadata for query planning and field interpretation.
+      - dst: mysql_main_db
+        proto: jdbc
+        desc: Writes per-dataset schema "last seen" stamps and reads some shared metadata.
+      - dst: api_gateway
+        proto: https
+        desc: Returns final request outcome to the gateway for client response logging.
+    logs:
+      query_ok:
+        desc: Query completed successfully (includes a freshness indicator derived from schema/ingest metadata).
+        lvl: INFO
+        msg: "query ok req_id={req_id} dataset={dataset} rows={rows} dur_ms={dur_ms} freshness_age_s={freshness_age_s} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dataset: {k: ch, v: [payments, checkout, auth]}
+          rows: {k: i, v: [0, 5000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [20, 900]}
+            freshness_age_s: {k: i, v: [0, 900]}
+          f:
+            dur_ms: {k: i, v: [30, 3000]}
+            freshness_age_s: {k: i, v: [0, 60]}
+      query_fail_db:
+        desc: Query failed due to inability to fetch schema/metadata from MySQL (often via cache miss path).
+        lvl: ERROR
+        msg: "query failed req_id={req_id} dataset={dataset} err={err} db_attempts={db_attempts} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dataset: {k: ch, v: [payments, checkout, auth]}
+          err: {k: ch, v: [db_conn_exhausted, lock_wait_timeout, db_unavailable]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            db_attempts: {k: i, v: [1, 1]}
+            dur_ms: {k: i, v: [30, 800]}
+          f:
+            db_attempts: {k: i, v: [1, 3]}
+            dur_ms: {k: i, v: [200, 15000]}
+      query_fail_unready:
+        desc: Query failed because the Retriever host is not ready to serve (startup checks or dependency checks not yet passing).
+        lvl: ERROR
+        msg: "query failed req_id={req_id} dataset={dataset} err={err} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dataset: {k: ch, v: [payments, checkout, auth]}
+          err: {k: ch, v: [startup_checks_failed, dependency_check_failed]}
+          dur_ms: {k: i, v: [30, 2000]}
+          trace_id: {k: hex, v: 32}
+      stamp_writer_metrics_running:
+        desc: Per-host minute summary when stamp-writer is active and writing to MySQL.
+        lvl: INFO
+        msg: "stamp writer running target={target_cluster} writes_ok_1m={writes_ok_1m} writes_err_1m={writes_err_1m} loop_ms={loop_ms}"
+        vars:
+          target_cluster: {k: ch, v: [cluster_a, cluster_b]}
+          writes_ok_1m: {k: i, v: [60, 220]}
+          writes_err_1m: {k: i, v: [0, 5]}
+          loop_ms: {k: i, v: [10, 120]}
+      stamp_writer_metrics_stopped:
+        desc: Per-host minute summary when stamp-writer is not producing writes (stalled/disabled).
+        lvl: WARN
+        msg: "stamp writer stopped target={target_cluster} writes_ok_1m={writes_ok_1m} writes_err_1m={writes_err_1m} loop_ms={loop_ms}"
+        vars:
+          target_cluster: {k: ch, v: [cluster_a, cluster_b]}
+          writes_ok_1m: {k: i, v: [0, 3]}
+          writes_err_1m: {k: i, v: [0, 10]}
+          loop_ms: {k: i, v: [10, 300]}
+      host_restart:
+        desc: Host restart marker (used during manual recovery/reboots).
+        lvl: WARN
+        msg: "host restart requested reason={reason} by={by}"
+        vars:
+          reason: {k: ch, v: [stamp_writer_recovery, post_failover_checks]}
+          by: {k: ch, v: [oncall]}
+    beh:
+      n:
+        desc: Emits stamp-writer metrics while healthy.
+        emit:
+          - id: stamp_writer_metrics_running
+            per_min: 1.0
+      f:
+        desc: During the incident, stamp-writer metrics show either stopped or running depending on recovery progress.
+        emit:
+          - id: stamp_writer_metrics_running
+            per_min: 1.0
+          - id: stamp_writer_metrics_stopped
+            per_min: 1.0
+
+  - id: schema_cache
+    name: Shared Schema Cache
+    svc: schema-cache
+    hosts: [cache-1, cache-2]
+    desc: Shared cache used by ingest and query to reduce load on the main MySQL schema store.
+    to:
+      - dst: mysql_main_db
+        proto: jdbc
+        desc: Fetches schema/dataset records on cache miss and during refresh.
+    logs:
+      cache_stats_warm:
+        desc: Periodic cache effectiveness summary when warm.
+        lvl: INFO
+        msg: "schema cache stats state=warm hit_ratio={hit_ratio} warm_schemas={warm_schemas} misses_1m={misses_1m} refresh_q={refresh_q}"
+        vars:
+          hit_ratio: {k: f, v: [0.90, 0.99]}
+          warm_schemas: {k: i, v: [5000, 12000]}
+          misses_1m: {k: i, v: [0, 250]}
+          refresh_q: {k: i, v: [0, 60]}
+      cache_stats_cold:
+        desc: Periodic cache effectiveness summary when cold/high-miss.
+        lvl: INFO
+        msg: "schema cache stats state=cold hit_ratio={hit_ratio} warm_schemas={warm_schemas} misses_1m={misses_1m} refresh_q={refresh_q}"
+        vars:
+          hit_ratio: {k: f, v: [0.05, 0.40]}
+          warm_schemas: {k: i, v: [300, 3000]}
+          misses_1m: {k: i, v: [800, 9000]}
+          refresh_q: {k: i, v: [200, 4000]}
+      refresh_error:
+        desc: Cache refresh errors when MySQL is slow or unavailable.
+        lvl: WARN
+        msg: "schema cache refresh error err={err} retry_in_ms={retry_in_ms}"
+        vars:
+          err: {k: ch, v: [db_timeout, db_unavailable]}
+          retry_in_ms: {k: i, v: [200, 5000]}
+    beh:
+      n:
+        desc: Emits periodic warm-cache stats and rare refresh errors.
+        emit:
+          - id: cache_stats_warm
+            per_min: 1.0
+            scope: global
+          - id: refresh_error
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Emits either cold-cache or warm-cache stats depending on recovery progress, plus more frequent refresh errors during the outage.
+        emit:
+          - id: cache_stats_warm
+            per_min: 1.0
+            scope: global
+          - id: cache_stats_cold
+            per_min: 1.0
+            scope: global
+          - id: refresh_error
+            per_min: 0.2
+            scope: global
+
+  - id: mysql_main_db
+    name: Main MySQL (RDS)
+    svc: mysql-main
+    hosts: [mysql-primary-1, mysql-primary-2]
+    desc: |
+      Stores critical shared metadata such as accounts, permissions, and schema records used by cache, ingest, and query.
+      Under load and rare internal lockups, it can deadlock/lock-wait and exhaust connections, cascading 5xx errors across services.
+    to: []
+    logs:
+      db_health_ok:
+        desc: Periodic high-level database health snapshot when operating normally.
+        lvl: INFO
+        msg: "db health state=ok conns_in_use={conns_in_use} threads_running={threads_running} lock_waits_1m={lock_waits_1m} cpu_pct={cpu_pct}"
+        vars:
+          conns_in_use: {k: i, v: [50, 250]}
+          threads_running: {k: i, v: [5, 60]}
+          lock_waits_1m: {k: i, v: [0, 5]}
+          cpu_pct: {k: i, v: [5, 70]}
+      db_health_overloaded:
+        desc: Periodic high-level database health snapshot under severe contention/lockup.
+        lvl: INFO
+        msg: "db health state=overloaded conns_in_use={conns_in_use} threads_running={threads_running} lock_waits_1m={lock_waits_1m} cpu_pct={cpu_pct}"
+        vars:
+          conns_in_use: {k: i, v: [700, 1000]}
+          threads_running: {k: i, v: [50, 400]}
+          lock_waits_1m: {k: i, v: [10, 600]}
+          cpu_pct: {k: i, v: [60, 100]}
+      innodb_lock_wait:
+        desc: Warning emitted when lock waits exceed expected thresholds.
+        lvl: WARN
+        msg: "innodb lock wait wait_ms={wait_ms} trx_id={trx_id}"
+        vars:
+          wait_ms: {k: i, v: [50, 20000]}
+          trx_id: {k: hex, v: 16}
+      too_many_connections:
+        desc: Emitted when the server reaches the connection limit and rejects new sessions.
+        lvl: ERROR
+        msg: "too many connections conns_in_use={conns_in_use} max_connections={max_connections}"
+        vars:
+          conns_in_use: {k: i, v: [995, 1000]}
+          max_connections: {k: i, v: [1000, 1000]}
+      innodb_internal_deadlock:
+        desc: Rare internal lockup/deadlock marker observed during extreme contention.
+        lvl: CRITICAL
+        msg: "innodb internal deadlock mutex={mutex} victim_thread={victim_thread}"
+        vars:
+          mutex: {k: str, v: "innodb_mutex_name"}
+          victim_thread: {k: i, v: [1, 512]}
+    beh:
+      n:
+        desc: Emits steady health snapshots; lock wait warnings are rare.
+        emit:
+          - id: db_health_ok
+            per_min: 1.0
+            scope: global
+          - id: innodb_lock_wait
+            per_min: 0.02
+            scope: global
+      f:
+        desc: During the incident window, health snapshots may show overloaded or ok depending on failover; lock waits and connection errors become common during the outage.
+        emit:
+          - id: db_health_ok
+            per_min: 1.0
+            scope: global
+          - id: db_health_overloaded
+            per_min: 1.0
+            scope: global
+          - id: innodb_lock_wait
+            per_min: 0.2
+            scope: global
+          - id: too_many_connections
+            per_min: 0.15
+            scope: global
+
+  - id: ops_console
+    name: Ops Console / On-call Actions
+    svc: null
+    hosts: [oncall-1]
+    desc: Represents discrete operator actions such as toggling feature flags, enabling/disabling circuit breakers, initiating database failover, and manual cache rebuild steps.
+    to:
+      - dst: api_gateway
+        proto: https
+        desc: Used to apply emergency traffic policies (circuit breakers) at the edge.
+      - dst: mysql_main_db
+        proto: https
+        desc: Used to initiate operational procedures like failover and manual metadata changes.
+    logs:
+      set_feature_flag:
+        desc: Operator changes a feature flag that controls Retriever stamp-writer targeting.
+        lvl: INFO
+        msg: "set feature flag flag={flag} value={value} by={by}"
+        vars:
+          flag: {k: ch, v: [retriever_stamp_writes_cluster]}
+          value: {k: ch, v: [cluster_a, cluster_b]}
+          by: {k: ch, v: [oncall]}
+      enable_ingest_circuit_breaker:
+        desc: Operator enables ingest circuit breaker to protect the database.
+        lvl: WARN
+        msg: "set ingest circuit breaker state={state} reason={reason} by={by}"
+        vars:
+          state: {k: ch, v: [open]}
+          reason: {k: ch, v: [protect_mysql]}
+          by: {k: ch, v: [oncall]}
+      disable_ingest_circuit_breaker:
+        desc: Operator disables ingest circuit breaker after dependencies are stable.
+        lvl: INFO
+        msg: "set ingest circuit breaker state={state} reason={reason} by={by}"
+        vars:
+          state: {k: ch, v: [closed]}
+          reason: {k: ch, v: [restore_ingest]}
+          by: {k: ch, v: [oncall]}
+      initiate_db_failover:
+        desc: Operator initiates a database failover to a replica.
+        lvl: CRITICAL
+        msg: "initiate db failover target={target} by={by}"
+        vars:
+          target: {k: ch, v: [replica_promote]}
+          by: {k: ch, v: [oncall]}
+      db_failover_complete:
+        desc: Operator observes failover completion and new primary promotion.
+        lvl: INFO
+        msg: "db failover complete new_primary={new_primary}"
+        vars:
+          new_primary: {k: ch, v: [mysql-primary-2]}
+      bulk_schema_stamp_update:
+        desc: Operator manually updates schema 'last written' timestamps to force cache reload.
+        lvl: WARN
+        msg: "bulk schema stamp update scope={scope} set_to={set_to} affected_schemas={affected_schemas} by={by}"
+        vars:
+          scope: {k: ch, v: [active_last_24h]}
+          set_to: {k: ch, v: [now]}
+          affected_schemas: {k: i, v: [1000, 20000]}
+          by: {k: ch, v: [oncall]}
+    beh:
+      n:
+        desc: No periodic logs; emits only discrete action markers when used.
+        emit: []
+      f:
+        desc: No periodic logs; emits only discrete action markers when used.
+        emit: []
+
+tracing:
+  on: true
+  origins: [api_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal ingest and query traffic flows with a warm schema cache and stable MySQL.
+    req:
+      - id: ingest_event
+        desc: Client ingests events; Shepherd resolves schema (mostly cache hit) and accepts the batch, then the gateway emits the response log.
+        rpm: 180.0
+        path: [api_gateway, shepherd_ingest, api_gateway]
+        emit: [shepherd_ingest.ingest_accepted, api_gateway.access_ingest_202]
+        latency_ms: [[12, 220], [15, 260]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: query_request
+        desc: Client queries recent data; Retriever serves the request and the gateway emits the response log.
+        rpm: 60.0
+        path: [api_gateway, retriever_engine, api_gateway]
+        emit: [retriever_engine.query_ok, api_gateway.access_query_200]
+        latency_ms: [[25, 750], [30, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: |
+      Failure behavior spanning outage and recovery steps: MySQL lockup and connection exhaustion cause broad 5xx,
+      ingest is circuit-broken, then failover and cache rebuild restore service but leave a minor freshness inconsistency.
+    req:
+      - id: ingest_event_fail_500
+        desc: Ingest fails because Shepherd cannot resolve schema/metadata from MySQL under lockup/connection pressure, then the gateway emits the 500 response log.
+        rpm: 180.0
+        path: [api_gateway, shepherd_ingest, api_gateway]
+        emit: [shepherd_ingest.ingest_failed_db, api_gateway.access_upstream_500]
+        latency_ms: [[220, 14500], [260, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ingest_event_blocked_503
+        desc: Ingest is rejected at the edge by circuit-breaker (does not reach Shepherd).
+        rpm: 180.0
+        path: [api_gateway]
+        emit: [api_gateway.access_circuit_503]
+        latency_ms: [[2, 15]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ingest_event_recovered_202
+        desc: Ingest succeeds after database recovery and cache rebuild steps, then the gateway emits the response log.
+        rpm: 180.0
+        path: [api_gateway, shepherd_ingest, api_gateway]
+        emit: [shepherd_ingest.ingest_accepted, api_gateway.access_ingest_202]
+        latency_ms: [[25, 500], [30, 650]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: query_request_fail_500
+        desc: Queries fail when Retriever cannot fetch required schema/metadata due to MySQL lockup/connection exhaustion, then the gateway emits the 500 response log.
+        rpm: 60.0
+        path: [api_gateway, retriever_engine, api_gateway]
+        emit: [retriever_engine.query_fail_db, api_gateway.access_upstream_500]
+        latency_ms: [[220, 14500], [260, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: query_request_fail_500_unready
+        desc: Queries fail because Retriever hosts are not ready to serve (post-failover checks/restarts), even though MySQL is responsive.
+        rpm: 60.0
+        path: [api_gateway, retriever_engine, api_gateway]
+        emit: [retriever_engine.query_fail_unready, api_gateway.access_upstream_500]
+        latency_ms: [[45, 900], [55, 1400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: query_request_recovered_200
+        desc: Queries succeed again after database recovery and retriever host restarts, then the gateway emits the response log.
+        rpm: 60.0
+        path: [api_gateway, retriever_engine, api_gateway]
+        emit: [retriever_engine.query_ok, api_gateway.access_query_200]
+        latency_ms: [[40, 1050], [45, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "Repair: constrained MySQL connection metrics so conns_in_use never exceeds max_connections; overloaded health snapshots now top out at 1000 and too_many_connections logs show near-cap usage."
+  - "This model keeps Honeycomb service names (Shepherd/Retriever) but simplifies the environment to the minimal dependency chain: edge → ingest/query → schema cache → main MySQL."
+  - "The feature-flag/worker-resume bug is represented by Retriever's stamp-writer switching to a 'stopped' metrics log during the outage and returning to a 'running' log after manual restarts."
+  - "MySQL's rare internal lockup is represented by elevated innodb_lock_wait and too_many_connections background logs plus a rare innodb_internal_deadlock marker (used as a one-shot in the scenario)."
+  - "Normal-phase expected volume: ~480 flow-logs/min plus ~6–8 background-logs/min."
+  - "Total scenario log volume estimate: ~24k–32k logs (flows dominate; background metrics provide stable anchors), within the 20k–100k target."
+```

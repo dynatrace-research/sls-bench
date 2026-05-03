@@ -1,0 +1,253 @@
+```yaml
+scenario:
+  id: travis_osx_vm_leak_and_cpu_reservation
+  title: OS X build outage from leaked VMs and CPU reservation boot failures
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Travis CI's OS X build scheduler provisions macOS build VMs on a vSphere cluster and relies on a separate janitor service to delete VMs.
+    After a vSphere credential rotation, the janitor could not authenticate and stopped cleaning up, while still reporting a stale "vm_total" metric that kept alerts quiet.
+    VM inventory grew into the thousands, causing vSphere admission-control denials and a surge of build re-queues; operators paused builds and ran increasingly aggressive cleanup.
+    After the leaked VMs were removed, new boot failures still appeared under backlog load due to CPU reservation configuration, so the system remained in reduced-capacity operation at the end of the scenario.
+
+  trigger_desc: |
+    A vSphere password rotation left vsphere-janitor running with invalid credentials; VM cleanup stopped.
+    The resulting VM leak accumulated until the vSphere cluster could no longer satisfy VM CPU reservations, causing power-on failures and build re-queues.
+
+  time:
+    total_minutes: 55
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 55}
+
+  phases:
+    n:
+      desc: |
+        OS X builds for .com and .org are dequeued steadily.
+        The VM manager clones and powers on build VMs successfully, and the janitor keeps inventory in the low hundreds while reporting live vm_total.
+      flows: [osx_build_start_ok]
+      manifestation:
+        - build_scheduler.build_started
+        - vsphere_janitor.vm_total_report_live
+        - vsphere_cluster.cluster_inventory_low
+
+    f:
+      desc: |
+        The system enters a failure period characterized by VM leak-induced capacity exhaustion and later boot failures from CPU reservation configuration.
+        Early in failure, vSphere rejects many VM power-on requests due to insufficient reservable CPU, triggering build re-queues and growing backlog.
+        Operators pause builds to let cleanup catch up, correct janitor authentication, and then run aggressive cleanup to delete leaked and abnormal-state VMs.
+        After inventory returns to normal, a separate CPU reservation limit causes power-on failures under backlog-driven load, requiring reduced capacity to remain stable.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: vsphere_janitor
+          event: |
+            Cleanup silently stops because vsphere-janitor cannot authenticate after a credential rotation; leaked VMs push the cluster into admission-control denials,
+            and build power-ons begin failing with re-queues while vm_total metrics remain at a plausible stale value.
+          why: |
+            Janitor uses a dedicated vSphere API account; an outdated password causes auth failures (directly observable).
+            Because of a janitor defect, vm_total continues to be emitted as the last-seen value, keeping alert checks "ok" even while cluster inventory (observable via vSphere)
+            and admission denials indicate thousands of VMs and insufficient reservable CPU.
+          flows: [osx_build_start_ok, osx_build_start_fail_leak]
+          rate_multipliers:
+            osx_build_start_fail_cpu_resv: 0.0
+            vsphere_janitor.vm_total_report_live: 0.0
+            vsphere_janitor.delete_vm_ok_normal: 0.0
+            vsphere_janitor.delete_vm_ok_aggressive: 0.0
+            vsphere_janitor.delete_vm_skipped: 0.0
+            vsphere_janitor.cleanup_cycle_aggressive: 0.0
+            vsphere_cluster.cluster_inventory_low: 0.0
+            vsphere_cluster.cluster_inventory_high: 1.0
+            metrics_alerting.ingest_vm_total_live: 0.0
+            metrics_alerting.ingest_vm_total_stale: 1.0
+          latency_multipliers:
+            osx_build_start_ok: {p50: 1.2, p95: 1.3}
+            osx_build_start_fail_leak: {p50: 1.3, p95: 1.4}
+          one_shots: []
+          manifestation:
+            - vsphere_janitor.auth_failed
+            - vsphere_janitor.vm_total_report_stale
+            - metrics_alerting.ingest_vm_total_stale
+            - vsphere_cluster.cluster_inventory_high
+            - vsphere_cluster.admission_denied_reservation
+            - osx_vm_manager.vm_poweron_failed_admission
+            - build_scheduler.build_requeued
+
+        - order: 2
+          at_min: 30
+          component: build_scheduler
+          event: |
+            Operators pause both OS X queues to stop new VM creation pressure, update janitor credentials, and restart vsphere-janitor;
+            cleanup resumes and vm_total reporting switches back to live values.
+          why: |
+            Pausing reduces competing resource demands while allowing cleanup to make progress (observable via pause marker and drop in build-start flows).
+            Restart with corrected credentials restores vSphere API access (observable by disappearance of auth_failed and the reappearance of live vm_total plus deletions).
+          flows: [osx_build_start_ok, osx_build_start_fail_leak]
+          rate_multipliers:
+            osx_build_start_ok: 0.0
+            osx_build_start_fail_leak: 0.0
+            osx_build_start_fail_cpu_resv: 0.0
+            vsphere_janitor.auth_failed: 0.0
+            vsphere_janitor.vm_total_report_stale: 0.0
+            vsphere_janitor.vm_total_report_live: 1.0
+            vsphere_janitor.delete_vm_ok_normal: 1.0
+            vsphere_janitor.delete_vm_skipped: 1.0
+            metrics_alerting.ingest_vm_total_stale: 0.0
+            metrics_alerting.ingest_vm_total_live: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: build_scheduler.pause_toggle
+              count: 1
+              hosts: [sched-1]
+            - ref: vsphere_janitor.janitor_restart
+              count: 1
+              hosts: [janitor-1]
+          manifestation:
+            - build_scheduler.pause_toggle
+            - vsphere_janitor.janitor_restart
+            - vsphere_janitor.vm_total_report_live
+            - vsphere_janitor.delete_vm_ok_normal
+            - vsphere_janitor.delete_vm_skipped
+
+        - order: 3
+          at_min: 38
+          component: vsphere_janitor
+          event: |
+            Cleanup is switched to an aggressive sweep to remove leaked VMs that were left in poweron_failed/unexpected states that normal cleanup would skip;
+            deletion rate spikes while builds remain paused.
+          why: |
+            A portion of leaked VMs are not in the "finished build VM" lifecycle state, so normal janitor logic skips them (observable via skip logs).
+            Aggressive mode broadens eligibility and rapidly deletes remaining inventory (observable via mode-set marker and elevated aggressive deletions).
+          flows: []
+          rate_multipliers:
+            vsphere_janitor.cleanup_cycle_normal: 0.0
+            vsphere_janitor.cleanup_cycle_aggressive: 1.0
+            vsphere_janitor.delete_vm_ok_normal: 0.2
+            vsphere_janitor.delete_vm_ok_aggressive: 2.0
+            vsphere_janitor.delete_vm_skipped: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: vsphere_janitor.cleanup_mode_set
+              count: 1
+              hosts: [janitor-1]
+          manifestation:
+            - vsphere_janitor.cleanup_mode_set
+            - vsphere_janitor.cleanup_cycle_aggressive
+            - vsphere_janitor.delete_vm_ok_aggressive
+
+        - order: 4
+          at_min: 44
+          component: build_scheduler
+          event: |
+            After inventory drops back near normal, builds are resumed; leak-driven boot failures disappear, but power-on failures now occur due to CPU reservation limits under backlog load.
+          why: |
+            With leaked VMs removed, vSphere inventory stabilizes and admission failures from "insufficient_reservations" stop.
+            However, the configured CPU reservations prevent booting the assumed maximum concurrency, so admission denials continue under load with a different reason
+            (directly observable in the vSphere/VM-manager boot-failure signatures; the configuration mismatch is inferred).
+          flows: [osx_build_start_ok, osx_build_start_fail_cpu_resv]
+          rate_multipliers:
+            osx_build_start_ok: 1.0
+            osx_build_start_fail_leak: 0.0
+            osx_build_start_fail_cpu_resv: 1.0
+            vsphere_cluster.cluster_inventory_high: 0.0
+            vsphere_cluster.cluster_inventory_low: 1.0
+            vsphere_janitor.cleanup_cycle_aggressive: 0.0
+            vsphere_janitor.cleanup_cycle_normal: 1.0
+            vsphere_janitor.delete_vm_ok_aggressive: 0.0
+            vsphere_janitor.delete_vm_ok_normal: 1.0
+            vsphere_janitor.delete_vm_skipped: 0.5
+          latency_multipliers:
+            osx_build_start_ok: {p50: 1.1, p95: 1.2}
+            osx_build_start_fail_cpu_resv: {p50: 1.0, p95: 1.1}
+          one_shots:
+            - ref: build_scheduler.pause_toggle
+              count: 1
+              hosts: [sched-1]
+          manifestation:
+            - build_scheduler.pause_toggle
+            - vsphere_cluster.cluster_inventory_low
+            - vsphere_cluster.admission_denied_cpu
+            - osx_vm_manager.vm_poweron_failed_cpu_reservation
+            - build_scheduler.build_requeued
+
+        - order: 5
+          at_min: 48
+          component: build_scheduler
+          event: |
+            Operators set a reduced-capacity limit to keep the cluster stable; boot failures become less frequent, but overall throughput remains reduced and backlog drains slowly.
+          why: |
+            Lowering concurrency reduces total reserved CPU pressure and prevents repeatedly hitting the reservation limit (partially observable via reduced rate of admission denials/re-queues and steadier successful starts).
+            The underlying CPU reservation configuration is not yet changed in this scenario, so the system continues operating below desired capacity.
+          flows: [osx_build_start_ok, osx_build_start_fail_cpu_resv]
+          rate_multipliers:
+            osx_build_start_ok: 0.6
+            osx_build_start_fail_cpu_resv: 0.3
+          latency_multipliers:
+            osx_build_start_ok: {p50: 0.9, p95: 0.9}
+            osx_build_start_fail_cpu_resv: {p50: 0.8, p95: 0.8}
+          one_shots:
+            - ref: build_scheduler.capacity_limit_set
+              count: 1
+              hosts: [sched-1]
+          manifestation:
+            - build_scheduler.capacity_limit_set
+            - build_scheduler.queue_backlog_metric
+            - vsphere_cluster.admission_denied_cpu
+
+      steady:
+        - component: build_scheduler
+          condition: |
+            OS X builds run under a reduced-capacity limit; the queues remain backlogged and build starts are throttled.
+          user_impact: |
+            Users experience long queue times and intermittent re-queues/boot failures, even though the platform is not fully down.
+          manifestation:
+            - build_scheduler.queue_backlog_metric
+            - build_scheduler.build_requeued
+        - component: osx_vm_manager
+          condition: |
+            A small but persistent rate of CPU-reservation-related power-on failures continues under load.
+          user_impact: |
+            Some builds are retried/re-queued before starting, extending end-to-end build latency.
+          manifestation:
+            - osx_vm_manager.vm_poweron_failed_cpu_reservation
+            - vsphere_cluster.admission_denied_cpu
+
+      feedback_loops:
+        - id: backlog_pressure_loop
+          desc: |
+            Re-queues and pauses create a growing backlog; when builds resume, the surge in start attempts increases concurrent VM boots,
+            which increases reservation pressure and produces more admission denials.
+        - id: stale_metric_blindness
+          desc: |
+            The janitor's stale vm_total metric masks the leak from alerting, delaying detection until user-visible re-queues and manual inventory inspection occur.
+
+      flows: [osx_build_start_ok, osx_build_start_fail_leak, osx_build_start_fail_cpu_resv]
+      manifestation:
+        - vsphere_janitor.auth_failed
+        - vsphere_janitor.vm_total_report_stale
+        - vsphere_cluster.cluster_inventory_high
+        - osx_vm_manager.vm_poweron_failed_admission
+        - osx_vm_manager.vm_poweron_failed_cpu_reservation
+        - build_scheduler.build_requeued
+        - build_scheduler.queue_backlog_metric
+
+  assumptions:
+    - |
+      Timeline is compressed into 55 minutes while preserving causal order:
+      auth breakage → VM leak → admission denials/re-queues → pause + fix janitor → aggressive cleanup → CPU reservation boot failures → reduced-capacity operation.
+    - |
+      Failure-phase piecewise volume estimate (rough order-of-magnitude, after multipliers):
+      - min 20-30: (20 rpm ok *4) + (160 rpm leak-fail *5) ≈ 880 logs/min, plus ~12 logs/min background ≈ 8.9k logs
+      - min 30-38 (paused): mostly background cleanup/metrics ≈ 40-50 logs/min ≈ 0.35k logs
+      - min 38-44 (aggressive cleanup): aggressive deletions ~1100/min plus other background ≈ 6.7k logs
+      - min 44-48 (resume): (20 rpm ok *4) + (70 rpm cpu-fail *5) ≈ 430 logs/min, plus ~41 logs/min background ≈ 1.9k logs
+      - min 48-55 (reduced capacity): (12 rpm ok *4) + (21 rpm cpu-fail *5) ≈ 153 logs/min, plus ~41 logs/min background ≈ 1.35k logs
+      Total estimated logs including normal phase and one-shots: ~21k-23k.
+    - |
+      One-shot counts: pause at min 30 (1), janitor restart at min 30 (1), janitor mode set at min 38 (1), resume at min 44 (1), capacity limit set at min 48 (1).
+    - |
+      Visibility rationale: janitor auth_failed and stale vm_total appear every minute early in failure; vSphere inventory-high snapshots appear every minute until cleanup;
+      admission_denied and vm_poweron_failed appear frequently via the failed build-start flows; pauses/capacity changes are pinned by one-shot operator logs.
+```

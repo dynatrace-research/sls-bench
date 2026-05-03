@@ -1,0 +1,163 @@
+```yaml
+scenario:
+  id: account_service_nginx_memcached_saturation
+  title: Memcached timeouts saturate Nginx, ALB marks all targets unhealthy
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The account service routes all API traffic through an Nginx proxy that uses Memcached to shortcut token verification,
+    and forwards cache misses to a Java application that verifies via Redis. Under extreme load, Memcached begins timing out,
+    causing Nginx workers to block and more verify requests to fall through to the application (increasing Redis load).
+    As worker threads saturate, Nginx stops serving unrelated traffic including health checks, leading the ALB to remove all
+    Nginx nodes and return 503 to most clients; signing in becomes largely blocked.
+
+  trigger_desc: |
+    Peak concurrency drives Memcached connection and network saturation; Nginx verify requests begin hitting the 100ms Memcached timeout,
+    consuming worker capacity and forcing more verification traffic to fall through to the Java app (Redis-backed).
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Clients perform frequent token verification; Nginx serves most verify requests from Memcached with low latency.
+        A smaller fraction of verify requests miss cache and are forwarded to the Java application, which checks Redis.
+        Sign-in traffic is passed through Nginx to the Java application and typically completes quickly.
+      flows: [verify_cache_hit, verify_cache_miss_fallback, signin_success]
+      manifestation: [nginx_proxy.worker_report, nginx_proxy.access_cache_hit, account_app.signin_ok, redis_cluster.latency_report]
+
+    f:
+      desc: |
+        Memcached becomes unstable and begins timing out. Nginx blocks workers while waiting for Memcached,
+        then forwards verification traffic to the Java app, increasing Redis load and end-to-end latency.
+        Worker contention escalates until Nginx returns 503 for some requests and stops reliably answering health checks.
+        The ALB then marks all Nginx targets unhealthy and returns 503 due to no healthy targets, leaving sign-in mostly blocked.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: memcached_cluster
+          event: |
+            Memcached saturation leads to frequent 100ms cache timeouts; token verification falls back through Nginx to the Java app.
+            Redis latency begins to rise due to the increased fall-through verification load.
+          why: |
+            Cache requests consume Nginx worker time while waiting for Memcached; when the cache path fails, verification is handled
+            by the Java app using Redis. Memcached instability and Nginx timeout logs are directly observable; the underlying network
+            saturation is partially observable via Memcached saturation metrics.
+          flows: [verify_memcached_timeout_fallback, verify_cache_hit_residual, signin_degraded]
+          rate_multipliers:
+            signin_nginx_503: 0.0
+            alb_503_no_targets: 0.0
+            alb_gateway.healthcheck_fail: 0.0
+            redis_cluster.latency_report: 1.5
+          latency_multipliers:
+            verify_memcached_timeout_fallback: {p50: 1.0, p95: 1.0}
+            signin_degraded: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation: [nginx_proxy.memcached_timeout, nginx_proxy.access_upstream_200, redis_cluster.latency_report]
+
+        - order: 2
+          at_min: 33
+          component: nginx_proxy
+          event: |
+            Nginx worker threads become exhausted by blocked Memcached calls, producing 503 responses and missed health checks.
+            Token verification continues to fall through, keeping Redis load elevated and increasing end-to-end latency.
+          why: |
+            Each Memcached timeout ties up a worker; as free workers approach zero, unrelated traffic (including /health) cannot be served.
+            This is directly observable through rising worker_report saturation and explicit 503 access logs, and ALB healthcheck failures.
+          flows: [signin_nginx_503, verify_memcached_timeout_fallback, signin_degraded]
+          rate_multipliers:
+            signin_degraded: 0.6
+            signin_nginx_503: 1.0
+            verify_memcached_timeout_fallback: 1.2
+            verify_cache_hit_residual: 0.5
+            alb_gateway.healthcheck_fail: 1.0
+            nginx_proxy.worker_report: 2.0
+            redis_cluster.latency_report: 2.0
+          latency_multipliers:
+            signin_degraded: {p50: 2.0, p95: 3.0}
+            verify_memcached_timeout_fallback: {p50: 1.2, p95: 1.3}
+          one_shots: []
+          manifestation: [nginx_proxy.access_503, alb_gateway.healthcheck_fail, nginx_proxy.worker_report]
+
+        - order: 3
+          at_min: 38
+          component: alb_gateway
+          event: |
+            After sustained missed health checks, the ALB marks all Nginx targets unhealthy and begins returning 503
+            due to no healthy targets, imposing near-complete downtime for sign-in and verification.
+          why: |
+            With health checks failing, the ALB removes all instances from rotation; most client requests no longer reach Nginx.
+            This is directly observable via the ALB no-targets access logs and the unhealthy target-group marker.
+          flows: [alb_503_no_targets]
+          rate_multipliers:
+            verify_memcached_timeout_fallback: 0.0
+            verify_cache_hit_residual: 0.0
+            signin_degraded: 0.0
+            signin_nginx_503: 0.0
+            alb_503_no_targets: 1.0
+            alb_gateway.healthcheck_fail: 1.0
+            nginx_proxy.worker_report: 1.5
+            redis_cluster.latency_report: 1.0
+            memcached_cluster.conn_saturation: 0.4
+          latency_multipliers:
+            alb_503_no_targets: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: alb_gateway.targets_marked_unhealthy
+              count: 1
+              hosts: [alb-1]
+          manifestation: [alb_gateway.access_no_targets, alb_gateway.targets_marked_unhealthy]
+
+      steady:
+        - component: alb_gateway
+          condition: |
+            The target group has no healthy Nginx instances; most client requests fail at the ALB with 503 no_healthy_targets.
+          user_impact: |
+            Signing in/out is mostly blocked and clients are frequently logged out or cannot establish sessions.
+          manifestation: [alb_gateway.access_no_targets, alb_gateway.healthcheck_fail]
+        - component: nginx_proxy
+          condition: |
+            Nginx remains in a saturated state (few/no free workers) but receives little client traffic because the ALB has drained targets.
+          user_impact: |
+            Requests rarely reach the service edge; if they do during brief control-plane transitions, latency is high.
+          manifestation: [nginx_proxy.worker_report]
+
+      feedback_loops:
+        - id: memcached_timeout_worker_starvation
+          desc: |
+            Memcached timeouts block Nginx workers; fewer free workers increases queuing and delays, which further reduces the ability
+            to serve health checks and normal traffic. More verify fall-through increases application/Redis work, which can add latency
+            to upstream responses and keep workers busy longer, reinforcing saturation.
+
+      flows: [verify_memcached_timeout_fallback, signin_nginx_503, alb_503_no_targets]
+      manifestation: [nginx_proxy.memcached_timeout, nginx_proxy.access_503, alb_gateway.access_no_targets, redis_cluster.latency_report]
+
+  assumptions:
+    - |
+      Scenario timeline is compressed to 50 minutes (25 normal, 25 failure) to fit log-generation needs while preserving the described progression:
+      cache timeouts lead to Nginx saturation with 503s and health-check misses, then the ALB drains all targets.
+    - |
+      Failure-phase piecewise breakdown (order-of-magnitude expectation):
+      minutes 25-33 (8 min) show verify fall-through dominating with elevated Redis metrics and no ALB no-targets yet;
+      minutes 33-38 (5 min) add Nginx 503s plus ALB healthcheck failures and higher worker-report frequency;
+      minutes 38-50 (12 min) are dominated by ALB 503 no-healthy-targets with Nginx mostly seeing only background worker reports
+      and reduced Redis/Memcached pressure because traffic no longer reaches the proxy/app.
+    - |
+      Estimated total volume about ~71k logs:
+      normal phase ~1.5k logs/min for 25 minutes (~37k) plus background;
+      failure phase ~2.0k logs/min for 8 minutes (~16k), ~2.2k logs/min for 5 minutes (~11k), and ~0.52k logs/min for 12 minutes (~6k),
+      plus one one-shot unhealthy marker.
+    - |
+      Metric-like Memcached/Redis fields and Nginx worker gauges are interpreted as scaled-down snapshots consistent with the scaled-down modeled request rates
+      (i.e., they do not represent full production RPS nor full-size worker pools in this incident specification).
+    - |
+      Visibility rationale:
+      high-rate verify traffic makes nginx_proxy.memcached_timeout frequent early in failure;
+      nginx_proxy.worker_report provides continuous saturation evidence;
+      alb_gateway.healthcheck_fail and alb_gateway.access_no_targets make the transition to drained targets obvious.
+```

@@ -1,0 +1,549 @@
+```yaml
+sys:
+  id: datadog_us_platform
+  desc: >
+    A regional observability SaaS control plane serving an interactive web UI/API while ingesting telemetry.
+    Most services discover dependencies and fetch runtime configuration via an internal service-discovery system,
+    accessed primarily through node-local DNS resolvers. During the modeled incident, a missing service record
+    produced uncached NXDOMAIN responses that drove a DNS thundering herd, destabilizing service discovery and
+    causing widespread dependency/config lookup failures and intermittent web/API availability.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: web_frontend
+    name: Web Frontend
+    svc: web
+    hosts: [web-1, web-2, web-3]
+    desc: >
+      Terminates user browser/API traffic and fans out to backend services. When downstream lookups fail,
+      it returns 5xx errors and logs dependency resolution failures.
+    to:
+      - dst: backend_api
+        proto: https
+        desc: Calls internal API to render dashboards and serve UI widgets.
+      - dst: dns_resolver
+        proto: udp
+        desc: Performs DNS lookups for internal service endpoints via the node-local resolver.
+    logs:
+      req_start:
+        desc: Request entry marker with identifiers.
+        lvl: INFO
+        msg: "req start method={method} route={route} req_id={req_id} user_id={user_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/dash", "/api/v1/query"]}
+          req_id: {k: hex, v: 16}
+          user_id: {k: i, v: [10000, 99999]}
+      access_ok:
+        desc: Successful request completion.
+        lvl: INFO
+        msg: "req end method={method} route={route} status=200 bytes={bytes} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/dash", "/api/v1/query"]}
+          bytes: {k: i, v: [2000, 250000]}
+          dur_ms: {k: i, v: [20, 2500]}
+          req_id: {k: hex, v: 16}
+      access_err:
+        desc: Failed request completion (5xx).
+        lvl: WARN
+        msg: "req end method={method} route={route} status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/dash", "/api/v1/query"]}
+          status: {k: i, v: [502, 504]}
+          err: {k: ch, v: [upstream_503, lookup_failed, timeout]}
+          dur_ms: {k: i, v: [50, 8000]}
+          req_id: {k: hex, v: 16}
+      dep_lookup_failed:
+        desc: Dependency resolution failure before a downstream call can be made.
+        lvl: WARN
+        msg: "dependency lookup failed dep={dep} via=dns err={err} req_id={req_id}"
+        vars:
+          dep: {k: ch, v: [backend-api]}
+          err: {k: ch, v: [SERVFAIL, timeout]}
+          req_id: {k: hex, v: 16}
+    beh:
+      n:
+        desc: Normal web tier has no significant background logs in this model.
+        emit: []
+      f:
+        desc: Failure adds no independent background emissions beyond request/flow logs.
+        emit: []
+
+  - id: backend_api
+    name: Backend API
+    svc: api
+    hosts: [api-1, api-2, api-3]
+    desc: >
+      Serves dashboard/widget queries for the web tier and periodically refreshes runtime configuration
+      from service discovery/config. When config/dependency lookups fail, it returns 503 to the web tier.
+    to:
+      - dst: service_discovery
+        proto: grpc
+        desc: Fetches dynamic configuration and discovers internal dependencies.
+      - dst: web_frontend
+        proto: https
+        desc: Sends HTTP responses back to the web tier.
+    logs:
+      req_ok:
+        desc: Successful API request handling.
+        lvl: INFO
+        msg: "handled op={op} status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [get_dashboard, query_timeseries, list_monitors]}
+          dur_ms: {k: i, v: [10, 800]}
+          req_id: {k: hex, v: 16}
+      req_err:
+        desc: Failed API request handling due to config/discovery issues.
+        lvl: ERROR
+        msg: "failed op={op} status=503 reason={reason} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [get_dashboard, query_timeseries, list_monitors]}
+          reason: {k: ch, v: [config_fetch_failed, dependency_unresolved, upstream_timeout]}
+          dur_ms: {k: i, v: [30, 6000]}
+          req_id: {k: hex, v: 16}
+      config_refresh_failed:
+        desc: Periodic config refresh could not reach service discovery/config.
+        lvl: ERROR
+        msg: "config refresh failed src=service-discovery err={err} waited_ms={waited_ms}"
+        vars:
+          err: {k: ch, v: [timeout, no_leader, connection_refused]}
+          waited_ms: {k: i, v: [200, 8000]}
+      fallback_config_enabled:
+        desc: Operator action enabling local static config fallback.
+        lvl: WARN
+        msg: "enabled local config fallback mode={mode} by={actor}"
+        vars:
+          mode: {k: ch, v: [read_only]}
+          actor: {k: ch, v: [oncall]}
+    beh:
+      n:
+        desc: Rare transient config refresh failures.
+        emit:
+          - id: config_refresh_failed
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: Frequent config refresh failures due to unstable discovery/config.
+        emit:
+          - id: config_refresh_failed
+            per_min: 0.8
+            scope: per_host
+
+  - id: intake_cluster
+    name: Telemetry Intake
+    svc: intake
+    hosts: [intake-1, intake-2, intake-3, intake-4]
+    desc: >
+      Accepts telemetry payloads and asynchronously triggers latency tracking by resolving a latency-tracker service.
+      In this model, payload ingestion remains successful, while latency tracking lookups can fail noisily.
+    to:
+      - dst: dns_resolver
+        proto: udp
+        desc: Performs DNS lookups for latency-tracker via node-local resolver.
+      - dst: latency_tracker
+        proto: grpc
+        desc: Would send async tracking instructions when a target endpoint is known.
+    logs:
+      payload_received:
+        desc: Payload received at intake edge.
+        lvl: INFO
+        msg: "payload received size_bytes={size_bytes} src_ip={src_ip} payload_id={payload_id}"
+        vars:
+          size_bytes: {k: i, v: [500, 60000]}
+          src_ip: {k: ip, v: "10.0.0.0/8"}
+          payload_id: {k: hex, v: 24}
+      payload_accepted:
+        desc: Payload accepted for processing.
+        lvl: INFO
+        msg: "payload accepted payload_id={payload_id} ingest_ms={ingest_ms}"
+        vars:
+          payload_id: {k: hex, v: 24}
+          ingest_ms: {k: i, v: [5, 300]}
+      tracking_dns_attempt:
+        desc: Attempt to resolve latency-tracker service for async latency tracking.
+        lvl: INFO
+        msg: "latency-tracker lookup qname={qname} attempt_id={attempt_id}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          attempt_id: {k: hex, v: 12}
+      tracking_started:
+        desc: Latency tracking successfully initiated after resolution.
+        lvl: INFO
+        msg: "latency tracking started qname={qname} attempt_id={attempt_id}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          attempt_id: {k: hex, v: 12}
+      tracking_skipped:
+        desc: Latency tracking suppressed due to failed resolution; ingestion is unaffected.
+        lvl: WARN
+        msg: "latency tracking skipped reason={reason} attempt_id={attempt_id}"
+        vars:
+          reason: {k: ch, v: [nxdomain, servfail, resolver_timeout]}
+          attempt_id: {k: hex, v: 12}
+    beh:
+      n:
+        desc: Normal intake background is not modeled.
+        emit: []
+      f:
+        desc: Failure adds no independent background emissions beyond request/flow logs.
+        emit: []
+
+  - id: dns_resolver
+    name: Node-local DNS Resolver
+    svc: dns-resolver
+    hosts: [dns-1, dns-2, dns-3, dns-4, dns-5]
+    desc: >
+      Caching DNS proxy used by services for service discovery. Normal positive answers are cached; in this incident
+      NXDOMAIN responses are intentionally not cached, amplifying repeated lookups when a record is missing.
+    to:
+      - dst: service_discovery
+        proto: udp
+        desc: Forwards cache misses to service-discovery DNS interface.
+      - dst: web_frontend
+        proto: udp
+        desc: Returns DNS responses to web tier clients.
+      - dst: intake_cluster
+        proto: udp
+        desc: Returns DNS responses to intake clients.
+    logs:
+      cache_hit:
+        desc: DNS answer served from local cache.
+        lvl: INFO
+        msg: "dns cache hit qname={qname} rcode=NOERROR ttl_s={ttl_s}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          ttl_s: {k: i, v: [5, 60]}
+      cache_miss_nxdomain:
+        desc: Cache miss forwarded upstream that results in NXDOMAIN and is not cached.
+        lvl: INFO
+        msg: "dns cache miss qname={qname} upstream=sd-dns rcode=NXDOMAIN cacheable=false dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          dur_ms: {k: i, v: [1, 800]}
+      cache_miss_servfail:
+        desc: Cache miss forwarded upstream that results in SERVFAIL due to upstream instability.
+        lvl: WARN
+        msg: "dns cache miss qname={qname} upstream=sd-dns rcode=SERVFAIL cacheable=true dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          dur_ms: {k: i, v: [5, 1200]}
+      upstream_timeout:
+        desc: Upstream DNS query timed out (latency-tracker lookup).
+        lvl: WARN
+        msg: "dns upstream timeout qname={qname} upstream=sd-dns timeout_ms={timeout_ms}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          timeout_ms: {k: i, v: [50, 2000]}
+      upstream_timeout_backend_api:
+        desc: Upstream DNS query timed out while resolving backend-api for the web tier.
+        lvl: WARN
+        msg: "dns upstream timeout qname={qname} upstream=sd-dns timeout_ms={timeout_ms}"
+        vars:
+          qname: {k: ch, v: ["backend-api.service.local"]}
+          timeout_ms: {k: i, v: [50, 2000]}
+    beh:
+      n:
+        desc: Resolver emits only per-request logs in this model.
+        emit: []
+      f:
+        desc: Resolver emits only per-request logs in this model.
+        emit: []
+
+  - id: service_discovery
+    name: Service Discovery & Dynamic Config Core
+    svc: service-discovery
+    hosts: [sd-1, sd-2, sd-3, sd-4, sd-5]
+    desc: >
+      Highly-available distributed directory used for DNS-based service discovery and dynamic configuration.
+      Under extreme DNS query load it can lose quorum or become too slow to reliably answer, impacting startups
+      and dependency resolution across the platform.
+    to:
+      - dst: dns_resolver
+        proto: udp
+        desc: Returns DNS answers to resolvers.
+    logs:
+      dns_nxdomain:
+        desc: Upstream DNS query answered NXDOMAIN (missing record).
+        lvl: INFO
+        msg: "dns query qname={qname} rcode=NXDOMAIN ans_count=0 dur_ms={dur_ms} client={client_ip}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          dur_ms: {k: i, v: [1, 900]}
+          client_ip: {k: ip, v: "10.0.0.0/8"}
+      dns_servfail:
+        desc: Upstream DNS query answered SERVFAIL during overload/quorum instability.
+        lvl: WARN
+        msg: "dns query qname={qname} rcode=SERVFAIL ans_count=0 dur_ms={dur_ms} client={client_ip}"
+        vars:
+          qname: {k: ch, v: ["latency-tracker.service.local"]}
+          dur_ms: {k: i, v: [10, 1500]}
+          client_ip: {k: ip, v: "10.0.0.0/8"}
+      raft_state:
+        desc: Periodic consensus/health snapshot for the cluster.
+        lvl: INFO
+        msg: "raft state role={role} leader={leader} term={term} commit_lag={commit_lag} qps={qps}"
+        vars:
+          role: {k: ch, v: [leader, follower, candidate]}
+          leader: {k: ch, v: ["true", "false"]}
+          term: {k: i, v: [50, 140]}
+        state_vars:
+          n:
+            commit_lag: {k: i, v: [0, 80]}
+            qps: {k: i, v: [2, 12]}
+          f:
+            commit_lag: {k: i, v: [200, 7000]}
+            qps: {k: i, v: [8, 60]}
+      quorum_lost:
+        desc: Quorum not met; cluster cannot reliably serve updates/answers.
+        lvl: ERROR
+        msg: "raft quorum not met nodes_up={nodes_up} needed=3 inflight={inflight}"
+        vars:
+          nodes_up: {k: i, v: [0, 2]}
+          inflight: {k: i, v: [500, 80000]}
+      client_admission:
+        desc: Operator action changing client admission to reduce load.
+        lvl: WARN
+        msg: "client admission mode set to {mode} by={actor} note={note}"
+        vars:
+          mode: {k: ch, v: [rate_limit]}
+          actor: {k: ch, v: [sd-oncall]}
+          note: {k: str, v: "short_reason"}
+    beh:
+      n:
+        desc: Cluster periodically reports health.
+        emit:
+          - id: raft_state
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Cluster health continues to be logged; quorum loss appears intermittently.
+        emit:
+          - id: raft_state
+            per_min: 1.0
+            scope: global
+          - id: quorum_lost
+            per_min: 0.2
+            scope: global
+
+  - id: latency_tracker
+    name: Latency Tracker Cluster
+    svc: latency-tracker
+    hosts: [lt-1, lt-2]
+    desc: >
+      Small auxiliary service used to measure end-to-end pipeline latency asynchronously after ingestion.
+      During recycling it can disappear from service discovery, triggering NXDOMAIN-driven retries by clients.
+    to:
+      - dst: service_discovery
+        proto: grpc
+        desc: Registers/deregisters its service endpoints in the discovery directory.
+    logs:
+      cluster_recycle:
+        desc: Cluster recycled (scaled down and back up).
+        lvl: INFO
+        msg: "cluster recycle started action={action} by={actor}"
+        vars:
+          action: {k: ch, v: [scale_down_up]}
+          actor: {k: ch, v: [automation, oncall]}
+    beh:
+      n:
+        desc: No significant background logs modeled.
+        emit: []
+      f:
+        desc: No significant background logs modeled.
+        emit: []
+
+tracing:
+  on: true
+  origins: [web_frontend, intake_cluster]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operations: web UI/API mostly succeeds; ingestion is accepted; latency-tracker lookups are usually
+      served from DNS cache.
+    req:
+      - id: ui_widget_ok
+        desc: User UI/API request succeeds via backend API.
+        rpm: 176
+        path: [web_frontend, backend_api, web_frontend]
+        emit: [web_frontend.req_start, backend_api.req_ok, web_frontend.access_ok]
+        latency_ms: [[1, 3], [30, 200], [10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ui_widget_backend_503
+        desc: Rare backend error propagates to user.
+        rpm: 3
+        path: [web_frontend, backend_api, web_frontend]
+        emit: [web_frontend.req_start, backend_api.req_err, web_frontend.access_err]
+        latency_ms: [[1, 3], [40, 400], [10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ui_widget_lookup_failed
+        desc: Rare DNS lookup failure prevents backend call.
+        rpm: 1
+        path: [web_frontend, dns_resolver, service_discovery, dns_resolver, web_frontend]
+        emit: [web_frontend.req_start, dns_resolver.upstream_timeout_backend_api, web_frontend.dep_lookup_failed, web_frontend.access_err]
+        latency_ms: [[1, 3], [50, 300], [1, 5], [5, 50]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: payload_ingest
+        desc: Telemetry payload ingestion remains on the data plane and succeeds.
+        rpm: 110
+        path: [intake_cluster]
+        emit: [intake_cluster.payload_received, intake_cluster.payload_accepted]
+        latency_ms: [[1, 3], [5, 150]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: latency_tracker_dns_ok
+        desc: Intake resolves latency-tracker via cached DNS and starts latency tracking (async).
+        rpm: 80
+        path: [intake_cluster, dns_resolver, intake_cluster]
+        emit: [intake_cluster.tracking_dns_attempt, dns_resolver.cache_hit, intake_cluster.tracking_started]
+        latency_ms: [[1, 2], [1, 5], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      Failure operations: service discovery becomes unstable under DNS load. Web and backend services intermittently
+      fail to resolve dependencies or refresh configuration; ingestion remains successful while latency tracking is
+      often skipped.
+    req:
+      - id: ui_widget_ok
+        desc: Some user UI/API requests still succeed.
+        rpm: 60
+        path: [web_frontend, backend_api, web_frontend]
+        emit: [web_frontend.req_start, backend_api.req_ok, web_frontend.access_ok]
+        latency_ms: [[1, 5], [60, 800], [20, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ui_widget_backend_503
+        desc: Backend returns 503 due to config/dependency issues.
+        rpm: 40
+        path: [web_frontend, backend_api, web_frontend]
+        emit: [web_frontend.req_start, backend_api.req_err, web_frontend.access_err]
+        latency_ms: [[1, 5], [80, 1500], [20, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: ui_widget_lookup_failed
+        desc: Web cannot resolve backend endpoints due to DNS/service discovery instability.
+        rpm: 80
+        path: [web_frontend, dns_resolver, service_discovery, dns_resolver, web_frontend]
+        emit: [web_frontend.req_start, dns_resolver.upstream_timeout_backend_api, web_frontend.dep_lookup_failed, web_frontend.access_err]
+        latency_ms: [[1, 5], [80, 1500], [1, 10], [20, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: payload_ingest
+        desc: Ingestion continues to accept payloads during the incident.
+        rpm: 110
+        path: [intake_cluster]
+        emit: [intake_cluster.payload_received, intake_cluster.payload_accepted]
+        latency_ms: [[1, 3], [5, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: latency_tracker_dns_nxdomain
+        desc: Repeated latency-tracker lookups return NXDOMAIN (not cached), causing rapid repeat queries.
+        rpm: 160
+        path: [intake_cluster, dns_resolver, service_discovery, dns_resolver, intake_cluster]
+        emit: [intake_cluster.tracking_dns_attempt, service_discovery.dns_nxdomain, dns_resolver.cache_miss_nxdomain, intake_cluster.tracking_skipped]
+        latency_ms: [[1, 2], [2, 50], [2, 80], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: latency_tracker_dns_servfail
+        desc: Some lookups get SERVFAIL responses as the discovery cluster becomes unstable.
+        rpm: 15
+        path: [intake_cluster, dns_resolver, service_discovery, dns_resolver, intake_cluster]
+        emit: [intake_cluster.tracking_dns_attempt, service_discovery.dns_servfail, dns_resolver.cache_miss_servfail, intake_cluster.tracking_skipped]
+        latency_ms: [[1, 2], [10, 200], [10, 200], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: latency_tracker_dns_timeout
+        desc: Some lookups time out waiting for the discovery DNS interface.
+        rpm: 20
+        path: [intake_cluster, dns_resolver, service_discovery, dns_resolver, intake_cluster]
+        emit: [intake_cluster.tracking_dns_attempt, dns_resolver.upstream_timeout, intake_cluster.tracking_skipped]
+        latency_ms: [[1, 2], [100, 2000], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    The real multi-product incident is simplified to a single region with a web tier, one backend API, telemetry intake,
+    node-local DNS resolvers, and a single core service-discovery/config cluster.
+  - |
+    The key causal mechanism preserved is: latency-tracker recycling -> missing DNS record -> NXDOMAIN not cached -> DNS
+    thundering herd -> service-discovery quorum/latency problems -> widespread dependency/config lookup failures -> web/API
+    intermittency.
+  - |
+    Web-tier DNS failures are modeled as timeouts resolving backend-api (backend-api.service.local), while the thundering
+    herd root cause remains the missing latency-tracker record (latency-tracker.service.local). Separate resolver timeout
+    log templates prevent contradictory qname/dep combinations in a single request chain.
+  - |
+    Ingestion is modeled as continuing to accept payloads (payload_ingest stays successful in failure) while latency
+    tracking is often skipped; this matches “incoming data was still ingested and processed”.
+  - |
+    service_discovery.raft_state qps ranges are aligned to the modeled DNS/query volumes (single-digit to low-tens qps
+    normal, tens qps under failure) to avoid implying large unmodeled traffic in the health snapshot.
+  - |
+    service_discovery.quorum_lost nodes_up is constrained to values < needed=3 (0..2) to avoid semantically impossible
+    "quorum not met" emissions with 3+ nodes up.
+  - |
+    Normal-phase expected volume is ~1,000 logs/min (web ~540, ingest ~220, latency-tracker DNS ok ~240, plus small
+    background), producing ~20k logs over 20 minutes.
+  - |
+    Scenario total volume is tuned to fall in 20k..100k by keeping web at ~180 rpm and concentrating the spike into DNS
+    lookup flows; service_discovery.raft_state provides low-rate baseline health markers while per-request DNS logs provide
+    high-visibility load signals.
+```

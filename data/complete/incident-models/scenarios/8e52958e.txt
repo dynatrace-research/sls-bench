@@ -1,0 +1,205 @@
+```yaml
+scenario:
+  id: jan_28_power_reboot_redis_dependency
+  title: Power disruption triggers reboot storm, Redis outage, and widespread HTTP 503
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally serves web/API traffic through HAProxy to web application servers that depend on a Redis cluster.
+    A facility power disruption triggers a reboot storm affecting a large fraction of hosts, including Redis and internal tooling.
+    HAProxy begins returning HTTP 503 due to backend unavailability, and surviving app processes also fail requests/boot when Redis is down.
+    ChatOps degradation delays public status updates while responders initially investigate network anomalies and then pivot to Redis recovery and hardware boot failures.
+
+  trigger_desc: |
+    A brief disruption in data-center power distribution causes ~25% of servers to reboot simultaneously, taking down multiple Redis nodes and several internal systems needed for coordination and recovery.
+
+  time:
+    total_minutes: 44
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 44}
+
+  phases:
+    n:
+      desc: |
+        Traffic flows normally through the edge load balancers to the application tier.
+        The backend pool is healthy, Redis cluster health is OK, and ChatOps heartbeats are steady.
+      flows: [web_request_ok]
+      manifestation:
+        - edge_lb.http_access_ok
+        - edge_lb.pool_state
+        - web_app.req_completed_ok
+        - redis_cluster.cluster_state
+        - chatops.heartbeat
+
+    f:
+      desc: |
+        After the power event, many hosts reboot and key backend capacity disappears.
+        Redis cluster availability drops, which both prevents many app processes from starting (hard dependency in the boot path) and causes requests that reach running processes to fail.
+        HAProxy frequently cannot connect to backends and returns HTTP 503; later, more requests reach app processes but still result in 503 due to Redis errors.
+        ChatOps is degraded early, delaying public status updates; a perceived connection spike leads to enabling DDoS mitigation during investigation.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: infra_monitor
+          event: |
+            Monitoring reports a facility power event and a reboot storm; HAProxy starts failing to connect to many backends and users see widespread 503s.
+          why: |
+            The power disruption reboots a large slice of servers, including Redis nodes and some internal systems.
+            This is directly observable via reboot alerts and immediate spikes in 503 access logs and backend connection failures.
+          flows: [web_request_503_backend_down, web_request_503_redis]
+          rate_multipliers:
+            web_request_503_backend_down: 1.4
+            web_request_503_redis: 0.3
+            infra_monitor.conn_spike: 0.0
+            ddos_shield.mitigation_stats: 0.0
+            fleet_manager.provision_blocked: 0.1
+            fleet_manager.oob_boot_error: 0.0
+            chatops.command_fail: 1.4
+          latency_multipliers:
+            web_request_503_backend_down: {p50: 1.2, p95: 1.4}
+          one_shots:
+            - ref: infra_monitor.power_glitch
+              count: 1
+              hosts: [mon-1]
+            - ref: infra_monitor.alert_page
+              count: 3
+              hosts: [mon-1]
+          manifestation:
+            - infra_monitor.power_glitch
+            - infra_monitor.host_reboot_alert
+            - edge_lb.backend_conn_fail
+            - edge_lb.http_access_503
+            - redis_cluster.cluster_state
+
+        - order: 2
+          at_min: 23
+          component: ddos_shield
+          event: |
+            Responders observe elevated inbound connection attempts and enable DDoS mitigation while continuing to validate network health.
+          why: |
+            Increased connection attempts are partially observable from monitoring logs; mitigation is an operational action taken under uncertainty.
+            Later investigation (outside this modeled window) determines this was not the underlying cause.
+          flows: []
+          rate_multipliers:
+            infra_monitor.conn_spike: 1.0
+            ddos_shield.mitigation_stats: 2.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ddos_shield.mitigation_enabled
+              count: 1
+              hosts: [waf-1]
+          manifestation:
+            - ddos_shield.mitigation_enabled
+            - infra_monitor.conn_spike
+            - ddos_shield.mitigation_stats
+
+        - order: 3
+          at_min: 28
+          component: chatops
+          event: |
+            With partial ChatOps functionality restored, the incident status is updated to red after an initial delay.
+          why: |
+            ChatOps runs on affected infrastructure; early command failures delay status updates.
+            The status-post log is a direct, discrete marker of communication catching up to the outage state.
+          flows: []
+          rate_multipliers:
+            chatops.command_fail: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: chatops.status_post_red
+              count: 1
+              hosts: [chat-2]
+          manifestation:
+            - chatops.command_fail
+            - chatops.status_post_red
+
+        - order: 4
+          at_min: 32
+          component: fleet_manager
+          event: |
+            Investigation converges on Redis being down and app processes failing to boot due to a hard Redis dependency; recovery pivots to rebuilding Redis on standby and cold power-cycling hosts with boot-disk detection failures.
+          why: |
+            The app boot failures and Redis cluster health are directly observable in app/Redis logs.
+            The boot-disk issue is partially observable via out-of-band console errors; cold power cycling is an operational action to restore drive visibility.
+          flows: [web_request_503_backend_down, web_request_503_redis]
+          rate_multipliers:
+            web_request_503_backend_down: 0.6
+            web_request_503_redis: 1.8
+            fleet_manager.oob_boot_error: 2.0
+            fleet_manager.provision_blocked: 1.5
+          latency_multipliers:
+            web_request_503_redis: {p50: 1.4, p95: 1.8}
+          one_shots:
+            - ref: fleet_manager.redis_rebuild_start
+              count: 1
+              hosts: [fleet-1]
+            - ref: fleet_manager.cold_power_cycle
+              count: 6
+              hosts: [fleet-1, fleet-2]
+          manifestation:
+            - web_app.boot_fail_redis
+            - redis_cluster.node_unreachable
+            - fleet_manager.oob_boot_error
+            - fleet_manager.redis_rebuild_start
+            - edge_lb.http_access_503
+
+      steady:
+        - component: redis_cluster
+          condition: |
+            Redis cluster remains down/degraded (multiple masters unavailable and nodes unreachable), blocking app boot and causing dependency failures.
+          user_impact: |
+            Requests that reach app processes frequently fail with HTTP 503 due to Redis unavailability.
+          manifestation:
+            - redis_cluster.cluster_state
+            - redis_cluster.node_unreachable
+            - web_app.redis_conn_error
+        - component: edge_lb
+          condition: |
+            Backend pool remains largely unhealthy; many requests cannot connect to any app backend and are terminated at the load balancer with 503.
+          user_impact: |
+            Users predominantly see HTTP 503 responses (site unavailable) and cannot use web/API features.
+          manifestation:
+            - edge_lb.pool_state
+            - edge_lb.backend_conn_fail
+            - edge_lb.http_access_503
+
+      feedback_loops:
+        - id: boot_dependency_blocks_capacity
+          desc: |
+            App processes require Redis during boot; when Redis is down, app capacity cannot come back quickly, which keeps HAProxy backend health low and prolongs 503s.
+        - id: recovery_tooling_dependency_drag
+          desc: |
+            Provisioning/rebuild actions are slowed because some internal dependencies (PXE/inventory/config) are on affected hardware, increasing time-to-replace for Redis and app nodes.
+
+      flows: [web_request_503_backend_down, web_request_503_redis]
+      manifestation:
+        - infra_monitor.host_reboot_alert
+        - web_app.boot_fail_redis
+        - redis_cluster.cluster_state
+        - edge_lb.backend_conn_fail
+        - edge_lb.http_access_503
+        - fleet_manager.provision_blocked
+
+  assumptions:
+    - |
+      Scenario duration is compressed to 44 minutes and ends before full recovery; it models the outage onset and the recovery pivot
+      while preserving the causal core from the post-mortem.
+    - |
+      Failure-phase piecewise rates (entry rpm, no retry amplification):
+      - minutes 20-32 (12 min): backend_down=220*1.4=308 rpm; redis_503=120*0.3=36 rpm.
+      - minutes 32-44 (12 min): backend_down=220*0.6=132 rpm; redis_503=120*1.8=216 rpm.
+    - |
+      Approximate log volume:
+      - Normal (20 min): 320 rpm * 3 logs/request ≈ 19,200 flow logs + ~150 background.
+      - Failure (24 min) flow logs:
+        * 20-32: backend_down ≈ 308 rpm * 3 ≈ 924 logs/min; redis_503 ≈ 36 rpm * 4 ≈ 144 logs/min.
+        * 32-44: backend_down ≈ 132 rpm * 3 ≈ 396 logs/min; redis_503 ≈ 216 rpm * 4 ≈ 864 logs/min.
+        Total failure flow logs ≈ 28k plus ~400–800 background plus 12 one-shots.
+      - Total ≈ 45k–55k logs (within 20k–100k).
+    - |
+      Visibility rationale: high-rate HAProxy 503 logs and backend connection failures make the outage boundary obvious; Redis cluster_state/node_unreachable and web_app.boot_fail_redis make the boot-path dependency diagnosable;
+      one-shots mark the power event, DDoS mitigation enablement, delayed status-red update, and the recovery pivot actions.
+```

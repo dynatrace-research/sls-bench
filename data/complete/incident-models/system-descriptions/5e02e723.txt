@@ -1,0 +1,700 @@
+```yaml
+sys:
+  id: monzo_cassandra_scaleup_404s
+  desc: >
+    A mobile banking backend serving app login, balance/transaction reads, card authorisations, and internal operational tooling.
+    Customer-facing services and internal services use a shared Cassandra cluster (quorum reads/writes).
+    An internal edge proxy uses a configuration service (backed by Cassandra) to validate internal traffic and route requests.
+    During a planned Cassandra scale-up, new nodes unexpectedly became active for reads/writes before they had streamed data, making some rows appear missing.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: app_api
+    name: Mobile App API
+    svc: app-api
+    hosts: [api-1, api-2]
+    desc: Public API for mobile app login and balance/transaction display, backed by the account service.
+
+    to:
+      - dst: account_service
+        proto: grpc
+        desc: Fetches session and account data.
+
+    logs:
+      http_in:
+        desc: Inbound request to the app API.
+        lvl: INFO
+        msg: "inbound {method} {endpoint} user={user_id} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          endpoint: {k: ch, v: [/login, /balance]}
+          user_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      http_out_200:
+        desc: Successful HTTP response.
+        lvl: INFO
+        msg: "response 200 {endpoint} user={user_id} dur_ms={dur_ms}"
+        vars:
+          endpoint: {k: ch, v: [/login, /balance]}
+          user_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 180]}
+
+      http_out_200_stale:
+        desc: Successful HTTP response but based on stale/partial data.
+        lvl: WARN
+        msg: "response 200 {endpoint} user={user_id} stale=true stale_age_s={stale_age_s} dur_ms={dur_ms}"
+        vars:
+          endpoint: {k: ch, v: [/balance]}
+          user_id: {k: uuid, v: null}
+          stale_age_s: {k: i, v: [30, 900]}
+          dur_ms: {k: i, v: [20, 300]}
+
+      http_out_503:
+        desc: Request failed due to missing backend data.
+        lvl: ERROR
+        msg: "response 503 {endpoint} user={user_id} err={err} dur_ms={dur_ms}"
+        vars:
+          endpoint: {k: ch, v: [/login]}
+          user_id: {k: uuid, v: null}
+          err: {k: ch, v: [backend_data_unavailable, session_missing]}
+          dur_ms: {k: i, v: [20, 350]}
+
+      api_metrics:
+        desc: Periodic service metrics as logged by the API.
+        lvl: INFO
+        msg: "api_metrics req_rpm={req_rpm} http_5xx_rpm={http_5xx_rpm} p95_ms={p95_ms}"
+        vars:
+          req_rpm: {k: i, v: [200, 450]}
+          http_5xx_rpm: {k: i, v: [0, 25]}
+          p95_ms: {k: i, v: [25, 220]}
+
+    beh:
+      n:
+        desc: Steady request handling with periodic metrics.
+        emit:
+          - id: api_metrics
+            per_min: 1.0
+      f:
+        desc: Continues emitting metrics; 5xx stays relatively low compared to the observed 404 issues elsewhere.
+        emit:
+          - id: api_metrics
+            per_min: 1.0
+
+  - id: account_service
+    name: Account Service
+    svc: account-service
+    hosts: [acct-1, acct-2]
+    desc: Reads sessions, balances, and transactions from Cassandra using quorum reads; returns data to the app API.
+
+    to:
+      - dst: cassandra_cluster
+        proto: cql
+        desc: Quorum reads for session and account rows.
+      - dst: app_api
+        proto: grpc
+        desc: Returns RPC responses to the app API (modeled as a return hop for path traversability).
+
+    logs:
+      session_read_ok:
+        desc: Session row found in Cassandra.
+        lvl: INFO
+        msg: "session_read user={user_id} replica={replica} cl=QUORUM result=HIT latency_ms={latency_ms}"
+        vars:
+          user_id: {k: uuid, v: null}
+          replica: {k: ch, v: [cass-a1, cass-a2, cass-a3]}
+          latency_ms: {k: i, v: [2, 40]}
+
+      session_read_empty:
+        desc: Session row appeared missing (quorum returned empty).
+        lvl: WARN
+        msg: "session_read user={user_id} replica={replica} cl=QUORUM result=MISS latency_ms={latency_ms}"
+        vars:
+          user_id: {k: uuid, v: null}
+          replica: {k: ch, v: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]}
+          latency_ms: {k: i, v: [2, 50]}
+
+      balance_read_ok:
+        desc: Balance/transactions read succeeded.
+        lvl: INFO
+        msg: "balance_read user={user_id} replica={replica} cl=QUORUM result=HIT latency_ms={latency_ms}"
+        vars:
+          user_id: {k: uuid, v: null}
+          replica: {k: ch, v: [cass-a1, cass-a2, cass-a3]}
+          latency_ms: {k: i, v: [4, 60]}
+
+      balance_read_partial:
+        desc: Some expected rows were missing; cached/previous values used.
+        lvl: WARN
+        msg: "balance_read user={user_id} replica={replica} cl=QUORUM result=PARTIAL missing_rows={missing_rows} fallback_cache=true latency_ms={latency_ms}"
+        vars:
+          user_id: {k: uuid, v: null}
+          replica: {k: ch, v: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]}
+          missing_rows: {k: i, v: [1, 12]}
+          latency_ms: {k: i, v: [8, 120]}
+
+      svc_metrics:
+        desc: Periodic account service metrics.
+        lvl: INFO
+        msg: "acct_metrics rpc_rpm={rpc_rpm} cass_timeouts_rpm={cass_timeouts_rpm} p95_ms={p95_ms}"
+        vars:
+          rpc_rpm: {k: i, v: [220, 360]}
+          cass_timeouts_rpm: {k: i, v: [0, 5]}
+          p95_ms: {k: i, v: [15, 140]}
+
+    beh:
+      n:
+        desc: Periodic metrics under normal read patterns.
+        emit:
+          - id: svc_metrics
+            per_min: 1.0
+      f:
+        desc: Metrics remain largely normal because reads return quickly even when data is missing.
+        emit:
+          - id: svc_metrics
+            per_min: 1.0
+
+  - id: internal_edge
+    name: Internal Edge Proxy
+    svc: internal-edge
+    hosts: [edge-1, edge-2]
+    desc: Authenticates/authorises employee traffic and routes to internal services; validates requests as internal by consulting config.
+
+    to:
+      - dst: config_service
+        proto: grpc
+        desc: Reads internal network range config used for internal traffic validation.
+      - dst: internal_tooling
+        proto: https
+        desc: Returns proxied responses back to internal tooling clients (modeled as a return hop for path traversability).
+
+    logs:
+      req_in:
+        desc: Inbound request to internal edge.
+        lvl: INFO
+        msg: "inbound {method} {route} tool={tool} src_ip={src_ip} employee={employee_id} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/cops/chat, /deploy/run]}
+          tool: {k: ch, v: [cops_console, deploy_tool]}
+          src_ip: {k: ip, v: "10.0.0.0/8"}
+          employee_id: {k: hex, v: 8}
+          trace_id: {k: hex, v: 32}
+
+      route_ok:
+        desc: Internal routing succeeded.
+        lvl: INFO
+        msg: "route {route} upstream={upstream} result=OK"
+        vars:
+          route: {k: ch, v: [/cops/chat, /deploy/run]}
+          upstream: {k: ch, v: [cops-backend, deploy-orchestrator]}
+
+      route_404:
+        desc: Internal edge returned 404 due to missing internal validation config.
+        lvl: WARN
+        msg: "route {route} result=404 reason=internal_config_missing cfg_key={cfg_key}"
+        vars:
+          route: {k: ch, v: [/cops/chat, /deploy/run]}
+          cfg_key: {k: ch, v: [private_network_cidr]}
+
+      edge_metrics:
+        desc: Periodic internal edge metrics under typical (mostly healthy) conditions.
+        lvl: INFO
+        msg: "edge_metrics req_rpm={req_rpm} http_4xx_rpm={http_4xx_rpm} p95_ms={p95_ms} view=baseline"
+        vars:
+          req_rpm: {k: i, v: [20, 120]}
+          http_4xx_rpm: {k: i, v: [0, 3]}
+          p95_ms: {k: i, v: [5, 80]}
+
+      edge_metrics_spike:
+        desc: Periodic internal edge metrics during incident windows where 4xx rates can be materially elevated or partially reduced.
+        lvl: INFO
+        msg: "edge_metrics req_rpm={req_rpm} http_4xx_rpm={http_4xx_rpm} p95_ms={p95_ms} view=incident"
+        vars:
+          req_rpm: {k: i, v: [20, 120]}
+          http_4xx_rpm: {k: i, v: [15, 110]}
+          p95_ms: {k: i, v: [5, 90]}
+
+    beh:
+      n:
+        desc: Low steady internal traffic and periodic metrics; no sustained 404 spikes.
+        emit:
+          - id: edge_metrics
+            per_min: 1.0
+          - id: edge_metrics_spike
+            per_min: 0.0
+      f:
+        desc: Two alternative metric views exist; the scenario suppresses one or the other to avoid contradictory 4xx reporting.
+        emit:
+          - id: edge_metrics
+            per_min: 1.0
+          - id: edge_metrics_spike
+            per_min: 1.0
+
+  - id: config_service
+    name: Configuration Service
+    svc: config-service
+    hosts: [cfg-1, cfg-2]
+    desc: Key-value configuration service used by other internal services; stores data in Cassandra.
+
+    to:
+      - dst: cassandra_cluster
+        proto: cql
+        desc: Quorum reads/writes of configuration keys.
+      - dst: internal_edge
+        proto: grpc
+        desc: Returns config RPC responses to internal edge (modeled as a return hop for path traversability).
+
+    logs:
+      get_ok:
+        desc: Configuration key retrieved successfully.
+        lvl: INFO
+        msg: "get key={key} result=OK value_hash={value_hash} replica={replica} latency_ms={latency_ms}"
+        vars:
+          key: {k: ch, v: [private_network_cidr, employee_allowlist, deploy_fallback_enabled]}
+          value_hash: {k: hex, v: 12}
+          replica: {k: ch, v: [cass-a1, cass-a2, cass-a3]}
+          latency_ms: {k: i, v: [2, 40]}
+
+      get_not_found_404:
+        desc: Configuration key not found (returned 404).
+        lvl: WARN
+        msg: "get key={key} result=NOT_FOUND status=404 replica={replica} latency_ms={latency_ms}"
+        vars:
+          key: {k: ch, v: [private_network_cidr]}
+          replica: {k: ch, v: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]}
+          latency_ms: {k: i, v: [2, 45]}
+
+      rpc_metrics:
+        desc: Periodic RPC metrics (can look healthy because NOT_FOUND is not a server error).
+        lvl: INFO
+        msg: "cfg_rpc_metrics ok_rpm={ok_rpm} err_5xx_rpm={err_5xx_rpm} p95_ms={p95_ms}"
+        vars:
+          ok_rpm: {k: i, v: [60, 140]}
+          err_5xx_rpm: {k: i, v: [0, 3]}
+          p95_ms: {k: i, v: [5, 40]}
+
+    beh:
+      n:
+        desc: Periodic metrics with mostly successful lookups.
+        emit:
+          - id: rpc_metrics
+            per_min: 1.0
+      f:
+        desc: Metrics still show low 5xx even while a specific key returns 404.
+        emit:
+          - id: rpc_metrics
+            per_min: 1.0
+
+  - id: cassandra_cluster
+    name: Cassandra Cluster
+    svc: cassandra
+    hosts: [cass-a1, cass-a2, cass-a3, cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]
+    desc: >
+      Distributed datastore used by multiple services. Data is replicated and accessed with quorum.
+      During the incident, new nodes joined and became active before streaming data, so some partition keys mapped to nodes without the underlying rows.
+
+    to: []
+
+    logs:
+      scale_up_start:
+        desc: Operator starts scaling up the cluster.
+        lvl: INFO
+        msg: "scale_up start add_nodes={add_nodes} auto_bootstrap={auto_bootstrap}"
+        vars:
+          add_nodes: {k: i, v: [6, 6]}
+          auto_bootstrap: {k: ch, v: [false]}
+
+      node_joined:
+        desc: A new node joined the ring.
+        lvl: INFO
+        msg: "node_joined node={node} join_state={join_state}"
+        vars:
+          node: {k: ch, v: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]}
+          join_state: {k: ch, v: [JOINED]}
+
+      ownership_changed:
+        desc: Token ownership changed to include the new nodes.
+        lvl: WARN
+        msg: "ring token_ownership_changed new_nodes_active={new_nodes_active}"
+        vars:
+          new_nodes_active: {k: i, v: [3, 6]}
+
+      decommission_start:
+        desc: Decommissioning of a new node begins.
+        lvl: WARN
+        msg: "decommission start node={node}"
+        vars:
+          node: {k: ch, v: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]}
+
+      decommission_complete:
+        desc: A new node is fully removed from the ring.
+        lvl: INFO
+        msg: "decommission complete node={node} duration_min={duration_min}"
+        vars:
+          node: {k: ch, v: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]}
+          duration_min: {k: i, v: [8, 10]}
+
+      metrics:
+        desc: Periodic cluster-level client-visible metrics.
+        lvl: INFO
+        msg: "cass_metrics read_rps={read_rps} write_rps={write_rps} timeouts_rpm={timeouts_rpm} p95_ms={p95_ms}"
+        vars:
+          read_rps: {k: i, v: [300, 700]}
+          write_rps: {k: i, v: [120, 320]}
+          timeouts_rpm: {k: i, v: [0, 5]}
+          p95_ms: {k: i, v: [5, 35]}
+
+    beh:
+      n:
+        desc: Periodic metrics; no topology changes.
+        emit:
+          - id: metrics
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Metrics still look mostly normal because reads are fast even when rows are missing.
+        emit:
+          - id: metrics
+            per_min: 0.2
+            scope: per_host
+
+  - id: mastercard_service
+    name: Card Authorisation Service
+    svc: card-auth-service
+    hosts: [mc-1, mc-2]
+    desc: Handles Mastercard authorisation flows; during the incident, an independent bug caused a small percentage of failures and deployment was hindered by internal tooling issues.
+
+    to: []
+
+    logs:
+      auth_req:
+        desc: Card authorisation request started.
+        lvl: INFO
+        msg: "card_auth start id={auth_id} amount_pence={amount_pence} mcc={mcc}"
+        vars:
+          auth_id: {k: uuid, v: null}
+          amount_pence: {k: i, v: [100, 50000]}
+          mcc: {k: ch, v: [5411, 5812, 5912, 5999]}
+
+      auth_ok:
+        desc: Card authorisation approved.
+        lvl: INFO
+        msg: "card_auth approved id={auth_id} dur_ms={dur_ms}"
+        vars:
+          auth_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [40, 900]}
+
+      auth_fail_bug:
+        desc: Card authorisation failed due to an unhandled error path.
+        lvl: ERROR
+        msg: "card_auth failed id={auth_id} err={err} path=unhandled_error_case"
+        vars:
+          auth_id: {k: uuid, v: null}
+          err: {k: ch, v: [upstream_timeout, upstream_5xx, parse_error]}
+
+      deploy_version:
+        desc: Service deployment marker for the incident fix rollout.
+        lvl: INFO
+        msg: "deployed version={version} via={via}"
+        vars:
+          version: {k: ch, v: [2019.07.29.2]}
+          via: {k: ch, v: [fallback_mechanism]}
+
+      mc_metrics:
+        desc: Periodic card auth metrics.
+        lvl: INFO
+        msg: "card_metrics auth_rpm={auth_rpm} fail_rpm={fail_rpm} p95_ms={p95_ms}"
+        vars:
+          auth_rpm: {k: i, v: [90, 150]}
+          fail_rpm: {k: i, v: [0, 20]}
+          p95_ms: {k: i, v: [80, 1200]}
+
+    beh:
+      n:
+        desc: Periodic metrics; low failure rate.
+        emit:
+          - id: mc_metrics
+            per_min: 1.0
+      f:
+        desc: Periodic metrics; failure rate can spike until deployment.
+        emit:
+          - id: mc_metrics
+            per_min: 1.0
+
+  - id: internal_tooling
+    name: Internal Tooling Clients (COps + Deploy)
+    svc: null
+    hosts: [ops-1]
+    desc: Represents internal user-facing tools that call internal services through the internal edge proxy.
+
+    to:
+      - dst: internal_edge
+        proto: https
+        desc: Sends COps console and deployment requests to internal edge.
+
+    logs:
+      tool_req:
+        desc: Tool request attempt.
+        lvl: INFO
+        msg: "tool_req tool={tool} op={op} trace={trace_id}"
+        vars:
+          tool: {k: ch, v: [cops_console, deploy_tool]}
+          op: {k: ch, v: [open_chat, send_message, deploy]}
+          trace_id: {k: hex, v: 32}
+
+      tool_ok:
+        desc: Tool request succeeded.
+        lvl: INFO
+        msg: "tool_resp tool={tool} status=200 dur_ms={dur_ms}"
+        vars:
+          tool: {k: ch, v: [cops_console, deploy_tool]}
+          dur_ms: {k: i, v: [20, 300]}
+
+      tool_err_404:
+        desc: Tool request failed due to internal edge 404.
+        lvl: ERROR
+        msg: "tool_resp tool={tool} status=404 dur_ms={dur_ms}"
+        vars:
+          tool: {k: ch, v: [cops_console, deploy_tool]}
+          dur_ms: {k: i, v: [10, 200]}
+
+      fallback_deploy_used:
+        desc: Operational marker that a fallback deploy mechanism was used.
+        lvl: WARN
+        msg: "deploy_fallback used app={app} version={version} operator={operator}"
+        vars:
+          app: {k: ch, v: [card-auth-service]}
+          version: {k: ch, v: [2019.07.29.2]}
+          operator: {k: hex, v: 8}
+
+      manual_cassandra_query:
+        desc: Operational marker for bypassing the config service and querying Cassandra directly.
+        lvl: INFO
+        msg: "manual_query cassandra key={key} result={result}"
+        vars:
+          key: {k: ch, v: [private_network_cidr]}
+          result: {k: ch, v: [MISSING]}
+
+      status_page_updated:
+        desc: Operational marker for public status page update.
+        lvl: INFO
+        msg: "status_page updated incident={incident} message_id={message_id}"
+        vars:
+          incident: {k: ch, v: [degraded_app_and_cards]}
+          message_id: {k: hex, v: 10}
+
+    beh:
+      n:
+        desc: No background emissions; tooling logs are request-driven.
+        emit: []
+      f:
+        desc: No background emissions; tooling logs are request-driven.
+        emit: []
+
+  - id: alerting
+    name: Alerting
+    svc: alertmanager
+    hosts: [alert-1]
+    desc: Emits automated alerts based on service error rates.
+
+    to: []
+
+    logs:
+      alert_fired:
+        desc: Alert triggered for elevated failure rate.
+        lvl: CRITICAL
+        msg: "alert fired name={name} severity={severity} value={value}"
+        vars:
+          name: {k: ch, v: [card_fail_rate, internal_edge_404_rate]}
+          severity: {k: ch, v: [page, high]}
+          value: {k: f, v: [0.01, 0.15]}
+
+    beh:
+      n:
+        desc: Alerts are event-driven only.
+        emit: []
+      f:
+        desc: Alerts are event-driven only.
+        emit: []
+
+tracing:
+  on: true
+  origins: [app_api, internal_edge]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation with successful reads from Cassandra and healthy internal routing.
+    req:
+      - id: app_login_ok_n
+        desc: User logs into the app successfully.
+        rpm: 35.0
+        path: [app_api, account_service, app_api]
+        emit: [app_api.http_in, account_service.session_read_ok, app_api.http_out_200]
+        latency_ms: [[2, 6], [8, 40], [2, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: app_balance_ok_n
+        desc: App refreshes balance/transactions successfully.
+        rpm: 250.0
+        path: [app_api, account_service, app_api]
+        emit: [app_api.http_in, account_service.balance_read_ok, app_api.http_out_200]
+        latency_ms: [[2, 6], [10, 60], [2, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_tool_ok_n
+        desc: COps console and deploy tool requests routed via internal edge successfully.
+        rpm: 30.0
+        path: [internal_tooling, internal_edge, config_service, internal_edge, internal_tooling]
+        emit: [internal_tooling.tool_req, internal_edge.req_in, config_service.get_ok, internal_edge.route_ok, internal_tooling.tool_ok]
+        latency_ms: [[1, 4], [1, 5], [2, 20], [1, 5], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: card_auth_ok_n
+        desc: Card authorisation requests succeed.
+        rpm: 120.0
+        path: [mastercard_service]
+        emit: [mastercard_service.auth_req, mastercard_service.auth_ok]
+        latency_ms: [[5, 20], [40, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: During the incident, new Cassandra nodes become active before data is present, so some reads return empty without errors; internal edge depends on a config key that appears missing.
+    req:
+      - id: app_login_ok_f
+        desc: Some users still log in successfully (reads hit old nodes holding data).
+        rpm: 30.0
+        path: [app_api, account_service, app_api]
+        emit: [app_api.http_in, account_service.session_read_ok, app_api.http_out_200]
+        latency_ms: [[2, 8], [10, 60], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: app_login_fail_missing_f
+        desc: Login fails when session rows appear missing (quorum returns empty).
+        rpm: 15.0
+        path: [app_api, account_service, app_api]
+        emit: [app_api.http_in, account_service.session_read_empty, app_api.http_out_503]
+        latency_ms: [[2, 8], [10, 80], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: app_balance_ok_f
+        desc: Many balance refreshes still succeed (reads hit old nodes).
+        rpm: 240.0
+        path: [app_api, account_service, app_api]
+        emit: [app_api.http_in, account_service.balance_read_ok, app_api.http_out_200]
+        latency_ms: [[2, 8], [12, 80], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: app_balance_stale_f
+        desc: Balance/transactions appear incomplete/old due to missing rows; cached fallback used.
+        rpm: 60.0
+        path: [app_api, account_service, app_api]
+        emit: [app_api.http_in, account_service.balance_read_partial, app_api.http_out_200_stale]
+        latency_ms: [[2, 8], [15, 120], [2, 15]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_tool_ok_f
+        desc: A minority of internal tool requests succeed when routing can be validated.
+        rpm: 10.0
+        path: [internal_tooling, internal_edge, config_service, internal_edge, internal_tooling]
+        emit: [internal_tooling.tool_req, internal_edge.req_in, config_service.get_ok, internal_edge.route_ok, internal_tooling.tool_ok]
+        latency_ms: [[1, 4], [1, 6], [2, 25], [1, 6], [5, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_tool_404_f
+        desc: Internal tool requests fail with 404 when internal edge can't read a required config key.
+        rpm: 25.0
+        path: [internal_tooling, internal_edge, config_service, internal_edge, internal_tooling]
+        emit: [internal_tooling.tool_req, internal_edge.req_in, config_service.get_not_found_404, internal_edge.route_404, internal_tooling.tool_err_404]
+        latency_ms: [[1, 4], [1, 6], [2, 30], [1, 6], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: card_auth_ok_f
+        desc: Card authorisations that succeed.
+        rpm: 115.0
+        path: [mastercard_service]
+        emit: [mastercard_service.auth_req, mastercard_service.auth_ok]
+        latency_ms: [[5, 20], [50, 1100]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: card_auth_fail_bug_f
+        desc: Card authorisations failing due to an unhandled error path (separate issue).
+        rpm: 10.0
+        path: [mastercard_service]
+        emit: [mastercard_service.auth_req, mastercard_service.auth_fail_bug]
+        latency_ms: [[5, 20], [20, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Simplified Monzo architecture into app_api + account_service for customer operations, plus internal_edge + config_service for internal access control/routing, plus cassandra_cluster as a single shared datastore."
+  - "Modelled the Cassandra scale-up as adding six nodes with auto_bootstrap=false; the key failure is that new nodes become active before streaming data, causing quorum reads to return empty (MISS/PARTIAL) without timeouts."
+  - "Adjusted internal_edge periodic metrics to avoid contradictory simultaneous 4xx reporting: both baseline and incident metric templates exist in failure-state behavior, but the scenario suppresses one or the other via event rate multipliers."
+  - "Widened internal_edge.edge_metrics_spike http_4xx_rpm domain to cover both peak 404 periods and partial post-decommission reduction."
+  - "Mastercard card failures are included as a concurrent, partially independent issue; deployment is hindered because deploy tooling uses internal_edge."
+  - "Constrained one-shot evidence logs to avoid narrative contradictions: manual_cassandra_query result is fixed to MISSING; deploy_version is fixed to version 2019.07.29.2 via fallback_mechanism."
+  - "Added explicit return-hop edges (account_service->app_api, config_service->internal_edge, internal_edge->internal_tooling) to make flow paths traversable for log ordering; these represent responses rather than new primary dependencies."
+  - "Normal-phase expected flow logs/min ≈ 1.2k; scenario total expected logs ≈ 71k (within 20k–100k) driven primarily by balance refresh traffic and a ~30-minute failure window."
+  - "Key diagnostic visibility comes from (1) internal_edge route_404, (2) config_service get_not_found_404 for private_network_cidr, (3) account_service reads hitting cass-n* replicas with MISS/PARTIAL, and (4) Cassandra topology one-shots (node_joined/ownership_changed/decommission markers) while cassandra metrics remain deceptively normal."
+```

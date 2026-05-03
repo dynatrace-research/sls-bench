@@ -1,0 +1,418 @@
+```yaml
+sys:
+  id: account_service_edge_outage
+  desc: >
+    An account service provides authentication and account-related APIs to game clients.
+    All traffic is routed through an Nginx proxy that shortcuts access-token verification via Memcached,
+    while other API calls are passed through to a Java (JAXRS) application.
+    When the cache tier becomes unstable, Nginx workers block on Memcached timeouts and can become saturated,
+    preventing other traffic (including health checks) from reaching the application and causing the load balancer to drain targets.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: alb_gateway
+    name: Public Application Load Balancer
+    svc: account-alb
+    hosts: [alb-1]
+    desc: >
+      Front door for account APIs. Routes requests to the Nginx proxy target group and performs periodic health checks.
+      When health checks fail broadly, it removes all targets and returns 503 to clients.
+      Access logs are emitted after the response is known (modeled as a logical response hop back to the ALB).
+    to:
+      - dst: nginx_proxy
+        proto: https
+        desc: Routes client API traffic to the Nginx proxy fleet.
+    logs:
+      access_ok:
+        desc: Access log for requests routed to a target; emitted after the response is known (includes final status and duration).
+        lvl: INFO
+        msg: "{method} {uri} status={status} dur_ms={dur_ms} target={target}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: [/account/api/oauth/verify, /account/api/login]}
+          status: {k: ch, v: [200, 401, 503]}
+          dur_ms: {k: i, v: [1, 6000]}
+          target: {k: ch, v: [ngx-a, ngx-b, ngx-c]}
+      access_no_targets:
+        desc: Access log when no healthy targets exist for the target group (ALB returns 503).
+        lvl: ERROR
+        msg: "{method} {uri} status=503 dur_ms={dur_ms} reason=no_healthy_targets"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: [/account/api/oauth/verify, /account/api/login]}
+          dur_ms: {k: i, v: [1, 300]}
+      targets_marked_unhealthy:
+        desc: Marker that targets were marked unhealthy due to missed health checks.
+        lvl: ERROR
+        msg: "target_group={tg} marked_unhealthy={count} reason={reason}"
+        vars:
+          tg: {k: ch, v: [account-nginx-tg]}
+          count: {k: i, v: [1, 3]}
+          reason: {k: ch, v: [health_check_timeout]}
+      healthcheck_fail:
+        desc: Periodic log indicating health checks to Nginx are failing/time out.
+        lvl: WARN
+        msg: "healthcheck failed path=/health target={target} timeout_ms={timeout_ms}"
+        vars:
+          target: {k: ch, v: [ngx-a, ngx-b, ngx-c]}
+          timeout_ms: {k: i, v: [500, 1500]}
+    beh:
+      n:
+        desc: In normal conditions, ALB health checks succeed and do not emit failures.
+        emit: []
+      f:
+        desc: When Nginx is saturated, health checks frequently fail, leading to target removal.
+        emit:
+          - id: healthcheck_fail
+            per_min: 6
+            scope: global
+
+  - id: nginx_proxy
+    name: Nginx Token-Verify Proxy
+    svc: account-nginx
+    hosts: [ngx-a, ngx-b, ngx-c]
+    desc: >
+      Reverse proxy in front of the Java application. For token verification it consults Memcached;
+      on cache miss or cache failure it forwards to the Java app. Worker saturation can block unrelated traffic
+      and even health check handling.
+    to:
+      - dst: memcached_cluster
+        proto: tcp
+        desc: Cache lookup for access token verification.
+      - dst: account_app
+        proto: http
+        desc: Forwards requests to the Java application when not served from cache.
+      - dst: alb_gateway
+        proto: https
+        desc: Logical response hop back to the load balancer for access logging.
+    logs:
+      worker_report:
+        desc: Periodic snapshot of worker utilization and pending Memcached work (modeled as a small effective worker pool in this scaled system).
+        lvl: INFO
+        msg: "workers busy={busy} free={free} memcache_pending={mc_pending}"
+        vars: {}
+        state_vars:
+          n:
+            busy: {k: i, v: [0, 3]}
+            free: {k: i, v: [5, 8]}
+            mc_pending: {k: i, v: [0, 4]}
+          f:
+            busy: {k: i, v: [6, 8]}
+            free: {k: i, v: [0, 2]}
+            mc_pending: {k: i, v: [10, 120]}
+      memcached_timeout:
+        desc: Nginx timed out waiting for Memcached while trying to verify a token.
+        lvl: WARN
+        msg: "memcached timeout key={key} timeout_ms={timeout_ms} active_conns={active_conns}"
+        vars:
+          key: {k: str, v: verify_token_cache_key}
+          timeout_ms: {k: i, v: [100, 100]}
+          active_conns: {k: i, v: [5, 120]}
+      cache_miss:
+        desc: Cache miss during token verification.
+        lvl: INFO
+        msg: "cache MISS key={key}"
+        vars:
+          key: {k: str, v: verify_token_cache_key}
+      access_cache_hit:
+        desc: Access log for a token verification served from cache.
+        lvl: INFO
+        msg: "req_id={req_id} {uri} status=200 cache=HIT rt_ms={rt_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          uri: {k: ch, v: [/account/api/oauth/verify]}
+          rt_ms: {k: i, v: [1, 6000]}
+      access_upstream_200:
+        desc: Access log for a request served by forwarding to the Java app.
+        lvl: INFO
+        msg: "req_id={req_id} {uri} status=200 upstream=account_app rt_ms={rt_ms} upstream_ms={upstream_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          uri: {k: ch, v: [/account/api/oauth/verify]}
+          rt_ms: {k: i, v: [1, 6000]}
+          upstream_ms: {k: i, v: [1, 5500]}
+      access_pass_200:
+        desc: Access log for non-verify traffic passed through to the Java app.
+        lvl: INFO
+        msg: "req_id={req_id} {uri} status=200 upstream=account_app rt_ms={rt_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          uri: {k: ch, v: [/account/api/login]}
+          rt_ms: {k: i, v: [1, 6000]}
+      access_503:
+        desc: Request failed because Nginx had no free workers to process it.
+        lvl: ERROR
+        msg: "req_id={req_id} {uri} status=503 error=no_free_workers"
+        vars:
+          req_id: {k: hex, v: 16}
+          uri: {k: ch, v: [/account/api/login, /account/api/oauth/verify]}
+    beh:
+      n:
+        desc: Nginx periodically reports worker utilization; cache issues are rare.
+        emit:
+          - id: worker_report
+            per_min: 2
+            scope: per_host
+      f:
+        desc: Under cache instability, Nginx worker utilization remains high and reports continue.
+        emit:
+          - id: worker_report
+            per_min: 2
+            scope: per_host
+
+  - id: account_app
+    name: Account Java Application
+    svc: account-jaxrs
+    hosts: [app-a, app-b, app-c]
+    desc: >
+      Core application implementing sign-in and token verification logic.
+      Receives forwarded traffic from Nginx and consults Redis for session/token data when needed.
+      (Response path back through Nginx is modeled as a logical hop to keep access-log ordering realistic.)
+    to:
+      - dst: redis_cluster
+        proto: tcp
+        desc: Token/session lookups when verify requests fall through to the application.
+      - dst: nginx_proxy
+        proto: http
+        desc: Logical response hop back to the proxy for access logging.
+    logs:
+      verify_token_ok:
+        desc: Application successfully verified an access token (typically backed by Redis in this model).
+        lvl: INFO
+        msg: "req_id={req_id} verifyToken ok user={user_id} backend=redis dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          user_id: {k: i, v: [1000000, 9999999]}
+          dur_ms: {k: i, v: [1, 5500]}
+      signin_ok:
+        desc: Application successfully completed sign-in.
+        lvl: INFO
+        msg: "req_id={req_id} signIn ok user={user_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          user_id: {k: i, v: [1000000, 9999999]}
+          dur_ms: {k: i, v: [5, 6000]}
+    beh:
+      n:
+        desc: The application does not emit periodic logs in this simplified model.
+        emit: []
+      f:
+        desc: The application does not emit periodic logs in this simplified model.
+        emit: []
+
+  - id: memcached_cluster
+    name: Memcached Cluster (Token Cache)
+    svc: account-memcached
+    hosts: [mc-1, mc-2, mc-3]
+    desc: >
+      Cache used by Nginx to shortcut access-token verification.
+      Under extreme load it experiences connection/network saturation and timeouts.
+    to: []
+    logs:
+      conn_saturation:
+        desc: Periodic indicator that Memcached is saturated (high connections/timeouts/evictions), scaled to this model's traffic.
+        lvl: WARN
+        msg: "listener saturated active_conns={active_conns} evictions={evictions} timeouts_s={timeouts_s}"
+        vars: {}
+        state_vars:
+          n:
+            active_conns: {k: i, v: [5, 40]}
+            evictions: {k: i, v: [0, 6]}
+            timeouts_s: {k: i, v: [0, 1]}
+          f:
+            active_conns: {k: i, v: [40, 140]}
+            evictions: {k: i, v: [5, 60]}
+            timeouts_s: {k: i, v: [1, 15]}
+    beh:
+      n:
+        desc: Low-rate saturation warnings may appear as background noise.
+        emit:
+          - id: conn_saturation
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Saturation warnings become common under failure load.
+        emit:
+          - id: conn_saturation
+            per_min: 1.5
+            scope: per_host
+
+  - id: redis_cluster
+    name: Redis Cluster (Session/Token Store)
+    svc: account-redis
+    hosts: [redis-1, redis-2]
+    desc: >
+      Backing store for sessions/tokens used by the Java application.
+      When Nginx cannot use Memcached, more verify traffic falls through to the app and Redis sees higher load/latency.
+    to: []
+    logs:
+      latency_report:
+        desc: Periodic latency and load snapshot (scaled to this model's traffic).
+        lvl: INFO
+        msg: "p99_ms={p99_ms} blocked_clients={blocked} ops_s={ops_s}"
+        vars: {}
+        state_vars:
+          n:
+            p99_ms: {k: i, v: [1, 12]}
+            blocked: {k: i, v: [0, 2]}
+            ops_s: {k: i, v: [20, 120]}
+          f:
+            p99_ms: {k: i, v: [8, 160]}
+            blocked: {k: i, v: [0, 25]}
+            ops_s: {k: i, v: [80, 450]}
+    beh:
+      n:
+        desc: Normal Redis latency snapshots.
+        emit:
+          - id: latency_report
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Redis latency snapshots continue, typically with higher values due to fall-through verification load.
+        emit:
+          - id: latency_report
+            per_min: 1.0
+            scope: per_host
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Clients call token verification frequently; most are served from Nginx Memcached cache.
+      Sign-in calls are passed through Nginx to the Java application.
+      ALB access logs are emitted after the response is returned (modeled via a final ALB hop in the path).
+    req:
+      - id: verify_cache_hit
+        desc: Access-token verification served directly from Nginx cache.
+        rpm: 400
+        path: [alb_gateway, nginx_proxy, alb_gateway]
+        emit: [nginx_proxy.access_cache_hit, alb_gateway.access_ok]
+        latency_ms: [[1, 6], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: verify_cache_miss_fallback
+        desc: Access-token verification cache miss; Nginx forwards to the Java app which verifies via Redis.
+        rpm: 80
+        path: [alb_gateway, nginx_proxy, account_app, nginx_proxy, alb_gateway]
+        emit: [nginx_proxy.cache_miss, account_app.verify_token_ok, nginx_proxy.access_upstream_200, alb_gateway.access_ok]
+        latency_ms: [[1, 5], [3, 15], [2, 20], [2, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: signin_success
+        desc: User sign-in request passed through Nginx to the Java app.
+        rpm: 120
+        path: [alb_gateway, nginx_proxy, account_app, nginx_proxy, alb_gateway]
+        emit: [account_app.signin_ok, nginx_proxy.access_pass_200, alb_gateway.access_ok]
+        latency_ms: [[20, 120], [2, 15], [2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Memcached becomes unstable, causing Nginx to block on cache timeouts and fall back to the Java app.
+      As worker threads saturate, Nginx begins returning 503 and eventually ALB removes all targets and returns 503.
+      ALB access logs for routed requests are emitted after the response (modeled via a final ALB hop).
+    req:
+      - id: verify_memcached_timeout_fallback
+        desc: Token verification hits Memcached timeout (100ms) then falls back to the Java app (Redis-backed).
+        rpm: 380
+        path: [alb_gateway, nginx_proxy, account_app, nginx_proxy, alb_gateway]
+        emit: [nginx_proxy.memcached_timeout, account_app.verify_token_ok, nginx_proxy.access_upstream_200, alb_gateway.access_ok]
+        latency_ms: [[200, 1200], [10, 140], [5, 80], [5, 90]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: verify_cache_hit_residual
+        desc: Residual fraction of verifications still served from cache despite instability.
+        rpm: 50
+        path: [alb_gateway, nginx_proxy, alb_gateway]
+        emit: [nginx_proxy.access_cache_hit, alb_gateway.access_ok]
+        latency_ms: [[2, 50], [2, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: signin_degraded
+        desc: Sign-in still reaches the Java app but is slower due to Nginx worker contention.
+        rpm: 120
+        path: [alb_gateway, nginx_proxy, account_app, nginx_proxy, alb_gateway]
+        emit: [account_app.signin_ok, nginx_proxy.access_pass_200, alb_gateway.access_ok]
+        latency_ms: [[250, 2200], [30, 300], [30, 350]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: signin_nginx_503
+        desc: Sign-in request reaches Nginx but fails with 503 due to no free workers.
+        rpm: 60
+        path: [alb_gateway, nginx_proxy, alb_gateway]
+        emit: [nginx_proxy.access_503, alb_gateway.access_ok]
+        latency_ms: [[5, 250], [5, 260]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: alb_503_no_targets
+        desc: After ALB marks all Nginx nodes unhealthy, requests fail at the load balancer with 503 no_healthy_targets.
+        rpm: 500
+        path: [alb_gateway]
+        emit: [alb_gateway.access_no_targets]
+        latency_ms: [[1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    The post-mortem describes multiple unrelated incidents; this model focuses only on the Account Service outage where
+    Memcached instability saturated Nginx and caused the ALB to pull all nodes out of rotation.
+  - |
+    Real-world throughput is orders of magnitude higher; request rates are scaled down to keep a single generated log file
+    within 20k..100k entries while preserving relative behavior shifts (cache-hit vs fall-through vs rejection vs ALB 503).
+  - |
+    To keep saturation signals quantitatively plausible under the scaled request rates, Nginx "workers" and related gauges
+    are modeled as a small effective worker pool (single-digit free/busy) rather than hundreds of threads/connections.
+  - |
+    Memcached/Redis metric-like fields (e.g., ops_s, timeouts_s, active_conns) are scaled down to be qualitatively consistent
+    with the scaled-down request rates rather than representing full production traffic.
+  - |
+    ALB access logs include final status and duration, so flows model them as occurring after upstream processing by adding a
+    logical response hop back to alb_gateway at the end of relevant request paths.
+  - |
+    Token verification is modeled as mostly cache-hit in normal, and mostly Memcached-timeout plus fall-through in failure,
+    matching the described 100ms timeout and increased Redis load.
+  - |
+    Health-check failures are represented as ALB failure-state background warnings (suppressed early, enabled later by scenario events),
+    plus a one-shot marker when the target group is drained.
+  - |
+    Volume estimate for a 50-minute scenario: normal phase about ~1.5k logs/min and failure phase varying by stage, totaling about ~70k logs.
+```

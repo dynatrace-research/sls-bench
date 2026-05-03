@@ -1,0 +1,557 @@
+```yaml
+sys:
+  id: manta_object_storage_incident_20150727
+  desc: >
+    A multi-tenant object storage API serves GET/PUT/DELETE and directory operations.
+    Each request consults a sharded PostgreSQL metadata tier to resolve the namespace to backend storage locations.
+    Only the shard owning a given tenant/path is queried, so a single shard outage causes partial request failures.
+    This model focuses on one affected metadata shard where wraparound autovacuum plus a long-lived pending DROP TRIGGER
+    (exclusive lock request) caused head-of-line lock blocking, API timeouts, and 500s.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: manta_api
+    name: Manta API
+    svc: manta-api
+    hosts: [api1, api2, api3]
+    desc: >
+      Public HTTP API front-end. For each request it queries the appropriate metadata shard.
+      If the metadata query hangs, the API times out and returns a 500.
+
+    to:
+      - dst: pg_shard_a
+        proto: jdbc
+        desc: Metadata queries for shard A.
+      - dst: pg_shard_b
+        proto: jdbc
+        desc: Metadata queries for shard B.
+
+    logs:
+      pg_query_ok:
+        desc: Metadata query completed successfully.
+        lvl: INFO
+        msg: "metadata query ok shard={shard} op={op} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          shard: {k: ch, v: [a, b]}
+          op: {k: ch, v: [get_object, put_object, del_object, list_dir]}
+          dur_ms: {k: i, v: [5, 800]}
+          trace_id: {k: hex, v: 32}
+
+      pg_query_timeout:
+        desc: Metadata query did not complete before the API timeout.
+        lvl: WARN
+        msg: "metadata query timeout shard={shard} op={op} timeout_ms={timeout_ms} waited_ms={waited_ms} trace={trace_id}"
+        vars:
+          shard: {k: ch, v: [a]}
+          op: {k: ch, v: [get_object, put_object, del_object, list_dir]}
+          timeout_ms: {k: i, v: [20000, 20000]}
+          waited_ms: {k: i, v: [20000, 20000]}
+          trace_id: {k: hex, v: 32}
+
+      http_2xx:
+        desc: Request completed successfully with a 2xx response.
+        lvl: INFO
+        msg: "resp {method} {ns_path} shard={shard} status={status} dur_ms={dur_ms} bytes={bytes} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, PUT, DELETE]}
+          ns_path: {k: str, v: "manta namespace path (e.g., /$user/stor/...)"}
+          shard: {k: ch, v: [a, b]}
+          status: {k: i, v: [200, 204]}
+          dur_ms: {k: i, v: [10, 2500]}
+          bytes: {k: i, v: [0, 10485760]}
+          trace_id: {k: hex, v: 32}
+
+      http_5xx:
+        desc: Request failed after upstream metadata failure/timeout.
+        lvl: ERROR
+        msg: "resp {method} {ns_path} shard={shard} status=500 dur_ms={dur_ms} err={err} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, PUT, DELETE]}
+          ns_path: {k: str, v: "manta namespace path (e.g., /$user/stor/...)"}
+          shard: {k: ch, v: [a]}
+          dur_ms: {k: i, v: [20000, 20500]}
+          err: {k: ch, v: [pg_timeout, pg_lock_wait]}
+          trace_id: {k: hex, v: 32}
+
+      api_metrics:
+        desc: Periodic API service metrics.
+        lvl: INFO
+        msg: "api_metrics rps={rps} err_rate={err_rate} p95_ms={p95_ms}"
+        vars:
+          rps: {k: f, v: [0.8, 2.5]}
+        state_vars:
+          n:
+            err_rate: {k: f, v: [0.0, 0.02]}
+            p95_ms: {k: i, v: [40, 250]}
+          f:
+            err_rate: {k: f, v: [0.0, 0.30]}
+            p95_ms: {k: i, v: [40, 32000]}
+
+    beh:
+      n:
+        desc: Mostly healthy request handling with low error rate.
+        emit:
+          - id: api_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Elevated error rate and latency due to shard-A metadata timeouts (but may return near-normal after mitigations).
+        emit:
+          - id: api_metrics
+            per_min: 1.0
+            scope: per_host
+
+  - id: pg_shard_a
+    name: PostgreSQL metadata shard A (primary)
+    svc: postgres
+    hosts: [pg-a1]
+    desc: >
+      Primary node for one metadata shard. During the incident a wraparound autovacuum ran while an exclusive-lock
+      DDL (DROP TRIGGER) remained pending, creating head-of-line lock blocking for regular metadata queries.
+
+    to:
+      - dst: trigger_mgr
+        proto: tcp
+        desc: Response traffic back to the trigger manager over existing client connections.
+
+    logs:
+      checkpoint_complete:
+        desc: Periodic checkpoint completion (background noise).
+        lvl: INFO
+        msg: "checkpoint complete wrote_mb={wrote_mb} sync_ms={sync_ms}"
+        vars:
+          wrote_mb: {k: i, v: [20, 600]}
+          sync_ms: {k: i, v: [10, 3000]}
+
+      autovacuum_start_wraparound:
+        desc: Wraparound-prevention autovacuum started on the metadata table.
+        lvl: WARN
+        msg: "autovacuum started rel={rel} reason=wraparound xid_age={xid_age}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          xid_age: {k: i, v: [150000000, 260000000]}
+
+      autovacuum_progress:
+        desc: Periodic progress marker for the long-running autovacuum.
+        lvl: INFO
+        msg: "autovacuum progress rel={rel} phase={phase} blk_read={blk_read} sleep_ms={sleep_ms}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          phase: {k: ch, v: [heap_scan, index_scan, freeze, cleanup]}
+          blk_read: {k: i, v: [500, 120000]}
+          sleep_ms: {k: i, v: [0, 1500]}
+
+      autovacuum_complete:
+        desc: Autovacuum completed and updated table metadata.
+        lvl: INFO
+        msg: "autovacuum complete rel={rel} tuples_frozen={tuples_frozen}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          tuples_frozen: {k: i, v: [1000000, 80000000]}
+
+      query_lock_wait:
+        desc: Representative lock-wait log for data-path queries on the metadata table.
+        lvl: WARN
+        msg: "statement waiting lock={lock} rel={rel} wait_s={wait_s}"
+        vars:
+          lock: {k: ch, v: [AccessShareLock]}
+          rel: {k: ch, v: [manta_metadata]}
+          wait_s: {k: i, v: [1, 60]}
+
+      ddl_exec_trigger:
+        desc: Trigger ensure DDL executed quickly (normal behavior).
+        lvl: INFO
+        msg: "statement executed ddl=drop_create_trigger rel={rel} dur_ms={dur_ms}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          dur_ms: {k: i, v: [50, 1200]}
+
+      ddl_drop_trigger_enqueued:
+        desc: DROP TRIGGER request is observed in the server (often the oldest active query during the incident).
+        lvl: WARN
+        msg: "ddl enqueued ddl=DROP TRIGGER rel={rel} pid={pid}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          pid: {k: i, v: [1000, 50000]}
+
+      ddl_lock_wait_drop_trigger:
+        desc: Server-side evidence that a DROP TRIGGER is still waiting for an AccessExclusiveLock.
+        lvl: WARN
+        msg: "statement waiting lock=AccessExclusiveLock rel={rel} wait_s={wait_s} ddl=DROP TRIGGER pid={pid}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          wait_s: {k: i, v: [30, 30000]}
+          pid: {k: i, v: [1000, 50000]}
+
+      shutdown_requested:
+        desc: Database shutdown request received (during restart).
+        lvl: WARN
+        msg: "received fast shutdown request from {by}"
+        vars:
+          by: {k: ch, v: [admin]}
+
+      startup_complete:
+        desc: Database startup completed and ready for connections.
+        lvl: INFO
+        msg: "database system is ready to accept connections"
+        vars: {}
+
+    beh:
+      n:
+        desc: Mostly quiet database with occasional checkpoints.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+      f:
+        desc: >
+          Long autovacuum activity, widespread lock waiting on the metadata table, and a long-lived pending DROP TRIGGER
+          (exclusive lock request) that keeps exclusive lock pending for extended periods.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+          - id: query_lock_wait
+            per_min: 20.0
+          - id: autovacuum_progress
+            per_min: 1.0
+          - id: ddl_lock_wait_drop_trigger
+            per_min: 0.3
+
+  - id: pg_shard_b
+    name: PostgreSQL metadata shard B (primary)
+    svc: postgres
+    hosts: [pg-b1]
+    desc: Healthy metadata shard used to show partial-outage behavior (most requests succeed).
+
+    to: []
+
+    logs:
+      checkpoint_complete:
+        desc: Periodic checkpoint completion (background noise).
+        lvl: INFO
+        msg: "checkpoint complete wrote_mb={wrote_mb} sync_ms={sync_ms}"
+        vars:
+          wrote_mb: {k: i, v: [20, 600]}
+          sync_ms: {k: i, v: [10, 3000]}
+
+    beh:
+      n:
+        desc: Normal database behavior.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+      f:
+        desc: Unaffected by the incident; continues normal checkpoints.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+
+  - id: pg_monitor
+    name: PostgreSQL monitor
+    svc: pg-monitor
+    hosts: [mon1]
+    desc: >
+      Scrapes pg_stat_activity/locks and emits summarized health signals for each shard.
+      During the incident, shard A shows many waiting queries and an exclusive lock pending while wraparound autovacuum is active.
+
+    to:
+      - dst: pg_shard_a
+        proto: jdbc
+        desc: Stats/lock scraping for shard A.
+      - dst: pg_shard_b
+        proto: jdbc
+        desc: Stats scraping for shard B.
+
+    logs:
+      pg_stats_ok:
+        desc: Normal shard stats snapshot.
+        lvl: INFO
+        msg: "pg_stats shard={shard} active={active} waiting={waiting} exclusive_pending={exclusive_pending} autovacuum={autovacuum} oldest_wait_s={oldest_wait_s}"
+        vars:
+          shard: {k: ch, v: [a, b]}
+          active: {k: i, v: [5, 90]}
+          waiting: {k: i, v: [0, 3]}
+          exclusive_pending: {k: i, v: [0, 0]}
+          autovacuum: {k: ch, v: [none, regular]}
+          oldest_wait_s: {k: i, v: [0, 8]}
+
+      pg_stats_bad:
+        desc: Incident snapshot showing shard-A lock pileup and wraparound autovacuum with an exclusive lock pending.
+        lvl: WARN
+        msg: "pg_stats shard=a active={active} waiting={waiting} exclusive_pending=1 autovacuum=wraparound oldest_wait_s={oldest_wait_s}"
+        vars:
+          active: {k: i, v: [20, 180]}
+          waiting: {k: i, v: [50, 450]}
+          oldest_wait_s: {k: i, v: [30, 2500]}
+
+      pg_alert:
+        desc: Alert emitted when lock waits are sustained on shard A.
+        lvl: ERROR
+        msg: "ALERT metadata shard a lock waits elevated waiting={waiting} oldest_wait_s={oldest_wait_s}"
+        vars:
+          waiting: {k: i, v: [50, 450]}
+          oldest_wait_s: {k: i, v: [30, 2500]}
+
+    beh:
+      n:
+        desc: Regular monitoring snapshots with no alerts.
+        emit:
+          - id: pg_stats_ok
+            per_min: 2.0
+            scope: global
+      f:
+        desc: Emits either "bad" or "ok" snapshots depending on mitigation state, plus alerts when degraded.
+        emit:
+          - id: pg_stats_bad
+            per_min: 4.0
+            scope: global
+          - id: pg_stats_ok
+            per_min: 4.0
+            scope: global
+          - id: pg_alert
+            per_min: 1.0
+            scope: global
+
+  - id: trigger_mgr
+    name: Trigger manager
+    svc: trigger-mgr
+    hosts: [trig1]
+    desc: >
+      Ensures a database trigger exists by issuing a DROP TRIGGER / CREATE TRIGGER sequence on (re)connect.
+      Normally quick; in this incident, a DROP TRIGGER became a long-lived pending exclusive-lock request on the database.
+
+    to:
+      - dst: pg_shard_a
+        proto: jdbc
+        desc: DDL against shard A metadata table.
+
+    logs:
+      ddl_start:
+        desc: DDL sequence started.
+        lvl: INFO
+        msg: "ensure_trigger start shard=a rel={rel}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+
+      ddl_done:
+        desc: DDL sequence completed successfully.
+        lvl: INFO
+        msg: "ensure_trigger done shard=a result=ok dur_ms={dur_ms}"
+        vars:
+          dur_ms: {k: i, v: [50, 2000]}
+
+      ddl_client_timeout:
+        desc: Client-side timeout waiting for the DDL to complete (not used in this scenario).
+        lvl: ERROR
+        msg: "ensure_trigger timeout shard=a waited_ms={waited_ms}"
+        vars:
+          waited_ms: {k: i, v: [10000, 120000]}
+
+    beh:
+      n:
+        desc: No periodic background logging; trigger changes are request-driven.
+        emit: []
+      f:
+        desc: No periodic background logging; trigger changes are request-driven.
+        emit: []
+
+  - id: ops_tool
+    name: Operator tooling
+    svc: ops
+    hosts: [ops1]
+    desc: >
+      Represents operator actions during the incident (lock snapshot, restart, filesystem prefetch, runtime patching,
+      and the final PostgreSQL configuration change to avoid wraparound autovacuum).
+      These are modeled as one-shot action markers.
+
+    to:
+      - dst: pg_shard_a
+        proto: ssh
+        desc: Administrative actions on the shard-A primary host.
+
+    logs:
+      pg_lock_snapshot_saved:
+        desc: Captured lock/queries snapshot for later analysis.
+        lvl: INFO
+        msg: "saved pg lock snapshot shard=a file={file}"
+        vars:
+          file: {k: str, v: "lock_snapshot_*.json"}
+
+      pg_restart_cmd:
+        desc: Restart command issued for PostgreSQL.
+        lvl: WARN
+        msg: "executed postgres restart shard=a method=svc_restart"
+        vars: {}
+
+      zfs_prefetch:
+        desc: Manual prefetch of table/index files to improve sequential reads across files.
+        lvl: INFO
+        msg: "prefetched table files rel={rel} bytes={bytes}"
+        vars:
+          rel: {k: ch, v: [manta_metadata]}
+          bytes: {k: i, v: [1073741824, 17179869184]}
+
+      patch_vacuum_delay:
+        desc: Runtime patch applied to reduce cost-based vacuum delay sleeping.
+        lvl: WARN
+        msg: "patched vacuum delay in running autovacuum process pid={pid}"
+        vars:
+          pid: {k: i, v: [1000, 50000]}
+
+      pg_autovacuum_threshold_tuned:
+        desc: PostgreSQL configuration adjusted to defer wraparound-triggered autovacuum on the metadata table (applied via restart in this model).
+        lvl: WARN
+        msg: "tuned autovacuum threshold shard=a param={param} old={old} new={new} action={action}"
+        vars:
+          param: {k: ch, v: [vacuum_freeze_table_age]}
+          old: {k: i, v: [150000000, 250000000]}
+          new: {k: i, v: [500000000, 1000000000]}
+          action: {k: ch, v: [restart]}
+
+    beh:
+      n:
+        desc: No periodic emissions.
+        emit: []
+      f:
+        desc: No periodic emissions.
+        emit: []
+
+tracing:
+  on: true
+  origins: [manta_api]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Requests are routed to the correct metadata shard; shard A and B respond normally.
+      Trigger manager occasionally performs a quick idempotent trigger ensure.
+    req:
+      - id: object_op_shard_a_success
+        desc: Object/dir operations whose metadata resides on shard A.
+        rpm: 70.0
+        path: [manta_api, pg_shard_a]
+        emit: [manta_api.pg_query_ok, manta_api.http_2xx]
+        latency_ms: [[25, 90], [30, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: object_op_shard_b_success
+        desc: Object/dir operations whose metadata resides on shard B.
+        rpm: 230.0
+        path: [manta_api, pg_shard_b]
+        emit: [manta_api.pg_query_ok, manta_api.http_2xx]
+        latency_ms: [[20, 70], [25, 110]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: ensure_trigger_success
+        desc: Trigger manager idempotently drops/recreates a trigger; normally quick.
+        rpm: 0.1
+        path: [trigger_mgr, pg_shard_a, trigger_mgr]
+        emit: [trigger_mgr.ddl_start, pg_shard_a.ddl_exec_trigger, trigger_mgr.ddl_done]
+        latency_ms: [[5, 20], [80, 300], [90, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Shard B remains healthy. Shard A experiences lock-induced query hangs and API timeouts.
+      A long-lived pending DROP TRIGGER (exclusive lock request) is represented via pg_shard_a background lock-wait logs
+      and pg_monitor exclusive_pending=1 during degraded windows.
+      Operator actions can temporarily clear the lock queue (restart) or speed autovacuum, and a final PostgreSQL
+      configuration change can defer wraparound autovacuum to restore normal service while leaving a latent wraparound risk.
+    req:
+      - id: object_op_shard_a_timeout
+        desc: Shard-A operations where the metadata query waits behind locks until the API times out (~20s) and returns 500.
+        rpm: 60.0
+        path: [manta_api, pg_shard_a]
+        emit: [manta_api.pg_query_timeout, manta_api.http_5xx]
+        latency_ms: [[20000, 20050], [20, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: object_op_shard_a_success
+        desc: Shard-A operations that still complete (e.g., those that reach the shard before the lock queue head forms).
+        rpm: 10.0
+        path: [manta_api, pg_shard_a]
+        emit: [manta_api.pg_query_ok, manta_api.http_2xx]
+        latency_ms: [[120, 900], [150, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: object_op_shard_b_success
+        desc: Shard-B operations continue normally during the partial outage.
+        rpm: 230.0
+        path: [manta_api, pg_shard_b]
+        emit: [manta_api.pg_query_ok, manta_api.http_2xx]
+        latency_ms: [[20, 75], [25, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: ensure_trigger_ok
+        desc: Trigger manager ensure-trigger completes (e.g., during recovery windows when locks clear).
+        rpm: 0.2
+        path: [trigger_mgr, pg_shard_a, trigger_mgr]
+        emit: [trigger_mgr.ddl_start, pg_shard_a.ddl_exec_trigger, trigger_mgr.ddl_done]
+        latency_ms: [[5, 25], [80, 500], [90, 800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    The real outage lasted ~10 hours; this model compresses it into a 60-minute scenario while preserving the causal core:
+    wraparound autovacuum + a long-lived pending exclusive-lock DDL (DROP TRIGGER) creates head-of-line blocking for shared-lock
+    metadata queries, producing partial API timeouts/500s.
+  - >
+    The long-lived nature of the DROP TRIGGER waiter is modeled explicitly as a failure-state background signal
+    (pg_shard_a.ddl_lock_wait_drop_trigger with wait_s up to 30000), rather than as many short-lived client attempts.
+    This keeps pg_monitor.pg_stats_bad's exclusive_pending=1 realistic over extended degraded intervals.
+  - >
+    API-side metadata timeouts are modeled with a fixed 20s upstream timeout (timeout_ms==waited_ms==20000), and the overall 500
+    response duration is constrained to ~20s plus small overhead (manta_api.http_5xx.dur_ms up to ~20500; flow step hints align),
+    avoiding contradictory per-request chronology.
+  - >
+    api_metrics is emitted per API host once per minute; rps is modeled per-host (~0.8-2.5 rps) to align with ~300 rpm total traffic
+    across three API hosts. Failure-state api_metrics ranges are widened to allow either degraded or recovered values during mitigations.
+  - >
+    Only two shards are modeled: shard A (affected) and shard B (healthy), sufficient to reproduce ~20% overall errors
+    (60 rpm timeouts out of 300 rpm total at failure baseline).
+  - >
+    Normal-phase log volume estimate: ~300 rpm * 2 logs/req + background (~5 logs/min) ≈ ~605 logs/min.
+  - >
+    Total scenario log volume estimate: ~36k-40k logs (flows dominate; additional monitor/lock-wait background and a few
+    operator one-shots), within the 20k..100k target.
+  - >
+    Diagnostic visibility anchors are emission-backed and frequent: manta_api.pg_query_timeout/http_5xx (impact),
+    pg_monitor.pg_stats_bad/pg_alert (lock pileup + exclusive pending), pg_shard_a.ddl_lock_wait_drop_trigger and autovacuum markers
+    (mechanism), and ops_tool restart/prefetch/patch/config-tune one-shots (operator actions and phase boundaries).
+```

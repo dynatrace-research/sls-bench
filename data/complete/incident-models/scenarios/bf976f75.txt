@@ -1,0 +1,243 @@
+```yaml
+scenario:
+  id: incident_2025_03_12_extstore_overload_memcached_envvars
+  title: Mis-deploy breaks Memcached envvars, overloads External Storage and degrades log-derived observability
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Non-user-facing MediaWiki deployments (api-int, parsoid, jobrunner) normally hit Memcached and only occasionally stress
+    the External Storage DB cluster. A Scap deployment rolls out a mismatched PHP image/envvars mount so the services
+    default to Memcached on localhost, causing cache failures and DB fallback reads/writes. External Storage connections
+    and query timeouts rise, causing high latency and database-related errors, while the flood of memcached error logs
+    overwhelms Logstash and leads to missing/blank log-derived dashboards and delayed/missing alerts. User-facing traffic
+    is minimally affected because the impacted deployments are auxiliary.
+
+  trigger_desc: |
+    Scap deployment for the PHP 8.1 rollout is executed with -Dbuild_mw_container_image:False, which (unexpectedly)
+    skips updating helmfile-defaults. Pods run the older PHP image while envvars.inc is mounted in the new PHP include
+    path, so php-fpm does not load MCROUTER_SERVER and MediaWiki uses the default 127.0.0.1:11213.
+
+  time:
+    total_minutes: 44
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 44}
+
+  phases:
+    n:
+      desc: |
+        api-int/parsoid/jobrunner execute internal requests and background jobs with Memcached reachable via mcrouter.
+        External Storage connection counts are stable and query timeouts are rare. Logstash remains low-latency and
+        Prometheus scrapes are mostly clean.
+      flows:
+        - api_int_request_ok
+        - api_int_request_db_error
+        - parsoid_request_ok
+        - parsoid_request_db_error
+        - jobrunner_job_ok
+        - jobrunner_job_db_error
+      manifestation:
+        - mw_api_int.cache_hit
+        - mw_jobrunner.http_end_ok
+        - external_storage_db.pool_stats
+        - logstash.pipeline_lag
+
+    f:
+      desc: |
+        After the deployment, Memcached configuration effectively disappears and each service falls back to DB reads.
+        External Storage sees a rapid increase in connections and queueing, producing timeouts and "too many connections"
+        errors that surface as MediaWiki DB errors and increased end-to-end durations. The memcached-error channel becomes
+        extremely noisy and Logstash accumulates lag, causing scrape failures and a gap in log-derived dashboards/alerts.
+        Mitigations reduce background job pressure but do not restore Memcached configuration by the end of the scenario.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: scap
+          event: |
+            Scap rolls the auxiliary MediaWiki deployments with helm defaults not updated; the resulting pods do not load
+            the intended envvars.inc for their PHP version and default Memcached to 127.0.0.1:11213. Cache lookups fail,
+            applications fall back to External Storage, and backend latency/DB errors begin.
+          why: |
+            The Memcached server address is delivered via a php-fpm include file whose directory is PHP-version-specific.
+            With a mismatched image vs envvars mount, php-fpm reads defaults, so MediaWiki uses localhost and emits
+            memcached connection errors; the resulting cache misses increase External Storage reads and connections.
+            Directly observable via cache_lookup_failed/memcached_spam and rising extstore pool_stats.
+          flows:
+            - api_int_request_ok
+            - api_int_request_db_error
+            - parsoid_request_ok
+            - parsoid_request_db_error
+            - jobrunner_job_ok
+            - jobrunner_job_db_error
+          rate_multipliers:
+            logstash.pipeline_drop: 0.0
+            prometheus.scrape_failed: 0.0
+          latency_multipliers:
+            api_int_request_ok: {p50: 1.0, p95: 1.0}
+            api_int_request_db_error: {p50: 1.0, p95: 1.0}
+            parsoid_request_ok: {p50: 1.0, p95: 1.0}
+            parsoid_request_db_error: {p50: 1.0, p95: 1.0}
+            jobrunner_job_ok: {p50: 1.0, p95: 1.0}
+            jobrunner_job_db_error: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: scap.deploy_start
+              count: 1
+              hosts: [deploy-1]
+          manifestation:
+            - mw_api_int.cache_lookup_failed
+            - mw_api_int.memcached_spam
+            - external_storage_db.pool_stats
+            - prometheus.alert_firing
+
+        - order: 2
+          at_min: 26
+          component: logstash
+          event: |
+            The sustained memcached error flood pushes Logstash behind; pipeline lag spikes and drops begin, and Prometheus
+            scrapes for log-derived metrics start failing, creating a dashboard/alert visibility gap (even though the
+            underlying application/DB behavior is already degraded).
+          why: |
+            High-volume error channels can exceed filter/output capacity, building queue depth and lag. When the exporter
+            cannot serve fresh metrics (or returns no data), Prometheus records scrape failures; this is observable but the
+            root cause (log volume) must be inferred from the concurrent memcached spam and Logstash lag.
+          flows:
+            - api_int_request_ok
+            - api_int_request_db_error
+            - parsoid_request_ok
+            - parsoid_request_db_error
+            - jobrunner_job_ok
+            - jobrunner_job_db_error
+          rate_multipliers:
+            logstash.pipeline_lag: 4.0
+            logstash.pipeline_drop: 1.0
+            prometheus.scrape_failed: 1.0
+          latency_multipliers:
+            api_int_request_ok: {p50: 1.0, p95: 1.0}
+            api_int_request_db_error: {p50: 1.0, p95: 1.0}
+            parsoid_request_ok: {p50: 1.0, p95: 1.0}
+            parsoid_request_db_error: {p50: 1.0, p95: 1.0}
+            jobrunner_job_ok: {p50: 1.0, p95: 1.0}
+            jobrunner_job_db_error: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - logstash.pipeline_lag
+            - prometheus.scrape_failed
+            - logstash.pipeline_drop
+
+        - order: 3
+          at_min: 34
+          component: ops_console
+          event: |
+            Responders apply mitigations to reduce parallelism/concurrency in background update pipelines, reducing the
+            job-driven request rate and lowering External Storage timeout frequency. With fewer errors being produced,
+            Logstash lag partially eases, but Memcached remains unreachable so cache fallback and memcached error spam
+            continue.
+          why: |
+            Lowering job parallelism reduces the rate of External Storage-heavy work and can partially relieve connection
+            pressure and queuing, improving request latencies and reducing timeout incidence. The reduced log production
+            also helps Logstash catch up somewhat. This does not address the missing MCROUTER_SERVER envvar, so the
+            underlying cache failure remains. Observable via ops change markers plus reduced extstore timeouts and
+            partially reduced Logstash lag.
+          flows:
+            - parsoid_request_ok
+            - parsoid_request_db_error
+            - jobrunner_job_ok
+            - jobrunner_job_db_error
+          rate_multipliers:
+            parsoid_request_ok: 0.8
+            parsoid_request_db_error: 0.8
+            jobrunner_job_ok: 0.6
+            jobrunner_job_db_error: 0.6
+            external_storage_db.query_timeout: 0.6
+            logstash.pipeline_lag: 2.0
+          latency_multipliers:
+            api_int_request_ok: {p50: 0.9, p95: 0.95}
+            api_int_request_db_error: {p50: 0.9, p95: 0.95}
+            parsoid_request_ok: {p50: 0.9, p95: 0.95}
+            parsoid_request_db_error: {p50: 0.9, p95: 0.95}
+            jobrunner_job_ok: {p50: 0.9, p95: 0.95}
+            jobrunner_job_db_error: {p50: 0.9, p95: 0.95}
+          one_shots:
+            - ref: ops_console.reduce_cirrus_parallelism
+              count: 1
+              hosts: [ops-1]
+            - ref: ops_console.reduce_changeprop_concurrency
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_console.reduce_changeprop_concurrency
+            - external_storage_db.query_timeout
+            - logstash.pipeline_lag
+
+      steady:
+        - component: mw_api_int
+          condition: |
+            Memcached remains configured to localhost, producing continuous cache lookup failures and high-volume memcached
+            client errors; api-int continues to fall back to External Storage with elevated latency and intermittent DB errors.
+          user_impact: |
+            Internal API requests are slower and sometimes fail; external user-facing traffic is minimally affected.
+          manifestation:
+            - mw_api_int.cache_lookup_failed
+            - mw_api_int.memcached_spam
+            - mw_api_int.db_error
+        - component: external_storage_db
+          condition: |
+            External Storage remains under elevated connection pressure with queued requests and recurring timeouts.
+          user_impact: |
+            Any dependent internal workflows (rendering, job execution, internal APIs) experience slowdowns and transient failures.
+          manifestation:
+            - external_storage_db.pool_stats
+            - external_storage_db.too_many_connections
+        - component: logstash
+          condition: |
+            Log processing remains laggy, with intermittent drops and scrape issues that reduce confidence in log-derived alerts.
+          user_impact: |
+            Responders have an observability gap for memcached-error-rate signals during the failure window.
+          manifestation:
+            - logstash.pipeline_lag
+            - prometheus.scrape_failed
+
+      feedback_loops:
+        - id: cache_miss_db_pressure_loop
+          desc: |
+            Cache failures force more DB reads, increasing External Storage queuing and timeouts, which increases request
+            durations and php-fpm worker saturation, further amplifying overall latency and error probability.
+        - id: log_flood_observability_loop
+          desc: |
+            Memcached error spam increases log volume, causing Logstash lag and scrape failures that hide the most relevant
+            memcached-error-rate signals, delaying recognition of the true trigger and prolonging the broken configuration.
+
+      flows:
+        - api_int_request_ok
+        - api_int_request_db_error
+        - parsoid_request_ok
+        - parsoid_request_db_error
+        - jobrunner_job_ok
+        - jobrunner_job_db_error
+      manifestation:
+        - prometheus.alert_firing
+        - external_storage_db.pool_stats
+        - mw_parsoid.db_error
+        - logstash.pipeline_lag
+
+  assumptions:
+    - |-
+      Repair note (S8): removed the event-2 step-change request latency multipliers (observability degradation does not itself imply a sudden app/DB latency jump), and adjusted event-3 latency multipliers to reflect the stated modest latency improvement from mitigations. Also updated event-3 narrative to explicitly state partial Logstash lag easing.
+    - |-
+      Timeline compression: the real incident spanned hours; this scenario compresses onset→worsening→mitigation into 44 minutes while keeping ordering and causal links.
+    - |-
+      Failure-phase breakdown (minutes): 20-26 initial misdeploy (cache failures + DB fallback), 26-34 observability gap emerges (Logstash lag/scrape failures), 34-44 mitigations reduce job pressure and partially ease Logstash lag but cache remains broken.
+    - |-
+      Quantitative repair: extstore connection-pressure numbers were reduced to hundreds (not thousands) to fit the modeled request/latency envelope while still making the n→f jump visible in pool_stats and too_many_connections.
+    - |-
+      Effective rough volumes:
+      - Normal (20 min): ~1.0k logs/min (~17 eps) => ~20k logs.
+      - Failure 20-26 (6 min): ~1.7k logs/min (~28 eps) => ~10k logs.
+      - Failure 26-34 (8 min): similar base plus more frequent logstash/prometheus symptom logs => ~14k logs.
+      - Failure 34-44 (10 min): reduced jobrunner/parsoid flow rates and fewer extstore timeouts, but memcached_spam persists => ~16k logs.
+      Total estimated logs: ~60k–70k (within 20k..100k).
+    - |-
+      Visibility rationale: cache_lookup_failed/server=127.0.0.1 and memcached_spam are frequent and immediately expose the missing MCROUTER_SERVER; extstore pool_stats/toomanyconnections corroborate overload; logstash.pipeline_lag + prometheus.scrape_failed make the observability gap diagnosable without inflating rare user-facing symptoms.
+```

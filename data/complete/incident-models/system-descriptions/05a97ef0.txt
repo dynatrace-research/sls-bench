@@ -1,0 +1,712 @@
+```yaml
+sys:
+  id: elb_service_us_east
+  desc: >
+    A regional Elastic Load Balancing (ELB) service consisting of a public API layer, a control plane that
+    manages load balancer configuration, a central state store that tracks backend membership/config, and
+    a data plane of running load balancers that handle customer traffic. The control plane reads/writes the
+    state store to service API operations and to push config updates (e.g., scaling, backend changes) to
+    load balancer nodes. During the modeled incident, a maintenance job logically deletes part of the ELB
+    state, degrading control plane API behavior and causing some config pushes to apply empty backend sets.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: elb_api
+    name: ELB Public API
+    svc: elb-api
+    hosts: [elb-api-1, elb-api-2]
+    desc: >
+      Public-facing API endpoints for creating and modifying load balancers. For mutating operations it
+      calls the ELB control plane and returns success or error to customers.
+
+    to:
+      - dst: elb_control_plane
+        proto: https
+        desc: Forwards Create/Modify requests to the control plane.
+
+    logs:
+      api_create_req:
+        desc: Customer request to create a new load balancer.
+        lvl: INFO
+        msg: "CreateLoadBalancer request lb={lb_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      api_create_ok:
+        desc: Successful CreateLoadBalancer response returned to the customer.
+        lvl: INFO
+        msg: "CreateLoadBalancer succeeded status=200 req_id={req_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [30, 1500]}
+          trace_id: {k: hex, v: 32}
+
+      api_modify_req:
+        desc: Customer request to modify an existing load balancer (normal path).
+        lvl: INFO
+        msg: "ModifyLoadBalancer request lb={lb_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      api_modify_ok:
+        desc: Successful ModifyLoadBalancer response returned to the customer.
+        lvl: INFO
+        msg: "ModifyLoadBalancer succeeded status=200 req_id={req_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [40, 4000]}
+          trace_id: {k: hex, v: 32}
+
+      api_modify_req_state:
+        desc: Customer ModifyLoadBalancer request during state-loss error handling.
+        lvl: INFO
+        msg: "ModifyLoadBalancer request (state-read) lb={lb_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      api_modify_err_state:
+        desc: ModifyLoadBalancer fails due to control-plane/state-store errors.
+        lvl: ERROR
+        msg: "ModifyLoadBalancer failed status=503 err={err} req_id={req_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          err: {k: ch, v: [StateNotFound, StateReadTimeout, ControlPlaneBusy]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [500, 20000]}
+          trace_id: {k: hex, v: 32}
+
+      api_modify_req_rejected:
+        desc: Customer ModifyLoadBalancer request after workflows are disabled.
+        lvl: INFO
+        msg: "ModifyLoadBalancer request (workflow-gated) lb={lb_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      api_modify_err_disabled:
+        desc: ModifyLoadBalancer is rejected because workflows are disabled to prevent propagation.
+        lvl: ERROR
+        msg: "ModifyLoadBalancer failed status=503 err=WorkflowDisabled req_id={req_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 800]}
+          trace_id: {k: hex, v: 32}
+
+    beh:
+      n:
+        desc: No standalone background logs modeled on the public API.
+        emit: []
+      f:
+        desc: No standalone background logs modeled on the public API.
+        emit: []
+
+  - id: elb_control_plane
+    name: ELB Control Plane
+    svc: elb-control
+    hosts: [elb-cp-1, elb-cp-2, elb-cp-3]
+    desc: >
+      Orchestrates ELB configuration, reads the central state store for backend membership and other
+      metadata, and pushes config updates to data plane load balancers. During the incident it experiences
+      increased latency and errors when reading state, and later pushes incomplete config for some LBs.
+
+    to:
+      - dst: elb_api
+        proto: https
+        desc: Returns operation results (success/error) to the API layer.
+      - dst: elb_state_store
+        proto: jdbc
+        desc: Reads/writes ELB state data (backend membership, config versions).
+      - dst: elb_data_plane
+        proto: rpc
+        desc: Pushes computed load balancer configuration to running data plane nodes.
+
+    logs:
+      cp_create_start:
+        desc: Start provisioning a new load balancer in response to CreateLoadBalancer.
+        lvl: INFO
+        msg: "provision start lb={lb_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      cp_modify_start:
+        desc: Start applying a customer-requested load balancer modification (normal path).
+        lvl: INFO
+        msg: "modify start lb={lb_id} change_id={change_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          change_id: {k: hex, v: 12}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      cp_push_config_modify:
+        desc: Push a computed config update for a customer modification.
+        lvl: INFO
+        msg: "push config (modify) lb={lb_id} backend_count={backend_count} change_id={change_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          backend_count: {k: i, v: [2, 35]}
+          change_id: {k: hex, v: 12}
+          trace_id: {k: hex, v: 32}
+
+      cp_scale_tick:
+        desc: Periodic control-plane scaling/descaling reconciliation tick.
+        lvl: INFO
+        msg: "autoscale reconcile tick lb={lb_id} change_id={change_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          change_id: {k: hex, v: 12}
+          trace_id: {k: hex, v: 32}
+      cp_push_config_scale:
+        desc: Push a computed config update for autoscaling.
+        lvl: INFO
+        msg: "push config (autoscale) lb={lb_id} backend_count={backend_count} change_id={change_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          backend_count: {k: i, v: [2, 35]}
+          change_id: {k: hex, v: 12}
+          trace_id: {k: hex, v: 32}
+
+      cp_modify_start_state:
+        desc: Start applying a customer modification during state-loss conditions.
+        lvl: INFO
+        msg: "modify start (state-read) lb={lb_id} change_id={change_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          change_id: {k: hex, v: 12}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      cp_state_missing:
+        desc: Control plane cannot find required state for an existing load balancer.
+        lvl: ERROR
+        msg: "state missing lb={lb_id} missing_key={missing_key} change_id={change_id} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          missing_key: {k: ch, v: [backend_map, listener_map, policy_map]}
+          change_id: {k: hex, v: 12}
+          dur_ms: {k: i, v: [50, 20000]}
+          trace_id: {k: hex, v: 32}
+
+      cp_modify_reject:
+        desc: Control plane rejects modification because workflows are gated off.
+        lvl: WARN
+        msg: "modify rejected lb={lb_id} reason=workflow_disabled req_id={req_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      cp_reconcile_tick:
+        desc: Reconciliation tick that attempts to compute and push config using state (can produce empty backend set if state is missing).
+        lvl: INFO
+        msg: "reconcile tick lb={lb_id} change_id={change_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          change_id: {k: hex, v: 12}
+          trace_id: {k: hex, v: 32}
+      cp_push_config_reconcile:
+        desc: Push a reconcile-generated config update, potentially with backend_count=0.
+        lvl: WARN
+        msg: "push config (reconcile) lb={lb_id} backend_count={backend_count} change_id={change_id} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          backend_count: {k: i, v: [0, 30]}
+          change_id: {k: hex, v: 12}
+          trace_id: {k: hex, v: 32}
+
+      workflow_gate_disabled:
+        desc: Operational action marker indicating workflows were disabled to prevent further impact.
+        lvl: WARN
+        msg: "workflow gate set enabled=false actor={actor} reason={reason}"
+        vars:
+          actor: {k: ch, v: [oncall_elb, engineer_b]}
+          reason: {k: ch, v: [prevent_propagation, mitigate_state_loss]}
+
+      workflow_gate_status:
+        desc: Periodic marker emitted after gating showing workflows remain disabled.
+        lvl: INFO
+        msg: "workflow gate status enabled=false disabled_workflows={disabled_workflows}"
+        vars:
+          disabled_workflows: {k: i, v: [3, 10]}
+
+      workflow_metrics:
+        desc: Periodic control plane metrics including observed state read latency and API error rate.
+        lvl: INFO
+        msg: "cp_metrics api_err_rate={api_err_rate} state_read_p95_ms={state_read_p95_ms} active_workflows={active_workflows}"
+        vars:
+          active_workflows: {k: i, v: [0, 40]}
+        state_vars:
+          n:
+            api_err_rate: {k: f, v: [0.0, 0.02]}
+            state_read_p95_ms: {k: i, v: [5, 60]}
+          f:
+            api_err_rate: {k: f, v: [0.1, 0.85]}
+            state_read_p95_ms: {k: i, v: [200, 5000]}
+
+    beh:
+      n:
+        desc: Emits low-error periodic health/latency metrics for the control plane.
+        emit:
+          - id: workflow_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Emits elevated error-rate and latency metrics due to missing state and read contention; gate status is emitted after mitigation.
+        emit:
+          - id: workflow_metrics
+            per_min: 2.0
+            scope: per_host
+          - id: workflow_gate_status
+            per_min: 1.0
+            scope: per_host
+
+  - id: elb_state_store
+    name: ELB State Store
+    svc: elb-state-db
+    hosts: [elb-db-1]
+    desc: >
+      Central metadata store for load balancer configuration and backend membership. During the incident,
+      parts of the state are logically deleted, leading to "not found" reads for existing load balancers and
+      increased latency as callers retry or scan.
+
+    to:
+      - dst: elb_control_plane
+        proto: jdbc
+        desc: Returns query results and write acknowledgements to the control plane.
+
+    logs:
+      db_create_write:
+        desc: Insert initial state for a newly created load balancer.
+        lvl: INFO
+        msg: "INSERT lb_state lb={lb_id} ok rows=1 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          dur_ms: {k: i, v: [5, 200]}
+          trace_id: {k: hex, v: 32}
+
+      db_read_state_ok_for_modify:
+        desc: Read full state for an existing LB during a customer modification.
+        lvl: INFO
+        msg: "SELECT lb_state (modify) lb={lb_id} rows=1 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          dur_ms: {k: i, v: [3, 120]}
+          trace_id: {k: hex, v: 32}
+
+      db_read_state_ok_for_scale:
+        desc: Read state during autoscaling reconciliation.
+        lvl: INFO
+        msg: "SELECT lb_state (autoscale) lb={lb_id} rows=1 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          dur_ms: {k: i, v: [3, 150]}
+          trace_id: {k: hex, v: 32}
+
+      db_read_state_notfound:
+        desc: Read of required LB state returns no rows after logical data deletion.
+        lvl: WARN
+        msg: "SELECT lb_state (state-loss) lb={lb_id} rows=0 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          dur_ms: {k: i, v: [20, 8000]}
+          trace_id: {k: hex, v: 32}
+
+      db_read_backend_map_notfound:
+        desc: Read of backend membership map returns no rows (reconcile path).
+        lvl: WARN
+        msg: "SELECT backend_map (reconcile) lb={lb_id} rows=0 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          dur_ms: {k: i, v: [20, 8000]}
+          trace_id: {k: hex, v: 32}
+
+      audit_delete:
+        desc: Audit log for a privileged maintenance deletion against production ELB state.
+        lvl: ERROR
+        msg: "AUDIT logical_delete table=elb_state scope=us-east rows={rows} actor={actor} ticket={ticket}"
+        vars:
+          rows: {k: i, v: [5000, 500000]}
+          actor: {k: ch, v: [dev_a]}
+          ticket: {k: ch, v: [none]}
+
+      db_metrics:
+        desc: Periodic DB metrics including latency and not-found rate.
+        lvl: INFO
+        msg: "db_metrics qps={qps} p95_ms={p95_ms} notfound_rate={notfound_rate}"
+        vars: {}
+        state_vars:
+          n:
+            qps: {k: i, v: [1, 2]}
+            p95_ms: {k: i, v: [3, 30]}
+            notfound_rate: {k: f, v: [0.0, 0.02]}
+          f:
+            qps: {k: i, v: [2, 12]}
+            p95_ms: {k: i, v: [100, 8000]}
+            notfound_rate: {k: f, v: [0.2, 0.95]}
+
+    beh:
+      n:
+        desc: Emits steady DB performance metrics under normal operation.
+        emit:
+          - id: db_metrics
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Emits elevated not-found rate and latency metrics after logical data loss.
+        emit:
+          - id: db_metrics
+            per_min: 1.0
+            scope: global
+
+  - id: elb_data_plane
+    name: ELB Data Plane (Load Balancer Nodes)
+    svc: elb-lb
+    hosts: [elb-lb-1, elb-lb-2, elb-lb-3, elb-lb-4]
+    desc: >
+      Running load balancer nodes that accept customer traffic and route to backend instances.
+      Normally they continue serving even if the control plane is degraded, but if a bad config push
+      applies an empty backend set, requests can return 503/504 with elevated latency.
+
+    to:
+      - dst: elb_control_plane
+        proto: rpc
+        desc: Sends acknowledgements/telemetry for applied config pushes back to the control plane.
+
+    logs:
+      access_ok:
+        desc: Access log for a successful proxied request.
+        lvl: INFO
+        msg: "lb={lb_id} client_ip={client_ip} method={method} uri={uri} status=200 target_status=200 latency_ms={latency_ms}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          client_ip: {k: ip, v: null}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: str, v: "/{service}/health|/{service}/api"}
+          latency_ms: {k: i, v: [5, 800]}
+
+      access_err:
+        desc: Access log for a request failing due to missing/empty backend pool.
+        lvl: WARN
+        msg: "lb={lb_id} client_ip={client_ip} method={method} uri={uri} status={status} target_status=- latency_ms={latency_ms}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          client_ip: {k: ip, v: null}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: str, v: "/{service}/health|/{service}/api"}
+          status: {k: i, v: [503, 504]}
+          latency_ms: {k: i, v: [50, 5000]}
+
+      dp_config_applied_modify:
+        desc: Data plane applies a config push originating from a customer modification.
+        lvl: INFO
+        msg: "config applied (modify) lb={lb_id} backend_count={backend_count} change_id={change_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          backend_count: {k: i, v: [2, 35]}
+          change_id: {k: hex, v: 12}
+
+      dp_config_applied_scale:
+        desc: Data plane applies a config push originating from autoscaling reconciliation.
+        lvl: INFO
+        msg: "config applied (autoscale) lb={lb_id} backend_count={backend_count} change_id={change_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          backend_count: {k: i, v: [2, 35]}
+          change_id: {k: hex, v: 12}
+
+      dp_config_applied_reconcile:
+        desc: Data plane applies a reconcile config push that may contain backend_count=0.
+        lvl: WARN
+        msg: "config applied (reconcile) lb={lb_id} backend_count={backend_count} change_id={change_id}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+          backend_count: {k: i, v: [0, 30]}
+          change_id: {k: hex, v: 12}
+
+      healthcheck_summary:
+        desc: Periodic summary of backend health observed by a load balancer node.
+        lvl: INFO
+        msg: "hc_summary lb={lb_id} backend_count={backend_count} fails={fails}"
+        vars:
+          lb_id: {k: ch, v: [lb-a1, lb-a2, lb-a3, lb-b1, lb-b2, lb-c1, lb-c2, lb-d1, lb-d2, lb-e1]}
+        state_vars:
+          n:
+            backend_count: {k: i, v: [2, 35]}
+            fails: {k: i, v: [0, 5]}
+          f:
+            backend_count: {k: i, v: [0, 35]}
+            fails: {k: i, v: [0, 120]}
+
+    beh:
+      n:
+        desc: Emits low-rate healthcheck summaries alongside request access logs.
+        emit:
+          - id: healthcheck_summary
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Emits healthcheck summaries; during this incident they become incident-like only once bad config pushes reach some LBs.
+        emit:
+          - id: healthcheck_summary
+            per_min: 1.0
+            scope: per_host
+
+  - id: ops_recovery
+    name: ELB Operations / Recovery Tooling
+    svc: elb-ops
+    hosts: [ops-1]
+    desc: >
+      Operational actions and recovery tooling used by on-call engineers. In this incident model it emits
+      markers for the attempted state restore that fails to produce a usable snapshot within the window.
+
+    to:
+      - dst: elb_state_store
+        proto: jdbc
+        desc: Executes state restore procedures against the state store.
+      - dst: elb_control_plane
+        proto: https
+        desc: Performs operational actions such as workflow gating.
+
+    logs:
+      restore_start:
+        desc: Start of an attempted point-in-time state restore procedure.
+        lvl: WARN
+        msg: "restore start method=point_in_time_restore_v1 target_snapshot=pre_delete actor={actor} ticket={ticket}"
+        vars:
+          actor: {k: ch, v: [oncall_elb]}
+          ticket: {k: ch, v: [INC-5521]}
+      restore_failed:
+        desc: Failure of the initial restore method to produce a usable snapshot.
+        lvl: ERROR
+        msg: "restore failed method=point_in_time_restore_v1 err={err} waited_min={waited_min} ticket={ticket}"
+        vars:
+          err: {k: ch, v: [SnapshotCorrupt, SnapshotIncomplete, TimeoutWaitingForSnapshot]}
+          waited_min: {k: i, v: [5, 5]}
+          ticket: {k: ch, v: [INC-5521]}
+
+    beh:
+      n:
+        desc: No background ops logs during normal operation.
+        emit: []
+      f:
+        desc: Ops actions are modeled as one-shots, not background chatter.
+        emit: []
+
+tracing:
+  on: true
+  origins: [elb_api, elb_control_plane]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation includes steady customer traffic through data plane load balancers, customer API
+      operations to create/modify load balancers, and periodic control-plane autoscaling reconciliation.
+    req:
+      - id: client_request_ok
+        desc: Customer application traffic proxied through load balancers.
+        rpm: 400.0
+        path: [elb_data_plane]
+        emit: [elb_data_plane.access_ok]
+        latency_ms: [[25, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: api_create_lb
+        desc: Customer creates a new load balancer (succeeds).
+        rpm: 5.0
+        path: [elb_api, elb_control_plane, elb_state_store, elb_control_plane, elb_api]
+        emit:
+          - elb_api.api_create_req
+          - elb_control_plane.cp_create_start
+          - elb_state_store.db_create_write
+          - elb_api.api_create_ok
+        latency_ms: [[1, 5], [5, 25], [10, 60], [40, 1500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_modify_lb_ok
+        desc: Customer modifies an existing load balancer (state read + config push succeed).
+        rpm: 20.0
+        path: [elb_api, elb_control_plane, elb_state_store, elb_control_plane, elb_data_plane, elb_control_plane, elb_api]
+        emit:
+          - elb_api.api_modify_req
+          - elb_control_plane.cp_modify_start
+          - elb_state_store.db_read_state_ok_for_modify
+          - elb_control_plane.cp_push_config_modify
+          - elb_data_plane.dp_config_applied_modify
+          - elb_api.api_modify_ok
+        latency_ms: [[1, 5], [3, 20], [8, 80], [10, 120], [15, 200], [50, 4000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: cp_autoscale_reconcile
+        desc: Control plane periodic autoscaling/descaling reconciliation (succeeds).
+        rpm: 6.0
+        path: [elb_control_plane, elb_state_store, elb_control_plane, elb_data_plane]
+        emit:
+          - elb_control_plane.cp_scale_tick
+          - elb_state_store.db_read_state_ok_for_scale
+          - elb_control_plane.cp_push_config_scale
+          - elb_data_plane.dp_config_applied_scale
+        latency_ms: [[2, 10], [5, 120], [10, 150], [10, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      After state data loss, customer Modify operations for existing load balancers fail or are later rejected.
+      Some control-plane reconciliation attempts push empty backend sets to a subset of load balancers, causing
+      elevated 503/504 responses and healthcheck failures on those modified LBs.
+    req:
+      - id: client_request_healthy
+        desc: Customer traffic through unaffected load balancers continues to succeed.
+        rpm: 380.0
+        path: [elb_data_plane]
+        emit: [elb_data_plane.access_ok]
+        latency_ms: [[30, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: client_request_impacted
+        desc: Customer traffic through misconfigured load balancers returns 503/504 with higher latency.
+        rpm: 20.0
+        path: [elb_data_plane]
+        emit: [elb_data_plane.access_err]
+        latency_ms: [[250, 1500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: api_create_lb
+        desc: Customer creates a new load balancer (still succeeds despite state loss affecting existing LBs).
+        rpm: 5.0
+        path: [elb_api, elb_control_plane, elb_state_store, elb_control_plane, elb_api]
+        emit:
+          - elb_api.api_create_req
+          - elb_control_plane.cp_create_start
+          - elb_state_store.db_create_write
+          - elb_api.api_create_ok
+        latency_ms: [[1, 5], [5, 25], [10, 80], [40, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_modify_lb_fail_state
+        desc: ModifyLoadBalancer fails because required state for existing LBs is missing/slow to read.
+        rpm: 20.0
+        path: [elb_api, elb_control_plane, elb_state_store, elb_control_plane, elb_api]
+        emit:
+          - elb_api.api_modify_req_state
+          - elb_control_plane.cp_modify_start_state
+          - elb_state_store.db_read_state_notfound
+          - elb_control_plane.cp_state_missing
+          - elb_api.api_modify_err_state
+        latency_ms: [[1, 5], [10, 100], [50, 8000], [100, 20000], [500, 20000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_modify_lb_rejected
+        desc: ModifyLoadBalancer is rejected after workflows are disabled to prevent additional impact.
+        rpm: 20.0
+        path: [elb_api, elb_control_plane, elb_api]
+        emit:
+          - elb_api.api_modify_req_rejected
+          - elb_control_plane.cp_modify_reject
+          - elb_api.api_modify_err_disabled
+        latency_ms: [[1, 5], [2, 20], [10, 800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: cp_reconcile_push_config
+        desc: Control-plane reconcile tick that can push empty backend sets to a subset of load balancers.
+        rpm: 6.0
+        path: [elb_control_plane, elb_state_store, elb_control_plane, elb_data_plane]
+        emit:
+          - elb_control_plane.cp_reconcile_tick
+          - elb_state_store.db_read_backend_map_notfound
+          - elb_control_plane.cp_push_config_reconcile
+          - elb_data_plane.dp_config_applied_reconcile
+        latency_ms: [[2, 10], [50, 8000], [10, 200], [10, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - >
+    The real ELB system is simplified into a single control plane, a single state store, and a data plane
+    emitting access/health logs sufficient to observe: (a) logical state deletion, (b) control plane API
+    degradation for existing LBs, and (c) misconfiguration of a subset of LBs after config pushes.
+  - >
+    "Create new load balancers works while managing existing load balancers fails" is modeled as successful
+    api_create_lb flows continuing during failure while api_modify paths fail/reject.
+  - >
+    For config-push flows that include both control-plane and data-plane logs with the same change_id, the
+    backend_count value is intended to represent the same computed/appplied backend pool size and should be
+    emitted consistently within a single request flow.
+  - >
+    Paths include coarse "return/ack" hops (state_store->control_plane, control_plane->api, data_plane->control_plane)
+    so that request lifecycles are traversable without implying the DB initiates calls.
+  - >
+    The db_metrics.qps field is modeled as a coarse aggregate rate over the database (including internal/non-modeled
+    background queries), but is kept in the low single-digit range in normal and low double-digit range in failure
+    to remain consistent with the modeled per-query DB log volume.
+  - >
+    The full multi-hour recovery is not modeled; the scenario ends while still failing to satisfy the
+    requirement that the incident scenario ends in failure. A later successful restore/merge/re-enable is
+    intentionally omitted.
+  - >
+    The restore tooling's waited_min is scaled to the compressed scenario timeline (minutes, not hours) so that
+    restore start/fail markers can be temporally consistent in a 60-minute simulation.
+  - >
+    Normal-phase log volume estimate: ~570 logs/min (400 client access + ~164 API/control-plane flow logs + ~6 background),
+    for ~30 minutes ≈ 17k logs.
+  - >
+    Total scenario log volume estimate: ~33k–42k logs across 60 minutes (client traffic dominates; control plane
+    API failures and reconcile pushes provide key diagnostics), within the 20k–100k target.
+  - >
+    Visibility anchors: elb_state_store.audit_delete (one-shot trigger), elb_control_plane.workflow_metrics + elb_state_store.db_metrics
+    (persistent degradation), elb_state_store.db_read_state_notfound + elb_control_plane.cp_state_missing + elb_api.api_modify_err_state
+    (API failure), elb_data_plane.dp_config_applied_reconcile and elb_data_plane.access_err (customer-facing degradation), and
+    elb_control_plane.workflow_gate_disabled plus elb_control_plane.workflow_gate_status (mitigation action and persistence).
+```

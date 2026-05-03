@@ -1,0 +1,191 @@
+```yaml
+scenario:
+  id: knight_powerpeg_rlp_incident
+  title: RLP flag activates legacy Power Peg on one SMARS host, then rollback spreads it
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally routes broker parent orders through SMARS and executes them on NYSE with bounded child order activity.
+    Shortly before heavy order flow, an internal alerting channel emits many low-priority emails referencing "Power Peg disabled",
+    reflecting a latent deployment/version inconsistency. When the RLP flag is enabled, one legacy SMARS host interprets the flag
+    as Power Peg activation and begins generating unthrottled child orders, causing extreme executions and exposure in account 33.
+    An attempted rollback spreads the legacy behavior to all hosts; SMARS is eventually shut down, leaving order flow rejected and large positions outstanding.
+
+  trigger_desc: |
+    The RLP feature flag is enabled for production order flow while one SMARS host is still running a legacy build where the repurposed flag maps to Power Peg logic.
+
+  time:
+    total_minutes: 46
+    phases:
+      n: {start_min: 0, end_min: 23}
+      f: {start_min: 23, end_min: 46}
+
+  phases:
+    n:
+      desc: |
+        SMARS routes parent orders normally using the updated build (rlp_v2) with the RLP flag off.
+        NYSE execution summaries show small, bounded execution counts, and PMON snapshots show low exposure.
+      flows: [parent_order_normal]
+      manifestation:
+        - smars_router.heartbeat
+        - smars_router.child_order_stats
+        - pmon.position_snapshot
+        - order_gateway.respond_ok
+
+    f:
+      desc: |
+        The failure phase begins as the system enables the RLP flag for live flow while a latent deployment discrepancy exists.
+        Initially only a fraction of orders hit a legacy host and trigger Power Peg; NYSE and PMON then detect anomalies.
+        A misguided rollback expands the legacy behavior to all hosts, amplifying child order generation and executions.
+        SMARS is finally shut down, halting routing but leaving the firm with large unintended positions and rejecting new orders.
+
+      events:
+        - order: 1
+          at_min: 23
+          component: bnet_alerting
+          event: |
+            A burst of internal emails referencing "SMARS: Power Peg disabled" is sent shortly before/at RLP enablement; live flow begins with the RLP flag on.
+          why: |
+            The alert burst reflects inconsistent SMARS host state and confusing flag semantics; it is directly observable via BNET logs but treated as low priority.
+            With the RLP flag enabled, a legacy host can enter Power Peg logic when it receives parent orders.
+          flows: [parent_order_ok, parent_order_powerpeg]
+          rate_multipliers:
+            parent_order_rejected: 0.0
+            smars_router.child_order_stats: 5.0
+            pmon.limit_breach: 0.0
+            nyse_venue.volume_alert: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: bnet_alerting.email_powerpeg_disabled
+              count: 97
+              hosts: [bnet1]
+          manifestation:
+            - bnet_alerting.email_powerpeg_disabled
+            - smars_router.powerpeg_activated
+            - smars_router.child_order_burst
+
+        - order: 2
+          at_min: 27
+          component: nyse_venue
+          event: |
+            NYSE detects abnormal member-attributed volume and begins alerting; PMON starts showing repeated gross limit breaches in account 33.
+          why: |
+            Unthrottled child-order generation increases executions and unmatched fills, producing visible NYSE volume anomalies and PMON exposure breaches (directly observable).
+          flows: [parent_order_powerpeg]
+          rate_multipliers:
+            nyse_venue.volume_alert: 6.0
+            pmon.limit_breach: 3.0
+            smars_router.child_order_stats: 8.0
+          latency_multipliers:
+            parent_order_powerpeg: {p50: 2.0, p95: 3.0}
+          one_shots:
+            - ref: pmon.operator_ack
+              count: 1
+              hosts: [pmon1]
+          manifestation:
+            - nyse_venue.volume_alert
+            - pmon.limit_breach
+            - smars_router.child_order_stats
+
+        - order: 3
+          at_min: 33
+          component: ops_console
+          event: |
+            Operators start a rollback to the "old" SMARS build across hosts, unintentionally propagating the legacy Power Peg behavior to all servers.
+          why: |
+            Manual incident response assumes the older build is safer; because the flag maps to Power Peg in the legacy build, rollout expands the faulty behavior (partially observable via build values and spike in SMARS stats).
+          flows: [parent_order_powerpeg]
+          rate_multipliers:
+            parent_order_ok: 0.0
+            parent_order_powerpeg: 8.0
+            smars_router.child_order_stats: 20.0
+          latency_multipliers:
+            parent_order_powerpeg: {p50: 3.0, p95: 5.0}
+          one_shots:
+            - ref: ops_console.rollback_started
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - ops_console.rollback_started
+            - smars_router.powerpeg_activated
+            - smars_router.child_order_burst
+
+        - order: 4
+          at_min: 39
+          component: ops_console
+          event: |
+            Engineers identify the routing engine as the source and shut down SMARS trading on all hosts; the gateway begins rejecting new orders and exchange alerts taper off.
+          why: |
+            Disabling SMARS stops new child order generation but does not unwind positions already accumulated; rejection is directly observable at the gateway and PMON continues to show large exposure.
+          flows: [parent_order_rejected]
+          rate_multipliers:
+            parent_order_ok: 0.0
+            parent_order_powerpeg: 0.0
+            parent_order_rejected: 1.0
+            smars_router.heartbeat: 0.0
+            smars_router.child_order_stats: 0.0
+            nyse_venue.volume_alert: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_console.shutdown_issued
+              count: 1
+              hosts: [ops1]
+            - ref: smars_router.shutdown_host
+              count: 8
+              hosts: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]
+          manifestation:
+            - ops_console.shutdown_issued
+            - smars_router.shutdown_host
+            - order_gateway.respond_err
+
+      steady:
+        - component: order_gateway
+          condition: |
+            SMARS remains disabled, so incoming parent orders are rejected at the gateway.
+          user_impact: |
+            Brokers cannot route orders through the system; orders fail quickly with downstream-disabled rejections.
+          manifestation:
+            - order_gateway.respond_err
+
+        - component: pmon
+          condition: |
+            Account 33 shows sustained, extreme gross exposure and repeated notify-only limit breaches without automated controls.
+          user_impact: |
+            The firm is left with large unintended positions requiring external liquidation/financing; operational and capital risk persists despite shutdown.
+          manifestation:
+            - pmon.position_snapshot
+            - pmon.limit_breach
+
+      feedback_loops:
+        - id: rollback_amplifies_fault
+          desc: |
+            The attempted rollback increases the blast radius by making all hosts interpret the live RLP flag as the legacy Power Peg activation path, turning a 1/8 host issue into a fleet-wide runaway.
+
+      flows: [parent_order_ok, parent_order_powerpeg, parent_order_rejected]
+      manifestation:
+        - smars_router.powerpeg_activated
+        - smars_router.child_order_burst
+        - smars_router.child_order_stats
+        - nyse_venue.volume_alert
+        - pmon.limit_breach
+        - order_gateway.respond_err
+
+  assumptions:
+    - |
+      The scenario compresses real timestamps to 46 minutes while preserving causal order: early warning emails → RLP enablement → NYSE/PMON detection → rollback propagation → shutdown with residual exposure.
+    - |
+      Failure-onset cleanliness: NYSE volume_alert and PMON limit_breach are explicitly suppressed at failure start (multipliers 0.0 in event 1) and then enabled/increased at minute 27 (event 2), matching the narrative that exchange alerts and console-visible breaches begin later.
+    - |
+      Failure-phase piecewise volume (approx):
+      - n phase (23 min): ~180 rpm * 4 ≈ 720 logs/min + ~15 background/min ⇒ ~16.9k logs.
+      - f23-27 (4 min): ~160 rpm (140 ok + 20 powerpeg) ⇒ ~760 logs/min plus 97 one-shot emails at minute 23 and elevated SMARS stats (NYSE alerts suppressed) ⇒ ~3.2k + 97 logs.
+      - f27-33 (6 min): same rpm but higher Power Peg latency and more NYSE/PMON background ⇒ ~4.8k logs.
+      - f33-39 (6 min): rollback shifts to ~160 rpm all Power Peg (multiplier 8 on 20 rpm) ⇒ ~960 logs/min plus amplified SMARS stats ⇒ ~5.8k logs.
+      - f39-46 (7 min): routing shut down; ~120 rpm rejected with 2 logs/req ⇒ ~240 logs/min plus PMON snapshots/breaches ⇒ ~1.8k logs.
+      Total ≈ 33k–40k logs (within 20k..100k).
+    - |
+      One-shot counts: 97 BNET emails at minute 23, 1 PMON operator acknowledgment at minute 27, 1 rollback marker at minute 33, 1 shutdown marker + 8 per-host shutdown logs at minute 39.
+    - |
+      Visibility rationale: even if only a subset of orders initially hit the legacy host, the Power Peg flow emits explicit activation + burst logs, SMARS per-minute stats amplify sharply, and (once enabled at minute 27) NYSE/PMON produce independent anomaly signals; after rollback, Power Peg logs become frequent and unmistakable.
+```

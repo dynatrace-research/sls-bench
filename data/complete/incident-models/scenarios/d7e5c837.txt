@@ -1,0 +1,257 @@
+```yaml
+scenario:
+  id: chrome_sync_throttle_unknown_type_crash
+  title: Chrome SyncThread crashes during quota-service incident (unknown throttled datatype)
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Chrome clients periodically run sync cycles against a Sync Server that depends on a Quota Service to
+    decide per-datatype throttling. A faulty load-balancer configuration change overloads the Quota Service,
+    and Sync Servers react by telling clients to throttle all datatypes. Some responses include throttled
+    datatype identifiers unknown to older/stable clients; due to a client-side enum-set/parsing bug, the
+    SyncThread throws std::out_of_range and Chrome crashes. Users experience repeated browser crashes and
+    missing crash reports due to intermittent crash upload failures.
+
+  trigger_desc: |
+    A load-balancer configuration rollout for traffic routed to the Quota Service is applied without an
+    explanatory comment and unintentionally skews/overconcentrates traffic onto a subset of quota-service
+    backends. This change happens in shared infrastructure and precedes any visible Chrome Sync symptoms;
+    the first internal effect is quota-service queue growth and latency increases observed by callers.
+
+  time:
+    total_minutes: 30
+    phases:
+      n: {start_min: 0, end_min: 15}
+      f: {start_min: 15, end_min: 30}
+
+  phases:
+    n:
+      desc: |
+        Chrome clients are steadily running scheduled sync jobs. Each sync cycle posts a protobuf request to
+        the Sync Server (sync_cycle_success), which performs a quota check and writes sync metadata before
+        returning a 200 response. Clients typically see an OK status and an empty throttled_types list.
+        Operationally, backend services show stable health logs and there are no widespread error patterns.
+        Occasional unrelated crash uploads succeed, but they are infrequent and not clustered.
+      flows: [sync_cycle_success, crash_report_upload_success]
+      manifestation:
+        - chrome_client.sync_job_start
+        - sync_server.sync_req_received
+        - sync_server.sync_resp_200
+        - chrome_client.sync_response
+
+    f:
+      desc: |
+        The incident begins with an infrastructure load-balancer change that degrades the Quota Service.
+        Initially, Sync Servers still succeed for many requests but observe rising quota RPC tail latency.
+        As the Quota Service becomes unreliable, Sync Servers begin responding conservatively by instructing
+        clients to throttle all datatypes, and some requests fail with 503s that trigger client retries.
+        A subset of throttle-all responses contains throttled datatype identifiers not recognized by older
+        clients; these clients hit an unhandled std::out_of_range in the sync thread and crash repeatedly.
+        The increased crash volume and shared infrastructure strain also cause intermittent crash upload
+        failures, leading to missing crash entries on some clients.
+      events:
+        - order: 1
+          at_min: 15
+          component: traffic_lb
+          event: |
+            A new LB configuration is applied for quota-service routing, and backend pool imbalance warnings
+            begin appearing while quota-service telemetry shows rising queue depth.
+          why: |
+            Skewed routing concentrates traffic on a subset of quota-service backends, increasing queueing
+            delay and tail latency. This is directly observable from traffic_lb.pool_imbalance and
+            quota_service.overload_warn; sync servers then surface the dependency strain via
+            sync_server.quota_rpc_slow. The exact misconfiguration details (rule/weights) require config
+            plane inspection outside the logs.
+          flows: [sync_cycle_ok_degraded, sync_cycle_quota_timeout_retry]
+          rate_multipliers:
+            sync_cycle_throttle_known: 0.0
+            sync_cycle_throttle_unknown_crash: 0.0
+            crash_report_upload_fail_retry: 0.0
+            sync_cycle_quota_timeout_retry: 0.2
+            quota_service.overload_warn: 1.5
+            sync_server.quota_rpc_slow: 1.2
+          one_shots:
+            - ref: traffic_lb.config_change_applied
+              count: 1
+              hosts: [lb_01]
+            - ref: traffic_lb.config_change_no_comment
+              count: 1
+              hosts: [lb_01]
+          manifestation:
+            - traffic_lb.config_change_applied
+            - traffic_lb.pool_imbalance
+            - quota_service.overload_warn
+
+        - order: 2
+          at_min: 18
+          component: sync_server
+          event: |
+            Sync Servers start replying to a growing fraction of /sync requests with throttle-all responses,
+            while some requests fail with 503 and clients begin scheduling retries.
+          why: |
+            With quota decisions unavailable or too slow, the Sync Server enters a safety/fail-closed path:
+            instead of risking quota overruns, it instructs clients to throttle broadly and sometimes returns
+            503 when dependency timeouts are exceeded. This transition is directly observable via an increase
+            in sync_server.sync_resp_throttle_all and sync_server.sync_resp_503, plus client-side retry logs
+            chrome_client.sync_retry_scheduled in sync_cycle_quota_timeout_retry.
+          flows: [sync_cycle_throttle_known, sync_cycle_quota_timeout_retry]
+          rate_multipliers:
+            sync_cycle_ok_degraded: 0.8
+            sync_cycle_throttle_known: 0.8
+            sync_cycle_quota_timeout_retry: 1.0
+            crash_report_upload_fail_retry: 0.2
+            sync_cycle_throttle_unknown_crash: 0.0
+            quota_service.overload_warn: 2.0
+            sync_server.quota_rpc_slow: 1.5
+          latency_multipliers:
+            sync_cycle_quota_timeout_retry: {p50: 1.3, p95: 1.6}
+            sync_cycle_throttle_known: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: sync_server.fail_closed_enabled
+              count: 1
+              hosts: [sync_01]
+          manifestation:
+            - sync_server.sync_resp_throttle_all
+            - sync_server.sync_resp_503
+            - chrome_client.sync_retry_scheduled
+
+        - order: 3
+          at_min: 20
+          component: chrome_client
+          event: |
+            A subset of clients begins crashing on the Chrome_SyncThread immediately after receiving
+            throttle-all responses; these clients log unknown specifics field numbers during parsing.
+          why: |
+            Throttle-all responses sometimes include unrecognized datatype identifiers (modeled as an unknown
+            specifics field number). A client-side bug converts the unknown identifier to an UNSPECIFIED enum
+            value and then uses it in an EnumSet/bitset indexed from FIRST_REAL_MODEL_TYPE, producing a
+            negative offset that triggers std::out_of_range and abort. The presence of unknown inputs is
+            directly observable from chrome_client.throttle_parse_warning and the immediate crash sequence
+            (chrome_client.sync_exception -> chrome_client.chrome_crash) in sync_cycle_throttle_unknown_crash;
+            the precise offset/EnumSet mechanism requires code knowledge beyond logs.
+          flows: [sync_cycle_throttle_unknown_crash, sync_cycle_throttle_known]
+          rate_multipliers:
+            sync_cycle_ok_degraded: 0.6
+            sync_cycle_throttle_known: 1.0
+            sync_cycle_throttle_unknown_crash: 1.2
+            sync_cycle_quota_timeout_retry: 1.2
+            crash_report_upload_fail_retry: 1.0
+            quota_service.overload_warn: 2.5
+            sync_server.quota_rpc_slow: 2.0
+          latency_multipliers:
+            sync_cycle_throttle_unknown_crash: {p50: 1.1, p95: 1.2}
+            sync_cycle_ok_degraded: {p50: 1.2, p95: 1.6}
+          manifestation:
+            - chrome_client.throttle_parse_warning
+            - chrome_client.sync_exception
+            - chrome_client.chrome_crash
+
+        - order: 4
+          at_min: 23
+          component: crash_collector
+          event: |
+            Crash upload failures increase sharply with 429/503 responses, and clients begin dropping some
+            crash reports after retries, while sync traffic remains dominated by throttling and retries.
+          why: |
+            Crash volume rises due to repeated client crashes and restarts, and shared infrastructure strain
+            reduces crash collector capacity, resulting in 429/503 responses. This is directly observable from
+            crash_collector.upload_failed and the elevated crash upload retry flow (crash_report_upload_fail_retry).
+            The coupling to shared infrastructure is only partially observable from these logs and generally
+            requires external infrastructure telemetry to confirm.
+          flows: [crash_report_upload_fail_retry, sync_cycle_quota_timeout_retry, sync_cycle_throttle_unknown_crash]
+          rate_multipliers:
+            crash_report_upload_fail_retry: 1.3
+            sync_cycle_throttle_unknown_crash: 1.5
+            sync_cycle_quota_timeout_retry: 1.3
+            sync_cycle_ok_degraded: 0.5
+            quota_service.overload_warn: 3.0
+            sync_server.quota_rpc_slow: 2.0
+          latency_multipliers:
+            crash_report_upload_fail_retry: {p50: 1.4, p95: 2.0}
+          manifestation:
+            - crash_collector.upload_failed
+            - chrome_client.crash_upload_done
+            - sync_server.sync_resp_throttle_all
+
+      steady:
+        - component: quota_service
+          condition: |
+            Quota Service remains overloaded with sustained queueing and elevated tail latency, producing
+            frequent overload warnings and missed deadlines for callers.
+          user_impact: |
+            Indirect: Chrome Sync becomes unstable and/or heavily throttled; retries increase and overall
+            sync freshness degrades.
+          manifestation: [quota_service.overload_warn, quota_service.health_ok]
+
+        - component: sync_server
+          condition: |
+            Sync Servers operate in a conservative fail-closed posture: many requests are answered with
+            throttle-all instructions and some with 503 after quota dependency timeouts.
+          user_impact: |
+            Users see delayed sync, features that depend on sync stall, and some clients enter retry loops.
+          manifestation: [sync_server.quota_rpc_slow, sync_server.sync_resp_throttle_all, sync_server.sync_resp_503]
+
+        - component: chrome_client
+          condition: |
+            A subset of clients crashes on the SyncThread when parsing throttle-all instructions containing
+            unrecognized datatype identifiers; others survive but remain throttled or retrying.
+          user_impact: |
+            Repeated Chrome crashes (especially around sync activity); sync settings may appear unreliable
+            and the browser may restart/crash-loop.
+          manifestation: [chrome_client.throttle_parse_warning, chrome_client.chrome_crash, chrome_client.sync_retry_scheduled]
+
+        - component: crash_collector
+          condition: |
+            Crash Collector intermittently rejects uploads due to bursty crash volume and reduced capacity,
+            causing some crash reports not to appear in client crash lists.
+          user_impact: |
+            Users/engineers may not see crashes recorded (missing crash entries) even when Chrome visibly crashes.
+          manifestation: [crash_collector.upload_failed, chrome_client.crash_upload_done]
+
+      feedback_loops:
+        - id: retry_and_crash_amplification
+          desc: |
+            Quota-service overload increases quota RPC timeouts -> Sync Server returns 503/throttle-all ->
+            clients retry more frequently and some crash -> restarts and retries create additional sync traffic ->
+            additional load on shared infrastructure and quota-service -> even more timeouts and throttle-all.
+
+      flows:
+        - sync_cycle_ok_degraded
+        - sync_cycle_throttle_known
+        - sync_cycle_throttle_unknown_crash
+        - sync_cycle_quota_timeout_retry
+        - crash_report_upload_fail_retry
+
+      manifestation:
+        - traffic_lb.pool_imbalance
+        - quota_service.overload_warn
+        - sync_server.quota_rpc_slow
+        - sync_server.sync_resp_throttle_all
+        - sync_server.sync_resp_503
+        - chrome_client.throttle_parse_warning
+        - chrome_client.sync_exception
+        - chrome_client.chrome_crash
+        - chrome_client.sync_retry_scheduled
+        - crash_collector.upload_failed
+        - chrome_client.crash_upload_done
+
+  assumptions:
+    - >
+      The post-mortem mentions a broad Google outage (initially framed as "Gmail is down") and a later root-cause
+      clarification. This scenario focuses on the confirmed mechanism: quota-service degradation due to a faulty
+      load-balancer config and the client crash due to unrecognized throttled datatypes.
+    - >
+      The timeline is compressed into a 30-minute window with failure starting mid-scenario; progression is modeled
+      in four events (config change -> server fail-closed throttling -> client parsing crash -> crash upload failures)
+      to reflect onset and escalation without introducing a recovery phase.
+    - >
+      Log-volume estimate (consistent with the system description’s rates):
+      Normal phase ~1,148 logs/min * 15 min ~= ~17,220.
+      Failure phase piecewise ~= ~37,540 (including ~2 one-shots).
+      Total ~= ~54,760 lines; failure is noisier due to retries and crash loops, matching the incident character.
+    - >
+      The “unknown throttled datatype” is represented both as a human-readable UNKNOWN_TYPE in throttled_types and as
+      a numeric specifics field number in chrome_client.throttle_parse_warning; the numeric mapping is an abstraction
+      of protobuf field-number-to-enum conversion described in the post-mortem.
+```

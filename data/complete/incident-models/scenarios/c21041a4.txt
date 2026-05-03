@@ -1,0 +1,272 @@
+```yaml
+scenario:
+  id: consul_tls_expiry_synchronized_restart
+  title: Expired Consul TLS cert forces fleet-synchronized restart; mitigation disables date verification
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The site serves user HTTP traffic via a frontend that relies on PostgreSQL through pgbouncer, while Patroni and pgbouncer depend on Consul for coordination.
+    An expired Consul mutual-TLS certificate is initially masked by long-lived existing connections, but new connections fail on revalidation.
+    Operators mitigate by staging config to disable certificate date validation and performing a synchronized Consul restart, producing brief internal Consul raft/API turbulence and delayed health-check issues.
+    Customer impact is effectively unchanged (500s remain at the noise floor), but the system ends in a degraded security posture (verify_date=false).
+
+  trigger_desc: |
+    A reconnect (e.g., restart of a Consul client/agent) forces a new mTLS handshake; because the Consul certificate is expired and cannot be renewed, new connections begin failing even though existing long-lived sessions had kept working.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        User requests are served normally with stable DB pooling.
+        Consul is healthy and largely quiet aside from low-rate raft peer snapshots, and Patroni reports Consul reachable.
+        A small background of unrelated 500s exists as normal noise.
+      flows: [user_http_ok_n, user_http_500_n]
+      manifestation:
+        - gitlab_frontend.http_access_ok
+        - pgbouncer_pool.txn_ok
+        - pgbouncer_pool.pool_stats
+        - postgres_db.pg_stat
+        - patroni_ha.patroni_loop_ok
+        - consul_cluster.raft_peers
+
+    f:
+      desc: |
+        The expired Consul TLS certificate becomes operationally dangerous: new or restarted clients cannot reconnect, while existing sessions can keep the site functioning.
+        Operators prepare a mitigation (pause Patroni, stage config verify_date=false, schedule synchronized restarts) and then execute a fleet restart.
+        During the restart, the Consul raft cluster briefly has no leader and probes observe transient internal 500/connection errors; dependent health checks may fail and can give up.
+        After stabilization, service functionality returns while Consul continues operating with verify_date=false.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: consul_cluster
+          event: |
+            A Consul reconnect attempt forces new TLS handshakes and Consul begins logging certificate-expiry handshake failures.
+            User-facing behavior remains normal because most application/database sessions are still using existing long-lived connections.
+          why: |
+            Existing long-lived TCP/TLS sessions remain valid, hiding the problem until a reconnect occurs.
+            The expired certificate causes x509 validation failures on new connections; the inability to renew the certificate is an external precondition.
+          flows: [user_http_ok_f]
+          rate_multipliers:
+            consul_raft_peers_probe_f: 0.0
+            consul_http_500_probe_f: 0.0
+            consul_raft_no_leader_probe_f: 0.0
+            consul_runtime_tls_config_poll_f: 0.0
+            pgbouncer_consul_lock_fail_probe_f: 0.0
+            patroni_consul_session_error_probe_f: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_audit.maintenance_start
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - consul_cluster.tls_handshake_error
+            - ops_audit.maintenance_start
+
+        - order: 2
+          at_min: 24
+          component: ops_audit
+          event: |
+            Operators begin the mitigation: Patroni is paused, Consul config is staged with verify_date=false, Chef is stopped to avoid reverting the change,
+            and monitoring probes of raft peer status are started while the restart job is scheduled.
+          why: |
+            The config change is safe to stage because it is only applied on restart.
+            Pausing Patroni reduces risk of an unplanned failover while Consul connectivity is disrupted.
+            Monitoring increases observability of raft health during the synchronized restart.
+          flows: [user_http_ok_f, consul_raft_peers_probe_f]
+          rate_multipliers:
+            consul_raft_peers_probe_f: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: patroni_ha.patroni_paused
+              count: 1
+              hosts: [db-01]
+            - ref: ops_audit.patroni_pause_recorded
+              count: 1
+              hosts: [ops-01]
+            - ref: ops_audit.config_staged
+              count: 1
+              hosts: [ops-01]
+            - ref: ops_audit.at_scheduled
+              count: 1
+              hosts: [ops-01]
+            - ref: ops_audit.pgbouncer_node_drained
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - ops_audit.config_staged
+            - ops_audit.at_scheduled
+            - patroni_ha.patroni_paused
+            - consul_cluster.raft_peers
+
+        - order: 3
+          at_min: 30
+          component: consul_cluster
+          event: |
+            The synchronized restart executes: Consul servers restart together, briefly refusing connections and then running without a leader.
+            Probe traffic observes transient internal 500 and no-leader conditions; dependent clients briefly fail their lock/session checks.
+          why: |
+            Restarting breaks existing sessions and forces renegotiation; until raft elects a leader, Consul cannot reliably serve KV/lock requests.
+            Because the restart is fleet-synchronized, the disruption is short but visible in no-leader and transient 500 responses.
+          flows:
+            - user_http_ok_f
+            - consul_http_500_probe_f
+            - consul_raft_no_leader_probe_f
+            - pgbouncer_consul_lock_fail_probe_f
+            - patroni_consul_session_error_probe_f
+            - consul_runtime_tls_config_poll_f
+          rate_multipliers:
+            consul_http_500_probe_f: 1.0
+            consul_raft_no_leader_probe_f: 1.0
+            pgbouncer_consul_lock_fail_probe_f: 2.0
+            patroni_consul_session_error_probe_f: 3.0
+            consul_cluster.tls_handshake_error: 0.0
+            consul_runtime_tls_config_poll_f: 1.0
+            pgbouncer_pool.consul_lock_ok: 0.1
+          latency_multipliers:
+            user_http_ok_f: {p50: 1.1, p95: 1.3}
+          one_shots:
+            - ref: consul_cluster.agent_restart
+              count: 5
+              hosts: [consul-01, consul-02, consul-03, consul-04, consul-05]
+          manifestation:
+            - consul_cluster.http_api_error_500
+            - consul_cluster.raft_no_leader
+            - pgbouncer_pool.consul_lock_fail
+            - patroni_ha.patroni_consul_error
+            - consul_cluster.agent_restart
+
+        - order: 4
+          at_min: 31
+          component: consul_cluster
+          event: |
+            Raft elects a leader and transient Consul 500/no-leader probe results stop, but some clients continue reconnecting.
+            Pgbouncer health-check processes can hit retry limits and disable themselves, stopping both success and failure health-check results until manually restarted.
+          why: |
+            Leadership restoration makes the cluster serviceable again, but clients and health-check loops may have internal retry limits and backoffs.
+            After a give-up threshold, the health-check loop stops running entirely, so no further health-check logs appear until restarted.
+          flows: [user_http_ok_f, patroni_consul_session_error_probe_f, consul_runtime_tls_config_poll_f]
+          rate_multipliers:
+            consul_http_500_probe_f: 0.0
+            consul_raft_no_leader_probe_f: 0.0
+            pgbouncer_consul_lock_fail_probe_f: 0.0
+            pgbouncer_pool.consul_lock_ok: 0.0
+            patroni_consul_session_error_probe_f: 1.5
+            consul_runtime_tls_config_poll_f: 1.0
+          latency_multipliers:
+            user_http_ok_f: {p50: 1.02, p95: 1.1}
+          one_shots:
+            - ref: consul_cluster.raft_leader_elected
+              count: 1
+              hosts: [consul-04]
+            - ref: pgbouncer_pool.healthcheck_giveup
+              count: 2
+              hosts: [pgb-01, pgb-02]
+          manifestation:
+            - consul_cluster.raft_leader_elected
+            - pgbouncer_pool.healthcheck_giveup
+            - patroni_ha.patroni_consul_error
+
+        - order: 5
+          at_min: 33
+          component: patroni_ha
+          event: |
+            Patroni re-establishes its Consul session and operators resume HA; pgbouncer health-check processes are manually restarted,
+            restoring health-check results. Consul remains configured with verify_date=false.
+          why: |
+            With the verify_date=false config active after restart, certificate-expiry validation no longer blocks new TLS sessions.
+            Manual restart clears health-check give-up state; the degraded posture remains because date validation is intentionally disabled.
+          flows: [user_http_ok_f, consul_raft_peers_probe_f, consul_runtime_tls_config_poll_f]
+          rate_multipliers:
+            pgbouncer_consul_lock_fail_probe_f: 0.2
+            pgbouncer_pool.consul_lock_ok: 1.0
+            patroni_consul_session_error_probe_f: 0.1
+            consul_raft_peers_probe_f: 0.2
+            consul_runtime_tls_config_poll_f: 1.0
+          latency_multipliers:
+            user_http_ok_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: patroni_ha.patroni_sync_complete
+              count: 1
+              hosts: [db-01]
+            - ref: patroni_ha.patroni_resumed
+              count: 1
+              hosts: [db-01]
+            - ref: ops_audit.patroni_resume_recorded
+              count: 1
+              hosts: [ops-01]
+            - ref: pgbouncer_pool.manual_healthcheck_restart
+              count: 2
+              hosts: [pgb-01, pgb-02]
+          manifestation:
+            - patroni_ha.patroni_sync_complete
+            - patroni_ha.patroni_resumed
+            - pgbouncer_pool.manual_healthcheck_restart
+            - pgbouncer_pool.consul_lock_ok
+            - consul_cluster.runtime_tls_config
+
+      steady:
+        - component: consul_cluster
+          condition: |
+            Consul and dependent services are functional again, but TLS certificate date verification remains disabled (verify_date=false),
+            allowing expired certificates to be used without blocking new connections.
+          user_impact: |
+            End users continue to see normal behavior (no measurable change in 500s), but the platform remains in a degraded security/operational state until certificates/CA are properly replaced.
+          manifestation:
+            - consul_cluster.runtime_tls_config
+            - consul_cluster.raft_peers
+            - pgbouncer_pool.consul_lock_ok
+            - gitlab_frontend.http_access_ok
+
+      feedback_loops:
+        - id: long_lived_sessions_mask_expiry
+          desc: |
+            Long-lived TCP/TLS sessions keep the system apparently healthy after certificate expiration, reducing early visibility.
+            Any restart or network flap forces renegotiation and can cause sudden, clustered internal failures across many services.
+
+      flows:
+        - user_http_ok_f
+        - user_http_500_f
+        - consul_raft_peers_probe_f
+        - consul_http_500_probe_f
+        - consul_raft_no_leader_probe_f
+        - consul_runtime_tls_config_poll_f
+        - pgbouncer_consul_lock_fail_probe_f
+        - patroni_consul_session_error_probe_f
+      manifestation:
+        - consul_cluster.tls_handshake_error
+        - consul_cluster.raft_no_leader
+        - consul_cluster.http_api_error_500
+        - consul_cluster.runtime_tls_config
+        - patroni_ha.patroni_consul_error
+        - pgbouncer_pool.consul_lock_fail
+        - pgbouncer_pool.healthcheck_giveup
+        - pgbouncer_pool.consul_lock_ok
+
+  assumptions:
+    - |
+      Repair note (per verifier): pgbouncer success health-check emission (pgbouncer_pool.consul_lock_ok) is explicitly suppressed from minute 31 until the manual restart at minute 33, making "give up" and "manual restart" semantically consistent.
+    - |
+      Piecewise failure-phase volume (approx, dominated by user request logs at ~1600 logs/min):
+      - minutes 20-24 (4 min): ~1600 logs/min + tls_handshake_error (~8/min global)
+      - minutes 24-30 (6 min): + consul_raft_peers_probe_f (~6/min) + ops one-shots at minute 24
+      - minute 30 (1 min): + consul_http_500_probe_f (~30/min) + consul_raft_no_leader_probe_f (~12/min) + pgbouncer/patroni probe errors + 5 consul agent_restart one-shots; pgbouncer consul_lock_ok reduced
+      - minutes 31-33 (2 min): probes stop; pgbouncer health-check disabled so both consul_lock_ok background and lock_fail probe are suppressed; 2 healthcheck_giveup one-shots at minute 31
+      - minutes 33-40 (7 min): steady degraded posture with consul_runtime_tls_config_poll_f (~1/min) and light raft peer probing (~1.2/min); pgbouncer consul_lock_ok restored; 2 manual healthcheck restart one-shots at minute 33
+    - |
+      Customer-visible 500 errors are modeled as a constant noise floor and do not spike during the restart (matches post-mortem "no change" on 500s graph).
+    - |
+      Visibility rationale:
+      - failure onset is visible via consul_cluster.tls_handshake_error
+      - restart turbulence is visible via consul_cluster.http_api_error_500 + consul_cluster.raft_no_leader (probe flows) plus agent_restart one-shots
+      - delayed secondary symptom is visible via pgbouncer_pool.healthcheck_giveup one-shots plus the subsequent absence/resumption of pgbouncer_pool.consul_lock_ok due to event multipliers
+      - steady degraded posture is visible via recurring consul_cluster.runtime_tls_config (poll flow)
+    - |
+      Estimated total logs across 40 minutes remain ~67k, dominated by user traffic access/txn logs, within the required 20k..100k envelope.
+```

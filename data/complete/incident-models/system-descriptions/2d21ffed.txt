@@ -1,0 +1,611 @@
+```yaml
+sys:
+  id: python_hosting_platform_livefile1_outage
+  desc: >
+    A multi-tenant Python hosting platform where user websites, scheduled jobs, and the control-panel
+    web app run on worker nodes that mount user home directories from NFS file servers.
+    File servers use multiple cloud block volumes and replicate to a backup server.
+    During the incident, a rare underlying block-volume failure on the oldest file server (livefile1)
+    caused NFS I/O to block and then time out, cascading into broader request backlogs and errors.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_proxy
+    name: Edge Proxy / Load Balancer
+    svc: edge-proxy
+    hosts: [edge1, edge2]
+    desc: Terminates client HTTPS and proxies requests to the control-panel API and tenant web runtimes.
+    to:
+      - dst: platform_api
+        proto: https
+        desc: Proxies control-panel requests.
+      - dst: web_runtime
+        proto: http
+        desc: Proxies tenant website requests.
+    logs:
+      access_ok:
+        desc: Successful HTTP access log for the client-facing request.
+        lvl: INFO
+        msg: '{method} {host}{uri} -> {status} upstream={upstream} dur_ms={dur_ms} req_id={req_id}'
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [control.example.com, user-site.example.com]}
+          uri: {k: ch, v: ["/", "/login", "/dashboard", "/files", "/reload", "/health"]}
+          status: {k: ch, v: ["200", "302"]}
+          upstream: {k: ch, v: [platform_api, web_runtime]}
+          dur_ms: {k: i, v: [5, 180000]}
+          req_id: {k: hex, v: 16}
+      access_err:
+        desc: Failed HTTP access log for the client-facing request.
+        lvl: WARN
+        msg: '{method} {host}{uri} -> {status} upstream={upstream} dur_ms={dur_ms} req_id={req_id}'
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [control.example.com, user-site.example.com]}
+          uri: {k: ch, v: ["/", "/login", "/dashboard", "/files", "/reload"]}
+          status: {k: ch, v: ["502", "503", "504"]}
+          upstream: {k: ch, v: [platform_api, web_runtime]}
+          dur_ms: {k: i, v: [50, 180000]}
+          req_id: {k: hex, v: 16}
+    beh:
+      n:
+        desc: Edge proxy runs normally; no background logs modeled.
+        emit: []
+      f:
+        desc: Edge proxy runs normally; no background logs modeled.
+        emit: []
+
+  - id: platform_api
+    name: Control-Panel API
+    svc: platform-api
+    hosts: [api1, api2]
+    desc: Serves the platform's own site (login/dashboard/files) and sometimes touches user files via NFS.
+    to:
+      - dst: file_server_livefile1
+        proto: nfs
+        desc: Reads some user file metadata/content from NFS-mounted home directories.
+      - dst: edge_proxy
+        proto: https
+        desc: Sends responses back through the edge proxy.
+    logs:
+      req_done_ok:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: 'req_id={req_id} endpoint={endpoint} result=ok dur_ms={dur_ms} user_id={user_id}'
+        vars:
+          req_id: {k: hex, v: 16}
+          endpoint: {k: ch, v: [dashboard, login, health, files, reload]}
+          user_id: {k: i, v: [1000, 9999]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [5, 5000]}
+          f:
+            dur_ms: {k: i, v: [10, 60000]}
+      req_done_err:
+        desc: Request completed with an error (often due to worker exhaustion or filesystem timeouts).
+        lvl: ERROR
+        msg: 'req_id={req_id} endpoint={endpoint} result=error err={err} dur_ms={dur_ms} user_id={user_id}'
+        vars:
+          req_id: {k: hex, v: 16}
+          endpoint: {k: ch, v: [dashboard, login, health, files, reload]}
+          err: {k: ch, v: [fs_timeout, worker_timeout, upstream_unavailable]}
+          dur_ms: {k: i, v: [50, 180000]}
+          user_id: {k: i, v: [1000, 9999]}
+      fs_timeout:
+        desc: Filesystem operation timed out while serving a control-panel endpoint.
+        lvl: WARN
+        msg: 'req_id={req_id} fs_op={fs_op} server={fs_server} timed_out_after_s={timeout_s}'
+        vars:
+          req_id: {k: hex, v: 16}
+          fs_op: {k: ch, v: [stat, listdir, open]}
+          fs_server: {k: ch, v: [livefile1]}
+          timeout_s: {k: i, v: [5, 60]}
+      api_health:
+        desc: Periodic API health metric.
+        lvl: INFO
+        msg: 'health ok=true inflight={inflight} p95_ms={p95_ms}'
+        vars: {}
+        state_vars:
+          n:
+            inflight: {k: i, v: [0, 200]}
+            p95_ms: {k: i, v: [10, 5000]}
+          f:
+            inflight: {k: i, v: [50, 700]}
+            p95_ms: {k: i, v: [50, 60000]}
+    beh:
+      n:
+        desc: Periodic health metrics.
+        emit:
+          - id: api_health
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Periodic health metrics continue, but show higher inflight and latency.
+        emit:
+          - id: api_health
+            per_min: 1.0
+            scope: per_host
+
+  - id: web_runtime
+    name: Tenant Web Runtime + Task Runner
+    svc: web-runtime
+    hosts: [web1, web2, web3, web4]
+    desc: Runs tenant WSGI workers and task runners; mounts user home directories via NFS.
+    to:
+      - dst: file_server_livefile1
+        proto: nfs
+        desc: Reads tenant code and data from NFS mounts.
+      - dst: edge_proxy
+        proto: http
+        desc: Sends responses back through the edge proxy.
+    logs:
+      site_req_ok:
+        desc: Tenant HTTP request served successfully.
+        lvl: INFO
+        msg: 'site_id={site_id} req_id={req_id} result=ok dur_ms={dur_ms}'
+        vars:
+          site_id: {k: i, v: [20000, 20500]}
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [3, 180000]}
+      site_req_err:
+        desc: Tenant HTTP request failed due to runtime or filesystem issues.
+        lvl: ERROR
+        msg: 'site_id={site_id} req_id={req_id} result=error err={err} dur_ms={dur_ms}'
+        vars:
+          site_id: {k: i, v: [20000, 20500]}
+          req_id: {k: hex, v: 16}
+          err: {k: ch, v: [fs_timeout, app_startup_timeout, upstream_unavailable]}
+          dur_ms: {k: i, v: [50, 180000]}
+      startup_begin:
+        desc: A request triggered a site start/reload.
+        lvl: INFO
+        msg: 'site_id={site_id} req_id={req_id} action={action}'
+        vars:
+          site_id: {k: i, v: [20000, 20500]}
+          req_id: {k: hex, v: 16}
+          action: {k: ch, v: [start, reload]}
+      startup_ready:
+        desc: Site start/reload completed.
+        lvl: INFO
+        msg: 'site_id={site_id} req_id={req_id} ready=true dur_ms={dur_ms}'
+        vars:
+          site_id: {k: i, v: [20000, 20500]}
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [200, 60000]}
+      startup_fail:
+        desc: Site start/reload failed, often due to slow/unavailable filesystem.
+        lvl: ERROR
+        msg: 'site_id={site_id} req_id={req_id} ready=false err={err} waited_ms={waited_ms} fs_server={fs_server}'
+        vars:
+          site_id: {k: i, v: [20000, 20500]}
+          req_id: {k: hex, v: 16}
+          err: {k: ch, v: [fs_timeout, stale_handle, slow_io]}
+          waited_ms: {k: i, v: [500, 60000]}
+          fs_server: {k: ch, v: [livefile1]}
+      task_ok:
+        desc: A scheduled/always-on task completed successfully.
+        lvl: INFO
+        msg: 'job_id={job_id} account_id={account_id} result=ok dur_ms={dur_ms}'
+        vars:
+          job_id: {k: uuid, v: null}
+          account_id: {k: i, v: [1000, 9999]}
+          dur_ms: {k: i, v: [200, 300000]}
+      task_fail_fs:
+        desc: A scheduled/always-on task failed due to filesystem access issues.
+        lvl: ERROR
+        msg: 'job_id={job_id} account_id={account_id} result=error err={err} fs_server={fs_server}'
+        vars:
+          job_id: {k: uuid, v: null}
+          account_id: {k: i, v: [1000, 9999]}
+          err: {k: ch, v: [fs_timeout, stale_handle, slow_io]}
+          fs_server: {k: ch, v: [livefile1]}
+      pool_metric:
+        desc: Worker pool utilization metric emitted by each host.
+        lvl: INFO
+        msg: 'pool size={size} busy={busy} queue={queue} p95_ms={p95_ms}'
+        vars:
+          size: {k: i, v: [64, 64]}
+          p95_ms: {k: i, v: [10, 60000]}
+        state_vars:
+          n:
+            busy: {k: i, v: [1, 20]}
+            queue: {k: i, v: [0, 20]}
+          f:
+            busy: {k: i, v: [40, 64]}
+            queue: {k: i, v: [50, 500]}
+      nfs_server_not_responding:
+        desc: NFS client warning when the server stops responding.
+        lvl: WARN
+        msg: 'nfs: server {fs_server} not responding, still trying'
+        vars:
+          fs_server: {k: ch, v: [livefile1]}
+      nfs_stale_handle:
+        desc: NFS client warning when mounts have stale file handles after server disruption.
+        lvl: WARN
+        msg: 'nfs: stale file handle mount={mount} server={fs_server}'
+        vars:
+          mount: {k: ch, v: ["/home"]}
+          fs_server: {k: ch, v: [livefile1]}
+    beh:
+      n:
+        desc: Low-noise periodic pool metrics.
+        emit:
+          - id: pool_metric
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Pool metrics remain, and NFS client warnings can appear depending on outage stage.
+        emit:
+          - id: pool_metric
+            per_min: 1.5
+            scope: per_host
+          - id: nfs_server_not_responding
+            per_min: 1.0
+            scope: per_host
+          - id: nfs_stale_handle
+            per_min: 2.0
+            scope: per_host
+
+  - id: file_server_livefile1
+    name: File Server livefile1 (NFS + LVM on cloud block volumes)
+    svc: nfs-server
+    hosts: [livefile1]
+    desc: Oldest file server hosting a subset of user home directories; exports NFS and mirrors to backup.
+    to:
+      - dst: web_runtime
+        proto: nfs
+        desc: Serves NFS traffic to the web/task worker nodes (responses/exports).
+      - dst: platform_api
+        proto: nfs
+        desc: Serves NFS traffic to the control-panel API workers (responses/exports).
+      - dst: backup_server
+        proto: drbd
+        desc: Real-time block replication to the backup server.
+    logs:
+      kernel_io_hang:
+        desc: Kernel block I/O error indicative of underlying volume trouble.
+        lvl: ERROR
+        msg: 'blk_update_request: I/O error dev={dev} sector={sector} op={op}'
+        vars:
+          dev: {k: ch, v: [xvdf, xvdg, xvdh]}
+          sector: {k: i, v: [10000, 9000000]}
+          op: {k: ch, v: [READ, WRITE]}
+      nfsd_timeout:
+        desc: NFS server-side operation timing out under blocked storage I/O.
+        lvl: WARN
+        msg: 'nfsd: client={client_ip} op={op} timed_out_after_s={timeout_s}'
+        vars:
+          client_ip: {k: ip, v: "10.0.0.0/24"}
+          op: {k: ch, v: [READ, WRITE, GETATTR]}
+          timeout_s: {k: i, v: [5, 60]}
+      disk_latency:
+        desc: Periodic disk latency gauge.
+        lvl: INFO
+        msg: 'disk latency_ms_p95={p95_ms} util_pct={util_pct}'
+        vars:
+          p95_ms: {k: i, v: [1, 60000]}
+          util_pct: {k: i, v: [1, 100]}
+      fsck_complete:
+        desc: Filesystem check completion after restoring volumes.
+        lvl: INFO
+        msg: 'fsck completed vg={vg} errors_fixed={errors_fixed}'
+        vars:
+          vg: {k: ch, v: [vg_users]}
+          errors_fixed: {k: i, v: [0, 50]}
+    beh:
+      n:
+        desc: Normal periodic disk metrics; no error spam.
+        emit:
+          - id: disk_latency
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the incident, kernel/NFS timeout logs increase as I/O blocks.
+        emit:
+          - id: disk_latency
+            per_min: 1.0
+            scope: per_host
+          - id: kernel_io_hang
+            per_min: 0.5
+            scope: per_host
+          - id: nfsd_timeout
+            per_min: 6.0
+            scope: per_host
+
+  - id: backup_server
+    name: Backup File Server (DRBD secondary)
+    svc: drbd-backup
+    hosts: [backup1]
+    desc: DRBD secondary holding a mirrored copy of livefile1's data, used to generate snapshots for recovery.
+    to: []
+    logs:
+      drbd_state:
+        desc: Periodic DRBD state.
+        lvl: INFO
+        msg: 'drbd res={res} role={role} conn={conn} synced_pct={synced_pct}'
+        vars:
+          res: {k: ch, v: [users]}
+          role: {k: ch, v: [Secondary]}
+          synced_pct: {k: i, v: [0, 100]}
+        state_vars:
+          n:
+            conn: {k: ch, v: [Connected]}
+          f:
+            conn: {k: ch, v: [Connected, StandAlone]}
+    beh:
+      n:
+        desc: Replication is connected and fully synced.
+        emit:
+          - id: drbd_state
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Replication may go standalone while the primary is down and then reconnect.
+        emit:
+          - id: drbd_state
+            per_min: 0.5
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring / Alerting
+    svc: monitoring
+    hosts: [mon1]
+    desc: Aggregates metrics and emits alerts on elevated HTTP errors and NFS timeouts.
+    to: []
+    logs:
+      alert:
+        desc: Alert emitted when a monitored metric exceeds threshold.
+        lvl: CRITICAL
+        msg: 'ALERT name={name} severity={severity} value={value} threshold={threshold}'
+        vars:
+          name: {k: ch, v: [http_5xx_rate, nfs_timeouts, worker_pool_saturation]}
+          severity: {k: ch, v: [warning, critical]}
+          value: {k: f, v: [0.0, 1.0]}
+          threshold: {k: f, v: [0.02, 0.20]}
+    beh:
+      n:
+        desc: Occasional low-rate alerts for transient issues.
+        emit:
+          - id: alert
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Alerts are frequent as HTTP errors and NFS issues occur.
+        emit:
+          - id: alert
+            per_min: 1.0
+            scope: global
+
+  - id: ops
+    name: Ops / Recovery Actions
+    svc: ops
+    hosts: [ops1]
+    desc: Represents operator actions and scripted recovery steps that leave audit logs.
+    to: []
+    logs:
+      stop_instance:
+        desc: Operator-initiated stop of the livefile1 instance.
+        lvl: INFO
+        msg: 'op_id={op_id} action=stop_instance target=livefile1 result=ok'
+        vars:
+          op_id: {k: hex, v: 12}
+      start_instance_delayed:
+        desc: Operator-initiated start of livefile1 where provisioning is delayed.
+        lvl: WARN
+        msg: 'op_id={op_id} action=start_instance target=livefile1 result=delayed'
+        vars:
+          op_id: {k: hex, v: 12}
+      open_aws_case:
+        desc: Operator opens an escalated support case with the cloud provider.
+        lvl: INFO
+        msg: 'op_id={op_id} action=open_aws_case provider=aws case_id={case_id} severity=high'
+        vars:
+          op_id: {k: hex, v: 12}
+          case_id: {k: str, v: "AWS-case-id"}
+      create_snapshots:
+        desc: Operator creates snapshots of backup volumes to rebuild the primary.
+        lvl: INFO
+        msg: 'op_id={op_id} action=create_snapshots source=backup1 volumes={volumes} result=ok'
+        vars:
+          op_id: {k: hex, v: 12}
+          volumes: {k: i, v: [3, 6]}
+      attach_restored_volumes:
+        desc: Operator attaches restored volumes to livefile1.
+        lvl: INFO
+        msg: 'op_id={op_id} action=attach_restored_volumes target=livefile1 volumes={volumes} result=ok'
+        vars:
+          op_id: {k: hex, v: 12}
+          volumes: {k: i, v: [3, 6]}
+      rolling_reboot:
+        desc: Operator starts a rolling reboot of the web/task cluster to refresh NFS mounts.
+        lvl: INFO
+        msg: 'op_id={op_id} action=rolling_reboot target=web_cluster result=started batch={batch}'
+        vars:
+          op_id: {k: hex, v: 12}
+          batch: {k: i, v: [1, 4]}
+    beh:
+      n:
+        desc: No routine background logs modeled.
+        emit: []
+      f:
+        desc: No routine background logs modeled; actions appear as one-shots in the scenario.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operations include control-panel browsing, tenant site requests, occasional site reload/start,
+      and scheduled/always-on task executions.
+    req:
+      - id: control_panel_dashboard_ok
+        desc: Control-panel dashboard/login request that does not require slow filesystem access.
+        rpm: 90.0
+        path: [edge_proxy, platform_api, edge_proxy]
+        emit: [platform_api.req_done_ok, edge_proxy.access_ok]
+        latency_ms: [[3, 20], [20, 300]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: control_panel_files_ok
+        desc: Control-panel file-related request that performs small NFS reads.
+        rpm: 30.0
+        path: [edge_proxy, platform_api, file_server_livefile1, platform_api, edge_proxy]
+        emit: [platform_api.req_done_ok, edge_proxy.access_ok]
+        latency_ms: [[5, 40], [40, 800]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_hot_ok
+        desc: Tenant site request served by an already-running worker with minimal filesystem reads.
+        rpm: 450.0
+        path: [edge_proxy, web_runtime, edge_proxy]
+        emit: [web_runtime.site_req_ok, edge_proxy.access_ok]
+        latency_ms: [[2, 10], [10, 120]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_coldstart_ok
+        desc: Tenant request triggers a start/reload, reads code from NFS, then serves successfully.
+        rpm: 30.0
+        path: [edge_proxy, web_runtime, file_server_livefile1, web_runtime, edge_proxy]
+        emit: [web_runtime.startup_begin, web_runtime.startup_ready, edge_proxy.access_ok]
+        latency_ms: [[3, 15], [400, 2500], [450, 3200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: scheduled_task_ok
+        desc: Scheduled/always-on task completes normally on a worker node.
+        rpm: 20.0
+        path: [web_runtime, file_server_livefile1]
+        emit: [web_runtime.task_ok]
+        latency_ms: [[200, 5000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      Failure begins with blocked storage I/O on livefile1, causing NFS timeouts. This cascades into
+      site start/reload failures and elevated platform errors. Later, volumes are restored from backup
+      snapshots and NFS returns, but client mounts can be stale and restored volumes can be slow to read
+      ("warm-up"), causing prolonged slow startups and intermittent errors for tenants on livefile1.
+    req:
+      - id: control_panel_dashboard_err
+        desc: Control-panel requests fail due to blocked workers and upstream timeouts.
+        rpm: 60.0
+        path: [edge_proxy, platform_api, edge_proxy]
+        emit: [platform_api.req_done_err, edge_proxy.access_err]
+        latency_ms: [[20, 2000], [2000, 60000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: control_panel_dashboard_ok_slow
+        desc: Control-panel requests that eventually succeed but are slow due to platform backlogs.
+        rpm: 30.0
+        path: [edge_proxy, platform_api, edge_proxy]
+        emit: [platform_api.req_done_ok, edge_proxy.access_ok]
+        latency_ms: [[50, 4000], [500, 15000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: control_panel_files_err
+        desc: Control-panel file operations time out against livefile1.
+        rpm: 30.0
+        path: [edge_proxy, platform_api, file_server_livefile1, platform_api, edge_proxy]
+        emit: [platform_api.fs_timeout, platform_api.req_done_err, edge_proxy.access_err]
+        latency_ms: [[5000, 60000], [5000, 60000], [5000, 60000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_other_hot_ok
+        desc: Tenant requests on unaffected file servers continue to succeed (already-running sites).
+        rpm: 450.0
+        path: [edge_proxy, web_runtime, edge_proxy]
+        emit: [web_runtime.site_req_ok, edge_proxy.access_ok]
+        latency_ms: [[3, 15], [15, 200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_other_coldstart_err
+        desc: Tenant start/reload requests fail because the shared starter/runtime blocks on livefile1 I/O.
+        rpm: 20.0
+        path: [edge_proxy, web_runtime, file_server_livefile1, web_runtime, edge_proxy]
+        emit: [web_runtime.startup_begin, web_runtime.startup_fail, edge_proxy.access_err]
+        latency_ms: [[5, 30], [2000, 60000], [2100, 65000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_livefile1_err
+        desc: Tenant site requests for accounts whose homes are on livefile1 fail due to filesystem timeouts.
+        rpm: 80.0
+        path: [edge_proxy, web_runtime, file_server_livefile1, web_runtime, edge_proxy]
+        emit: [web_runtime.site_req_err, edge_proxy.access_err]
+        latency_ms: [[500, 5000], [2000, 60000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_livefile1_slow_ok
+        desc: Tenant site requests on livefile1 succeed but are very slow while restored volumes warm up.
+        rpm: 80.0
+        path: [edge_proxy, web_runtime, file_server_livefile1, web_runtime, edge_proxy]
+        emit: [web_runtime.site_req_ok, edge_proxy.access_ok]
+        latency_ms: [[200, 30000], [250, 32000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: hosted_site_other_hot_err_reboot
+        desc: Brief tenant errors on otherwise-unaffected sites during rolling reboots/remounts.
+        rpm: 40.0
+        path: [edge_proxy, web_runtime, edge_proxy]
+        emit: [web_runtime.site_req_err, edge_proxy.access_err]
+        latency_ms: [[20, 500], [100, 5000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: scheduled_task_fs_fail
+        desc: Scheduled/always-on tasks fail because worker nodes cannot access livefile1 homes.
+        rpm: 12.0
+        path: [web_runtime, file_server_livefile1]
+        emit: [web_runtime.task_fail_fs]
+        latency_ms: [[100, 60000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: scheduled_task_slow_ok
+        desc: Scheduled/always-on tasks on livefile1 resume after restore/remount but run slowly during volume warm-up.
+        rpm: 8.0
+        path: [web_runtime, file_server_livefile1]
+        emit: [web_runtime.task_ok]
+        latency_ms: [[2000, 120000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - >
+    Repair from verifier feedback: control_panel_files_err latency hints were updated so that platform_api.req_done_err and
+    edge_proxy.access_err represent the full end-to-end request time (matching the 5–60s filesystem timeout), preventing
+    contradictory short dur_ms values after long I/O timeouts.
+  - >
+    Repair from earlier verifier feedback: cold-start flows' final edge_proxy access-log latency hints were updated to reflect
+    the total end-to-end request duration (comparable to startup_ready/startup_fail durations), preventing generation of
+    contradictory access-log dur_ms values for slow start/reload requests.
+  - >
+    platform_api.api_health uses state_vars so failure-state health metrics can show elevated inflight/p95 without
+    contradicting the narrative.
+  - >
+    Return-path hops were made explicit by adding response edges
+    (platform_api->edge_proxy, web_runtime->edge_proxy) and by adjusting file-server flows to return
+    through the calling service (file_server_livefile1->platform_api/web_runtime) instead of directly
+    to edge_proxy.
+  - >
+    Timeline is compressed into a 50-minute scenario while preserving the causal progression:
+    volume failure -> NFS I/O hang/timeouts -> broad errors/backlogs -> restore from backup snapshots ->
+    stale mounts/rolling reboot -> lingering slow I/O from volume warm-up.
+  - >
+    The model focuses on one representative file server (livefile1) and the main coupling points:
+    control-panel file operations and the shared site start/reload path both depend on NFS.
+  - >
+    "Other file servers" are abstracted as "unaffected sites": their already-running requests remain OK,
+    but start/reload can fail early due to shared worker contention and later see brief errors during rolling reboots.
+  - >
+    Estimated normal-phase volume: ~1,250–1,350 logs/min (mostly request logs) over 25 min => ~31k–34k logs.
+  - >
+    Estimated failure-phase volume: ~1,350–1,650 logs/min over 25 min (errors + NFS warnings/alerts + resumed slow tasks) => ~34k–41k logs.
+    Total estimated logs ~65k–75k, within the 20,000–100,000 target.
+  - >
+    Key diagnostic visibility is ensured by: elevated file_server_livefile1.nfsd_timeout/kernel_io_hang,
+    web_runtime NFS client warnings, monitoring alerts, and clear shifts between error flows and slow-success flows
+    (hosted_site_livefile1_slow_ok and scheduled_task_slow_ok) after restoration.
+```

@@ -1,0 +1,282 @@
+```yaml
+scenario:
+  id: gitlab_com_db_data_loss_jan2017_compressed
+  title: Write spike, replication stall, and accidental primary data directory deletion
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    GitLab.com serves web/API traffic and stores metadata in a PostgreSQL primary with a streaming replica.
+    A sustained write spike (snippet creation/sign-in churn) increases lock contention and slows the primary,
+    then replication lag grows until it is effectively stalled. During urgent replica re-seeding and config
+    changes, an operator accidentally runs a destructive removal on the primary data directory, taking the site down.
+    Service is restored from an older snapshot, leaving an irrecoverable data loss window while replication/backup posture remains broken.
+
+  trigger_desc: |
+    Abusive clients begin hammering write endpoints (notably snippet creation and sign-in related writes),
+    pushing the primary into lock contention and starting the cascade toward replication lag and emergency operations.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Steady web traffic produces mostly successful SQL query/commit logs on the primary followed by successful HTTP responses on the web tier.
+        Replication monitoring reports low lag and the replica emits occasional standby heartbeats.
+        Backup worker logs may appear but are not actively used by operators during the normal window.
+      flows: [read_web_n, write_snippet_n]
+      manifestation:
+        - pg_primary_db1.sql_query_ok
+        - pg_primary_db1.sql_tx_commit
+        - rails_web.http_access
+        - repl_monitor.repl_lag_ok
+
+    f:
+      desc: |
+        A write-heavy traffic surge increases DB pressure, causing lock timeouts and app DB pool saturation.
+        Replication lag subsequently becomes extreme and on-call attempts to re-seed the replica, encountering WAL sender limits
+        and restart complications. A mistaken destructive command on the primary data directory causes immediate database unavailability,
+        forcing a restore from an older snapshot and resulting in a lasting data loss window.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: rails_web
+          event: |
+            Abusive write traffic surges, increasing lock contention on the primary and generating HTTP 500s from write endpoints.
+            Replication monitoring still reports routine lag samples and has not yet paged as stalled.
+          why: |
+            The primary experiences sustained write pressure; lock wait timeouts are directly observable via Postgres lock timeout logs
+            and corresponding HTTP 500s. Replication lag exists but has not crossed the critical paging threshold yet.
+          flows: [write_snippet_ok_f, write_snippet_lock_timeout_f, read_web_f]
+          rate_multipliers:
+            read_web_f: 1.1
+            write_snippet_ok_f: 1.6
+            write_snippet_lock_timeout_f: 3.0
+            abuse_blocked_request_f: 0.0
+            web_request_db_unavailable_f: 0.0
+            repl_monitor.repl_lag_ok: 1.0
+            repl_monitor.repl_lag_critical: 0.0
+            pg_replica_db2.basebackup_waiting: 0.0
+            pg_replica_db2.primary_conn_failed: 0.0
+            pg_primary_db1.wal_sender_limit: 0.0
+          latency_multipliers:
+            read_web_f: {p50: 1.2, p95: 1.8}
+            write_snippet_ok_f: {p50: 1.5, p95: 2.0}
+            write_snippet_lock_timeout_f: {p50: 1.2, p95: 1.2}
+          one_shots: []
+          manifestation:
+            - rails_web.db_pool_saturated
+            - pg_primary_db1.sql_lock_timeout
+            - rails_web.http_500
+
+        - order: 2
+          at_min: 33
+          component: repl_monitor
+          event: |
+            Replication lag crosses the critical threshold and paging triggers, replacing routine lag samples with critical stalled alerts.
+            On-call attempts to re-seed db2 and increases max_wal_senders on db1; a restart initially fails due to semaphore/resource limits,
+            then max_connections is reduced and PostgreSQL starts. Abuse blocking is enabled, reducing some write pressure while blocked requests appear.
+          why: |
+            The monitor’s critical lag logs show the replica is far behind/stalled. Increasing max_wal_senders is a plausible response to
+            connection rejection; restart failure is visible via the startup semaphore error. pg_basebackup can appear stuck while waiting for WAL start,
+            producing repeated waiting warnings.
+          flows: [abuse_blocked_request_f, write_snippet_ok_f, write_snippet_lock_timeout_f, read_web_f]
+          rate_multipliers:
+            read_web_f: 1.0
+            write_snippet_ok_f: 0.9
+            write_snippet_lock_timeout_f: 1.2
+            abuse_blocked_request_f: 1.0
+            web_request_db_unavailable_f: 0.0
+            repl_monitor.repl_lag_ok: 0.0
+            repl_monitor.repl_lag_critical: 1.0
+            pg_replica_db2.basebackup_waiting: 1.0
+            pg_replica_db2.primary_conn_failed: 0.0
+            pg_primary_db1.wal_sender_limit: 1.0
+          latency_multipliers:
+            read_web_f: {p50: 1.1, p95: 1.6}
+            write_snippet_ok_f: {p50: 1.4, p95: 1.8}
+            write_snippet_lock_timeout_f: {p50: 1.2, p95: 1.2}
+          one_shots:
+            - ref: ops_console.wipe_replica_datadir
+              count: 1
+              hosts: [ops01]
+            - ref: ops_console.start_basebackup
+              count: 1
+              hosts: [ops01]
+            - ref: pg_replica_db2.basebackup_start
+              count: 1
+              hosts: [db2]
+            - ref: ops_console.set_max_wal_senders
+              count: 1
+              hosts: [ops01]
+            - ref: ops_console.restart_postgres
+              count: 1
+              hosts: [ops01]
+            - ref: pg_primary_db1.postgres_startup_failed_semaphores
+              count: 1
+              hosts: [db1]
+            - ref: ops_console.set_max_connections
+              count: 1
+              hosts: [ops01]
+            - ref: pg_primary_db1.postgres_started
+              count: 1
+              hosts: [db1]
+          manifestation:
+            - repl_monitor.repl_lag_critical
+            - pg_primary_db1.wal_sender_limit
+            - pg_replica_db2.basebackup_waiting
+            - pg_primary_db1.postgres_startup_failed_semaphores
+
+        - order: 3
+          at_min: 38
+          component: ops_console
+          event: |
+            While troubleshooting replication and base backup behavior, an operator accidentally runs a destructive removal on db1’s PostgreSQL
+            data directory and stops it within seconds, but the primary is left effectively empty and becomes unavailable.
+            The web tier rapidly shifts to returning 503s for both reads and writes.
+          why: |
+            The destructive command is directly observable via ops audit logs. The primary then cannot find a valid data directory, and clients fail fast,
+            producing a burst of HTTP 503s. With the primary down, the replica reports connection failures.
+          flows: [web_request_db_unavailable_f]
+          rate_multipliers:
+            read_web_f: 0.0
+            write_snippet_ok_f: 0.0
+            write_snippet_lock_timeout_f: 0.0
+            abuse_blocked_request_f: 0.0
+            web_request_db_unavailable_f: 1.0
+            repl_monitor.repl_lag_critical: 1.0
+            pg_replica_db2.primary_conn_failed: 1.0
+            pg_replica_db2.basebackup_waiting: 0.3
+            pg_primary_db1.wal_sender_limit: 0.0
+          latency_multipliers:
+            web_request_db_unavailable_f: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: ops_console.rmrf_on_primary_datadir
+              count: 1
+              hosts: [ops01]
+            - ref: pg_primary_db1.data_dir_missing
+              count: 2
+              hosts: [db1]
+          manifestation:
+            - rails_web.http_503
+            - pg_replica_db2.primary_conn_failed
+            - pg_primary_db1.data_dir_missing
+
+        - order: 4
+          at_min: 44
+          component: ops_console
+          event: |
+            Operators restore db1 from an older snapshot/copy taken from staging, bringing PostgreSQL back online.
+            Web traffic resumes, but the restored snapshot age implies a lasting data loss window; replication remains unhealthy and operators confirm
+            that object-storage backups are missing/empty.
+          why: |
+            The restore is visible via ops restore markers and a fresh Postgres started log. Replication remains stalled because the replica is still not
+            fully caught up/re-seeded, continuing to trigger critical lag logs. Backup bucket listing is a direct operational check confirming missing backups.
+          flows: [read_web_f, write_snippet_ok_f, write_snippet_lock_timeout_f, abuse_blocked_request_f]
+          rate_multipliers:
+            read_web_f: 0.7
+            write_snippet_ok_f: 0.8
+            write_snippet_lock_timeout_f: 0.4
+            abuse_blocked_request_f: 0.5
+            web_request_db_unavailable_f: 0.0
+            repl_monitor.repl_lag_critical: 1.0
+            pg_replica_db2.primary_conn_failed: 0.0
+            pg_replica_db2.basebackup_waiting: 0.8
+            pg_primary_db1.wal_sender_limit: 0.6
+          latency_multipliers:
+            read_web_f: {p50: 1.1, p95: 1.3}
+            write_snippet_ok_f: {p50: 1.2, p95: 1.5}
+            write_snippet_lock_timeout_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_console.lvm_snapshot_found
+              count: 1
+              hosts: [ops01]
+            - ref: ops_console.restore_from_snapshot
+              count: 1
+              hosts: [ops01]
+            - ref: pg_primary_db1.postgres_started
+              count: 1
+              hosts: [db1]
+            - ref: backup_worker.s3_bucket_list
+              count: 1
+              hosts: [backup01]
+          manifestation:
+            - repl_monitor.repl_lag_critical
+            - rails_web.http_access
+            - backup_worker.s3_bucket_list
+            - pg_replica_db2.basebackup_waiting
+
+      steady:
+        - component: pg_primary_db1
+          condition: |
+            Primary database is online but restored from an older snapshot, creating a permanent data loss window for recent metadata.
+          user_impact: |
+            Users can access Git repositories, but recent issues/merge requests/users/comments/snippets created during the lost window are missing.
+          manifestation:
+            - pg_primary_db1.sql_tx_commit
+            - rails_web.http_access
+            - pg_primary_db1.checkpoint_complete
+        - component: repl_monitor
+          condition: |
+            Replication remains unhealthy with large lag; the replica is not reliably caught up/re-seeded.
+          user_impact: |
+            Reduced redundancy and higher operational risk; failover is not trustworthy while lag remains extreme.
+          manifestation:
+            - repl_monitor.repl_lag_critical
+            - pg_replica_db2.basebackup_waiting
+        - component: backup_worker
+          condition: |
+            Logical backups/object-storage backups are missing or ineffective, limiting recovery options.
+          user_impact: |
+            Recovery relies on older snapshots rather than recent backups, increasing potential data loss in future incidents.
+          manifestation:
+            - backup_worker.backup_job_summary
+
+      feedback_loops:
+        - id: write_pressure_lock_contention
+          desc: |
+            Elevated write traffic increases lock contention and query times, which holds locks longer and further increases contention and HTTP 500s.
+        - id: replica_reseed_confusion
+          desc: |
+            pg_basebackup waiting behavior can look like a hang, increasing operator uncertainty and the likelihood of risky manual steps under time pressure.
+
+      flows: [read_web_f, write_snippet_ok_f, write_snippet_lock_timeout_f, abuse_blocked_request_f, web_request_db_unavailable_f]
+      manifestation:
+        - pg_primary_db1.sql_lock_timeout
+        - rails_web.http_500
+        - repl_monitor.repl_lag_critical
+        - rails_web.http_503
+        - pg_replica_db2.basebackup_waiting
+
+  assumptions:
+    - |
+      Timeline is compressed into 50 minutes to fit the scenario window while preserving ordering:
+      write spike → replication stall and attempted re-seed → accidental deletion → restore from older snapshot.
+    - |
+      Replication monitoring is modeled as mutually exclusive background emissions in failure:
+      routine repl_lag_ok is active early in failure, then suppressed when repl_lag_critical paging starts.
+    - |
+      Failure-phase piecewise volume/rates (approx):
+        - min 25-33 (8m): read_web_f~264 rpm, write_ok~224 rpm, lock_timeout~180 rpm; blocked/unavailable suppressed;
+          ~1.34k logs/min including SQL logs and elevated app warnings.
+        - min 33-38 (5m): read~240 rpm, write_ok~126 rpm, lock_timeout~72 rpm, blocked~40 rpm; critical lag + basebackup waiting active;
+          ~0.92k logs/min.
+        - min 38-44 (6m): DB down; web_request_db_unavailable_f~400 rpm dominates; replica conn failures appear;
+          ~0.40k logs/min.
+        - min 44-50 (6m): service returns at reduced rate; replication still critical;
+          ~0.63k logs/min.
+    - |
+      One-shot counts:
+        - event2: 8 ops/DB markers
+        - event3: 3 markers
+        - event4: 4 markers
+    - |
+      Total estimated logs across the scenario: ~40k-55k (request+SQL dominated), ensuring visibility of key diagnostics:
+      lock timeouts (db/app), replication stalled paging (monitor), basebackup waiting/primary unreachable (replica),
+      and the destructive ops command plus restore markers.
+```

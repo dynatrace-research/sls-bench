@@ -1,0 +1,573 @@
+```yaml
+sys:
+  id: bigquery_writeapi_us_multi
+  desc: >
+    A simplified model of BigQuery's Storage Write API Streaming frontend in the US multi-region, fronted by
+    a load balancer and supported by autoscaling, monitoring, and an engineering control plane. Clients use
+    the Write API to stream rows into BigQuery; a separate InsertAll API exists and sees minor collateral impact
+    during this incident. The incident centers on a deadlock in an internal streaming RPC library that causes
+    frontend instances to become stuck under a sudden traffic/logging surge, leading to persistent connection
+    failures and UNAVAILABLE errors.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: US Multi-Region Edge Load Balancer
+    svc: edge-lb
+    hosts: [lb-usm-1, lb-usm-2, lb-usm-3]
+    desc: >
+      Regional load balancer that terminates client connections and routes streaming RPC traffic to Write API
+      frontend instances. Emits connection-failure logs and periodic backend-pool health snapshots.
+
+    to:
+      - dst: writeapi_frontend
+        proto: grpc
+        desc: Routes client streaming RPC connections to selected Write API frontend backends.
+
+    logs:
+      access_ok:
+        desc: Terminal access log emitted after a request/stream attempt completes successfully.
+        lvl: INFO
+        msg: "writeapi request complete status={status} backend={backend} dur_ms={dur_ms} peer={peer_ip}"
+        vars:
+          status: {k: ch, v: ["200"]}
+          backend: {k: str, v: "writeapi-fe-<id> (id~1..100)"}
+          dur_ms: {k: i, v: [1, 8000]}
+          peer_ip: {k: ip, v: null}
+
+      access_err:
+        desc: Terminal access log emitted after a request/stream attempt completes with an error.
+        lvl: INFO
+        msg: "writeapi request complete status={status} backend={backend} dur_ms={dur_ms} peer={peer_ip}"
+        vars:
+          status: {k: ch, v: ["503", "504"]}
+          backend: {k: str, v: "writeapi-fe-<id> (id~1..100)"}
+          dur_ms: {k: i, v: [10, 8000]}
+          peer_ip: {k: ip, v: null}
+
+      conn_failure:
+        desc: Connection-level failures where the client cannot establish/keep a streaming connection to a backend.
+        lvl: WARN
+        msg: "writeapi connection failure backend={backend} reason={reason} waited_ms={waited_ms} peer={peer_ip}"
+        vars:
+          backend: {k: str, v: "writeapi-fe-<id> (id~1..100)"}
+          reason: {k: ch, v: [timeout, reset_by_peer, handshake_failed]}
+          waited_ms: {k: i, v: [50, 8000]}
+          peer_ip: {k: ip, v: null}
+
+      pool_health:
+        desc: Periodic snapshot of backend pool health and active connections before the manual max-instance cap increase.
+        lvl: INFO
+        msg: "backend_pool healthy={healthy} stuck={stuck} inflight_conns={inflight}"
+        vars: {}
+        state_vars:
+          n:
+            healthy: {k: i, v: [15, 20]}
+            stuck: {k: i, v: [0, 0]}
+            inflight: {k: i, v: [5000, 20000]}
+          f:
+            healthy: {k: i, v: [5, 15]}
+            stuck: {k: i, v: [1, 5]}
+            inflight: {k: i, v: [15000, 90000]}
+
+      pool_health_postcap:
+        desc: Periodic snapshot of backend pool health after the manual max-instance cap increase (more healthy backends present).
+        lvl: INFO
+        msg: "backend_pool healthy={healthy} stuck={stuck} inflight_conns={inflight}"
+        vars: {}
+        state_vars:
+          n:
+            healthy: {k: i, v: [15, 20]}
+            stuck: {k: i, v: [0, 0]}
+            inflight: {k: i, v: [5000, 20000]}
+          f:
+            healthy: {k: i, v: [20, 80]}
+            stuck: {k: i, v: [1, 20]}
+            inflight: {k: i, v: [20000, 120000]}
+
+    beh:
+      n:
+        desc: Regular backend pool snapshots during healthy operation.
+        emit:
+          - id: pool_health
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: >
+          Backend pool snapshots continue during failure. A second snapshot template is modeled for the post-cap period
+          and is activated/suppressed by scenario events to avoid contradictory instance-count semantics.
+        emit:
+          - id: pool_health
+            per_min: 1.0
+            scope: per_host
+          - id: pool_health_postcap
+            per_min: 1.0
+            scope: per_host
+
+  - id: writeapi_frontend
+    name: BigQuery Storage Write API Streaming Frontend
+    svc: bq-writeapi-frontend
+    hosts:
+      [
+        writeapi-fe-1, writeapi-fe-2, writeapi-fe-3, writeapi-fe-4, writeapi-fe-5, writeapi-fe-6, writeapi-fe-7,
+        writeapi-fe-8, writeapi-fe-9, writeapi-fe-10, writeapi-fe-11, writeapi-fe-12, writeapi-fe-13, writeapi-fe-14,
+        writeapi-fe-15, writeapi-fe-16, writeapi-fe-17, writeapi-fe-18, writeapi-fe-19, writeapi-fe-20, writeapi-fe-21,
+        writeapi-fe-22, writeapi-fe-23, writeapi-fe-24, writeapi-fe-25, writeapi-fe-26, writeapi-fe-27, writeapi-fe-28,
+        writeapi-fe-29, writeapi-fe-30, writeapi-fe-31, writeapi-fe-32, writeapi-fe-33, writeapi-fe-34, writeapi-fe-35,
+        writeapi-fe-36, writeapi-fe-37, writeapi-fe-38, writeapi-fe-39, writeapi-fe-40, writeapi-fe-41, writeapi-fe-42,
+        writeapi-fe-43, writeapi-fe-44, writeapi-fe-45, writeapi-fe-46, writeapi-fe-47, writeapi-fe-48, writeapi-fe-49,
+        writeapi-fe-50, writeapi-fe-51, writeapi-fe-52, writeapi-fe-53, writeapi-fe-54, writeapi-fe-55, writeapi-fe-56,
+        writeapi-fe-57, writeapi-fe-58, writeapi-fe-59, writeapi-fe-60, writeapi-fe-61, writeapi-fe-62, writeapi-fe-63,
+        writeapi-fe-64, writeapi-fe-65, writeapi-fe-66, writeapi-fe-67, writeapi-fe-68, writeapi-fe-69, writeapi-fe-70,
+        writeapi-fe-71, writeapi-fe-72, writeapi-fe-73, writeapi-fe-74, writeapi-fe-75, writeapi-fe-76, writeapi-fe-77,
+        writeapi-fe-78, writeapi-fe-79, writeapi-fe-80, writeapi-fe-81, writeapi-fe-82, writeapi-fe-83, writeapi-fe-84,
+        writeapi-fe-85, writeapi-fe-86, writeapi-fe-87, writeapi-fe-88, writeapi-fe-89, writeapi-fe-90, writeapi-fe-91,
+        writeapi-fe-92, writeapi-fe-93, writeapi-fe-94, writeapi-fe-95, writeapi-fe-96, writeapi-fe-97, writeapi-fe-98,
+        writeapi-fe-99, writeapi-fe-100
+      ]
+    desc: >
+      Stateless streaming frontend handling AppendRows RPCs. Under the incident condition, an internal streaming
+      RPC library bug can deadlock handler goroutines, leaving some instances stuck and unable to serve new
+      connections, producing UNAVAILABLE and connection failures upstream.
+
+    to:
+      - dst: storage_backend
+        proto: grpc
+        desc: Writes accepted rows to BigQuery storage ingestion backend.
+      - dst: edge_lb
+        proto: tcp
+        desc: Responses flow back through the load balancer to clients.
+
+    logs:
+      append_begin:
+        desc: Per-attempt start of an AppendRows stream/request at the frontend.
+        lvl: INFO
+        msg: "AppendRows begin stream_id={stream_id} project={project} table={dataset}.{table} inflight={inflight}"
+        vars:
+          stream_id: {k: hex, v: 16}
+          project: {k: ch, v: [analytics-prod, etl-prod, customer-x]}
+          dataset: {k: ch, v: [events, logs]}
+          table: {k: ch, v: [clicks, impressions, raw]}
+        state_vars:
+          n:
+            inflight: {k: i, v: [1, 500]}
+          f:
+            inflight: {k: i, v: [200, 8000]}
+
+      append_ok:
+        desc: Successful completion of an AppendRows attempt.
+        lvl: INFO
+        msg: "AppendRows ok stream_id={stream_id} rows={rows} dur_ms={dur_ms}"
+        vars:
+          stream_id: {k: hex, v: 16}
+          rows: {k: i, v: [1, 20000]}
+          dur_ms: {k: i, v: [2, 4000]}
+
+      append_unavail:
+        desc: Frontend rejects/fails an AppendRows attempt as UNAVAILABLE when overloaded or stuck.
+        lvl: ERROR
+        msg: "AppendRows error stream_id={stream_id} grpc_status=UNAVAILABLE err={err} dur_ms={dur_ms}"
+        vars:
+          stream_id: {k: hex, v: 16}
+          err: {k: ch, v: [frontend_overloaded, rpc_deadlock, queue_full]}
+          dur_ms: {k: i, v: [50, 8000]}
+
+      rpc_deadlock_watchdog:
+        desc: Watchdog detects blocked handlers consistent with a deadlock/stuck runtime.
+        lvl: ERROR
+        msg: "rpc watchdog blocked_handlers={blocked} goroutines={goroutines}"
+        vars:
+          blocked: {k: i, v: [1, 400]}
+          goroutines: {k: i, v: [200, 8000]}
+
+      fe_health:
+        desc: Periodic frontend health snapshot for observability.
+        lvl: INFO
+        msg: "health ok={ok} cpu_pct={cpu_pct} mem_gb={mem_gb} active_streams={active_streams}"
+        vars:
+          ok: {k: ch, v: [true, false]}
+        state_vars:
+          n:
+            cpu_pct: {k: i, v: [5, 60]}
+            mem_gb: {k: i, v: [8, 16]}
+            active_streams: {k: i, v: [50, 800]}
+          f:
+            cpu_pct: {k: i, v: [30, 95]}
+            mem_gb: {k: i, v: [16, 64]}
+            active_streams: {k: i, v: [500, 8000]}
+
+    beh:
+      n:
+        desc: Frontends periodically report health; deadlock watchdog does not fire.
+        emit:
+          - id: fe_health
+            per_min: 0.5
+            scope: per_host
+          - id: rpc_deadlock_watchdog
+            per_min: 0.0
+            scope: per_host
+      f:
+        desc: Frontends show elevated active streams and occasional watchdog errors during deadlock/stuck conditions.
+        emit:
+          - id: fe_health
+            per_min: 1.0
+            scope: per_host
+          - id: rpc_deadlock_watchdog
+            per_min: 0.15
+            scope: per_host
+
+  - id: insertall_api
+    name: BigQuery InsertAll API
+    svc: bq-insertall
+    hosts: [insertall-1, insertall-2]
+    desc: >
+      Separate ingestion API. During the incident, it experiences a small increase in failures due to
+      traffic shifts and shared regional pressure.
+
+    to:
+      - dst: storage_backend
+        proto: grpc
+        desc: Writes incoming rows to the storage ingestion backend.
+
+    logs:
+      insert_req:
+        desc: Start of an InsertAll request.
+        lvl: INFO
+        msg: "InsertAll begin project={project} table={dataset}.{table} rows={rows}"
+        vars:
+          project: {k: ch, v: [analytics-prod, etl-prod, customer-x]}
+          dataset: {k: ch, v: [events, logs]}
+          table: {k: ch, v: [clicks, impressions, raw]}
+          rows: {k: i, v: [1, 500]}
+
+      insert_ok:
+        desc: Successful InsertAll completion.
+        lvl: INFO
+        msg: "InsertAll ok rows={rows} dur_ms={dur_ms}"
+        vars:
+          rows: {k: i, v: [1, 500]}
+          dur_ms: {k: i, v: [5, 2000]}
+
+      insert_fail:
+        desc: InsertAll failure (typically transient backend pressure/timeouts).
+        lvl: WARN
+        msg: "InsertAll failed status={status} reason={reason} dur_ms={dur_ms}"
+        vars:
+          status: {k: i, v: [503, 504]}
+          reason: {k: ch, v: [backend_overloaded, timeout]}
+          dur_ms: {k: i, v: [50, 5000]}
+
+    beh:
+      n:
+        desc: No periodic background logs modeled for InsertAll in this incident.
+        emit: []
+      f:
+        desc: No periodic background logs modeled for InsertAll in this incident.
+        emit: []
+
+  - id: storage_backend
+    name: BigQuery Storage Ingestion Backend
+    svc: bq-storage-backend
+    hosts: [storage-1, storage-2, storage-3]
+    desc: >
+      Backend ingestion layer that receives committed rows from the Write API and InsertAll.
+      In this incident it remains mostly healthy; included to provide corroborating evidence that
+      the primary failure is in the streaming frontend.
+
+    to: []
+
+    logs:
+      ingest_metric:
+        desc: Periodic ingest health/throughput metric.
+        lvl: INFO
+        msg: "storage ingest qps={qps} err_rate={err_rate}"
+        vars: {}
+        state_vars:
+          n:
+            qps: {k: i, v: [2000, 6000]}
+            err_rate: {k: f, v: [0.0, 0.01]}
+          f:
+            qps: {k: i, v: [2500, 9000]}
+            err_rate: {k: f, v: [0.0, 0.02]}
+
+    beh:
+      n:
+        desc: Stable ingest metrics during normal operation.
+        emit:
+          - id: ingest_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Ingest metrics remain largely stable despite frontend-side connection failures.
+        emit:
+          - id: ingest_metric
+            per_min: 1.0
+            scope: global
+
+  - id: autoscaler
+    name: Internal Autoscaler
+    svc: autoscaler
+    hosts: [as-1]
+    desc: >
+      Automation that adjusts resources for the Write API frontend (memory bumps and scale-out).
+      During this incident, scaling actions occur but do not immediately resolve stuck instances.
+
+    to: []
+
+    logs:
+      memory_increase:
+        desc: Autoscaler action to increase memory on the target service.
+        lvl: INFO
+        msg: "autoscaler increased memory target={target} from_gb={from_gb} to_gb={to_gb}"
+        vars:
+          target: {k: ch, v: [writeapi-frontend]}
+          from_gb: {k: i, v: [16, 32]}
+          to_gb: {k: i, v: [32, 64]}
+
+      scale_out:
+        desc: Autoscaler scale-out within the initial max-instance cap (pre-manual-cap-increase).
+        lvl: INFO
+        msg: "autoscaler scaled target={target} from={from} to={to} instances"
+        vars:
+          target: {k: ch, v: [writeapi-frontend]}
+          from: {k: i, v: [10, 18]}
+          to: {k: i, v: [15, 20]}
+
+      scale_out_postcap:
+        desc: Autoscaler scale-out after the manual max-instance cap increase.
+        lvl: INFO
+        msg: "autoscaler scaled target={target} from={from} to={to} instances"
+        vars:
+          target: {k: ch, v: [writeapi-frontend]}
+          from: {k: i, v: [20, 70]}
+          to: {k: i, v: [60, 100]}
+
+      tick:
+        desc: Periodic autoscaler evaluation tick.
+        lvl: DEBUG
+        msg: "autoscaler tick pending_actions={pending}"
+        vars:
+          pending: {k: i, v: [0, 5]}
+
+    beh:
+      n:
+        desc: Low-rate autoscaler ticks in normal operation.
+        emit:
+          - id: tick
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Autoscaler continues ticking during failure.
+        emit:
+          - id: tick
+            per_min: 0.2
+            scope: global
+
+  - id: control_plane
+    name: Service Control Plane
+    svc: control-plane
+    hosts: [cp-1]
+    desc: >
+      Engineering control plane used to apply configuration changes and restart instances. Used for manual
+      max-instance adjustment and later rolling restarts during this incident.
+
+    to: []
+
+    logs:
+      set_max_instances:
+        desc: Manual configuration change for maximum instance count.
+        lvl: INFO
+        msg: "updated target={target} max_instances {from}->{to}"
+        vars:
+          target: {k: ch, v: [writeapi-frontend]}
+          from: {k: i, v: [20, 20]}
+          to: {k: i, v: [100, 100]}
+
+      restart_instance:
+        desc: Manual/controlled restart of a Write API frontend instance.
+        lvl: WARN
+        msg: "restarting target={target} instance={instance} reason={reason}"
+        vars:
+          target: {k: ch, v: [writeapi-frontend]}
+          instance: {k: str, v: "writeapi-fe-<id> (id~1..100)"}
+          reason: {k: ch, v: [deadlock_suspected, stuck_process]}
+
+      audit_tick:
+        desc: Periodic control-plane operational heartbeat.
+        lvl: DEBUG
+        msg: "control-plane audit tick ops_in_flight={ops}"
+        vars:
+          ops: {k: i, v: [0, 20]}
+
+    beh:
+      n:
+        desc: Low-rate control-plane heartbeats.
+        emit:
+          - id: audit_tick
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Control-plane heartbeats continue during failure.
+        emit:
+          - id: audit_tick
+            per_min: 0.2
+            scope: global
+
+  - id: monitoring
+    name: Monitoring & Alerting
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Monitoring system that runs synthetic checks and emits an alert when error rate is elevated.
+
+    to: []
+
+    logs:
+      synthetic_check:
+        desc: Synthetic check of the Write API (observed status and latency).
+        lvl: INFO
+        msg: "synthetic writeapi check status={status} dur_ms={dur_ms}"
+        vars:
+          status: {k: ch, v: [OK, UNAVAILABLE]}
+          dur_ms: {k: i, v: [10, 8000]}
+
+      alert_firing:
+        desc: Alert indicating elevated streaming Write API error rate in the region.
+        lvl: CRITICAL
+        msg: "alert={name} region={region} value={value} threshold={threshold}"
+        vars:
+          name: {k: ch, v: [writeapi_streaming_error_rate]}
+          region: {k: ch, v: [us-multi]}
+          value: {k: f, v: [0.03, 0.6]}
+          threshold: {k: f, v: [0.02, 0.02]}
+
+    beh:
+      n:
+        desc: Low-rate synthetic checks in normal operation.
+        emit:
+          - id: synthetic_check
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Synthetic checks run more frequently during the incident window.
+        emit:
+          - id: synthetic_check
+            per_min: 0.5
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal traffic dominated by successful Write API streaming appends with occasional InsertAll ingestion.
+    req:
+      - id: write_append_success_n
+        desc: Successful streaming Write API append attempt.
+        rpm: 350.0
+        path: [edge_lb, writeapi_frontend, edge_lb]
+        emit: [writeapi_frontend.append_begin, writeapi_frontend.append_ok, edge_lb.access_ok]
+        latency_ms: [[1, 6], [15, 120], [20, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: insertall_success_n
+        desc: Successful InsertAll request.
+        rpm: 70.0
+        path: [insertall_api, storage_backend]
+        emit: [insertall_api.insert_req, insertall_api.insert_ok]
+        latency_ms: [[1, 4], [20, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Failure traffic shows elevated connection failures and UNAVAILABLE responses due to stuck/deadlocked frontends.
+    req:
+      - id: write_append_success_f
+        desc: Successful Write API append attempt during the incident (reduced success fraction, higher latency).
+        rpm: 220.0
+        path: [edge_lb, writeapi_frontend, edge_lb]
+        emit: [writeapi_frontend.append_begin, writeapi_frontend.append_ok, edge_lb.access_ok]
+        latency_ms: [[2, 10], [120, 2000], [150, 2500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: write_append_fail_unavailable_f
+        desc: Frontend returns UNAVAILABLE due to overload/stuck handlers; LB logs error completion.
+        rpm: 220.0
+        path: [edge_lb, writeapi_frontend, edge_lb]
+        emit: [writeapi_frontend.append_begin, writeapi_frontend.append_unavail, edge_lb.access_err]
+        latency_ms: [[2, 10], [150, 3500], [200, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: write_append_fail_conn_f
+        desc: Client connection fails at the load balancer (backend stuck or connection pressure); no frontend logs.
+        rpm: 300.0
+        path: [edge_lb]
+        emit: [edge_lb.conn_failure]
+        latency_ms: [[300, 7000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: insertall_success_f
+        desc: InsertAll continues mostly successfully during the incident.
+        rpm: 80.0
+        path: [insertall_api, storage_backend]
+        emit: [insertall_api.insert_req, insertall_api.insert_ok]
+        latency_ms: [[1, 5], [40, 800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: insertall_fail_f
+        desc: Minor elevated InsertAll failures due to regional pressure.
+        rpm: 20.0
+        path: [insertall_api, storage_backend]
+        emit: [insertall_api.insert_req, insertall_api.insert_fail]
+        latency_ms: [[1, 5], [80, 2500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Verifier fix: insertall_fail_f.path includes storage_backend to match failure semantics (backend_overloaded/timeout) while keeping InsertAll logs emitted at the API layer."
+  - "Verifier fix: monitoring.alert_firing.value is constrained to be >= threshold to avoid semantic contradiction while the alert is firing."
+  - "The real incident's instance counts (e.g., 200->1000) are scaled down by ~10x (e.g., 20->100) to keep logs compact while preserving the remediation story; the writeapi_frontend host list is expanded to 100 to make pool-health counts and restart actions realizable."
+  - "To avoid contradictory cap semantics, autoscaler scale-out is split into pre-cap (<=20 instances) and post-cap (<=100 instances) templates, and the LB pool health snapshot is split into pre-cap vs post-cap templates activated by scenario events."
+  - "Time is compressed into a <=60 minute scenario while preserving the ordered beats: traffic surge + RPC deadlock -> autoscaling/memory bump -> manual max-instances increase -> continued degradation -> rolling restarts begin improving service."
+  - "The internal streaming RPC library bug is represented via frontend watchdog errors and elevated inflight/active_streams; the exact library and thread mechanics are abstracted."
+  - "The main customer symptom (Write API connection failures / UNAVAILABLE) is represented by edge_lb.conn_failure and writeapi_frontend.append_unavail, with edge_lb.access_ok/access_err providing clear success vs error completion."
+  - "InsertAll impact is modeled as a small added failure flow in the failure state; its failure statuses are restricted to 5xx to match pressure/timeout reasons."
+  - "Normal-phase expected volume (approx): ~350 rpm Write API * 3 logs + ~70 rpm InsertAll * 2 logs + background (notably ~50/min frontend health across the fleet) => ~1.25k logs/min."
+  - "Total expected scenario volume (approx): normal ~31k logs + failure ~63k logs + one-shots/background ~1k => ~95k logs (within 20k..100k)."
+```

@@ -1,0 +1,182 @@
+```yaml
+scenario:
+  id: su3_tailspin_after_sps_spike
+  title: Brief SPS slowdown triggers prolonged AT tailspin via agent reconnect storm
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The scale unit normally serves user APIs through a load balancer and processes steady agent heartbeats on the AT farm, with SPS providing identity/auth support.
+    A short SPS latency spike causes agents to miss heartbeats and then reconnect in large numbers.
+    The reconnect surge overwhelms the AT’s message-queue/threadpool processing, keeping queues and thread counts high even after SPS recovers.
+    Users see elevated latency and 503/504s, and health probes start timing out later, causing the load balancer to drain AT backends while one-by-one recycling fails to quickly restore service.
+
+  trigger_desc: |
+    A transient SPS latency spike (roughly 90 seconds) occurs while the scale unit is under normal user and agent load.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        User API calls are forwarded by the load balancer and handled by ATs with low internal queuing and typical end-to-end latency.
+        Agents send a steady 1/min heartbeat pattern that is processed quickly.
+        SPS periodic telemetry remains in typical healthy ranges, and AT message-queue metrics remain low and stable.
+        Health checks complete quickly.
+      flows: [user_api_request, agent_heartbeat, health_probe_ok]
+      manifestation: [edge_lb.summary, sps_auth.sps_latency, tfs_at.mq_stats, tfs_at.http_access, tfs_at.agent_heartbeat]
+
+    f:
+      desc: |
+        The incident begins with SPS becoming slow briefly, increasing end-to-end latency and contributing to failed identity-related operations.
+        Agents that miss heartbeats are marked offline and begin reconnecting; as they succeed, the AT queues and batches work to mark them online.
+        Under bursty reconnect load, the AT’s threadpool/message-queue processing saturates, driving up threads and queue depth and delaying unrelated work (including health checks).
+        The load balancer later starts observing probe timeouts and drains backends; operators attempt dump collection and one-by-one recycling, but the system remains in a degraded, unstable state by the end of the scenario.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: sps_auth
+          event: |
+            SPS enters a short latency spike, increasing downstream wait times for AT identity operations and slowing user/API handling.
+          why: |
+            The slowdown is externally caused (e.g., transient contention) and is directly visible via SPS telemetry markers; AT request logs show higher total request duration during the spike window.
+          flows: [user_api_request_degraded, agent_heartbeat_reconnect]
+          rate_multipliers:
+            agent_heartbeat_reconnect: 0.8
+            health_probe_timeout: 0.0
+            tfs_at.mq_starvation: 0.0
+          latency_multipliers:
+            user_api_request_degraded: {p50: 1.8, p95: 2.5}
+            agent_heartbeat_reconnect: {p50: 1.6, p95: 2.2}
+          one_shots:
+            - ref: sps_auth.sps_slow_spike
+              count: 1
+              hosts: [sps-ncus-1]
+          manifestation: [sps_auth.sps_slow_spike, tfs_at.http_access]
+
+        - order: 2
+          at_min: 23
+          component: sps_auth
+          event: |
+            SPS response times return to typical levels, but agent reconnect traffic rises and AT message-queue pressure becomes sustained, with saturation warnings now appearing.
+          why: |
+            Once SPS is responsive again, many agents succeed in reconnecting around the same time; AT batches and processes a large backlog, stressing its internal threadpool/message queue.
+            SPS recovery is directly observable; the AT tailspin is observable via mq_stats and the appearance of mq_starvation warnings.
+          flows: [agent_heartbeat_reconnect, user_api_request_degraded]
+          rate_multipliers:
+            agent_heartbeat_reconnect: 1.4
+            tfs_at.mq_starvation: 50.0
+          latency_multipliers:
+            agent_heartbeat_reconnect: {p50: 1.4, p95: 2.5}
+            user_api_request_degraded: {p50: 1.2, p95: 1.8}
+          one_shots:
+            - ref: sps_auth.sps_recovered
+              count: 1
+              hosts: [sps-ncus-1]
+          manifestation: [sps_auth.sps_recovered, tfs_at.mq_stats, tfs_at.mq_starvation]
+
+        - order: 3
+          at_min: 27
+          component: edge_lb
+          event: |
+            Health probe timeouts begin and the load balancer records a backend health transition; operators pull a backend out for dump collection and recycle it.
+          why: |
+            AT threadpool saturation delays health endpoint execution; repeated probe failures cause the LB to drain a backend.
+            Operator mitigation actions are directly observable; the underlying saturation is observable via mq_stats/mq_starvation.
+          flows: [health_probe_timeout, health_probe_ok_degraded, user_api_request_degraded]
+          rate_multipliers:
+            health_probe_timeout: 40.0
+            user_api_request_degraded: 1.1
+            tfs_at.mq_starvation: 150.0
+          latency_multipliers:
+            health_probe_ok_degraded: {p50: 1.3, p95: 1.8}
+            user_api_request_degraded: {p50: 1.4, p95: 2.2}
+          one_shots:
+            - ref: edge_lb.backend_state
+              count: 1
+              hosts: [vip-1]
+            - ref: ops_console.collect_dump
+              count: 1
+              hosts: [op-1]
+            - ref: ops_console.recycle_at
+              count: 1
+              hosts: [op-1]
+          manifestation: [edge_lb.probe_timeout, edge_lb.backend_state, ops_console.collect_dump, ops_console.recycle_at]
+
+        - order: 4
+          at_min: 33
+          component: tfs_at
+          event: |
+            Saturation expands across more ATs: thread/queue metrics remain high and probe timeouts become more frequent while user traffic starts to fall as clients back off.
+          why: |
+            With fewer healthy backends, remaining ATs take more work, sustaining message-queue backlog; even when a backend is drained, queued work can continue consuming threads.
+            The degraded state is observable via mq_stats/mq_starvation, probe timeout logs, and rising 5xx responses in AT access logs.
+          flows: [health_probe_timeout, agent_heartbeat_reconnect, user_api_request_degraded]
+          rate_multipliers:
+            health_probe_timeout: 80.0
+            agent_heartbeat_reconnect: 1.2
+            user_api_request_degraded: 0.8
+            tfs_at.mq_starvation: 250.0
+          latency_multipliers:
+            agent_heartbeat_reconnect: {p50: 1.6, p95: 2.8}
+            user_api_request_degraded: {p50: 1.5, p95: 2.6}
+          one_shots:
+            - ref: edge_lb.backend_state
+              count: 1
+              hosts: [vip-1]
+            - ref: ops_console.recycle_at
+              count: 2
+              hosts: [op-1]
+          manifestation: [tfs_at.mq_stats, tfs_at.mq_starvation, edge_lb.probe_timeout, tfs_at.http_access]
+
+      steady:
+        - component: tfs_at
+          condition: |
+            AT message-queue/threadpool processing remains saturated (high inflight_threads and queue_depth), leading to long internal queuing and sporadic request timeouts.
+          user_impact: |
+            User API calls experience high latency and elevated 503/504s; agent heartbeats are frequently queued or time out.
+          manifestation: [tfs_at.mq_stats, tfs_at.mq_starvation, tfs_at.http_access, tfs_at.agent_heartbeat]
+        - component: edge_lb
+          condition: |
+            Load balancer continues to see health probe timeouts and keeps some backends drained, concentrating load onto fewer ATs.
+          user_impact: |
+            Reduced backend capacity amplifies latency and failure rates for users and agents.
+          manifestation: [edge_lb.probe_timeout, edge_lb.summary]
+
+      feedback_loops:
+        - id: agent_reconnect_backlog
+          desc: |
+            Missed agent heartbeats create reconnect surges; reconnect processing fills the message queue and consumes threadpool threads,
+            which slows additional reconnect processing and keeps queue depth elevated.
+        - id: lb_load_concentration
+          desc: |
+            Probe failures drain some ATs, shifting traffic to fewer backends; the increased per-backend load further raises queuing and threadpool pressure,
+            producing more probe failures and additional draining.
+
+      flows: [user_api_request_degraded, agent_heartbeat_reconnect, health_probe_ok_degraded, health_probe_timeout]
+      manifestation: [sps_auth.sps_latency, tfs_at.mq_stats, tfs_at.mq_starvation, edge_lb.probe_timeout, ops_console.recycle_at]
+
+  assumptions:
+    - |
+      Timeline is compressed to 40 minutes while preserving the core beats: brief SPS spike → agent reconnect surge → AT saturation → LB draining and ineffective one-by-one recycling.
+    - |
+      Normal phase (0-20): expected logs/min ≈ user 200 rpm *2 = 400, agent 350 rpm *1 = 350, probes 100 rpm *1 = 100, background ≈ 6 => ~856/min; over 20 min ≈ 17k logs.
+    - |
+      Failure phase piecewise (all approximate, including background; probe timeouts and mq_starvation are suppressed at failure onset and activated later):
+        - 20-23 (3 min): agent multiplier 0.8, probe timeouts suppressed, mq_starvation suppressed => ~980–990 logs/min => ~3.0k logs.
+        - 23-27 (4 min): agent multiplier 1.4, mq_starvation enabled (≈1/min/host), still no probe timeouts => ~1.4k logs/min => ~5.5k–5.7k logs.
+        - 27-33 (6 min): probe timeouts activated (≈20/min), mq_starvation increased (≈3/min/host) => ~1.45k logs/min => ~8.5k–9k logs.
+        - 33-40 (7 min): probe timeouts more frequent (≈40/min), mq_starvation higher (≈5/min/host), user multiplier 0.8 => ~1.25k–1.3k logs/min => ~8.5k–9.5k logs.
+    - |
+      One-shots: event1 (1), event2 (1), event3 (4), event4 (3) => 9 one-shot logs total.
+    - |
+      Total expected log volume ≈ 40k–60k, meeting the 20k..100k target while ensuring decisive signals appear: SPS spike/recovery markers, persistent mq_stats with later mq_starvation, probe timeouts beginning mid-failure, LB health transitions, and ops recycle/dump actions.
+    - |
+      Visibility rationale: mq_stats emits 1/min/host throughout failure (≈80 logs over 20 min on 4 hosts), mq_starvation is suppressed until min 23 and then amplified to visible rates,
+      and probe_timeout is suppressed until min 27 and then rises sharply; SPS spike/recovery are one-shots so the trigger is always evident.
+```

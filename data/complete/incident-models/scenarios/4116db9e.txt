@@ -1,0 +1,239 @@
+```yaml
+scenario:
+  id: us_backbone_control_plane_deschedule_20190602
+  title: Network control plane descheduled leads to BGP withdrawals and backbone packet loss
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A multi-region cloud backbone normally carries traffic for regional customer APIs with low latency and minimal errors.
+    A rare maintenance event triggers automation that deschedules network control plane jobs across multiple locations.
+    After a short fail-static window, BGP sessions drop and routes are withdrawn, sharply reducing backbone capacity and causing packet loss.
+    Customers experience elevated latency and intermittent 504 timeouts from a representative regional Storage API, while monitoring/tooling also degrades.
+
+  trigger_desc: |
+    Maintenance automation starts a rare maintenance event and (due to misconfiguration plus a bug) issues a deschedule request that evicts
+    multiple independent network control plane clusters across physical locations.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        The regional Storage API in us-east4 serves steady customer traffic with low tail latency and near-zero errors.
+        The network control plane emits heartbeats, and backbone utilization remains moderate. Monitoring scrapes succeed.
+      flows: [storage_object_get_n]
+      manifestation:
+        - storage_api.req_end_200
+        - storage_api.request_stats
+        - net_control_plane.heartbeat
+        - monitoring.scrape_ok
+        - backbone_router.link_utilization
+
+    f:
+      desc: |
+        Maintenance automation evicts network control plane jobs across multiple locations. The backbone initially continues to forward traffic
+        in fail-static mode, but within minutes BGP routes are withdrawn and congestion/packet loss rises on key US backbone links.
+        Customer-facing Storage API calls show increased latency and a rising fraction of 504 timeouts with retries.
+        Tooling and monitoring contend with the same congested network and begin timing out, slowing mitigation and restoration.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: maintenance_automation
+          event: |
+            A rare maintenance event starts; automation computes an overly broad scope and the cluster manager begins evicting network control plane jobs.
+            Customer traffic is not yet significantly impacted during the initial fail-static period.
+          why: |
+            Two normally-benign configuration choices (evict-on-maintenance and eligibility for a rare maintenance type) combined with a bug that
+            allows multi-cluster, multi-location descheduling. Directly observable via automation start marker and eviction logs; control plane absence
+            is inferred from missing heartbeats/health.
+          flows: [storage_object_get_ok_f, storage_object_get_timeout_f]
+          rate_multipliers:
+            storage_object_get_timeout_f: 0.2
+            cluster_manager.job_evicted: 15.0
+            cluster_manager.job_rescheduled: 0.0
+            net_control_plane.config_rebuild_step: 0.0
+            backbone_router.packet_loss_high: 0.0
+            backbone_router.packet_loss_low: 0.0
+            monitoring.scrape_timeout: 0.0
+            monitoring.tool_query_timeout: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: maintenance_automation.maintenance_start
+              count: 1
+              hosts: [auto-1]
+          manifestation:
+            - maintenance_automation.maintenance_start
+            - cluster_manager.job_evicted
+
+        - order: 2
+          at_min: 27
+          component: monitoring
+          event: |
+            Monitoring detects missing control plane signals and pages oncall for a SEV1, while user-facing impact is still limited.
+          why: |
+            The alert is driven by absence of expected heartbeats/health endpoints after job eviction. This is directly observable via the alert-open log.
+          flows: [storage_object_get_ok_f]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.alert_open
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - monitoring.alert_open
+            - cluster_manager.job_evicted
+
+        - order: 3
+          at_min: 29
+          component: backbone_router
+          event: |
+            The initial deschedule wave is largely complete (only straggler evictions continue), and the fail-static window expires.
+            BGP sessions drop and routes are withdrawn on congested backbone links, sharply increasing packet loss.
+            Storage API latency spikes and 504 timeouts become common.
+          why: |
+            The cluster manager completes most evictions soon after the maintenance request is issued; after that only residual/late evictions occur.
+            With the network control plane absent long enough, some routing between impacted locations is withdrawn, reducing capacity and causing congestion.
+            Directly observable via BGP session-down markers and packet-loss metrics; customer impact is observed as 504s and higher p95 latency.
+          flows: [storage_object_get_ok_f, storage_object_get_timeout_f]
+          rate_multipliers:
+            storage_object_get_ok_f: 0.8
+            storage_object_get_timeout_f: 12.0
+            cluster_manager.job_evicted: 1.5
+            backbone_router.packet_loss_high: 1.0
+            backbone_router.packet_loss_low: 0.0
+            monitoring.scrape_timeout: 1.0
+            monitoring.tool_query_timeout: 1.0
+          latency_multipliers:
+            storage_object_get_ok_f: {p50: 3.0, p95: 4.0}
+          one_shots:
+            - ref: backbone_router.bgp_session_down
+              count: 8
+              hosts: [rtr-a, rtr-b]
+            - ref: monitoring.alert_open
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - backbone_router.bgp_session_down
+            - backbone_router.packet_loss_high
+            - storage_api.req_end_504
+
+        - order: 4
+          at_min: 40
+          component: maintenance_automation
+          event: |
+            Engineers halt the maintenance automation and start rescheduling the network control plane; QoS is adjusted to reduce congestion from lower priority traffic.
+            Control plane processes restart and begin rebuilding lost configuration.
+          why: |
+            Halting automation prevents further evictions. Rescheduling restores control plane compute, but full recovery is delayed because configuration must be rebuilt
+            and redistributed during an ongoing network event. Tooling remains impaired due to congestion (partially observable via tool timeouts).
+          flows: [storage_object_get_ok_f, storage_object_get_timeout_f]
+          rate_multipliers:
+            storage_object_get_ok_f: 0.9
+            storage_object_get_timeout_f: 6.0
+            cluster_manager.job_evicted: 0.0
+            cluster_manager.job_rescheduled: 5.0
+            net_control_plane.config_rebuild_step: 1.0
+            monitoring.tool_query_timeout: 1.2
+          latency_multipliers:
+            storage_object_get_ok_f: {p50: 2.5, p95: 3.5}
+          one_shots:
+            - ref: maintenance_automation.automation_halted
+              count: 1
+              hosts: [auto-1]
+            - ref: cluster_manager.reschedule_batch_start
+              count: 1
+              hosts: [cm-1]
+            - ref: net_control_plane.ncp_process_start
+              count: 2
+              hosts: [ncp-1, ncp-2]
+            - ref: backbone_router.qos_policy_update
+              count: 1
+              hosts: [rtr-a]
+          manifestation:
+            - maintenance_automation.automation_halted
+            - net_control_plane.config_rebuild_step
+            - backbone_router.qos_policy_update
+
+        - order: 5
+          at_min: 50
+          component: net_control_plane
+          event: |
+            Rebuilt configuration begins publishing; packet loss shifts from severe to moderate.
+            Control-plane rescheduling continues but tapers as most instances are already back, so fewer reschedule logs appear.
+            504 timeouts reduce but do not fully disappear by the end of the window.
+          why: |
+            As control plane state is regenerated and distributed, routing/capacity partially returns and congestion eases.
+            The cluster manager's reschedule activity drops once the bulk of the control-plane jobs have been placed; remaining work is smaller and more incremental.
+            Directly observable via config publish marker and a change in packet-loss metric stream from "high" to "elevated".
+          flows: [storage_object_get_ok_f, storage_object_get_timeout_f]
+          rate_multipliers:
+            storage_object_get_ok_f: 1.0
+            storage_object_get_timeout_f: 3.0
+            backbone_router.packet_loss_high: 0.2
+            backbone_router.packet_loss_low: 1.0
+            cluster_manager.job_rescheduled: 1.5
+            monitoring.scrape_timeout: 0.6
+            monitoring.tool_query_timeout: 0.6
+          latency_multipliers:
+            storage_object_get_ok_f: {p50: 1.8, p95: 2.5}
+          one_shots:
+            - ref: net_control_plane.config_publish_started
+              count: 3
+              hosts: [ncp-1, ncp-2]
+          manifestation:
+            - net_control_plane.config_publish_started
+            - backbone_router.packet_loss_low
+            - storage_api.request_stats
+
+      steady:
+        - component: backbone_router
+          condition: |
+            Backbone capacity remains partially reduced with ongoing moderate packet loss on key US region pairs.
+          user_impact: |
+            Some requests complete with elevated tail latency while a smaller but persistent fraction fail with timeouts.
+          manifestation: [backbone_router.packet_loss_low, backbone_router.link_utilization]
+
+        - component: storage_api
+          condition: |
+            The regional Storage API continues to see retries and intermittent upstream timeouts.
+          user_impact: |
+            Users observe slow requests and occasional 504 errors when accessing objects in the affected region.
+          manifestation: [storage_api.req_end_504, storage_api.request_stats]
+
+        - component: monitoring
+          condition: |
+            Monitoring scrapes and internal tool queries are still intermittently timing out due to residual congestion.
+          user_impact: |
+            Operators have reduced visibility and slower incident coordination compared with normal conditions.
+          manifestation: [monitoring.scrape_timeout, monitoring.tool_query_timeout]
+
+      feedback_loops:
+        - id: congestion_tooling_contention
+          desc: |
+            Congestion increases timeouts for monitoring and operational tools, reducing visibility and slowing mitigation actions.
+        - id: fail_static_then_withdraw
+          desc: |
+            Loss of the control plane does not immediately break forwarding (fail static), but after a short window routing withdraws,
+            rapidly reducing capacity and amplifying congestion and packet loss.
+
+      flows: [storage_object_get_ok_f, storage_object_get_timeout_f]
+      manifestation:
+        - backbone_router.packet_loss_high
+        - storage_api.req_end_504
+        - monitoring.scrape_timeout
+        - cluster_manager.job_evicted
+        - net_control_plane.config_rebuild_step
+
+  assumptions:
+    - "Timeline is compressed into a 60-minute window ending mid-recovery to keep the scenario within limits while preserving the causal progression (deschedule → fail-static → BGP withdrawal → congestion → mitigation → slow rebuild)."
+    - "Failure-phase breakdown (minutes): 25-29 eviction/fail-static (limited user impact), 29-40 severe packet loss (evictions mostly complete, stragglers only), 40-50 mitigation+rebuild (evictions halted, rescheduling burst), 50-60 partial recovery (moderate loss; rescheduling taper)."
+    - "Approx effective volume: normal ~615 logs/min (mostly storage request start/end + small retry rate), failure ~720 logs/min (added timeout flow and higher retries) plus ~15 logs/min background; total ~40k logs."
+    - "Key diagnostics are made likely-visible by design: eviction burst (cluster_manager.job_evicted early), BGP drops (backbone_router.bgp_session_down one-shot burst), packet loss metrics (backbone_router.packet_loss_*), customer-facing timeouts (storage_api.req_end_504, typically multi-second), and mitigation markers (automation_halted/config_publish_started)."
+    - "Per-host stats (storage_api.request_stats ok_rpm/err_rpm) are modeled as approximate splits of the global flow RPMs across 3 storage_api hosts, and allow peaks that correspond to the event multipliers applied to timeout flows."
+```

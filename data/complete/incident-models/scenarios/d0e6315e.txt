@@ -1,0 +1,216 @@
+```yaml
+scenario:
+  id: leap_second_negative_srtt_rrdns
+  title: Leap-second clock rewind triggers recovered panics in CNAME DNS resolution
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The edge DNS service normally answers authoritative queries and performs internal recursive lookups only for CNAME-based origin discovery.
+    During the leap second, a subset of hosts experienced a ~1s backward clock step, allowing negative wall-clock RTT samples to enter resolver performance smoothing.
+    Within minutes, some resolver-selection weights became invalid and triggered recovered panics during CNAME lookup selection, returning SERVFAIL for a small fraction of DNS queries.
+    A hotfix rollout started with a canary restart and reduced errors, but the scenario ends while at least one affected host remains unpatched and a small residual SERVFAIL rate persists.
+
+  trigger_desc: |
+    A leap-second-related time synchronization adjustment steps the system clock backward on a subset of edge hosts while they are measuring resolver RTTs using a non-monotonic wall clock.
+
+  time:
+    total_minutes: 56
+    phases:
+      n: {start_min: 0, end_min: 28}
+      f: {start_min: 28, end_min: 56}
+
+  phases:
+    n:
+      desc: |
+        Edge DNS hosts serve mostly healthy query traffic. A minority of queries require resolving a customer-configured CNAME
+        target to discover origin IPs, which triggers internal recursive DNS activity and weighted selection among internal resolvers.
+        Periodic metrics show stable smoothed RTTs and essentially no panics.
+      flows: [dns_simple_query_n, dns_cname_lookup_n, dns_cname_lookup_retry_n]
+      manifestation:
+        - dns_edge.dns_response_ok
+        - dns_edge.upstream_selected
+        - internal_resolver.recursive_response_ok
+        - dns_edge.rrdns_metrics
+
+    f:
+      desc: |
+        After the leap-second clock rewind on a subset of edge hosts, some resolver RTT measurements become negative.
+        Due to smoothing, the smoothed RTT used for weighting can drift below zero after enough samples.
+        When a CNAME lookup on an affected host tries to perform weighted upstream selection, an invalid (negative) weight can trigger a panic;
+        the panic is recovered, but the DNS request returns SERVFAIL. A hotfix later resets negative stats on patched hosts and rolling
+        restarts reduce the impacted fraction, but not all affected hosts are restarted within this scenario window.
+
+      events:
+        - order: 1
+          at_min: 28
+          component: time_sync
+          event: |
+            A leap-second adjustment steps the clock backward on two edge hosts; initial CNAME lookups on those hosts begin to intermittently fail with recovered panics and SERVFAIL.
+          why: |
+            RRDNS measures resolver RTT with wall-clock time.Now(); a backward step can produce negative RTT samples.
+            Those samples can later influence smoothed stats and the weighted selection code path. The clock step is directly observable via time-sync logs;
+            the internal negative RTT/smoothed state is only indirectly observable through resulting panics and (later) anomaly metrics.
+          flows: [dns_cname_panic_fail_f]
+          rate_multipliers:
+            dns_cname_fixed_reset_f: 0.0
+            dns_edge.rrdns_metrics_neg: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: time_sync.clock_step
+              count: 2
+              hosts: [dns-edge-02, dns-edge-04]
+          manifestation:
+            - time_sync.clock_step
+            - dns_edge.rrdns_panic_recovered
+            - dns_edge.dns_response_servfail
+
+        - order: 2
+          at_min: 32
+          component: monitoring
+          event: |
+            Monitoring detects elevated SERVFAIL for CNAME-related queries and opens a paging alert for DNS errors.
+          why: |
+            The SERVFAIL responses generated after recovered panics raise the observed error-rate metric above the alert threshold.
+            This alert is directly observable in monitoring logs, but it is an effect rather than the root cause.
+          flows: [dns_cname_panic_fail_f]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.alert_open
+              count: 1
+              hosts: [mon-01]
+          manifestation:
+            - monitoring.alert_open
+            - dns_edge.dns_response_servfail
+
+        - order: 3
+          at_min: 38
+          component: dns_edge
+          event: |
+            As smoothing incorporates additional negative RTT samples, recovered panics become more frequent and hosts begin emitting anomaly metrics that show negative min_srtt_ms.
+          why: |
+            Smoothing can accumulate enough negative contribution that per-resolver smoothed RTT becomes negative.
+            When that negative value reaches the weighted-selection routine, it can trigger a panic (recovered), failing the request.
+            This progression is observable via increased recovered-panic logs and the onset of rrdns_metrics_neg anomaly snapshots.
+          flows: [dns_cname_panic_fail_f]
+          rate_multipliers:
+            dns_cname_panic_fail_f: 4.0
+            dns_edge.rrdns_metrics: 1.4
+            dns_edge.rrdns_metrics_neg: 1.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - dns_edge.rrdns_metrics_neg
+            - dns_edge.rrdns_panic_recovered
+            - dns_edge.dns_response_servfail
+
+        - order: 4
+          at_min: 44
+          component: deploy_orchestrator
+          event: |
+            A hotfix is deployed to a canary node and that node is restarted; on patched nodes, negative upstream stats are reset instead of propagating into selection, reducing SERVFAIL and reducing anomaly-metric frequency.
+          why: |
+            The hotfix prevents negative values from reaching weighted selection by resetting upstream performance state when a negative stat is detected.
+            Restarting clears any already-corrupted in-memory state. The deployment and restart are directly observable; the behavioral change is observable through reset logs, fewer panics, and fewer anomaly snapshots.
+          flows: [dns_cname_fixed_reset_f, dns_cname_panic_fail_f]
+          rate_multipliers:
+            dns_cname_panic_fail_f: 1.5
+            dns_cname_fixed_reset_f: 1.0
+            dns_edge.rrdns_metrics: 1.0
+            dns_edge.rrdns_metrics_neg: 0.6
+          latency_multipliers: {}
+          one_shots:
+            - ref: deploy_orchestrator.deploy_start
+              count: 1
+              hosts: [deploy-01]
+            - ref: dns_edge.process_restart
+              count: 1
+              hosts: [dns-edge-02]
+            - ref: deploy_orchestrator.deploy_finish
+              count: 1
+              hosts: [deploy-01]
+          manifestation:
+            - deploy_orchestrator.deploy_start
+            - dns_edge.process_restart
+            - dns_edge.upstream_stats_reset
+
+        - order: 5
+          at_min: 50
+          component: deploy_orchestrator
+          event: |
+            Rollout expands to additional edge hosts; recovered panics, SERVFAIL, and negative-sRTT anomaly snapshots continue to fall, but an affected host has not yet been restarted and a small residual failure rate remains by the end of the window.
+          why: |
+            As more hosts are patched/restarted, fewer queries land on instances with corrupted in-memory stats.
+            Residual errors indicate at least one clock-stepped host is still running with corrupted state (or without the hotfix) within this compressed scenario window.
+          flows: [dns_cname_fixed_reset_f, dns_cname_panic_fail_f]
+          rate_multipliers:
+            dns_cname_panic_fail_f: 0.6
+            dns_cname_fixed_reset_f: 2.0
+            dns_edge.rrdns_metrics: 0.8
+            dns_edge.rrdns_metrics_neg: 0.3
+          latency_multipliers: {}
+          one_shots:
+            - ref: deploy_orchestrator.deploy_start
+              count: 1
+              hosts: [deploy-01]
+            - ref: dns_edge.process_restart
+              count: 1
+              hosts: [dns-edge-03]
+            - ref: deploy_orchestrator.deploy_finish
+              count: 1
+              hosts: [deploy-01]
+          manifestation:
+            - deploy_orchestrator.deploy_finish
+            - dns_edge.rrdns_panic_recovered
+            - dns_edge.dns_response_servfail
+
+      steady:
+        - component: dns_edge
+          condition: |
+            A small fraction of CNAME lookups still hit an affected edge host that has not yet been restarted/patched (e.g., dns-edge-04),
+            where negative smoothed RTT state can trigger recovered panics during weighted resolver selection.
+          user_impact: |
+            Some DNS resolutions for CNAME-based configurations intermittently return SERVFAIL; a smaller downstream fraction of HTTP requests would fail due to unsuccessful name resolution.
+          manifestation:
+            - dns_edge.rrdns_panic_recovered
+            - dns_edge.dns_response_servfail
+            - dns_edge.rrdns_metrics_neg
+
+      feedback_loops:
+        - id: smoothed_negative_srtt_persists
+          desc: |
+            Once negative RTT samples are incorporated into smoothed upstream performance, the negative state persists on that host and affects subsequent selections.
+            This creates repeated panics on that instance until the stats are reset by hotfix logic or cleared by a restart.
+
+      flows:
+        - dns_simple_query_f
+        - dns_cname_lookup_f
+        - dns_cname_lookup_retry_f
+        - dns_cname_panic_fail_f
+        - dns_cname_fixed_reset_f
+      manifestation:
+        - dns_edge.rrdns_panic_recovered
+        - dns_edge.dns_response_servfail
+        - dns_edge.rrdns_metrics
+        - dns_edge.rrdns_metrics_neg
+        - dns_edge.upstream_stats_reset
+
+  assumptions:
+    - >
+      The original incident lasted multiple hours across many data centers; this scenario compresses the timeline to 56 minutes while keeping the ordering:
+      clock rewind → smoothing-driven worsening (now evidenced by delayed onset of rrdns_metrics_neg) → canary hotfix → broader rollout (still incomplete by end).
+    - >
+      Failure-phase piecewise breakdown (effective): minutes 28-38 low errors (panic flow ~0.4 rpm; rrdns_metrics_neg suppressed);
+      minutes 38-44 peak (panic flow ~1.6 rpm; rrdns_metrics_neg enabled); minutes 44-50 mitigated (panic flow ~0.6 rpm; fixed-reset flow ~2 rpm; anomaly metrics reduced);
+      minutes 50-56 further reduced but not eliminated (panic flow ~0.24 rpm; fixed-reset flow ~4 rpm; anomaly metrics rarer).
+    - >
+      Approximate log volume: normal phase 28 min * ~1330 logs/min ≈ 37k; failure phase 28 min * ~1330–1345 logs/min plus one-shots ≈ 37k–38k;
+      total ≈ 74k–75k logs (within 20k–100k).
+    - >
+      Visibility rationale: the trigger is evidenced by time_sync.clock_step one-shots; the smoothing-driven progression is evidenced by the onset of dns_edge.rrdns_metrics_neg
+      plus increased dns_edge.rrdns_panic_recovered and dns_edge.dns_response_servfail; mitigation/rollout is evidenced by deploy_orchestrator logs, dns_edge.process_restart,
+      and dns_edge.upstream_stats_reset after patch activation.
+    - >
+      Rollout is intentionally modeled as incomplete: only one of the two clock-stepped edge hosts is restarted early in-window, leaving a supported residual dns_cname_panic_fail_f rate in steady state.
+```

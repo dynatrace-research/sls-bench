@@ -1,0 +1,257 @@
+```yaml
+scenario:
+  id: uscentral_gateway_corridor_packet_loss_may2022
+  title: Packet loss and prolonged backbone reconvergence from central gateway campus
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Customer API traffic from a central US edge traverses a backbone corridor to west-region services (Storage, SQL, Messages),
+    while connectivity gateways run VPN and Interconnect health probes. A fiber-path component failure reduces bandwidth on the
+    corridor and triggers automated reconvergence; because the intended second-best path is still being augmented, some traffic
+    migrates to a third-best path and convergence takes longer than expected. Customers observe intermittent packet loss, elevated
+    latency, and transient 5xx/errors, with some services (notably Storage and SQL) continuing to show impact after the corridor
+    stabilizes due to backlog and delayed recovery.
+
+  trigger_desc: |
+    A component on a fiber path feeding the central US gateway campus fails, reducing available bandwidth on a backbone corridor
+    and initiating automatic traffic migration to alternate paths.
+
+  time:
+    total_minutes: 45
+    phases:
+      n: {start_min: 0, end_min: 15}
+      f: {start_min: 15, end_min: 45}
+
+  phases:
+    n:
+      desc: |
+        The corridor operates normally with low loss and stable RTT. Cloud Storage, Cloud SQL, and Messages API requests succeed
+        with typical latency. VPN keepalives and Interconnect BFD probes succeed, and global routing propagation delay is low.
+      flows: [gcs_api_call_n, cloudsql_op_n, messages_publish_n, vpn_keepalive_n, interconnect_bfd_n]
+      manifestation:
+        - netmon.corridor_health
+        - cloud_router_cp.route_update_delay
+        - api_edge_uscentral.edge_health
+
+    f:
+      desc: |
+        After a corridor bandwidth reduction, the backbone begins reconverging. Packet loss alarms and interface drops appear,
+        connectivity probes begin timing out, and routing propagation slows. Because a topology augmentation leaves the second-best
+        path insufficient, some traffic is pushed to a third-best path, extending the migration. Downstream services show elevated
+        latency and transient 5xx; later, SQL replication lag and messaging backlog warnings appear. As reconvergence completes,
+        sustained packet-loss alarms and probe timeouts stop, but Storage and SQL continue to show residual elevated latency and
+        occasional errors due to ongoing recovery.
+
+      events:
+        - order: 1
+          at_min: 15
+          component: backbone_gateway_central
+          event: |
+            A backbone interface on the central gateway campus drops, reducing corridor capacity; automated reconvergence begins and
+            packet-loss alarms are observed.
+          why: |
+            The fiber-path component failure manifests as an interface-down condition and reduced available bandwidth. Packet loss
+            occurs while traffic is redistributed over remaining paths; this is directly observable via telemetry, loss alarms, and
+            elevated drop counters.
+          flows:
+            - vpn_keepalive_fail_f
+            - interconnect_bfd_fail_f
+            - gcs_api_call_err_f
+          rate_multipliers:
+            messages_publish_err_f: 0.0
+            cloudsql_op_err_f: 0.0
+            gcs_api_call_err_f: 0.5
+            messages_west.backlog_warn: 0.0
+            cloud_sql_west.replication_lag_warn: 0.0
+          latency_multipliers:
+            gcs_api_call_ok_f: {p50: 1.1, p95: 1.2}
+            vpn_keepalive_ok_f: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: backbone_gateway_central.link_state_change
+              count: 1
+              hosts: [gw-uc1-r1]
+            - ref: te_controller.reconv_start
+              count: 1
+              hosts: [te-ctrl-1]
+          manifestation:
+            - backbone_gateway_central.link_state_change
+            - te_controller.reconv_start
+            - netmon.loss_alarm
+
+        - order: 2
+          at_min: 17
+          component: te_controller
+          event: |
+            Traffic engineering selects a less-preferred alternate (third-best) path for the corridor, prolonging migration; packet loss
+            and probe timeouts increase and the Messages availability issue begins.
+          why: |
+            During topology augmentation, the intended second-best fallback lacks sufficient capacity, requiring some traffic to shift
+            to a third-best path, which increases convergence time. This is partially observable via TE path selection markers and
+            sustained loss alarms; the augmentation status itself is external context.
+          flows:
+            - messages_publish_err_f
+            - vpn_keepalive_fail_f
+            - interconnect_bfd_fail_f
+          rate_multipliers:
+            netmon.loss_alarm: 2.0
+            vpn_keepalive_fail_f: 1.3
+            interconnect_bfd_fail_f: 1.3
+            messages_publish_err_f: 1.0
+            messages_west.backlog_warn: 1.0
+            te_controller.reconv_progress: 1.3
+          latency_multipliers:
+            messages_publish_ok_f: {p50: 1.2, p95: 1.4}
+          one_shots:
+            - ref: te_controller.path_selected
+              count: 1
+              hosts: [te-ctrl-1]
+          manifestation:
+            - te_controller.path_selected
+            - netmon.loss_alarm
+            - messages_west.backlog_warn
+
+        - order: 3
+          at_min: 21
+          component: gcs_api_west
+          event: |
+            Downstream services amplify: Storage 5xx/latency increase and Cloud SQL operation failures begin; replication lag warnings appear.
+          why: |
+            Sustained packet loss and reconnection churn increase request timeouts and transient 5xx. For Cloud SQL, prolonged disruption
+            also delays replication, producing lag warnings. These are directly observable in service error logs and lag metrics.
+          flows:
+            - gcs_api_call_err_f
+            - cloudsql_op_err_f
+          rate_multipliers:
+            gcs_api_call_err_f: 1.6
+            cloudsql_op_err_f: 1.0
+            cloud_sql_west.replication_lag_warn: 1.0
+            cloud_router_cp.route_update_delay: 1.6
+          latency_multipliers:
+            gcs_api_call_ok_f: {p50: 1.25, p95: 1.45}
+            cloudsql_op_ok_f: {p50: 1.2, p95: 1.5}
+          one_shots: []
+          manifestation:
+            - gcs_api_west.gcs_err
+            - cloud_sql_west.replication_lag_warn
+            - cloud_router_cp.route_update_delay
+
+        - order: 4
+          at_min: 33
+          component: netmon
+          event: |
+            Sustained packet-loss alarms become infrequent as most traffic has migrated off the degraded link; VPN keepalive and
+            Interconnect BFD timeouts stop and Messages availability recovers, while Storage and SQL remain slower than normal.
+          why: |
+            As reconvergence progresses, fewer flows traverse the most impaired segment, reducing sustained-loss windows and eliminating
+            probe timeouts. Messages clears backlog and stops failing publishes, while Storage/SQL remain impacted by residual retries,
+            queued work, and replica catch-up.
+          flows:
+            - messages_publish_ok_f
+            - vpn_keepalive_ok_f
+            - interconnect_bfd_ok_f
+          rate_multipliers:
+            netmon.loss_alarm: 0.2
+            vpn_keepalive_fail_f: 0.0
+            interconnect_bfd_fail_f: 0.0
+            vpn_keepalive_ok_f: 1.2
+            interconnect_bfd_ok_f: 1.15
+            messages_publish_err_f: 0.0
+            messages_west.backlog_warn: 0.2
+          latency_multipliers:
+            messages_publish_ok_f: {p50: 0.9, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - netmon.loss_alarm
+            - connectivity_gateway.vpn_keepalive_ok
+            - connectivity_gateway.bfd_ok
+
+        - order: 5
+          at_min: 35
+          component: te_controller
+          event: |
+            Reconvergence completes for the corridor; sustained packet-loss alarms and probe timeouts stop, controller reconvergence
+            progress logs cease, but Storage and SQL continue partial recovery (elevated latency, occasional errors, and replication lag).
+          why: |
+            Routing/TE reprogramming finishes, stabilizing the corridor and preventing sustained packet-loss windows. Application-level
+            recovery can lag behind due to queued work, retries, and replica catch-up; this is observable via remaining service errors
+            and lag warnings.
+          flows:
+            - gcs_api_call_err_f
+            - cloudsql_op_err_f
+          rate_multipliers:
+            netmon.loss_alarm: 0.0
+            vpn_keepalive_fail_f: 0.0
+            interconnect_bfd_fail_f: 0.0
+            te_controller.reconv_progress: 0.0
+            gcs_api_call_err_f: 0.8
+            cloudsql_op_err_f: 0.8
+            cloud_sql_west.replication_lag_warn: 1.0
+          latency_multipliers:
+            gcs_api_call_ok_f: {p50: 0.95, p95: 1.1}
+            cloudsql_op_ok_f: {p50: 0.95, p95: 1.2}
+          one_shots:
+            - ref: te_controller.reconv_complete
+              count: 1
+              hosts: [te-ctrl-1]
+          manifestation:
+            - te_controller.reconv_complete
+            - cloud_sql_west.replication_lag_warn
+            - gcs_api_west.gcs_err
+
+      steady:
+        - component: gcs_api_west
+          condition: |
+            Corridor reconvergence is complete, but Cloud Storage still shows elevated latency with occasional transient 5xx
+            as clients/backends drain retries and reconnect churn.
+          user_impact: |
+            Some customers see slower Storage API calls and intermittent HTTP 500/503 responses.
+          manifestation: [gcs_api_west.gcs_err, api_edge_uscentral.edge_resp_gcs_err]
+
+        - component: cloud_sql_west
+          condition: |
+            SQL operations remain slower and a subset still fail; replication lag remains elevated while replicas catch up.
+          user_impact: |
+            Exports/updates/deletes may fail or take longer; west-region replication is delayed.
+          manifestation: [cloud_sql_west.replication_lag_warn, cloud_sql_west.sql_err]
+
+      feedback_loops:
+        - id: loss_retransmit_congestion_loop
+          desc: |
+            Packet loss causes retries and retransmissions, which raise effective load on remaining links and prolong loss windows,
+            increasing the time until the corridor stabilizes.
+        - id: delayed_service_recovery_loop
+          desc: |
+            Even after routing stabilizes, queued work and replica catch-up keep latency elevated and errors present for some APIs.
+
+      flows:
+        - gcs_api_call_ok_f
+        - gcs_api_call_err_f
+        - cloudsql_op_ok_f
+        - cloudsql_op_err_f
+        - messages_publish_ok_f
+        - messages_publish_err_f
+        - vpn_keepalive_ok_f
+        - vpn_keepalive_fail_f
+        - interconnect_bfd_ok_f
+        - interconnect_bfd_fail_f
+      manifestation:
+        - netmon.corridor_health
+        - netmon.loss_alarm
+        - te_controller.reconv_progress
+        - backbone_gateway_central.iface_stats
+        - cloud_router_cp.route_update_delay
+        - connectivity_gateway.gw_stats
+        - gcs_api_west.gcs_err
+        - cloud_sql_west.replication_lag_warn
+        - messages_west.backlog_warn
+
+  assumptions:
+    - "Timeline mapping: normal 15m, failure 30m; failure includes both the ~20m corridor instability and a longer tail of service recovery (Storage/SQL), consistent with the report's longer Storage/SQL impact windows."
+    - "One-shot semantic binding: backbone_gateway_central.link_state_change is modeled only as state=down, and te_controller.path_selected is modeled only as path_rank=3, to prevent event narratives from being contradicted by generated values."
+    - "Modeled service impacts match the report qualitatively: VPN/Interconnect and routing delays start immediately; Messages issues begin shortly after; SQL lag appears after sustained disruption; Storage and SQL can continue beyond corridor stabilization."
+    - "Failure-phase piecewise volume (very rough): 15–17 (2m) ~650–750 logs/min; 17–21 (4m) ~750–950 logs/min; 21–33 (12m) ~850–1100 logs/min; 33–35 (2m) ~650–850 logs/min (probe timeouts eliminated, alarms reduced); 35–45 (10m) ~620–820 logs/min (no loss alarms/probe timeouts; TE progress logs stopped; residual Storage/SQL errors + lag remain)."
+    - "One-shots per event: event1=2 (link_state_change, reconv_start), event2=1 (path_selected), event5=1 (reconv_complete)."
+    - "Visibility rationale: diagnosable via netmon.loss_alarm + router drop_ppm at onset, TE path_selected with rank=3 for prolonged convergence, elevated cloud_router_cp.route_update_delay, time-bounded Messages backlog/errors, and delayed cloud_sql_west.replication_lag_warn plus residual gcs 5xx after reconvergence completion."
+    - "Total log estimate over 45 minutes: ~28k–43k logs (request flows dominate volume; background telemetry ensures key network symptoms remain visible during the active packet-loss interval)."
+```

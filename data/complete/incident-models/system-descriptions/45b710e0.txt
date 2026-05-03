@@ -1,0 +1,399 @@
+```yaml
+sys:
+  id: arpanet_imp_routing
+  desc: >
+    A packet-switched network of IMP nodes provides connectivity between TIP terminal servers and remote hosts.
+    IMPs exchange routing updates using a flooding protocol with sequence numbers to keep the network-wide view consistent.
+    During the incident, corrupted routing-update sequence numbers form a cycle that is repeatedly accepted and forwarded,
+    driving high CPU and buffer starvation in IMPs and causing neighbor lines to be declared down, leading to widespread "net trouble" for users.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: tip_access
+    name: TIP Terminal Access
+    svc: tip
+    hosts: [tip01, tip07]
+    desc: Dial-up terminal access concentrator; initiates connections via a local IMP and reports user-facing errors.
+
+    to:
+      - dst: imp_node
+        proto: ncp
+        desc: Sends user connection requests to the local IMP for routing.
+
+    logs:
+      conn_request:
+        desc: User attempts to open a connection to a remote host via the local IMP.
+        lvl: INFO
+        msg: "open connection user={user} dst_host={dst_host} local_imp={local_imp}"
+        vars:
+          user: {k: ch, v: [alice, bob, carol, dave, erin, frank]}
+          dst_host: {k: str, v: "remote-hostname"}
+          local_imp: {k: ch, v: [imp12, imp17, imp33]}
+      conn_ok:
+        desc: TIP reports a successful connection establishment.
+        lvl: INFO
+        msg: "connection established dst_host={dst_host} dst_ip={dst_ip}"
+        vars:
+          dst_host: {k: str, v: "remote-hostname"}
+          dst_ip: {k: ip, v: null}
+      net_trouble:
+        desc: TIP reports a network failure indicating no viable physical path.
+        lvl: ERROR
+        msg: "net trouble: no physical path dst_host={dst_host} local_imp={local_imp}"
+        vars:
+          dst_host: {k: str, v: "remote-hostname"}
+          local_imp: {k: ch, v: [imp12, imp17, imp33]}
+
+    beh:
+      n: {desc: "TIP emits no periodic logs in this model; activity is request-driven.", emit: []}
+      f: {desc: "TIP emits no periodic logs in this model; activity is request-driven.", emit: []}
+
+  - id: imp_node
+    name: IMP Node (routing + line protocol)
+    svc: imp
+    hosts: [imp12, imp17, imp29, imp33, imp41, imp50]
+    desc: >
+      IMP software maintains routing state, floods routing updates, and runs a line up/down protocol with neighbors.
+      Under heavy routing-update churn, CPU and buffers are consumed by routing processing, starving line protocol messages.
+
+    to:
+      - dst: imp_node
+        proto: ncp
+        desc: Neighbor-to-neighbor control traffic, including flooded routing updates.
+      - dst: tip_access
+        proto: ncp
+        desc: Serves TIP connection routing and session maintenance.
+
+    logs:
+      ru_rx_normal:
+        desc: Routing update packet received under normal conditions.
+        lvl: INFO
+        msg: "routing update rx origin={origin_imp} seq={seq} from={from_imp} bytes={bytes}"
+        vars:
+          origin_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41, imp50]}
+          seq: {k: i, v: [0, 63]}
+          from_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41]}
+          bytes: {k: i, v: [48, 96]}
+      ru_rx_cycle:
+        desc: Routing update received from the incident's cycling origin/sequence set.
+        lvl: INFO
+        msg: "routing update rx origin={origin_imp} seq={seq} from={from_imp} bytes={bytes}"
+        vars:
+          origin_imp: {k: ch, v: [imp50]}
+          seq: {k: ch, v: [8, 40, 44]}
+          from_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41]}
+          bytes: {k: i, v: [48, 96]}
+      ru_accept:
+        desc: Update accepted as most recent for its origin based on sequence comparison.
+        lvl: INFO
+        msg: "routing update accepted origin={origin_imp} seq={seq} prev_seq={prev_seq}"
+        vars:
+          origin_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41, imp50]}
+          seq: {k: i, v: [0, 63]}
+          prev_seq: {k: i, v: [0, 63]}
+      ru_fwd:
+        desc: Update forwarded (flooded) to a neighbor after acceptance.
+        lvl: INFO
+        msg: "routing update fwd origin={origin_imp} seq={seq} to={to_imp} kind={tx_kind}"
+        vars:
+          origin_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41, imp50]}
+          seq: {k: i, v: [0, 63]}
+          to_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41]}
+        state_vars:
+          n:
+            tx_kind: {k: ch, v: [initial]}
+          f:
+            tx_kind: {k: ch, v: [initial, retransmit]}
+      ru_enqueue:
+        desc: Update queued for routing processing; backlog indicates CPU/resource pressure.
+        lvl: WARN
+        msg: "routing update queued origin={origin_imp} seq={seq} q_depth={q_depth}"
+        vars:
+          origin_imp: {k: ch, v: [imp50]}
+          seq: {k: ch, v: [8, 40, 44]}
+          q_depth: {k: i, v: [200, 8000]}
+      ru_qdrop:
+        desc: Update dropped due to excessive queue depth/buffer pressure.
+        lvl: ERROR
+        msg: "routing update dropped origin={origin_imp} seq={seq} q_depth={q_depth}"
+        vars:
+          origin_imp: {k: ch, v: [imp50]}
+          seq: {k: ch, v: [8, 40, 44]}
+          q_depth: {k: i, v: [2000, 12000]}
+
+      cpu_stat:
+        desc: Periodic CPU usage snapshot.
+        lvl: INFO
+        msg: "cpu load cpu_pct={cpu_pct} routing_pct={routing_pct}"
+        vars:
+          cpu_pct: {k: i, v: [5, 99]}
+          routing_pct: {k: i, v: [1, 98]}
+      cpu_warn:
+        desc: High CPU warning indicating routing process dominates.
+        lvl: WARN
+        msg: "cpu high cpu_pct={cpu_pct} routing_pct={routing_pct}"
+        vars:
+          cpu_pct: {k: i, v: [85, 100]}
+          routing_pct: {k: i, v: [70, 100]}
+      buf_stat:
+        desc: Periodic buffer pool snapshot.
+        lvl: INFO
+        msg: "buffers free={buf_free} total={buf_total} waiters={buf_waiters}"
+        vars:
+          buf_free: {k: i, v: [0, 4096]}
+          buf_total: {k: i, v: [4096, 4096]}
+          buf_waiters: {k: i, v: [0, 900]}
+      buffer_low:
+        desc: Buffer starvation impacting protocol processing (e.g., HELLO/I-HEARD-YOU reception).
+        lvl: ERROR
+        msg: "buffer starvation free={buf_free} waiters={buf_waiters} symptom={symptom}"
+        vars:
+          buf_free: {k: i, v: [0, 80]}
+          buf_waiters: {k: i, v: [50, 1500]}
+          symptom: {k: ch, v: [rx_no_buffer, hello_drop, update_queue_full]}
+
+      line_state:
+        desc: Neighbor line declared up/down by the line protocol.
+        lvl: WARN
+        msg: "line {neighbor_imp} state={state} reason={reason}"
+        vars:
+          neighbor_imp: {k: ch, v: [imp12, imp17, imp29, imp33, imp41, imp50]}
+          state: {k: ch, v: [up, down]}
+          reason: {k: ch, v: [hello_timeout, quality_low, admin_reset]}
+
+      session_route_ok:
+        desc: Session routing decision succeeded for a TIP connection.
+        lvl: INFO
+        msg: "route ok dst_host={dst_host} next_hop={next_hop} rtt_ms={rtt_ms}"
+        vars:
+          dst_host: {k: str, v: "remote-hostname"}
+          next_hop: {k: ch, v: [imp12, imp17, imp29, imp33, imp41]}
+          rtt_ms: {k: i, v: [20, 220]}
+      session_route_fail:
+        desc: Session routing decision failed (e.g., no physical path due to lines down).
+        lvl: ERROR
+        msg: "route fail dst_host={dst_host} cause={cause}"
+        vars:
+          dst_host: {k: str, v: "remote-hostname"}
+          cause: {k: ch, v: [no_physical_path, routing_busy, line_down]}
+      session_reset:
+        desc: Existing session broken due to routing/line instability.
+        lvl: WARN
+        msg: "session reset peer={peer} reason={reason}"
+        vars:
+          peer: {k: str, v: "peer-id"}
+          reason: {k: ch, v: [line_flap, route_change, timeout]}
+
+      restart_complete:
+        desc: IMP restarted after operator action (dumps taken externally; modeled as a flag).
+        lvl: INFO
+        msg: "restart complete dump_taken={dump_taken} uptime_s={uptime_s}"
+        vars:
+          dump_taken: {k: ch, v: [yes]}
+          uptime_s: {k: i, v: [5, 120]}
+      patch_applied:
+        desc: IMP applied a temporary routing patch to ignore updates from a specific origin.
+        lvl: INFO
+        msg: "patch applied ignore_origin={ignore_origin} patch_id={patch_id}"
+        vars:
+          ignore_origin: {k: ch, v: [imp50]}
+          patch_id: {k: ch, v: [temp_ignore_origin]}
+
+    beh:
+      n:
+        desc: Normal operation shows low CPU warnings and stable lines; routing is mostly event-driven via flows.
+        emit:
+          - id: cpu_stat
+            per_min: 1.0
+          - id: buf_stat
+            per_min: 1.0
+          - id: cpu_warn
+            per_min: 0.05
+          - id: buffer_low
+            per_min: 0.01
+          - id: line_state
+            per_min: 0.08
+          - id: session_reset
+            per_min: 0.03
+      f:
+        desc: Under routing-update storm conditions, CPU and buffers are pressured and lines flap.
+        emit:
+          - id: cpu_stat
+            per_min: 1.0
+          - id: buf_stat
+            per_min: 1.0
+          - id: cpu_warn
+            per_min: 0.8
+          - id: buffer_low
+            per_min: 0.5
+          - id: line_state
+            per_min: 0.2
+          - id: session_reset
+            per_min: 0.2
+
+  - id: ncc
+    name: Network Control Center (NCC)
+    svc: ncc
+    hosts: [ncc01]
+    desc: Central operations system that issues restarts and broadcasts patches over the network itself.
+
+    to:
+      - dst: imp_node
+        proto: ncp
+        desc: Remote control/patch distribution to IMPs over the network.
+
+    logs:
+      restart_cmd:
+        desc: NCC issues a restart command to a set of IMPs.
+        lvl: WARN
+        msg: "restart issued imp={imp_id} reason={reason}"
+        vars:
+          imp_id: {k: ch, v: [imp12, imp17, imp33, imp29]}
+          reason: {k: ch, v: [routing_storm, diagnostics]}
+      patch_broadcast_start:
+        desc: NCC begins broadcasting a patch to all reachable IMPs.
+        lvl: WARN
+        msg: "patch broadcast started ignore_origin={ignore_origin}"
+        vars:
+          ignore_origin: {k: ch, v: [imp50]}
+      patch_ack:
+        desc: NCC receives patch acknowledgements (or timeouts) from IMPs during rollout.
+        lvl: INFO
+        msg: "patch ack imp={imp_id} status={status} lag_s={lag_s}"
+        vars:
+          imp_id: {k: ch, v: [imp12, imp17, imp33, imp29, imp41]}
+          status: {k: ch, v: [applied, pending, unreachable]}
+          lag_s: {k: i, v: [30, 14400]}
+
+    beh:
+      n:
+        desc: No active patching in normal conditions.
+        emit:
+          - id: patch_ack
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Patch acknowledgements can appear during attempted mitigation; otherwise quiet.
+        emit:
+          - id: patch_ack
+            per_min: 0.7
+            scope: global
+
+tracing:
+  on: true
+  origins: [tip_access, ncc]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user sessions succeed and routing updates are flooded at a modest rate.
+    req:
+      - id: tip_connect_success
+        desc: TIP opens a session to a remote host; IMP resolves route and session is established.
+        rpm: 80.0
+        path: [tip_access, imp_node, tip_access]
+        emit: [tip_access.conn_request, imp_node.session_route_ok, tip_access.conn_ok]
+        latency_ms: [[8, 25], [5, 18], [10, 35]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: routing_update_processed_n
+        desc: IMP receives, accepts, and forwards a routing update as part of normal flooding.
+        rpm: 200.0
+        path: [imp_node, imp_node]
+        emit: [imp_node.ru_rx_normal, imp_node.ru_accept, imp_node.ru_fwd]
+        latency_ms: [[1, 4], [1, 6], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Routing update storm and resource starvation dominate; most user sessions fail with no physical path.
+    req:
+      - id: tip_connect_fail_net_trouble
+        desc: TIP attempts to open a session but IMP cannot find a viable physical path due to lines down/routing busy.
+        rpm: 75.0
+        path: [tip_access, imp_node, tip_access]
+        emit: [tip_access.conn_request, imp_node.session_route_fail, tip_access.net_trouble]
+        latency_ms: [[10, 35], [50, 250], [5, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: tip_connect_success_rare
+        desc: Rare successful connection during the outage (local islands of connectivity).
+        rpm: 2.0
+        path: [tip_access, imp_node, tip_access]
+        emit: [tip_access.conn_request, imp_node.session_route_ok, tip_access.conn_ok]
+        latency_ms: [[10, 40], [40, 220], [10, 45]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: routing_update_backlog
+        desc: IMP receives a cycling-origin update but can only enqueue it due to CPU contention.
+        rpm: 600.0
+        path: [imp_node, imp_node]
+        emit: [imp_node.ru_rx_cycle, imp_node.ru_enqueue]
+        latency_ms: [[1, 5], [5, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: routing_update_processed_f
+        desc: Some updates are still processed and forwarded, perpetuating circulation.
+        rpm: 150.0
+        path: [imp_node, imp_node]
+        emit: [imp_node.ru_rx_cycle, imp_node.ru_accept, imp_node.ru_fwd]
+        latency_ms: [[1, 6], [5, 60], [1, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: routing_update_drop
+        desc: Under severe queue/buffer pressure, some cycling updates are dropped.
+        rpm: 50.0
+        path: [imp_node, imp_node]
+        emit: [imp_node.ru_rx_cycle, imp_node.ru_qdrop]
+        latency_ms: [[1, 6], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |-
+    System is modeled as TIPs, multiple IMP nodes, and an NCC; host systems beyond TIP/IMP are abstracted into dst_host fields.
+  - |-
+    The causal core is preserved: corrupted routing update sequence numbers for origin IMP50 form a cycle, causing indefinite flooding/processing.
+  - |-
+    The hardware malfunction and bit-dropping in/near IMP29 is not directly logged; it is inferred from the repeating seq set {8,40,44} and origin=imp50.
+  - |-
+    Line up/down protocol details (HELLO/I-HEARD-YOU) are represented via line_state reason=hello_timeout and buffer_starvation symptom=hello_drop.
+  - |-
+    Normal-phase volume estimate (15 min): ~850 logs/min from flows + ~13 logs/min background across 6 IMPs => ~12k-13k logs.
+  - |-
+    With failure routing storm modeled at thousands of logs/min, total scenario volume is expected ~60k logs (target 20k-100k), making key signals (ru_rx_cycle, cpu_warn, buffer_low, line_state, tip net_trouble) very likely to appear.
+```

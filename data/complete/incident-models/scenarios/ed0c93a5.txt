@@ -1,0 +1,201 @@
+```yaml
+scenario:
+  id: writeapi_streaming_deadlock_usm_20221013
+  title: Write API streaming deadlock under traffic surge causes persistent connection failures
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system provides high-throughput streaming ingestion via the BigQuery Storage Write API, fronted by a regional load balancer.
+    An unexpected surge of incoming and logging traffic triggers a deadlock in an internal streaming RPC library within the Write API frontend,
+    leaving some instances stuck and causing elevated connection failures and UNAVAILABLE responses for customers in the US multi-region.
+    Autoscaling and manual capacity increases do not clear the stuck instances; availability improves only after engineers begin restarting affected instances.
+
+  trigger_desc: |
+    A sudden increase of Write API incoming traffic and logging load in the US multi-region triggers a deadlock bug in the internal streaming RPC library used by the Write API streaming frontend.
+
+  time:
+    total_minutes: 55
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 55}
+
+  phases:
+    n:
+      desc: |
+        Streaming Write API traffic is steady and mostly successful. The load balancer reports no stuck backends, frontend health is OK,
+        and synthetic checks report OK with low latency. InsertAll ingestion runs normally with low failure rates.
+      flows: [write_append_success_n, insertall_success_n]
+      manifestation: [edge_lb.pool_health, writeapi_frontend.fe_health, monitoring.synthetic_check, edge_lb.access_ok]
+
+    f:
+      desc: |
+        At failure onset, a traffic and logging surge interacts with a streaming RPC library bug, causing deadlocks in the Write API frontends.
+        Some instances become stuck and continue receiving connections due to load balancing behavior, producing persistent connection failures
+        and UNAVAILABLE responses. Automated remediation (memory increase, scale-out within the current cap) and manual max-instance increases add capacity
+        but do not clear the stuck instances. Only after engineers identify the need to restart stuck instances do error rates begin to fall, though the
+        incident is not fully mitigated by the end of this scenario window.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: writeapi_frontend
+          event: |
+            A sudden surge in streaming traffic coincides with frontend handler deadlocks; customers begin seeing connection failures and UNAVAILABLE errors.
+          why: |
+            The internal streaming RPC library can deadlock under elevated load, leaving some frontend handlers stuck. This is indirectly observable via
+            watchdog errors and rising inflight/active_streams; customer impact is directly observable via LB connection failures and UNAVAILABLE responses.
+          flows: [write_append_fail_conn_f, write_append_fail_unavailable_f, write_append_success_f]
+          rate_multipliers:
+            edge_lb.pool_health_postcap: 0.0
+          latency_multipliers:
+            write_append_success_f: {p50: 1.8, p95: 2.5}
+            write_append_fail_unavailable_f: {p50: 1.8, p95: 2.5}
+            write_append_fail_conn_f: {p50: 1.4, p95: 1.6}
+          one_shots: []
+          manifestation: [edge_lb.conn_failure, writeapi_frontend.append_unavail, edge_lb.access_err, edge_lb.pool_health]
+
+        - order: 2
+          at_min: 28
+          component: monitoring
+          event: |
+            Internal alerting fires for elevated Write API streaming error rate; automation increases memory and attempts a small scale-out within the current cap.
+          why: |
+            Error-rate monitors trigger on sustained connection failures/UNAVAILABLE. Autoscaling actions are directly observable via autoscaler logs,
+            but they do not immediately resolve deadlocked/stuck instances.
+          flows: [write_append_fail_conn_f, write_append_fail_unavailable_f]
+          rate_multipliers:
+            monitoring.synthetic_check: 3.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.alert_firing
+              count: 1
+              hosts: [mon-1]
+            - ref: autoscaler.memory_increase
+              count: 6
+              hosts: [as-1]
+            - ref: autoscaler.scale_out
+              count: 1
+              hosts: [as-1]
+          manifestation: [monitoring.alert_firing, autoscaler.memory_increase, autoscaler.scale_out]
+
+        - order: 3
+          at_min: 34
+          component: control_plane
+          event: |
+            Engineers increase the maximum allowed Write API frontend instances (20 -> 100). More healthy backends appear in the pool, but customer-facing errors remain elevated.
+          why: |
+            Increasing the cap allows more instances to be created, but existing deadlocked instances remain stuck and can continue receiving traffic
+            through load balancing, so errors persist despite additional capacity.
+          flows: [write_append_fail_conn_f, write_append_fail_unavailable_f, insertall_fail_f]
+          rate_multipliers:
+            edge_lb.pool_health: 0.0
+            edge_lb.pool_health_postcap: 1.0
+            write_append_fail_conn_f: 1.2
+            write_append_fail_unavailable_f: 1.1
+            insertall_fail_f: 1.1
+          latency_multipliers:
+            write_append_fail_unavailable_f: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: control_plane.set_max_instances
+              count: 1
+              hosts: [cp-1]
+          manifestation: [control_plane.set_max_instances, edge_lb.pool_health_postcap, edge_lb.conn_failure]
+
+        - order: 4
+          at_min: 48
+          component: writeapi_frontend
+          event: |
+            Despite continued resource additions, stuck frontends accumulate and deadlock watchdog errors become more frequent; connection failures rise further.
+          why: |
+            Additional load and connection churn increases contention, producing more blocked handlers on affected instances. This is observable as an increase
+            in watchdog error logs and a higher rate of LB-level connection failures.
+          flows: [write_append_fail_conn_f, write_append_fail_unavailable_f, write_append_success_f]
+          rate_multipliers:
+            write_append_success_f: 0.9
+            write_append_fail_conn_f: 1.4
+            write_append_fail_unavailable_f: 1.2
+            writeapi_frontend.rpc_deadlock_watchdog: 4.0
+          latency_multipliers:
+            write_append_fail_conn_f: {p50: 1.2, p95: 1.3}
+            write_append_fail_unavailable_f: {p50: 1.3, p95: 1.5}
+          one_shots:
+            - ref: autoscaler.scale_out_postcap
+              count: 1
+              hosts: [as-1]
+          manifestation: [writeapi_frontend.rpc_deadlock_watchdog, edge_lb.conn_failure, edge_lb.pool_health_postcap, autoscaler.scale_out_postcap]
+
+        - order: 5
+          at_min: 52
+          component: control_plane
+          event: |
+            Engineers begin restarting suspected-stuck Write API frontend instances; success rate improves but errors persist within the scenario window.
+          why: |
+            Restarting clears deadlocked processes and removes them from the pool, reducing the probability that new connections land on stuck backends.
+            Improvement is directly observable via fewer connection failures and fewer watchdog errors, but not all instances are restarted by scenario end.
+          flows: [write_append_success_f, write_append_fail_conn_f, write_append_fail_unavailable_f, insertall_fail_f]
+          rate_multipliers:
+            write_append_success_f: 1.4
+            write_append_fail_conn_f: 0.6
+            write_append_fail_unavailable_f: 0.7
+            insertall_fail_f: 0.7
+            writeapi_frontend.rpc_deadlock_watchdog: 0.4
+          latency_multipliers:
+            write_append_success_f: {p50: 0.7, p95: 0.8}
+            write_append_fail_unavailable_f: {p50: 0.8, p95: 0.9}
+            write_append_fail_conn_f: {p50: 0.8, p95: 0.9}
+          one_shots:
+            - ref: control_plane.restart_instance
+              count: 25
+              hosts: [cp-1]
+          manifestation: [control_plane.restart_instance, edge_lb.conn_failure, writeapi_frontend.append_ok]
+
+      steady:
+        - component: edge_lb
+          condition: |
+            After the cap increase, the backend pool has more healthy instances but still contains some stuck frontends; the load balancer continues to observe intermittent connection failures and elevated inflight connections.
+          user_impact: |
+            Write API clients in the US multi-region experience intermittent inability to establish/keep streaming connections and sporadic elevated latency.
+          manifestation: [edge_lb.pool_health_postcap, edge_lb.conn_failure, edge_lb.access_err]
+
+        - component: writeapi_frontend
+          condition: |
+            A subset of frontends remain impacted by blocked handlers; UNAVAILABLE errors persist but at a reduced rate after restarts begin.
+          user_impact: |
+            Some streaming append attempts fail with UNAVAILABLE even though a growing fraction succeed.
+          manifestation: [writeapi_frontend.append_unavail, writeapi_frontend.rpc_deadlock_watchdog]
+
+      feedback_loops:
+        - id: lb_routes_to_stuck_backends
+          desc: |
+            Connection-based routing can continue sending new clients to already-stuck instances until those instances are restarted/removed,
+            sustaining error rates even as additional healthy capacity is added.
+
+      flows: [write_append_success_f, write_append_fail_unavailable_f, write_append_fail_conn_f, insertall_success_f, insertall_fail_f]
+      manifestation:
+        - edge_lb.conn_failure
+        - writeapi_frontend.append_unavail
+        - writeapi_frontend.rpc_deadlock_watchdog
+        - edge_lb.pool_health
+        - edge_lb.pool_health_postcap
+        - monitoring.synthetic_check
+        - edge_lb.access_err
+
+  assumptions:
+    - "The 5-hour real incident is compressed to a 55-minute model while keeping the same causal progression and operator actions."
+    - "InsertAll failed requests are modeled as reaching the storage backend (path includes storage_backend) even though only API-layer logs are emitted for the failure outcome."
+    - "Fleet size is modeled explicitly (100 writeapi_frontend hosts) to make pool-health snapshots (e.g., 20-80 healthy) and restart actions (25 instances) realizable under per-host emissions."
+    - |
+      Failure-phase piecewise breakdown (minutes are within failure phase 25..55):
+        - 25-34 (9m): baseline failure rates/latencies active (initial surge and deadlocks); edge_lb.pool_health_postcap suppressed.
+        - 34-48 (14m): cap increased and more backends appear; pool-health template switches to edge_lb.pool_health_postcap; errors persist.
+        - 48-52 (4m): deadlock/stuck symptoms worsen; conn failures and watchdog errors are higher; post-cap scale-out occurs.
+        - 52-55 (3m): restarts begin; successes rise and failures decline but do not fully disappear by end.
+    - |
+      One-shot counts by event: e2=8 (alert+memory bumps+pre-cap scale), e3=1 (max instances), e4=1 (post-cap scale), e5=25 (restart actions).
+    - |
+      Visibility rationale: during failure, high-signal edge_lb.conn_failure and writeapi_frontend.append_unavail logs occur frequently; pool-health snapshots show stuck/inflight changes and the post-cap capacity increase;
+      writeapi_frontend.rpc_deadlock_watchdog spikes during worsening; restarts are evidenced by control_plane.restart_instance one-shots and improved writeapi_frontend.append_ok volume.
+    - |
+      Estimated total logs: normal ~31k, failure ~63k (after multipliers), background/one-shots ~1k => ~95k (within 20k..100k).
+```

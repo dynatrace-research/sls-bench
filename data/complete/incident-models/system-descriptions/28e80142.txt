@@ -1,0 +1,428 @@
+```yaml
+sys:
+  id: honeycomb_slo_pipeline
+  desc: >
+    A simplified model of Honeycomb's internal SLO processing pipeline. Retriever publishes mutation events to a Kafka
+    topic, and Beagle consumes those events to compute and write SLO points into a Postgres-backed SLO database.
+    Operators use a runbook tool to scale services and apply SLO topic definitions. In this incident, a topic-name typo
+    in a runbook entry causes Beagle to crash-loop and SLO processing to fall behind.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ops_tool
+    name: Ops Runbook Tool
+    svc: ops-tool
+    hosts: [ops-1]
+    desc: >
+      Operator tool used to execute runbooks (scaling actions and manual SLO configuration changes). It emits action
+      logs used as incident markers.
+    to:
+      - dst: slo_db
+        proto: jdbc
+        desc: Writes/updates SLO topic definitions in the SLO database.
+    logs:
+      scale_retriever:
+        desc: Marker for scaling the retriever deployment.
+        lvl: INFO
+        msg: "scaled deployment=retriever replicas={replicas} by={user} result=ok"
+        vars:
+          replicas: {k: i, v: [4, 24]}
+          user: {k: ch, v: [oncall, sre]}
+      scale_beagle:
+        desc: Marker for scaling the beagle deployment.
+        lvl: INFO
+        msg: "scaled deployment=beagle replicas={replicas} by={user} result=ok"
+        vars:
+          replicas: {k: i, v: [2, 16]}
+          user: {k: ch, v: [oncall, sre]}
+      apply_slo_def_wrong:
+        desc: Marker for applying an SLO definition row with the mis-typed Kafka topic (underscore).
+        lvl: INFO
+        msg: "applied SLO definition app=beagle stream=retriever_mutation topic=honeycomb-prod.retriever_mutation shard_count={shards} mode=manual by={user}"
+        vars:
+          shards: {k: i, v: [1, 64]}
+          user: {k: ch, v: [oncall, sre]}
+      apply_slo_def_correct:
+        desc: Marker for applying an SLO definition row with the correct Kafka topic (hyphen).
+        lvl: INFO
+        msg: "applied SLO definition app=beagle stream=retriever_mutation topic=honeycomb-prod.retriever-mutation shard_count={shards} mode=manual by={user}"
+        vars:
+          shards: {k: i, v: [1, 64]}
+          user: {k: ch, v: [oncall, sre]}
+    beh:
+      n:
+        desc: No periodic emissions; ops actions are modeled as scenario one-shots.
+        emit: []
+      f:
+        desc: No periodic emissions; ops actions are modeled as scenario one-shots.
+        emit: []
+
+  - id: retriever
+    name: Retriever (mutation publisher)
+    svc: retriever
+    hosts: [retriever-1, retriever-2, retriever-3, retriever-4]
+    desc: >
+      Produces mutation events to Kafka for downstream processing. In this incident model, retriever remains healthy
+      and continues producing.
+    to:
+      - dst: kafka_cluster
+        proto: kafka
+        desc: Publishes mutation events to the retriever mutation topic.
+    logs:
+      mutation_publish_ok:
+        desc: Successful publish of a mutation event.
+        lvl: INFO
+        msg: "published mutation event topic={topic} partition={partition} offset={offset} bytes={bytes} dur_ms={dur_ms}"
+        vars:
+          topic: {k: ch, v: [honeycomb-prod.retriever-mutation]}
+          partition: {k: i, v: [0, 47]}
+          offset: {k: i, v: [100000, 5000000]}
+          bytes: {k: i, v: [200, 4000]}
+          dur_ms: {k: i, v: [2, 40]}
+      heartbeat:
+        desc: Low-rate health marker.
+        lvl: INFO
+        msg: "healthcheck ok build={build} uptime_s={uptime_s}"
+        vars:
+          build: {k: ch, v: [r-1.42.0]}
+          uptime_s: {k: i, v: [60, 200000]}
+    beh:
+      n:
+        desc: Retriever is stable and emits occasional heartbeats.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+      f:
+        desc: Retriever remains stable during the Beagle incident and continues emitting occasional heartbeats.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+
+  - id: kafka_cluster
+    name: Kafka Cluster
+    svc: kafka
+    hosts: [kafka-1, kafka-2, kafka-3]
+    desc: >
+      Kafka brokers providing topics used by retriever and beagle. Broker-side per-request logs are not modeled;
+      only periodic broker stats are emitted.
+    to:
+      - dst: beagle
+        proto: kafka
+        desc: Serves fetch responses/metadata to Beagle consumers (modeled as the reverse hop in batch processing paths).
+    logs:
+      broker_stats:
+        desc: Periodic broker stats useful as background noise and to confirm cluster activity.
+        lvl: INFO
+        msg: "broker={broker_id} net_out_mb_s={net_out} req_q={req_q}"
+        vars:
+          broker_id: {k: i, v: [1, 3]}
+          net_out: {k: i, v: [10, 200]}
+          req_q: {k: i, v: [0, 500]}
+      controller_election:
+        desc: Rare controller leadership changes.
+        lvl: WARN
+        msg: "controller changed to broker={broker_id} reason={reason}"
+        vars:
+          broker_id: {k: i, v: [1, 3]}
+          reason: {k: ch, v: [broker_restart, maintenance, leader_imbalance]}
+    beh:
+      n:
+        desc: Kafka emits periodic broker stats; rare controller events.
+        emit:
+          - id: broker_stats
+            per_min: 0.5
+          - id: controller_election
+            per_min: 0.01
+            scope: global
+      f:
+        desc: Kafka remains generally healthy; emits the same periodic broker stats.
+        emit:
+          - id: broker_stats
+            per_min: 0.5
+          - id: controller_election
+            per_min: 0.01
+            scope: global
+
+  - id: slo_db
+    name: SLO Database (Postgres)
+    svc: postgres
+    hosts: [pg-1]
+    desc: >
+      Stores Beagle SLO definitions and derived SLO points. In this incident, an incorrect topic string is inserted
+      into SLO definitions via a runbook, indirectly causing Beagle to crash-loop.
+    to: []
+    logs:
+      checkpoint_complete:
+        desc: Periodic checkpoint completion.
+        lvl: INFO
+        msg: "checkpoint complete write_mb={write_mb} dur_ms={dur_ms}"
+        vars:
+          write_mb: {k: i, v: [50, 2000]}
+          dur_ms: {k: i, v: [200, 15000]}
+      slow_query:
+        desc: Rare slow query warning, not central to the incident.
+        lvl: WARN
+        msg: "slow query dur_ms={dur_ms} db={db}"
+        vars:
+          dur_ms: {k: i, v: [500, 20000]}
+          db: {k: ch, v: [beagle_slo]}
+    beh:
+      n:
+        desc: Periodic checkpoints; occasional slow queries.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.15
+            scope: global
+          - id: slow_query
+            per_min: 0.01
+            scope: global
+      f:
+        desc: Similar checkpoint behavior during the incident.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.15
+            scope: global
+          - id: slow_query
+            per_min: 0.01
+            scope: global
+
+  - id: beagle
+    name: Beagle (SLO processor)
+    svc: beagle
+    hosts: [beagle-1, beagle-2, beagle-3, beagle-4]
+    desc: >
+      Consumes retriever mutation events from Kafka and computes/writes SLO points to the SLO database. It periodically
+      logs consumer lag when running. In failure, it can crash-loop when configured to consume a non-existent topic,
+      resulting in missing/spotty lag logs during the loop and delayed SLO data once processing resumes.
+    to:
+      - dst: kafka_cluster
+        proto: kafka
+        desc: Consumes the retriever mutation topic.
+      - dst: slo_db
+        proto: jdbc
+        desc: Writes derived SLO points and reads SLO definitions.
+    logs:
+      process_start:
+        desc: Process start marker (also indicates restart loops when frequent).
+        lvl: INFO
+        msg: "beagle starting build={build} group={group}"
+        vars:
+          build: {k: ch, v: [b-2.18.1]}
+          group: {k: ch, v: [beagle-slo]}
+      consumer_rebalance:
+        desc: Consumer group rebalance marker.
+        lvl: WARN
+        msg: "consumer group rebalance phase={phase} generation={gen} members={members}"
+        vars:
+          phase: {k: ch, v: [join, sync, stabilize]}
+          gen: {k: i, v: [1, 500]}
+          members: {k: i, v: [1, 12]}
+      lag_metric:
+        desc: Periodic log of consumer lag for the correct mutation topic (emitted only while Beagle is running).
+        lvl: INFO
+        msg: "consumer lag topic={topic} p95_lag_s={lag_s} assigned_partitions={parts}"
+        vars:
+          topic: {k: ch, v: [honeycomb-prod.retriever-mutation]}
+          parts: {k: i, v: [1, 48]}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 30]}
+          f:
+            lag_s: {k: i, v: [120, 1800]}
+      batch_fetch:
+        desc: A successful batch fetch from Kafka for the correct mutation topic.
+        lvl: INFO
+        msg: "fetched batch topic={topic} partitions={parts} max_bytes={max_bytes} fetch_ms={fetch_ms}"
+        vars:
+          topic: {k: ch, v: [honeycomb-prod.retriever-mutation]}
+          parts: {k: i, v: [1, 48]}
+          max_bytes: {k: i, v: [1048576, 16777216]}
+          fetch_ms: {k: i, v: [5, 200]}
+      batch_processed:
+        desc: A batch was processed; in failure this reflects processing while lagged and catching up slowly.
+        lvl: INFO
+        msg: "processed batch topic={topic} msgs={msgs} lag_s={lag_s} proc_ms={proc_ms}"
+        vars:
+          topic: {k: ch, v: [honeycomb-prod.retriever-mutation]}
+        state_vars:
+          n:
+            msgs: {k: i, v: [10, 40]}
+            lag_s: {k: i, v: [0, 30]}
+            proc_ms: {k: i, v: [20, 180]}
+          f:
+            msgs: {k: i, v: [60, 140]}
+            lag_s: {k: i, v: [120, 1800]}
+            proc_ms: {k: i, v: [120, 1200]}
+      slo_write_ok:
+        desc: Successful write of derived SLO points.
+        lvl: INFO
+        msg: "wrote SLO points service={service} points={points} write_ms={write_ms}"
+        vars:
+          service: {k: ch, v: [retriever_mutation]}
+          points: {k: i, v: [100, 20000]}
+          write_ms: {k: i, v: [5, 200]}
+      consumer_error_unknown_topic:
+        desc: Kafka client error when trying to consume a mis-typed/non-existent topic.
+        lvl: ERROR
+        msg: "kafka consume error topic={topic} err={err}"
+        vars:
+          topic: {k: ch, v: [honeycomb-prod.retriever_mutation]}
+          err: {k: ch, v: [UnknownTopicOrPartition]}
+      panic_exit:
+        desc: Process exit after an unrecoverable consumer startup error.
+        lvl: CRITICAL
+        msg: "exiting due to unrecoverable error reason={reason}"
+        vars:
+          reason: {k: ch, v: [consumer_start_failed, panic]}
+    beh:
+      n:
+        desc: Beagle runs steadily with occasional restarts/rebalances and low lag.
+        emit:
+          - id: process_start
+            per_min: 0.06
+            scope: global
+          - id: consumer_rebalance
+            per_min: 0.05
+          - id: lag_metric
+            per_min: 1.0
+      f:
+        desc: >
+          In failure, Beagle can enter a rapid restart loop (frequent process_start). Lag logs may be absent while the
+          loop is active and resume once Beagle successfully runs again.
+        emit:
+          - id: process_start
+            per_min: 7.5
+            scope: global
+          - id: consumer_rebalance
+            per_min: 0.1
+          - id: lag_metric
+            per_min: 1.0
+
+  - id: alerting
+    name: Alerting
+    svc: alertmanager
+    hosts: [alert-1]
+    desc: >
+      Evaluates Beagle lag/crashloop signals and emits alert notifications. Used as an operator-visible confirmation of
+      customer-impacting delay.
+    to:
+      - dst: beagle
+        proto: http
+        desc: Scrapes Beagle metrics endpoints (simplified as log-driven signals).
+    logs:
+      notifier_ok:
+        desc: Background marker that alerting is running.
+        lvl: INFO
+        msg: "notifier ok integrations={integrations}"
+        vars:
+          integrations: {k: ch, v: [pagerduty, slack]}
+      alert_fired:
+        desc: Alert notification emitted when lag or crash-loop conditions are met.
+        lvl: WARN
+        msg: "alert {name} severity={sev} value={value} threshold={thresh} for={for_min}m"
+        vars:
+          name: {k: ch, v: [beagle_slo_lag_high, beagle_crashlooping]}
+          sev: {k: ch, v: [page, ticket]}
+          value: {k: i, v: [1, 2000]}
+          thresh: {k: i, v: [60, 300]}
+          for_min: {k: i, v: [1, 15]}
+    beh:
+      n:
+        desc: Alerting runs normally; no lag/crash alerts.
+        emit:
+          - id: notifier_ok
+            per_min: 0.3
+            scope: global
+      f:
+        desc: Alerting continues running and emits lag/crash alerts during the incident.
+        emit:
+          - id: notifier_ok
+            per_min: 0.3
+            scope: global
+          - id: alert_fired
+            per_min: 0.3
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal steady publishing of mutation events and continuous SLO processing.
+    req:
+      - id: publish_retriever_mutation
+        desc: Retriever publishes a mutation event to Kafka.
+        rpm: 2000
+        path: [retriever, kafka_cluster]
+        emit: [retriever.mutation_publish_ok]
+        latency_ms: [[5, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: beagle_process_slo_batch
+        desc: Beagle fetches and processes a batch of mutation events and writes SLO points.
+        rpm: 80
+        path: [beagle, kafka_cluster, beagle, slo_db]
+        emit: [beagle.batch_fetch, beagle.batch_processed, beagle.slo_write_ok]
+        latency_ms: [[15, 60], [40, 150], [10, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: Retriever continues publishing; Beagle may crash-loop on misconfigured topic and later process while lagged.
+    req:
+      - id: publish_retriever_mutation
+        desc: Retriever continues publishing mutation events to Kafka.
+        rpm: 2000
+        path: [retriever, kafka_cluster]
+        emit: [retriever.mutation_publish_ok]
+        latency_ms: [[5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: beagle_consume_unknown_topic
+        desc: Beagle attempts to start consuming a mis-typed topic and fails quickly, contributing to crash-looping.
+        rpm: 30
+        path: [beagle, kafka_cluster]
+        emit: [beagle.consumer_error_unknown_topic, beagle.panic_exit]
+        latency_ms: [[5, 30], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: beagle_process_slo_batch
+        desc: When Beagle is able to run, it processes batches but remains behind (high lag) and catches up slowly.
+        rpm: 30
+        path: [beagle, kafka_cluster, beagle, slo_db]
+        emit: [beagle.batch_fetch, beagle.batch_processed, beagle.slo_write_ok]
+        latency_ms: [[20, 80], [160, 1100], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "This model focuses on the retriever scale-up runbook error (topic name typo) that caused Beagle crash-looping and SLO processing delays; other September issues (EXT4 bug, Kafka network throttling, Sarama single-connection contention) are omitted."
+  - "The incorrect SLO topic is modeled as a mis-typed Kafka topic string stored in SLO definitions and picked up by Beagle, causing repeated UnknownTopicOrPartition errors and process exits."
+  - "Crash-loop rate alignment: beagle_consume_unknown_topic is set to 30 rpm and beagle.process_start is scope=global at 7.5/min; with scenario multipliers (4x then 8x), both restarts and unknown-topic exits align at ~30/min then ~60/min."
+  - "Throughput alignment: publish_retriever_mutation is 2000 rpm. Normal beagle_process_slo_batch is 80 rpm with 10–40 msgs/batch (~2000 msgs/min). After the fix, failure-state beagle_process_slo_batch is reduced to 30 rpm with 60–140 msgs/batch (~1800–4200 msgs/min), making it plausible that backlog remains for many minutes rather than clearing instantly."
+  - "Normal-phase volume estimate: ~2000 flow logs/min (retriever) + ~240 flow logs/min (beagle) + ~7 background logs/min ≈ ~2247 logs/min."
+  - "Total scenario volume estimate (40 min): ~85k–90k logs depending on multipliers and background noise, within the 20k–100k target."
+  - "Key diagnostic visibility is ensured via: ops_tool.apply_slo_def_wrong/apply_slo_def_correct one-shots (wrong vs correct topic), beagle.consumer_error_unknown_topic + beagle.panic_exit and elevated beagle.process_start during crash-looping, and beagle.lag_metric + alerting.alert_fired once Beagle resumes while still lagged."
+```

@@ -1,0 +1,506 @@
+```yaml
+sys:
+  id: aws_ebs_az_degradation_2012_10_22
+  desc: >
+    A single Availability Zone storage subsystem provides block storage (EBS-like volumes) to compute
+    instances and is managed by a control plane API. Storage servers run a low-priority fleet
+    reporting agent that periodically reports maintenance data to an internal collection service via
+    internal DNS. During the modeled incident, stale internal DNS causes some agents to repeatedly
+    contact a dead collector endpoint, triggering a latent memory leak that exhausts host memory,
+    leading to slow/stuck volume I/O and a failover storm; later, an overly aggressive API throttling
+    policy degrades read-only “Describe*” APIs for some customers.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_frontend
+    name: EC2/EBS API Frontend
+    svc: control-plane-api
+    hosts: [api-1, api-2]
+    desc: >
+      Handles customer API calls for describing and mutating compute/storage resources. Can enforce
+      throttling policies to protect the control plane during operational stress.
+    to:
+      - dst: ebs_failover_mgr
+        proto: https
+        desc: Control-plane calls that coordinate storage actions and query AZ health.
+    logs:
+      api_req_describe:
+        desc: Start of a read-only Describe* API request.
+        lvl: INFO
+        msg: "api request op={op} acct={acct} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [DescribeInstances, DescribeVolumes, DescribeImages]}
+          acct: {k: ch, v: [acct_001, acct_002, acct_003, acct_004, acct_005, acct_006]}
+          req_id: {k: uuid, v: null}
+      api_req_mutation:
+        desc: Start of a resource-mutating API request (launch/create/terminate).
+        lvl: INFO
+        msg: "api request op={op} acct={acct} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [RunInstances, TerminateInstances, CreateVolume, AttachVolume]}
+          acct: {k: ch, v: [acct_001, acct_002, acct_003, acct_004, acct_005, acct_006]}
+          req_id: {k: uuid, v: null}
+      api_resp_200:
+        desc: Successful API response.
+        lvl: INFO
+        msg: "api response 200 op={op} acct={acct} req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          op: {k: ch, v: [DescribeInstances, DescribeVolumes, DescribeImages, RunInstances, TerminateInstances, CreateVolume, AttachVolume]}
+          acct: {k: ch, v: [acct_001, acct_002, acct_003, acct_004, acct_005, acct_006]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [10, 1200]}
+      api_resp_429_aggressive:
+        desc: Throttled API response under the aggressive policy (Too Many Requests).
+        lvl: WARN
+        msg: "api response 429 op={op} acct={acct} req_id={req_id} policy=aggressive retry_after_ms={retry_after_ms}"
+        vars:
+          op: {k: ch, v: [DescribeInstances, DescribeVolumes, DescribeImages]}
+          acct: {k: ch, v: [acct_001, acct_002, acct_003, acct_004, acct_005, acct_006]}
+          req_id: {k: uuid, v: null}
+          retry_after_ms: {k: i, v: [100, 2000]}
+      api_resp_429_relaxed:
+        desc: Throttled API response under the relaxed policy (Too Many Requests).
+        lvl: WARN
+        msg: "api response 429 op={op} acct={acct} req_id={req_id} policy=relaxed retry_after_ms={retry_after_ms}"
+        vars:
+          op: {k: ch, v: [DescribeInstances, DescribeVolumes, DescribeImages]}
+          acct: {k: ch, v: [acct_001, acct_002, acct_003, acct_004, acct_005, acct_006]}
+          req_id: {k: uuid, v: null}
+          retry_after_ms: {k: i, v: [100, 2000]}
+      api_agg_1m:
+        desc: One-minute aggregate API activity and throttling counter (coarse, not per-customer).
+        lvl: INFO
+        msg: "api agg 1m total={total} throttled={throttled} p95_ms={p95_ms}"
+        vars:
+          total: {k: i, v: [200, 2000]}
+          throttled: {k: i, v: [0, 600]}
+          p95_ms: {k: i, v: [40, 2500]}
+      throttle_policy_set_aggressive:
+        desc: Operator action marker when aggressive throttling is enabled.
+        lvl: WARN
+        msg: "throttle policy set to aggressive reason=recovery"
+        vars: {}
+      throttle_policy_set_relaxed:
+        desc: Operator action marker when throttling is relaxed after customer impact is recognized.
+        lvl: WARN
+        msg: "throttle policy set to relaxed reason=rollback"
+        vars: {}
+    beh:
+      n:
+        desc: Regular aggregate counters while APIs operate normally.
+        emit:
+          - id: api_agg_1m
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Aggregate counters continue during the incident; per-customer impact is not fully visible in this metric.
+        emit:
+          - id: api_agg_1m
+            per_min: 1.0
+            scope: per_host
+
+  - id: ebs_failover_mgr
+    name: EBS Failover Manager
+    svc: ebs-control
+    hosts: [failover-1]
+    desc: >
+      Coordinates failover/recovery of volumes between storage servers in the AZ. Under correlated
+      storage host failures it can generate high failover activity that competes for resources.
+    to:
+      - dst: ebs_storage
+        proto: grpc
+        desc: Issues failover commands and queries volume/host health.
+    logs:
+      failover_task_enqueued:
+        desc: A failover/recovery task has been enqueued for a volume.
+        lvl: INFO
+        msg: "failover task enqueued vol=vol-{vol_hex} src={src_host} dst={dst_host} reason={reason}"
+        vars:
+          vol_hex: {k: hex, v: 8}
+          src_host: {k: ch, v: [ebs-a1, ebs-a2, ebs-a3]}
+          dst_host: {k: ch, v: [ebs-a4, ebs-a5, ebs-a6]}
+          reason: {k: ch, v: [stuck_io, degraded_perf]}
+      failover_metrics_1m:
+        desc: Cluster health snapshot used by operators during events.
+        lvl: INFO
+        msg: "failover metrics stuck_vols={stuck_vols} failover_q={failover_q} healthy_hosts={healthy_hosts}"
+        vars: {}
+        state_vars:
+          n:
+            stuck_vols: {k: i, v: [0, 5]}
+            failover_q: {k: i, v: [0, 10]}
+            healthy_hosts: {k: i, v: [18, 25]}
+          f:
+            stuck_vols: {k: i, v: [10, 600]}
+            failover_q: {k: i, v: [5, 450]}
+            healthy_hosts: {k: i, v: [3, 22]}
+      failover_rate_limited:
+        desc: Failover rate limiting is actively skipping work to reduce load.
+        lvl: WARN
+        msg: "failover rate limited skipped={skipped} q_depth={q_depth}"
+        vars:
+          skipped: {k: i, v: [5, 200]}
+          q_depth: {k: i, v: [30, 600]}
+      failover_rate_limit_reduced:
+        desc: Operator action marker for reducing failover throughput.
+        lvl: WARN
+        msg: "updated failover rate limit old_per_min={old_per_min} new_per_min={new_per_min}"
+        vars:
+          old_per_min: {k: i, v: [80, 140]}
+          new_per_min: {k: i, v: [10, 50]}
+    beh:
+      n:
+        desc: Occasional failover tasks and low cluster counters during normal operations.
+        emit:
+          - id: failover_task_enqueued
+            per_min: 0.2
+            scope: global
+          - id: failover_metrics_1m
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Failover activity rises under correlated host degradation; storm levels are reached later via scenario events.
+        emit:
+          - id: failover_task_enqueued
+            per_min: 5.0
+            scope: global
+          - id: failover_metrics_1m
+            per_min: 0.2
+            scope: global
+          - id: failover_rate_limited
+            per_min: 0.05
+            scope: global
+
+  - id: ebs_storage
+    name: EBS Storage Server
+    svc: ebs-data
+    hosts: [ebs-a1, ebs-a2, ebs-a3]
+    desc: >
+      Serves block I/O for volumes. Runs a low-priority collection-agent that periodically reports
+      maintenance data to a fleet collector discovered via internal DNS. Under the incident, the
+      agent leaks memory when it cannot reach a stale collector address, causing memory pressure and
+      slow/stuck I/O handling.
+    to:
+      - dst: internal_dns
+        proto: dns
+        desc: Resolves the fleet collector endpoint.
+      - dst: fleet_collector
+        proto: https
+        desc: Sends maintenance reports from the collection-agent.
+    logs:
+      host_mem_sample:
+        desc: Periodic host memory and queue depth sample.
+        lvl: INFO
+        msg: "mem sample free_mb={free_mb} agent_rss_mb={agent_rss_mb} io_q_depth={io_q_depth}"
+        vars:
+          io_q_depth: {k: i, v: [0, 250]}
+        state_vars:
+          n:
+            free_mb: {k: i, v: [4000, 16000]}
+            agent_rss_mb: {k: i, v: [40, 140]}
+          f:
+            free_mb: {k: i, v: [50, 3500]}
+            agent_rss_mb: {k: i, v: [300, 4500]}
+      low_free_mem:
+        desc: Host is under memory pressure and low-priority agent is among top consumers.
+        lvl: WARN
+        msg: "low free memory free_mb={free_mb} top_proc=collection-agent rss_mb={agent_rss_mb}"
+        vars: {}
+        state_vars:
+          n:
+            free_mb: {k: i, v: [1500, 4000]}
+            agent_rss_mb: {k: i, v: [80, 250]}
+          f:
+            free_mb: {k: i, v: [20, 1200]}
+            agent_rss_mb: {k: i, v: [800, 5000]}
+      agent_report_ok:
+        desc: Collection-agent successfully reports maintenance data.
+        lvl: INFO
+        msg: "collection-agent reported collector={collector} resolved_ip={resolved_ip} dur_ms={dur_ms} status=OK"
+        vars:
+          collector: {k: ch, v: [collector-b]}
+          resolved_ip: {k: ip, v: "10.0.20.0/24"}
+          dur_ms: {k: i, v: [20, 400]}
+      agent_report_err:
+        desc: Collection-agent fails to contact its collector endpoint.
+        lvl: WARN
+        msg: "collection-agent failed collector={collector} resolved_ip={resolved_ip} err={err} retry_in_ms={retry_in_ms}"
+        vars:
+          err: {k: ch, v: [timeout, conn_refused, host_unreachable]}
+          retry_in_ms: {k: i, v: [100, 5000]}
+        state_vars:
+          n:
+            collector: {k: ch, v: [collector-b]}
+            resolved_ip: {k: ip, v: "10.0.20.0/24"}
+          f:
+            collector: {k: ch, v: [collector-a]}
+            resolved_ip: {k: ip, v: "10.0.10.0/24"}
+      io_ok:
+        desc: Successful volume I/O completion log (sampled at the server).
+        lvl: INFO
+        msg: "volume io completed vol=vol-{vol_hex} op={op} bytes={bytes} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          vol_hex: {k: hex, v: 8}
+          op: {k: ch, v: [read, write]}
+          bytes: {k: i, v: [4096, 1048576]}
+          req_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [1, 25]}
+          f:
+            dur_ms: {k: i, v: [10, 500]}
+      io_timeout:
+        desc: Volume I/O request timed out / became stuck at the server.
+        lvl: ERROR
+        msg: "volume io timeout vol=vol-{vol_hex} op={op} waited_ms={waited_ms} io_q_depth={io_q_depth} req_id={req_id}"
+        vars:
+          vol_hex: {k: hex, v: 8}
+          op: {k: ch, v: [read, write]}
+          waited_ms: {k: i, v: [500, 12000]}
+          io_q_depth: {k: i, v: [20, 400]}
+          req_id: {k: uuid, v: null}
+      agent_restart:
+        desc: Operator action marker for restarting the collection-agent to free memory.
+        lvl: INFO
+        msg: "ops restarted collection-agent pid={pid} freed_mb={freed_mb}"
+        vars:
+          pid: {k: i, v: [1000, 65000]}
+          freed_mb: {k: i, v: [200, 5000]}
+    beh:
+      n:
+        desc: Hosts report stable memory and successful fleet reporting; memory pressure warnings are rare.
+        emit:
+          - id: host_mem_sample
+            per_min: 1.0
+          - id: agent_report_ok
+            per_min: 1.0
+          - id: agent_report_err
+            per_min: 0.02
+          - id: low_free_mem
+            per_min: 0.02
+      f:
+        desc: Fleet reporting failures trigger a memory leak; strong memory pressure and I/O symptoms build later via scenario events.
+        emit:
+          - id: host_mem_sample
+            per_min: 1.0
+          - id: agent_report_ok
+            per_min: 0.2
+          - id: agent_report_err
+            per_min: 1.0
+          - id: low_free_mem
+            per_min: 0.2
+
+  - id: internal_dns
+    name: Internal DNS Service
+    svc: internal-dns
+    hosts: [dns-1, dns-2]
+    desc: >
+      Resolves internal service names (including the fleet collector endpoint). During the incident,
+      some resolvers are assumed to have stale records, but the system lacks strong alarms for this condition.
+    to: []
+    logs:
+      dns_stats:
+        desc: Periodic DNS statistics and stale RRset count.
+        lvl: INFO
+        msg: "dns stats queries_1m={queries_1m} nxdomain_1m={nxdomain_1m} stale_rrsets={stale_rrsets}"
+        vars:
+          queries_1m: {k: i, v: [500, 5000]}
+          nxdomain_1m: {k: i, v: [0, 50]}
+        state_vars:
+          n:
+            stale_rrsets: {k: i, v: [0, 2]}
+          f:
+            stale_rrsets: {k: i, v: [5, 80]}
+    beh:
+      n:
+        desc: Normal DNS operations with minimal stale RRsets.
+        emit:
+          - id: dns_stats
+            per_min: 0.5
+      f:
+        desc: Elevated stale RRsets on some resolvers; not necessarily alarming by itself.
+        emit:
+          - id: dns_stats
+            per_min: 0.5
+
+  - id: fleet_collector
+    name: Fleet Collection Service
+    svc: fleet-collector
+    hosts: [collector-1]
+    desc: >
+      Receives maintenance reports from storage hosts. The service is tolerant of missing data and
+      continues to appear healthy even when some hosts cannot report.
+    to: []
+    logs:
+      ingest_ok:
+        desc: Periodic ingestion heartbeat for the collector.
+        lvl: INFO
+        msg: "collector ingest ok reports_1m={reports_1m} lag_ms={lag_ms}"
+        vars:
+          reports_1m: {k: i, v: [600, 2200]}
+          lag_ms: {k: i, v: [10, 500]}
+    beh:
+      n:
+        desc: Collector ingests reports and emits periodic heartbeat.
+        emit:
+          - id: ingest_ok
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Collector still emits heartbeat; missing reports are tolerated and not strongly surfaced.
+        emit:
+          - id: ingest_ok
+            per_min: 0.5
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal customer API usage and steady EBS I/O with low latency and low error rates.
+    req:
+      - id: ebs_io_ok
+        desc: Sampled successful volume I/O operations on storage servers.
+        rpm: 400.0
+        path: [ebs_storage]
+        emit: [ebs_storage.io_ok]
+        latency_ms: [[3, 15]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_describe_ok
+        desc: Successful Describe* API calls.
+        rpm: 180.0
+        path: [api_frontend]
+        emit: [api_frontend.api_req_describe, api_frontend.api_resp_200]
+        latency_ms: [[2, 6], [25, 90]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_mutation_ok
+        desc: Successful resource mutation API calls (launch/create/attach).
+        rpm: 40.0
+        path: [api_frontend]
+        emit: [api_frontend.api_req_mutation, api_frontend.api_resp_200]
+        latency_ms: [[2, 6], [40, 160]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: In the affected AZ, storage host memory pressure leads to increased I/O latency/timeouts and elevated failover activity.
+    req:
+      - id: ebs_io_ok
+        desc: Successful I/O still occurs but with elevated latency due to memory pressure.
+        rpm: 260.0
+        path: [ebs_storage]
+        emit: [ebs_storage.io_ok]
+        latency_ms: [[30, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: ebs_io_timeout
+        desc: I/O requests that time out on stuck/degraded volumes.
+        rpm: 30.0
+        path: [ebs_storage]
+        emit: [ebs_storage.io_timeout]
+        latency_ms: [[900, 8000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_describe_ok
+        desc: Describe* calls that succeed but may be slower due to control plane load.
+        rpm: 160.0
+        path: [api_frontend]
+        emit: [api_frontend.api_req_describe, api_frontend.api_resp_200]
+        latency_ms: [[2, 6], [60, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_describe_throttled_aggressive
+        desc: Describe* calls rejected by an aggressive throttling policy (activated later via scenario events).
+        rpm: 0.05
+        path: [api_frontend]
+        emit: [api_frontend.api_req_describe, api_frontend.api_resp_429_aggressive]
+        latency_ms: [[2, 6], [5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_describe_throttled_relaxed
+        desc: Describe* calls rejected under a relaxed throttling policy (activated later via scenario events).
+        rpm: 0.05
+        path: [api_frontend]
+        emit: [api_frontend.api_req_describe, api_frontend.api_resp_429_relaxed]
+        latency_ms: [[2, 6], [5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_mutation_ok
+        desc: Mutating calls mostly continue to succeed during the incident.
+        rpm: 40.0
+        path: [api_frontend]
+        emit: [api_frontend.api_req_mutation, api_frontend.api_resp_200]
+        latency_ms: [[2, 6], [70, 320]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Repair note (S8): failover_metrics_1m failure-state domains were widened to admit early/low values as well as later storm values,
+    and the scenario suppresses these metrics at failure onset and enables them during the storm window to match the stated progression.
+  - |
+    Repair note (S7): Failover rate-limit values and failover task rates were aligned so that the rate-limit reduction is meaningful.
+    Failover task emission in failure is modeled at tens-to-hundreds per minute during the storm window, and the rate-limit change log uses
+    old_per_min/new_per_min domains consistent with those rates.
+  - |
+    The modeled system focuses on the causal core: stale internal DNS -> collection-agent connection failures -> memory leak on storage hosts -> I/O timeouts and failover storm, plus a later overly aggressive API throttling policy affecting Describe* calls.
+  - |
+    Downstream customer services impacted by stuck volumes (e.g., RDS/ELB) are omitted to keep the model minimal; their effects are represented indirectly by elevated I/O timeouts and failover activity in the AZ.
+  - |
+    The “fraction of hosts with stale DNS” is simplified as most modeled storage hosts showing agent connection errors in failure; this is sufficient to produce correlated memory pressure and stuck volumes.
+  - |
+    For failover_task_enqueued, dst_host is modeled as a separate pool of candidate hosts (ebs-a4..ebs-a6) to ensure src_host != dst_host and keep the log semantics coherent without adding extra components/flows.
+  - |
+    Throttling policy changes are modeled with policy-specific action markers and policy-specific 429 logs (aggressive vs relaxed) to avoid contradictory carrier values in the incident timeline.
+  - |
+    Failover rate-limit changes are modeled with a reduction-specific marker whose domains ensure old_per_min > new_per_min in all generated logs.
+  - |
+    Normal-phase expected volume (25 min): ~840–870 logs/min (mostly flow logs) => ~21k–22k logs.
+  - |
+    Whole-scenario expected volume (60 min): ~45k–52k logs depending on failure multipliers; within the 20k–100k target.
+  - |
+    Visibility anchors: ebs_storage.agent_report_err (stale collector-a), ebs_storage.host_mem_sample/low_free_mem (agent RSS growth),
+    ebs_storage.io_timeout (stuck I/O), ebs_failover_mgr.failover_task_enqueued & failover_metrics_1m (failover storm),
+    api_frontend.api_resp_429_aggressive/api_resp_429_relaxed plus throttle_policy_set_* (throttling window and change).
+```

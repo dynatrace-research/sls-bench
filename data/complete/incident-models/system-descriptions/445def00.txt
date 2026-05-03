@@ -1,0 +1,549 @@
+```yaml
+sys:
+  id: mandrill_mailer
+  desc: >
+    Transactional email sending service. API servers accept/execute send jobs, persist per-message/job state in a sharded
+    Postgres-backed K/V store, and hand off to workers that deliver mail via an external SMTP relay. One shard (shard4)
+    is hotter than others due to hashing skew. This incident models shard4 entering Postgres XID wraparound protection,
+    causing write failures, repeated retry attempts, disk spooling, and reduced effective throughput until a vacuum +
+    large-table truncation allows shard4 to return to read-write and backlogs begin draining.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: mandrill_api
+    name: Mandrill API Servers
+    svc: mandrill-api
+    hosts: [api-1, api-2, api-3]
+    desc: >
+      Executes send jobs, writes message/job metadata to the sharded Postgres K/V store, and schedules work for mail workers.
+      When shard4 writes fail, jobs are retried and may be spooled to local disk for later processing, increasing disk pressure.
+    to:
+      - dst: postgres_shard4
+        proto: jdbc
+        desc: Writes/reads hot shard4 K/V and job-state rows.
+      - dst: postgres_shards
+        proto: jdbc
+        desc: Writes/reads non-shard4 K/V and job-state rows.
+      - dst: mail_worker
+        proto: redis
+        desc: Enqueues lightweight work items for delivery workers.
+      - dst: log_aggregator
+        proto: https
+        desc: Ships application logs and error events to centralized aggregation/alerting.
+    logs:
+      api_req_other:
+        desc: Send job processing starts and maps to a non-shard4 shard.
+        lvl: INFO
+        msg: "send job start msg_id={msg_id} account={account} shard={shard}"
+        vars:
+          msg_id: {k: uuid, v: null}
+          account: {k: ch, v: [acct_01, acct_02, acct_03, acct_04, acct_05]}
+          shard: {k: ch, v: [shard1, shard2, shard3, shard5]}
+      api_req_shard4:
+        desc: Send job processing starts and maps to shard4.
+        lvl: INFO
+        msg: "send job start msg_id={msg_id} account={account} shard=shard4"
+        vars:
+          msg_id: {k: uuid, v: null}
+          account: {k: ch, v: [acct_01, acct_02, acct_03, acct_04, acct_05]}
+      kv_write_ok_other:
+        desc: Successful metadata write to a non-shard4 shard.
+        lvl: INFO
+        msg: "kv write ok shard={shard} key={key} txn_ms={txn_ms}"
+        vars:
+          shard: {k: ch, v: [shard1, shard2, shard3, shard5]}
+          key: {k: str, v: "msg:{uuid}|job:{uuid}"}
+        state_vars:
+          n:
+            txn_ms: {k: i, v: [2, 25]}
+          f:
+            txn_ms: {k: i, v: [3, 60]}
+      kv_write_ok_shard4:
+        desc: Successful metadata write to shard4.
+        lvl: INFO
+        msg: "kv write ok shard=shard4 key={key} txn_ms={txn_ms}"
+        vars:
+          key: {k: str, v: "msg:{uuid}|job:{uuid}"}
+        state_vars:
+          n:
+            txn_ms: {k: i, v: [3, 40]}
+          f:
+            txn_ms: {k: i, v: [3, 80]}
+      kv_write_err_shard4:
+        desc: Metadata write failed against shard4 (connection rejected / shutdown / maintenance).
+        lvl: ERROR
+        msg: "kv write failed shard=shard4 sqlstate={sqlstate} err=\"{err}\" txn_ms={txn_ms}"
+        vars:
+          sqlstate: {k: ch, v: [57P01, 55000]}
+          err:
+            {k: ch,
+             v: ["database is not accepting commands to avoid wraparound data loss",
+                 "terminating connection due to administrator command",
+                 "could not connect to server: Connection refused"]}
+        state_vars:
+          n:
+            txn_ms: {k: i, v: [5, 80]}
+          f:
+            txn_ms: {k: i, v: [30, 900]}
+      retry_write:
+        desc: Application retry marker for shard4 writes.
+        lvl: WARN
+        msg: "retrying kv write shard=shard4 attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [50, 1500]}
+      job_spooled:
+        desc: Job is written to local disk spool for later retry.
+        lvl: WARN
+        msg: "spooled job to disk msg_id={msg_id} spool_path={spool_path} reason={reason}"
+        vars:
+          msg_id: {k: uuid, v: null}
+          spool_path: {k: str, v: "/var/spool/mandrill/spool-*.json"}
+          reason: {k: ch, v: [db_shutdown, db_timeout]}
+      healthcheck:
+        desc: Periodic API health summary.
+        lvl: INFO
+        msg: "health ok reqs_1m={reqs_1m} errs_1m={errs_1m}"
+        vars: {}
+        state_vars:
+          n:
+            reqs_1m: {k: i, v: [110, 170]}
+            errs_1m: {k: i, v: [0, 3]}
+          f:
+            reqs_1m: {k: i, v: [90, 170]}
+            errs_1m: {k: i, v: [25, 140]}
+      disk_usage_metric:
+        desc: Periodic disk usage for local spool volume.
+        lvl: INFO
+        msg: "spool disk usage pct={disk_pct} spool_q={spool_q}"
+        vars: {}
+        state_vars:
+          n:
+            disk_pct: {k: i, v: [35, 60]}
+            spool_q: {k: i, v: [0, 400]}
+          f:
+            disk_pct: {k: i, v: [60, 95]}
+            spool_q: {k: i, v: [2000, 20000]}
+      disk_low:
+        desc: Disk space low warning on API host.
+        lvl: WARN
+        msg: "disk space low pct={disk_pct} free_gb={free_gb}"
+        vars:
+          disk_pct: {k: i, v: [85, 98]}
+          free_gb: {k: i, v: [1, 20]}
+    beh:
+      n:
+        desc: Regular health and light disk telemetry; most work succeeds.
+        emit:
+          - id: healthcheck
+            per_min: 1.0
+            scope: per_host
+          - id: disk_usage_metric
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: Increased disk telemetry and occasional low-space warnings as spooled jobs accumulate.
+        emit:
+          - id: healthcheck
+            per_min: 1.0
+            scope: per_host
+          - id: disk_usage_metric
+            per_min: 1.0
+            scope: per_host
+          - id: disk_low
+            per_min: 0.8
+            scope: per_host
+
+  - id: mail_worker
+    name: Mail Delivery Workers
+    svc: mandrill-worker
+    hosts: [worker-1, worker-2]
+    desc: >
+      Pulls work items and delivers messages to an external SMTP relay. Reports queue depth and, during recovery,
+      reports backlog draining as shard4 becomes writable again.
+    to:
+      - dst: log_aggregator
+        proto: https
+        desc: Ships worker logs and metrics.
+      - dst: postgres_shard4
+        proto: jdbc
+        desc: Reads/updates shard4-backed message/job state when needed.
+      - dst: postgres_shards
+        proto: jdbc
+        desc: Reads/updates non-shard4 state.
+    logs:
+      smtp_sent:
+        desc: Message delivered successfully.
+        lvl: INFO
+        msg: "smtp delivered msg_id={msg_id} provider={provider} dur_ms={dur_ms}"
+        vars:
+          msg_id: {k: uuid, v: null}
+          provider: {k: ch, v: [smtp_relay_a, smtp_relay_b]}
+          dur_ms: {k: i, v: [50, 800]}
+      queue_depth:
+        desc: Periodic queue depth metric (main queue and local spool backlog).
+        lvl: INFO
+        msg: "queue depth main={main_q} spool={spool_q}"
+        vars: {}
+        state_vars:
+          n:
+            main_q: {k: i, v: [200, 2500]}
+            spool_q: {k: i, v: [0, 300]}
+          f:
+            main_q: {k: i, v: [3000, 50000]}
+            spool_q: {k: i, v: [2000, 25000]}
+      spool_backlog_warn:
+        desc: Warning that spooled backlog is impairing delivery throughput.
+        lvl: WARN
+        msg: "spool backlog elevated spool_q={spool_q} disk_pct={disk_pct}"
+        vars:
+          spool_q: {k: i, v: [5000, 30000]}
+          disk_pct: {k: i, v: [75, 98]}
+      backlog_drain:
+        desc: Periodic metric indicating backlogs are draining after shard4 becomes writable.
+        lvl: INFO
+        msg: "backlog draining drained_1m={drained_1m} main_q={main_q} spool_q={spool_q}"
+        vars:
+          drained_1m: {k: i, v: [100, 2500]}
+          main_q: {k: i, v: [1000, 30000]}
+          spool_q: {k: i, v: [200, 12000]}
+    beh:
+      n:
+        desc: Healthy queue metrics at low-to-moderate depths.
+        emit:
+          - id: queue_depth
+            per_min: 1.0
+            scope: per_host
+          - id: backlog_drain
+            per_min: 0.0
+            scope: per_host
+      f:
+        desc: Queue depth increases and backlog warnings begin; backlog draining metrics are enabled later in recovery.
+        emit:
+          - id: queue_depth
+            per_min: 2.0
+            scope: per_host
+          - id: spool_backlog_warn
+            per_min: 0.6
+            scope: per_host
+          - id: backlog_drain
+            per_min: 1.0
+            scope: per_host
+
+  - id: postgres_shard4
+    name: Postgres Shard4 (hot shard)
+    svc: postgres
+    hosts: [pg-shard4-1]
+    desc: >
+      Hotter-than-average shard receiving disproportionate writes. Autovacuum lag can allow XID age to approach the
+      wraparound protection threshold, at which point Postgres may refuse writes / shut down for safety and require
+      standalone maintenance (VACUUM) and sometimes data reduction to complete in time.
+    to:
+      - dst: mandrill_api
+        proto: jdbc
+        desc: Returns query results / errors for shard4 requests.
+      - dst: log_aggregator
+        proto: https
+        desc: Ships Postgres logs/metrics and maintenance markers.
+    logs:
+      xid_metric:
+        desc: Periodic XID age metric relative to freeze threshold (incident-high values).
+        lvl: INFO
+        msg: "xid age snapshot age={xid_age} freeze_max_age={freeze_max_age}"
+        vars:
+          freeze_max_age: {k: i, v: [2000000000, 2000000000]}
+        state_vars:
+          n:
+            xid_age: {k: i, v: [1100000000, 1700000000]}
+          f:
+            xid_age: {k: i, v: [2050000000, 2120000000]}
+      xid_metric_post:
+        desc: Periodic XID age metric after maintenance progress has reduced XID pressure.
+        lvl: INFO
+        msg: "xid age snapshot(post-maint) age={xid_age} freeze_max_age={freeze_max_age}"
+        vars:
+          xid_age: {k: i, v: [50000000, 300000000]}
+          freeze_max_age: {k: i, v: [2000000000, 2000000000]}
+      conn_reject:
+        desc: Connection or command rejected due to shutdown/maintenance.
+        lvl: ERROR
+        msg: "connection rejected: {reason}"
+        vars:
+          reason: {k: ch, v: [wraparound_protection, maintenance_mode]}
+      wraparound_shutdown:
+        desc: Postgres enters wraparound protection shutdown mode.
+        lvl: CRITICAL
+        msg: "database shutdown to avoid wraparound; xid_age={xid_age}"
+        vars:
+          xid_age: {k: i, v: [2080000000, 2140000000]}
+      standalone_mode:
+        desc: Database started in standalone maintenance mode for repair work.
+        lvl: INFO
+        msg: "started in standalone maintenance mode"
+        vars: {}
+      vacuum_started:
+        desc: A manual VACUUM operation was initiated.
+        lvl: INFO
+        msg: "VACUUM started"
+        vars: {}
+      vacuum_setting:
+        desc: Maintenance/vacuum settings changed to attempt faster progress.
+        lvl: INFO
+        msg: "vacuum settings updated cost_delay_ms={cost_delay_ms} maintenance_work_mem_mb={mw_mem_mb}"
+        vars:
+          cost_delay_ms: {k: i, v: [0, 20]}
+          mw_mem_mb: {k: i, v: [1024, 8192]}
+      vacuum_progress:
+        desc: Periodic progress snapshot while vacuum is running.
+        lvl: INFO
+        msg: "VACUUM progress phase={phase} rel={rel} scanned_pct={scanned_pct} remaining_h={remaining_h}"
+        vars:
+          phase: {k: ch, v: [scanning, vacuuming, freezing]}
+          rel: {k: ch, v: [kv_store, job_state, search, url]}
+          scanned_pct: {k: f, v: [0.0, 99.9]}
+          remaining_h: {k: f, v: [1.0, 240.0]}
+      truncate_search:
+        desc: Large table truncation executed for the Search table to reduce vacuum workload/XID pressure.
+        lvl: WARN
+        msg: "truncate table search executed"
+        vars: {}
+      truncate_url:
+        desc: Large table truncation executed for the Url table to reduce vacuum workload/XID pressure.
+        lvl: WARN
+        msg: "truncate table url executed"
+        vars: {}
+      vacuum_completed:
+        desc: Manual maintenance completes and database is ready for normal connections again.
+        lvl: INFO
+        msg: "VACUUM completed xid_age_after={xid_age_after}"
+        vars:
+          xid_age_after: {k: i, v: [50000000, 300000000]}
+    beh:
+      n:
+        desc: Shard runs normally with periodic internal metrics.
+        emit:
+          - id: xid_metric
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: >
+          In wraparound protection/maintenance, shard4 rejects connections and emits XID telemetry; when manual
+          maintenance is underway, periodic VACUUM progress snapshots also appear. After successful maintenance,
+          a lower XID snapshot metric may be emitted while the system is still in degraded recovery overall.
+        emit:
+          - id: xid_metric
+            per_min: 1.0
+            scope: per_host
+          - id: xid_metric_post
+            per_min: 1.0
+            scope: per_host
+          - id: conn_reject
+            per_min: 30.0
+            scope: per_host
+          - id: vacuum_progress
+            per_min: 2.0
+            scope: per_host
+
+  - id: postgres_shards
+    name: Postgres Other Shards
+    svc: postgres
+    hosts: [pg-shard1-1, pg-shard2-1, pg-shard3-1, pg-shard5-1]
+    desc: >
+      Remaining shards of the K/V store. They continue operating normally during this incident and handle the majority
+      of writes/reads.
+    to:
+      - dst: mandrill_api
+        proto: jdbc
+        desc: Returns query results for non-shard4 requests.
+      - dst: log_aggregator
+        proto: https
+        desc: Ships periodic Postgres checkpoint logs.
+    logs:
+      checkpoint:
+        desc: Periodic checkpoint completion log.
+        lvl: INFO
+        msg: "checkpoint complete write_ms={write_ms} buffers={buffers}"
+        vars:
+          write_ms: {k: i, v: [50, 1200]}
+          buffers: {k: i, v: [5000, 80000]}
+    beh:
+      n:
+        desc: Normal background checkpoint noise.
+        emit:
+          - id: checkpoint
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Other shards remain healthy; checkpoint noise continues.
+        emit:
+          - id: checkpoint
+            per_min: 0.5
+            scope: per_host
+
+  - id: log_aggregator
+    name: Central Log Aggregation & Alerting
+    svc: log-agg
+    hosts: [log-1]
+    desc: >
+      Ingests logs and evaluates alerts. High background noise/backlog can delay evaluations and obscure the first
+      appearance of a key error signature until responders investigate directly.
+    to: []
+    logs:
+      ingest_summary:
+        desc: Periodic ingestion summary with backlog indicator and dominant error source.
+        lvl: INFO
+        msg: "ingest summary errs_1m={errs_1m} top_service={top_service} backlog={backlog}"
+        vars:
+          top_service: {k: ch, v: [mandrill-api, billing-api, auth-service, edge-proxy]}
+        state_vars:
+          n:
+            errs_1m: {k: i, v: [0, 50]}
+            backlog: {k: i, v: [0, 100]}
+          f:
+            errs_1m: {k: i, v: [500, 5000]}
+            backlog: {k: i, v: [1000, 20000]}
+      alert_eval:
+        desc: Alert evaluation delayed due to backlog and drops.
+        lvl: WARN
+        msg: "alert evaluation delayed backlog={backlog} dropped={dropped}"
+        vars:
+          backlog: {k: i, v: [1000, 30000]}
+          dropped: {k: i, v: [0, 8000]}
+      incident_opened:
+        desc: Operational marker that responders opened an investigation.
+        lvl: INFO
+        msg: "incident opened id={inc_id} title=\"{title}\""
+        vars:
+          inc_id: {k: hex, v: 8}
+          title: {k: ch, v: ["shard4 write failures", "email send degradation", "database incident"]}
+      alert_rule_added:
+        desc: Operational marker that new XID wraparound alerting was added.
+        lvl: INFO
+        msg: "alert rule added name={name} threshold={threshold}"
+        vars:
+          name: {k: ch, v: [pg_xid_wraparound]}
+          threshold: {k: i, v: [1900000000, 2100000000]}
+    beh:
+      n:
+        desc: Routine ingestion summaries; alerting runs normally.
+        emit:
+          - id: ingest_summary
+            per_min: 2.0
+            scope: global
+      f:
+        desc: High error volume creates backlog; delayed evaluations become visible once backlog builds.
+        emit:
+          - id: ingest_summary
+            per_min: 2.0
+            scope: global
+          - id: alert_eval
+            per_min: 1.5
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Send jobs are executed, metadata is written to the appropriate Postgres shard, and workers deliver mail via SMTP.
+      Shard4 behaves like the other shards in the healthy baseline.
+    req:
+      - id: send_email_other
+        desc: Send job mapped to a non-shard4 shard (majority of traffic).
+        rpm: 336.0
+        path: [mandrill_api, postgres_shards, mandrill_api, mail_worker]
+        emit: [mandrill_api.api_req_other, mandrill_api.kv_write_ok_other, mail_worker.smtp_sent]
+        latency_ms: [[5, 10], [6, 20], [80, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: send_email_shard4_ok
+        desc: Send job mapped to shard4 (minority of traffic).
+        rpm: 84.0
+        path: [mandrill_api, postgres_shard4, mandrill_api, mail_worker]
+        emit: [mandrill_api.api_req_shard4, mandrill_api.kv_write_ok_shard4, mail_worker.smtp_sent]
+        latency_ms: [[5, 12], [8, 30], [85, 260]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Shard4 enters wraparound protection and rejects writes; shard4-mapped send jobs repeatedly fail (with retries) and are
+      spooled to disk, reducing throughput until maintenance completes and shard4 returns to read-write (with residual backlog).
+    req:
+      - id: send_email_other
+        desc: Send job mapped to a non-shard4 shard continues to succeed.
+        rpm: 336.0
+        path: [mandrill_api, postgres_shards, mandrill_api, mail_worker]
+        emit: [mandrill_api.api_req_other, mandrill_api.kv_write_ok_other, mail_worker.smtp_sent]
+        latency_ms: [[6, 14], [7, 30], [90, 320]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: send_email_shard4_fail
+        desc: Shard4-mapped send job attempts fail to persist state; attempts are retried with backoff.
+        rpm: 84.0
+        path: [mandrill_api, postgres_shard4, mandrill_api]
+        emit: [mandrill_api.api_req_shard4, mandrill_api.kv_write_err_shard4]
+        latency_ms: [[6, 15], [40, 400]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [mandrill_api.retry_write]
+          backoff_ms: [[150, 700], [300, 1200]]
+        trace: false
+      - id: spool_job_shard4
+        desc: After shard4 write attempts fail, the job is spooled to local disk for later replay.
+        rpm: 84.0
+        path: [mandrill_api]
+        emit: [mandrill_api.job_spooled]
+        latency_ms: [[8, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: send_email_shard4_ok
+        desc: After maintenance, shard4-mapped send jobs succeed again (backlog replay and new jobs).
+        rpm: 84.0
+        path: [mandrill_api, postgres_shard4, mandrill_api, mail_worker]
+        emit: [mandrill_api.api_req_shard4, mandrill_api.kv_write_ok_shard4, mail_worker.smtp_sent]
+        latency_ms: [[6, 16], [12, 60], [95, 360]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    The multi-day outage is compressed into a 50-minute scenario while preserving the causal arc (wraparound shutdown → retries/spooling/disk pressure → vacuum → truncation → vacuum completion and partial recovery/backlog drain).
+  - |
+    The reported "only ~80% of queued emails sent" is modeled as an 80/20 shard split: non-shard4 sends continue; shard4-mapped sends fail until recovery.
+  - |
+    Postgres does not log every query; per-request outcomes are modeled in application logs, while Postgres emits background rejection and vacuum telemetry plus discrete maintenance markers.
+  - |
+    XID telemetry is split into an incident-high snapshot (xid_metric) and a post-maintenance snapshot (xid_metric_post) so the scenario can suppress the former after recovery without contradicting the narrative.
+  - |
+    Normal-phase expected volume is dominated by send flows (~1260 flow-logs/min) with light background telemetry (~12 logs/min).
+  - |
+    Total expected log volume over the full scenario is ~70k–90k depending on retry amplification multipliers, within the 20k..100k target range.
+  - |
+    Key diagnostic visibility comes from shard4 wraparound shutdown (one-shot), shard4 connection rejections (high-rate background), API shard4 write failures/retries plus spooling flows, disk/queue pressure metrics, and maintenance markers (vacuum start/progress, truncations, vacuum completion, and alert-rule addition).
+```

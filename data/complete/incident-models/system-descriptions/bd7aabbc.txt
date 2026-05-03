@@ -1,0 +1,529 @@
+```yaml
+sys:
+  id: aws_lambda_cell_use1
+  desc: >
+    A regional AWS Lambda cell serving synchronous and asynchronous function invocations.
+    The Lambda Frontend receives invocation requests and routes them to execution environments
+    managed by an Invocation Manager. An event routing service (EventBridge-like) delivers
+    asynchronous events to Lambda, and a dependent identity service (STS-like) calls Lambda for
+    SAML federation. The incident models a single cell becoming degraded while other cells are healthy.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: lambda_frontend
+    name: Lambda Frontend (single cell)
+    svc: lambda-frontend
+    hosts: [lf-1, lf-2, lf-3, lf-4]
+    desc: >
+      Receives invoke requests (sync and async), selects an execution environment when needed, and returns results.
+      For async invocation types it returns an acceptance response (202) to the caller. It also participates in fleet
+      scaling decisions for the cell.
+    to:
+      - dst: invocation_manager
+        proto: grpc
+        desc: Requests and tracks execution environments for a given function.
+      - dst: event_router
+        proto: https
+        desc: Returns async invoke acceptance/response to the event router client.
+      - dst: sts_gateway
+        proto: https
+        desc: Returns synchronous invocation outcomes to the STS caller.
+    logs:
+      invoke_received:
+        desc: Entry log for an invocation attempt (sync or async).
+        lvl: INFO
+        msg: "Invoke request accepted trace={trace_id} req_id={req_id} fn={fn} type={invoke_type}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          req_id: {k: uuid, v: null}
+          fn: {k: ch, v: [fn-auth, fn-orders, fn-metrics]}
+          invoke_type: {k: ch, v: [sync, async]}
+      invoke_retry:
+        desc: Marks an internal retry attempt by the frontend for a sync invocation.
+        lvl: WARN
+        msg: "Retrying invoke trace={trace_id} req_id={req_id} attempt={attempt} reason={reason}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          req_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: [no_capacity, upstream_timeout]}
+      invoke_success:
+        desc: Terminal log for a successful synchronous invocation (function completed).
+        lvl: INFO
+        msg: "Invoke completed trace={trace_id} req_id={req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 3000]}
+      async_accepted:
+        desc: Terminal log for an accepted asynchronous invocation (accepted/enqueued).
+        lvl: INFO
+        msg: "Async invoke accepted trace={trace_id} req_id={req_id} fn={fn} status=202 dur_ms={dur_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          req_id: {k: uuid, v: null}
+          fn: {k: ch, v: [fn-auth, fn-orders, fn-metrics]}
+          dur_ms: {k: i, v: [2, 500]}
+      invoke_error:
+        desc: Terminal log for a failed invocation attempt (sync or async request error).
+        lvl: ERROR
+        msg: "Invoke failed trace={trace_id} req_id={req_id} status={status} err={err} dur_ms={dur_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          req_id: {k: uuid, v: null}
+          status: {k: ch, v: [429, 500, 503, 504]}
+          err: {k: ch, v: [NoCapacity, Timeout, Throttled]}
+          dur_ms: {k: i, v: [50, 10000]}
+      scaling_threshold_crossed:
+        desc: One-shot marker that the cell's frontend scaling crossed a previously untested size.
+        lvl: WARN
+        msg: "Frontend scaling crossed cell limit cell={cell_id} desired_hosts={desired_hosts}"
+        vars:
+          cell_id: {k: ch, v: [use1-cell-07]}
+          desired_hosts: {k: i, v: [800, 1400]}
+      scale_down_initiated:
+        desc: One-shot marker for mitigation by scaling down the frontend fleet.
+        lvl: INFO
+        msg: "Mitigation: scaling down frontend cell={cell_id} new_desired_hosts={desired_hosts}"
+        vars:
+          cell_id: {k: ch, v: [use1-cell-07]}
+          desired_hosts: {k: i, v: [500, 900]}
+      frontend_metrics:
+        desc: Periodic cell-level frontend metrics used to spot error-rate and latency shifts.
+        lvl: INFO
+        msg: "Cell metrics cell={cell_id} inv_rps={inv_rps} err_rate={err_rate} p95_ms={p95_ms}"
+        vars:
+          cell_id: {k: ch, v: [use1-cell-07]}
+        state_vars:
+          n:
+            inv_rps: {k: f, v: [1.0, 8.0]}
+            err_rate: {k: f, v: [0.0, 0.02]}
+            p95_ms: {k: i, v: [40, 250]}
+          f:
+            inv_rps: {k: f, v: [1.0, 10.0]}
+            err_rate: {k: f, v: [0.1, 0.7]}
+            p95_ms: {k: i, v: [400, 4000]}
+    beh:
+      n:
+        desc: Low error rate and stable latency; periodic metrics are emitted from each frontend host.
+        emit:
+          - id: frontend_metrics
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Error rate and tail latency rise for the affected cell; metrics are emitted more frequently.
+        emit:
+          - id: frontend_metrics
+            per_min: 1.0
+            scope: per_host
+
+  - id: invocation_manager
+    name: Lambda Invocation Manager
+    svc: lambda-invocation-manager
+    hosts: [im-1, im-2, im-3]
+    desc: >
+      Allocates and tracks execution environments and reports pool state for the cell.
+      During the incident it continues allocating but reports low ready/in-use capacity.
+    to:
+      - dst: exec_env_pool
+        proto: grpc
+        desc: Starts and maintains execution environments on worker hosts.
+      - dst: lambda_frontend
+        proto: grpc
+        desc: Returns allocation/provisioning results to the frontend.
+    logs:
+      allocate_env:
+        desc: Allocation attempt for an execution environment for a function.
+        lvl: DEBUG
+        msg: "Allocating execution environment trace={trace_id} fn={fn} alloc_id={alloc_id}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          fn: {k: ch, v: [fn-auth, fn-orders, fn-metrics]}
+          alloc_id: {k: hex, v: 16}
+      provision_blocked:
+        desc: Indicates the allocator cannot provide a ready environment within the attempt.
+        lvl: WARN
+        msg: "Provisioning blocked trace={trace_id} fn={fn} reason={reason} ready={ready} allocated={allocated}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          fn: {k: ch, v: [fn-auth, fn-orders, fn-metrics]}
+          reason: {k: ch, v: [no_ready_env, quota_reached]}
+          ready: {k: i, v: [0, 200]}
+          allocated: {k: i, v: [1000, 10000]}
+      pool_stats:
+        desc: Periodic pool state for the cell; key indicator for ready vs allocated divergence.
+        lvl: INFO
+        msg: "Env pool stats cell={cell_id} allocated={allocated} ready={ready} in_use={in_use}"
+        vars:
+          cell_id: {k: ch, v: [use1-cell-07]}
+        state_vars:
+          n:
+            allocated: {k: i, v: [1500, 2500]}
+            ready: {k: i, v: [200, 600]}
+            in_use: {k: i, v: [100, 500]}
+          f:
+            allocated: {k: i, v: [3000, 9000]}
+            ready: {k: i, v: [0, 120]}
+            in_use: {k: i, v: [0, 120]}
+      capacity_gap_snapshot:
+        desc: One-shot snapshot used by engineers to note readiness below target.
+        lvl: WARN
+        msg: "Capacity below target cell={cell_id} ready={ready} target_ready={target_ready}"
+        vars:
+          cell_id: {k: ch, v: [use1-cell-07]}
+          ready: {k: i, v: [0, 200]}
+          target_ready: {k: i, v: [200, 800]}
+    beh:
+      n:
+        desc: Pool maintains healthy ready capacity; periodic stats are emitted.
+        emit:
+          - id: pool_stats
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Pool stats show elevated allocated capacity with low ready/in-use capacity.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+            scope: per_host
+
+  - id: exec_env_pool
+    name: Execution Environment Pool
+    svc: lambda-exec-env
+    hosts: [envd-1, envd-2, envd-3]
+    desc: >
+      Worker-side service that makes execution environments available to the invocation manager.
+      In this model it only emits a readiness log when a cold start completes.
+    to:
+      - dst: invocation_manager
+        proto: grpc
+        desc: Reports environment readiness and lifecycle state back to the invocation manager.
+    logs:
+      env_ready:
+        desc: Emitted when an execution environment becomes ready for use.
+        lvl: DEBUG
+        msg: "Execution environment ready alloc_id={alloc_id} host={host} cold_start_ms={cold_ms}"
+        vars:
+          alloc_id: {k: hex, v: 16}
+          host: {k: ch, v: [envd-1, envd-2, envd-3]}
+          cold_ms: {k: i, v: [10, 800]}
+    beh:
+      n:
+        desc: No background emissions; readiness is logged only when used by request flows.
+        emit: []
+      f:
+        desc: No background emissions; readiness is logged only for the subset of successful requests.
+        emit: []
+
+  - id: event_router
+    name: Event Router (EventBridge-like)
+    svc: event-router
+    hosts: [er-1, er-2]
+    desc: >
+      Accepts events from producers and delivers them to Lambda asynchronously with retries.
+      When Lambda is degraded, delivery attempts fail and the queue backlog/age increases.
+    to:
+      - dst: lambda_frontend
+        proto: https
+        desc: Delivers asynchronous events to Lambda functions via invoke API.
+    logs:
+      delivery_attempt:
+        desc: Start of an event delivery attempt to Lambda.
+        lvl: INFO
+        msg: "Delivering event trace={trace_id} evt_id={evt_id} target={fn} lag_s={lag_s}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          evt_id: {k: uuid, v: null}
+          fn: {k: ch, v: [fn-auth, fn-orders, fn-metrics]}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 5]}
+          f:
+            lag_s: {k: i, v: [10, 900]}
+      delivery_retry:
+        desc: Marks a retry scheduled for an event delivery attempt.
+        lvl: WARN
+        msg: "Retrying event delivery trace={trace_id} evt_id={evt_id} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          evt_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 5]}
+          backoff_ms: {k: i, v: [500, 6000]}
+      delivery_success:
+        desc: Terminal log for a successful delivery to Lambda (async accepted).
+        lvl: INFO
+        msg: "Event delivered evt_id={evt_id} status=202 lag_s={lag_s}"
+        vars:
+          evt_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 5]}
+          f:
+            lag_s: {k: i, v: [10, 900]}
+      delivery_deferred:
+        desc: Terminal log for a delivery attempt that is deferred for later retry.
+        lvl: WARN
+        msg: "Event delivery deferred evt_id={evt_id} reason={reason}"
+        vars:
+          evt_id: {k: uuid, v: null}
+          reason: {k: ch, v: [invoke_error, throttled]}
+      queue_stats:
+        desc: Periodic queue depth and maximum age indicator for deliveries.
+        lvl: INFO
+        msg: "Queue stats source={source} depth={depth} max_age_s={max_age_s}"
+        vars:
+          source: {k: ch, v: [eventbridge]}
+        state_vars:
+          n:
+            depth: {k: i, v: [0, 500]}
+            max_age_s: {k: i, v: [0, 10]}
+          f:
+            depth: {k: i, v: [2000, 20000]}
+            max_age_s: {k: i, v: [60, 900]}
+      queue_lag_snapshot:
+        desc: One-shot snapshot of queue lag taken during investigation/monitoring.
+        lvl: WARN
+        msg: "Observed queue lag source={source} depth={depth} max_age_s={max_age_s}"
+        vars:
+          source: {k: ch, v: [eventbridge]}
+          depth: {k: i, v: [1000, 25000]}
+          max_age_s: {k: i, v: [30, 900]}
+    beh:
+      n:
+        desc: Queue remains near-empty and max age stays low; periodic stats are emitted globally.
+        emit:
+          - id: queue_stats
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Backlog and max age increase; periodic stats are emitted more frequently.
+        emit:
+          - id: queue_stats
+            per_min: 1.5
+            scope: global
+
+  - id: sts_gateway
+    name: Identity Token Service (STS-like)
+    svc: sts-gateway
+    hosts: [sts-1, sts-2]
+    desc: >
+      Handles SAML federation requests and calls a Lambda function as part of request processing.
+      When Lambda is degraded, it may throttle/return errors for new federation requests.
+    to:
+      - dst: lambda_frontend
+        proto: https
+        desc: Calls Lambda synchronously for federation-related logic.
+    logs:
+      saml_req:
+        desc: Entry log for a SAML federation request.
+        lvl: INFO
+        msg: "SAML federation request trace={trace_id} req_id={req_id} idp={idp}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          req_id: {k: uuid, v: null}
+          idp: {k: ch, v: [okta, aadfs]}
+      saml_ok:
+        desc: Terminal log for a successful SAML federation request.
+        lvl: INFO
+        msg: "SAML federation success req_id={req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 3000]}
+      saml_throttled:
+        desc: Terminal log for a failed/throttled federation request due to upstream issues.
+        lvl: ERROR
+        msg: "SAML federation failed req_id={req_id} status={status} err={err} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          status: {k: ch, v: [429, 503]}
+          err: {k: ch, v: [UpstreamLambdaError, Throttled]}
+          dur_ms: {k: i, v: [100, 8000]}
+      throttle_metric:
+        desc: Periodic indicator that throttling is active for SAML federation.
+        lvl: WARN
+        msg: "STS throttling active scope={scope} throttled_rps={thr_rps}"
+        vars:
+          scope: {k: ch, v: [saml_federation]}
+        state_vars:
+          n:
+            thr_rps: {k: i, v: [0, 2]}
+          f:
+            thr_rps: {k: i, v: [5, 80]}
+    beh:
+      n:
+        desc: Throttling is normally inactive or minimal.
+        emit:
+          - id: throttle_metric
+            per_min: 0.1
+            scope: per_host
+      f:
+        desc: Throttling may be enabled to protect STS during upstream Lambda degradation.
+        emit:
+          - id: throttle_metric
+            per_min: 0.3
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [lambda_frontend, event_router, sts_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation with low error rates, quick async delivery, and successful federation calls.
+    req:
+      - id: sync_invoke_ok_n
+        desc: Synchronous Lambda invoke succeeds on first attempt.
+        rpm: 180.0
+        path: [lambda_frontend, invocation_manager, exec_env_pool, invocation_manager, lambda_frontend]
+        emit:
+          - lambda_frontend.invoke_received
+          - invocation_manager.allocate_env
+          - exec_env_pool.env_ready
+          - lambda_frontend.invoke_success
+        latency_ms: [[2, 8], [3, 12], [10, 120], [15, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: async_event_delivery_ok_n
+        desc: Event router delivers an event to Lambda successfully (Lambda accepts async invoke with 202) with low lag.
+        rpm: 50.0
+        path: [event_router, lambda_frontend, event_router]
+        emit:
+          - event_router.delivery_attempt
+          - lambda_frontend.invoke_received
+          - lambda_frontend.async_accepted
+          - event_router.delivery_success
+        latency_ms: [[2, 10], [3, 15], [3, 40], [2, 10]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.1
+          emit_per_retry: [event_router.delivery_retry]
+          backoff_ms: [[200, 800]]
+        trace: true
+
+      - id: sts_saml_federation_ok_n
+        desc: STS processes a SAML federation request and the Lambda dependency succeeds.
+        rpm: 20.0
+        path: [sts_gateway, lambda_frontend, invocation_manager, exec_env_pool, invocation_manager, lambda_frontend, sts_gateway]
+        emit:
+          - sts_gateway.saml_req
+          - lambda_frontend.invoke_received
+          - invocation_manager.allocate_env
+          - lambda_frontend.invoke_success
+          - sts_gateway.saml_ok
+        latency_ms: [[2, 8], [3, 12], [3, 15], [30, 400], [5, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      A single cell enters a degraded state where execution environments are allocated but few become ready/in-use.
+      Synchronous invokes see retries, elevated latency, and errors; async deliveries accumulate backlog.
+      Mitigations later reduce sync failures, but async backlog persists.
+    req:
+      - id: sync_invoke_f_err
+        desc: Synchronous invoke fails after retries due to lack of ready execution environments.
+        rpm: 120.0
+        path: [lambda_frontend, invocation_manager, lambda_frontend]
+        emit:
+          - lambda_frontend.invoke_received
+          - invocation_manager.allocate_env
+          - invocation_manager.provision_blocked
+          - lambda_frontend.invoke_error
+        latency_ms: [[2, 10], [5, 20], [300, 2500], [500, 8000]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [lambda_frontend.invoke_retry]
+          backoff_ms: [[100, 500], [200, 1200]]
+        trace: true
+
+      - id: sync_invoke_f_ok
+        desc: Synchronous invoke succeeds but with elevated latency in the affected cell.
+        rpm: 60.0
+        path: [lambda_frontend, invocation_manager, exec_env_pool, invocation_manager, lambda_frontend]
+        emit:
+          - lambda_frontend.invoke_received
+          - invocation_manager.allocate_env
+          - exec_env_pool.env_ready
+          - lambda_frontend.invoke_success
+        latency_ms: [[2, 10], [5, 20], [50, 600], [150, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: async_event_delivery_f_fail
+        desc: Event delivery attempts fail and are deferred for retry, growing backlog and lag.
+        rpm: 40.0
+        path: [event_router, lambda_frontend, invocation_manager, lambda_frontend, event_router]
+        emit:
+          - event_router.delivery_attempt
+          - lambda_frontend.invoke_received
+          - invocation_manager.provision_blocked
+          - lambda_frontend.invoke_error
+          - event_router.delivery_deferred
+        latency_ms: [[2, 12], [3, 15], [200, 2000], [300, 5000], [2, 12]]
+        retry:
+          max_attempts: 5
+          expected_attempts: 3.0
+          emit_per_retry: [event_router.delivery_retry]
+          backoff_ms: [[1000, 5000], [2000, 8000], [4000, 15000], [8000, 30000]]
+        trace: true
+
+      - id: async_event_delivery_f_ok
+        desc: After sync capacity improves, event router starts delivering backlog successfully but with high lag (Lambda accepts async invoke with 202).
+        rpm: 15.0
+        path: [event_router, lambda_frontend, event_router]
+        emit:
+          - event_router.delivery_attempt
+          - lambda_frontend.invoke_received
+          - lambda_frontend.async_accepted
+          - event_router.delivery_success
+        latency_ms: [[2, 12], [3, 15], [3, 80], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: sts_saml_federation_f
+        desc: STS SAML federation calls Lambda and fails/throttles due to upstream Lambda errors.
+        rpm: 15.0
+        path: [sts_gateway, lambda_frontend, invocation_manager, lambda_frontend, sts_gateway]
+        emit:
+          - sts_gateway.saml_req
+          - lambda_frontend.invoke_received
+          - invocation_manager.provision_blocked
+          - lambda_frontend.invoke_error
+          - sts_gateway.saml_throttled
+        latency_ms: [[2, 10], [3, 15], [200, 2500], [300, 6000], [5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "The model represents one affected Lambda cell (cell_id use1-cell-07) in us-east-1; other cells are omitted."
+  - "Async invocation is modeled as a request that returns status=202 on acceptance (lambda_frontend.async_accepted) and is confirmed by the event router (event_router.delivery_success). Synchronous completion remains status=200 (lambda_frontend.invoke_success)."
+  - "The latent defect is modeled observationally as a persistent divergence between allocated and ready/in-use capacity (invocation_manager.pool_stats) plus per-request provisioning blocks."
+  - "Dependent services are simplified to an async event router (EventBridge-like) and an STS-like SAML federation path to show downstream impact without modeling every AWS service mentioned."
+  - "Normal-phase volume estimate is ~1.05k request/attempt logs per minute plus ~5 background logs per minute across hosts."
+  - "Total scenario volume estimate over 50 minutes is ~65k-75k logs driven primarily by sync invoke traffic and retries, within the 20k-100k target."
+  - "Visibility rationale: key diagnostics (lambda_frontend.frontend_metrics, invocation_manager.pool_stats/provision_blocked, event_router.queue_stats, and lambda_frontend.invoke_error) occur at high enough rates to appear repeatedly; mitigation actions are one-shot markers."
+```

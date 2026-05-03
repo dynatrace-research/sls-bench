@@ -1,0 +1,502 @@
+```yaml
+sys:
+  id: joyent_sdc_us_east_1
+  desc: >
+    A single SmartDataCenter-like data center providing a customer API (control plane) and a fleet of compute nodes
+    that host customer instances. Compute nodes PXE-boot via an internal DHCP/TFTP boot service that can serve from
+    cached state when the control plane is unavailable. Operators and automation can run a remote tooling service to
+    execute actions (including reboots) across sets of servers. The incident models an accidental mass reboot, a boot
+    storm that overloads boot infrastructure, and delayed control-plane recovery due to stateful quorum components.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ops_tool
+    name: Operator Remote Tooling
+    svc: sdc-ops-tool
+    hosts: [ops1]
+    desc: >
+      Remote execution tooling used by automation and operators to run actions on sets of servers (compute nodes and
+      control-plane hosts). In this incident it issues a mistaken mass reboot, and later a smaller targeted reboot batch.
+    to:
+      - dst: node_agent
+        proto: ssh
+        desc: Executes commands on compute nodes via remote shell.
+      - dst: sdc_api
+        proto: ssh
+        desc: Executes commands on API hosts (e.g., reboot/restart) via remote shell.
+      - dst: control_store
+        proto: ssh
+        desc: Executes commands on control-plane stateful hosts (e.g., reboot) via remote shell.
+      - dst: boot_service
+        proto: ssh
+        desc: Executes commands on boot-infrastructure hosts (e.g., reboot) via remote shell.
+    logs:
+      cmd_invoke:
+        desc: The (mistaken) mass-reboot command was invoked.
+        lvl: INFO
+        msg: "Executing action={action} target={target} requested_by={user}"
+        vars:
+          action: {k: ch, v: [reboot]}
+          target: {k: ch, v: [all_us_east_1]}
+          user: {k: ch, v: [oncall_ops]}
+      target_expanded:
+        desc: The resolved server set for the mass reboot after expanding selectors.
+        lvl: WARN
+        msg: "Target expanded to servers={server_count} az={az} selector={selector}"
+        vars:
+          server_count: {k: i, v: [35, 60]}
+          az: {k: ch, v: [us-east-1]}
+          selector: {k: ch, v: [role=all]}
+      reboot_dispatched:
+        desc: A mass reboot batch was dispatched to the resolved server set.
+        lvl: ERROR
+        msg: "Issued reboot batch_id={batch_id} servers={server_count} az={az}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          server_count: {k: i, v: [35, 60]}
+          az: {k: ch, v: [us-east-1]}
+      cmd_invoke_targeted:
+        desc: A targeted reboot command was invoked for lagging nodes.
+        lvl: INFO
+        msg: "Executing action={action} target={target} requested_by={user} reason={reason}"
+        vars:
+          action: {k: ch, v: [reboot]}
+          target: {k: ch, v: [lagging_nodes]}
+          user: {k: ch, v: [oncall_ops]}
+          reason: {k: ch, v: [legacy_dhcp_lease_failure, slow_pxe_boot]}
+      target_expanded_targeted:
+        desc: The resolved server set for a targeted reboot batch.
+        lvl: INFO
+        msg: "Target expanded to servers={server_count} az={az} selector={selector}"
+        vars:
+          server_count: {k: i, v: [1, 10]}
+          az: {k: ch, v: [us-east-1]}
+          selector: {k: ch, v: [role=lagging]}
+      reboot_dispatched_targeted:
+        desc: A targeted reboot batch was dispatched to a small server set.
+        lvl: WARN
+        msg: "Issued reboot batch_id={batch_id} servers={server_count} az={az} target={target}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          server_count: {k: i, v: [1, 10]}
+          az: {k: ch, v: [us-east-1]}
+          target: {k: ch, v: [lagging_nodes]}
+      audit_tick:
+        desc: Periodic audit marker from the tooling service.
+        lvl: INFO
+        msg: "ops_tool audit ok run_id={run_id}"
+        vars:
+          run_id: {k: hex, v: 8}
+    beh:
+      n:
+        desc: Low-rate audit markers; most logs are one-shot operator actions.
+        emit:
+          - id: audit_tick
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Low-rate audit markers during incident.
+        emit:
+          - id: audit_tick
+            per_min: 0.1
+            scope: per_host
+
+  - id: sdc_api
+    name: SDC Customer API
+    svc: sdc-api
+    hosts: [api1, api2, api3]
+    desc: >
+      Customer-facing API for instance and account operations. During the incident it is unavailable after the reboot,
+      then later serves a small fraction of requests as control-plane state is manually recovered.
+    to:
+      - dst: control_store
+        proto: tcp
+        desc: Reads and writes control-plane state via a stateful quorum store.
+    logs:
+      http_200_access:
+        desc: Successful API response access log.
+        lvl: INFO
+        msg: "HTTP {method} {req_path} status=200 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          req_path: {k: ch, v: [/v1/instances, /v1/account, /v1/ping]}
+          dur_ms: {k: i, v: [5, 1500]}
+          trace_id: {k: hex, v: 32}
+      http_503_access:
+        desc: Failed API response access log due to service unavailable.
+        lvl: WARN
+        msg: "HTTP {method} {req_path} status=503 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          req_path: {k: ch, v: [/v1/instances, /v1/account, /v1/ping]}
+          dur_ms: {k: i, v: [1, 200]}
+          trace_id: {k: hex, v: 32}
+      startup_wait:
+        desc: API startup waiting for control-plane quorum.
+        lvl: WARN
+        msg: "API starting; waiting_for_quorum={quorum} last_err={last_err}"
+        vars:
+          quorum: {k: ch, v: [absent, partial]}
+          last_err: {k: ch, v: [no_leader, connect_timeout]}
+      restart:
+        desc: API service restart marker.
+        lvl: INFO
+        msg: "Restarting API service reason={reason} ticket={ticket}"
+        vars:
+          reason: {k: ch, v: [control_plane_recovery, host_reboot]}
+          ticket: {k: hex, v: 10}
+    beh:
+      n:
+        desc: No significant background logging beyond request access logs.
+        emit: []
+      f:
+        desc: While down or restarting, the API logs repeated startup-wait messages.
+        emit:
+          - id: startup_wait
+            per_min: 0.6
+            scope: per_host
+
+  - id: control_store
+    name: Control Plane Quorum Store
+    svc: sdc-control-store
+    hosts: [cs1, cs2, cs3]
+    desc: >
+      Stateful quorum store for control-plane metadata. It can survive limited failures, but a full data-center reboot
+      leaves it without enough history to automatically re-form quorum and requires manual recovery.
+    to: []
+    logs:
+      store_metrics:
+        desc: Periodic state/health metrics for the quorum store.
+        lvl: INFO
+        msg: "store_metrics role={role} peers_visible={peers} commit_lag_ms={lag_ms}"
+        vars:
+          role: {k: ch, v: [leader, follower, unknown]}
+          peers: {k: i, v: [0, 3]}
+        state_vars:
+          n:
+            lag_ms: {k: i, v: [0, 200]}
+          f:
+            lag_ms: {k: i, v: [0, 20000]}
+      quorum_lost:
+        desc: Quorum is lost and no leader is available.
+        lvl: ERROR
+        msg: "Quorum lost; peers_visible={peers} term={term}"
+        vars:
+          peers: {k: i, v: [0, 2]}
+          term: {k: i, v: [1, 2000]}
+      election:
+        desc: Leader election attempts.
+        lvl: INFO
+        msg: "Leader election term={term} votes={votes} peers_visible={peers}"
+        vars:
+          term: {k: i, v: [1, 2000]}
+          votes: {k: i, v: [0, 3]}
+          peers: {k: i, v: [0, 3]}
+      recovery_blocked:
+        desc: Automatic recovery is blocked due to insufficient persisted history.
+        lvl: WARN
+        msg: "Recovery blocked history_entries={hist} required={required} safe_mode={safe_mode}"
+        vars:
+          hist: {k: i, v: [0, 800]}
+          required: {k: i, v: [500, 2500]}
+          safe_mode: {k: ch, v: [true]}
+      manual_recover:
+        desc: Manual intervention applied to recover quorum.
+        lvl: INFO
+        msg: "Manual recovery applied op={op} new_term={term} peers_bootstrapped={peers}"
+        vars:
+          op: {k: ch, v: [reseed, force_leader]}
+          term: {k: i, v: [1, 2000]}
+          peers: {k: i, v: [1, 3]}
+    beh:
+      n:
+        desc: Regular health metrics under stable quorum.
+        emit:
+          - id: store_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the outage the store repeatedly attempts elections and reports blocked recovery.
+        emit:
+          - id: store_metrics
+            per_min: 2.0
+            scope: per_host
+          - id: election
+            per_min: 0.6
+            scope: per_host
+          - id: quorum_lost
+            per_min: 0.15
+            scope: per_host
+          - id: recovery_blocked
+            per_min: 0.4
+            scope: per_host
+
+  - id: boot_service
+    name: DHCP/TFTP Boot Service
+    svc: sdc-boot
+    hosts: [boot1, boot2]
+    desc: >
+      Provides DHCP/TFTP PXE boot responses to servers. It serves from cached control-plane state when needed.
+      Under simultaneous reboots it becomes a contention point, and throttles may be adjusted to increase throughput.
+    to:
+      - dst: control_store
+        proto: tcp
+        desc: Periodically refreshes cached boot state from the control plane when available.
+      - dst: node_agent
+        proto: udp
+        desc: Responds to DHCP/TFTP (PXE) requests from compute nodes during boot.
+    logs:
+      pxe_req:
+        desc: A PXE request was handled and a DHCP lease was offered/assigned.
+        lvl: INFO
+        msg: "PXE request node={node} lease_ip={lease_ip} cache={cache} rtt_ms={rtt_ms}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          lease_ip: {k: ip, v: "10.1.0.0/16"}
+          cache: {k: ch, v: [hit, stale]}
+          rtt_ms: {k: i, v: [1, 1500]}
+      dhcp_no_offer:
+        desc: DHCP did not produce a usable offer/ack for a PXE request within the wait window.
+        lvl: WARN
+        msg: "DHCP no offer node={node} err={err} waited_ms={waited_ms}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          err: {k: ch, v: [no_offer, timeout]}
+          waited_ms: {k: i, v: [500, 15000]}
+      throttle_drop:
+        desc: Throttling/queue pressure caused request drops or deferrals.
+        lvl: WARN
+        msg: "Throttling PXE qlen={qlen} dropped={dropped} max_qps={max_qps}"
+        vars:
+          qlen: {k: i, v: [0, 800]}
+          dropped: {k: i, v: [1, 200]}
+          max_qps: {k: i, v: [50, 500]}
+      throttle_update:
+        desc: Operator-adjusted throttle configuration change.
+        lvl: INFO
+        msg: "Updated throttles max_qps={max_qps} tftp_workers={workers}"
+        vars:
+          max_qps: {k: i, v: [200, 1200]}
+          workers: {k: i, v: [8, 64]}
+      tftp_metrics:
+        desc: Periodic metrics of boot throughput and latency (aggregate PXE sessions per minute, not packet-level TFTP blocks).
+        lvl: INFO
+        msg: "boot_metrics sessions_per_min={sessions_per_min} active_transfers={active} avg_rtt_ms={avg_rtt_ms}"
+        vars:
+          active: {k: i, v: [0, 30]}
+        state_vars:
+          n:
+            sessions_per_min: {k: i, v: [0, 2]}
+            avg_rtt_ms: {k: i, v: [1, 40]}
+          f:
+            sessions_per_min: {k: i, v: [1, 8]}
+            avg_rtt_ms: {k: i, v: [5, 1200]}
+      cache_refresh_warn:
+        desc: Control plane cannot be reached; serving PXE using cached state.
+        lvl: WARN
+        msg: "Control-plane unavailable; serving from cache age_s={age_s} cache_state={cache_state}"
+        vars:
+          age_s: {k: i, v: [0, 7200]}
+          cache_state: {k: ch, v: [stale]}
+    beh:
+      n:
+        desc: Low-rate metrics with occasional cache refresh warnings.
+        emit:
+          - id: tftp_metrics
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Elevated metrics and cache serving while the control plane is impaired.
+        emit:
+          - id: tftp_metrics
+            per_min: 2.0
+            scope: global
+          - id: cache_refresh_warn
+            per_min: 0.6
+            scope: global
+
+  - id: node_agent
+    name: Compute Node Agent
+    svc: sdc-agent
+    hosts:
+      [cn001, cn002, cn003, cn004, cn005, cn006, cn007, cn008, cn009, cn010,
+       cn011, cn012, cn013, cn014, cn015, cn016, cn017, cn018, cn019, cn020,
+       cn021, cn022, cn023, cn024, cn025, cn026, cn027, cn028, cn029, cn030]
+    desc: >
+      Agent on each compute node that reports status and participates in provisioning/maintenance workflows.
+      It logs PXE boot attempts, retries/backoff, and a DHCP lease failure symptom on legacy NIC hardware.
+    to:
+      - dst: boot_service
+        proto: udp
+        desc: Performs DHCP/TFTP PXE boot interactions with the boot service.
+      - dst: sdc_api
+        proto: https
+        desc: Reports node status and receives orchestration commands.
+    logs:
+      heartbeat:
+        desc: Periodic node status heartbeat.
+        lvl: INFO
+        msg: "node_heartbeat node={node} vms={vms} agent_state={agent_state}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          vms: {k: i, v: [0, 48]}
+          agent_state: {k: ch, v: [ready, draining]}
+      pxe_attempt_start:
+        desc: Start of a PXE attempt (may repeat if retries occur).
+        lvl: INFO
+        msg: "PXE attempt start node={node} attempt={attempt} reason={reason}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          attempt: {k: i, v: [1, 5]}
+          reason: {k: ch, v: [reboot, power_on]}
+      pxe_retry:
+        desc: Retry marker for PXE with backoff.
+        lvl: WARN
+        msg: "PXE retry node={node} next_attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          attempt: {k: i, v: [2, 5]}
+          backoff_ms: {k: i, v: [200, 4000]}
+      boot_complete:
+        desc: Node finished booting (control plane may still be unavailable).
+        lvl: INFO
+        msg: "Boot complete node={node} took_ms={took_ms} net_ok={net_ok}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          took_ms: {k: i, v: [5000, 240000]}
+          net_ok: {k: ch, v: [true]}
+      dhcp_lease_failed:
+        desc: DHCP lease acquisition failed on boot due to NIC/driver behavior.
+        lvl: ERROR
+        msg: "DHCP lease failed node={node} nic={nic} err={err}"
+        vars:
+          node: {k: str, v: "cn{001..030}"}
+          nic: {k: ch, v: [legacy_nic]}
+          err: {k: ch, v: [timeout, no_offer]}
+    beh:
+      n:
+        desc: Agents emit heartbeats regularly across the fleet.
+        emit:
+          - id: heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Heartbeats reduce as nodes reboot and some remain offline.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [sdc_api]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal customer API usage with occasional compute-node PXE boots.
+    req:
+      - id: api_requests_ok
+        desc: Customer API requests succeed under healthy control-plane conditions.
+        rpm: 900.0
+        path: [sdc_api]
+        emit: [sdc_api.http_200_access]
+        latency_ms: [[25, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: pxe_boot_normal
+        desc: Occasional PXE boots (hardware maintenance or new capacity) under normal demand.
+        rpm: 0.2
+        path: [node_agent, boot_service, node_agent]
+        emit: [node_agent.pxe_attempt_start, boot_service.pxe_req, node_agent.boot_complete]
+        latency_ms: [[5, 30], [5, 30], [20000, 60000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: After a mass reboot, customers see API unavailability while the fleet reboots and PXE demand spikes.
+    req:
+      - id: api_requests_503
+        desc: Customer API requests fail fast as API hosts and/or control plane are unavailable.
+        rpm: 650.0
+        path: [sdc_api]
+        emit: [sdc_api.http_503_access]
+        latency_ms: [[15, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: api_requests_partial_200
+        desc: A small fraction of API requests succeed after manual control-plane recovery begins.
+        rpm: 70.0
+        path: [sdc_api]
+        emit: [sdc_api.http_200_access]
+        latency_ms: [[60, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: pxe_boot_success
+        desc: Compute nodes successfully PXE boot via DHCP/TFTP.
+        rpm: 1.2
+        path: [node_agent, boot_service, node_agent]
+        emit: [node_agent.pxe_attempt_start, boot_service.pxe_req, node_agent.boot_complete]
+        latency_ms: [[5, 40], [20, 800], [30000, 180000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: pxe_boot_throttled
+        desc: PXE attempts are throttled/dropped, causing retries with backoff before nodes can boot.
+        rpm: 0.8
+        path: [node_agent, boot_service]
+        emit: [node_agent.pxe_attempt_start, boot_service.throttle_drop]
+        latency_ms: [[5, 30], [10, 300]]
+        retry:
+          max_attempts: 5
+          expected_attempts: 2.2
+          emit_per_retry: [node_agent.pxe_retry]
+          backoff_ms: [[400, 900], [800, 1500], [1500, 2500], [2500, 4000]]
+        trace: false
+      - id: legacy_nic_dhcp_fail
+        desc: A subset of legacy hardware intermittently fails to obtain a DHCP lease on boot.
+        rpm: 0.4
+        path: [node_agent, boot_service, node_agent]
+        emit: [node_agent.pxe_attempt_start, boot_service.dhcp_no_offer, node_agent.dhcp_lease_failed]
+        latency_ms: [[5, 30], [500, 15000], [5000, 30000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Names and internal Joyent SDC components are simplified into five services; the control plane's stateful layer is modeled as one quorum store."
+  - "Compute-node identity is consistently modeled as cn001..cn030 (no hyphen); all node={node} fields use the same domain so logs correlate to node_agent.hosts."
+  - "ops_tool is modeled as being able to execute reboot actions on all server roles (compute, API, control-store, boot-service) via SSH; this supports the incident claim that the mass reboot affected the entire data center."
+  - "This incident-specific model uses a small, explicit compute fleet of 30 nodes (cn001..cn030); PXE flow rates represent aggregate per-node boot sessions/attempts across that fleet."
+  - "PXE boot behavior is modeled as request flows (PXE attempts) rather than per-node lifecycle; rates represent aggregate behavior with retries and occasional reboots."
+  - "The boot service is assumed to be able to serve from cached state even when the control plane is down; this appears as cache_refresh_warn in failure."
+  - "Boot-service PXE handling is split into success (boot_service.pxe_req with lease_ip assigned) vs DHCP failure (boot_service.dhcp_no_offer with no lease_ip) to keep legacy DHCP-failure chains causally consistent."
+  - "ops_tool reboot evidence is split into mass vs targeted batches (separate log IDs) so later operator reboots can be small (1–10) without contradicting the initial all-servers reboot (35–60)."
+  - "boot_service.tftp_metrics reports aggregate PXE sessions per minute so its throughput fields are consistent with the modeled PXE attempt flow rates and the 30-node fleet size."
+  - "Normal-phase volume estimate: ~900 API req/min * 1 log/req + (~15 node heartbeats/min + ~4 control/boot metrics/min) ~= ~919 logs/min."
+  - "Scenario total volume estimate (50 min): normal ~23k logs + failure ~17k–19k logs + background/one-shots ~= ~40k–45k logs (target 20k–100k)."
+  - "Key diagnostic visibility: mass reboot is evidenced by ops_tool one-shots; boot contention by boot_service.throttle_drop/metrics and node_agent.pxe_retry; legacy NIC issue by node_agent.dhcp_lease_failed (activated later); and control-plane recovery difficulty by control_store.recovery_blocked/quorum_lost plus sdc_api.startup_wait."
+```

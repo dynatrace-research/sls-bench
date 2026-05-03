@@ -1,0 +1,208 @@
+```yaml
+scenario:
+  id: browserstack_shellshock_legacy_host_2014
+  title: Legacy prototype Shellshock compromise leads to AWS credential abuse, DB lock alerts, and service takedown
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The service normally handles user web traffic via a frontend backed by an RDS database, while production servers block Shellshock probes.
+    An attacker exploits an unpatched, inactive legacy prototype host to obtain embedded AWS keys and perform AWS control-plane actions.
+    The attacker mounts a backup-derived configuration path to access the database and begins a bulk copy that locks/contends on a key table, triggering lock-wait alerts and user-facing slowness/errors.
+    Operators block the attacker and take the service into maintenance mode while rotating keys, causing a sustained outage at the end of the scenario.
+
+  trigger_desc: |
+    A Shellshock exploit is successfully executed against an old prototype EC2 host that was left running and unpatched, exposing embedded AWS credentials.
+
+  time:
+    total_minutes: 34
+    phases:
+      n: {start_min: 0, end_min: 17}
+      f: {start_min: 17, end_min: 34}
+
+  phases:
+    n:
+      desc: |
+        Users browse and run sessions through the public web frontend with typical latencies.
+        Monitoring samples DB lock-wait metrics at a low baseline and the DB emits routine checkpoint logs.
+        Production web servers occasionally log blocked Shellshock probes, indicating patching at the public edge.
+      flows: [user_dashboard_ok, shellshock_probe_prod]
+      manifestation:
+        - web_frontend.http_resp_ok
+        - web_frontend.web_health_ok
+        - monitoring.metric_db_lockwait
+        - web_frontend.shellshock_block
+
+    f:
+      desc: |
+        The incident begins with successful Shellshock exploitation of an inactive legacy prototype host.
+        Using embedded AWS credentials, the attacker performs AWS actions recorded in CloudTrail, later gaining DB access and initiating a bulk copy.
+        The bulk copy and related contention cause lock waits and slow queries, degrading user request latency and causing 500 errors, which triggers monitoring alerts.
+        Operators then revoke the attacker’s DB ingress, terminate the attacker instance, rotate keys, and enable maintenance mode, leaving the service unavailable through the end.
+
+      events:
+        - order: 1
+          at_min: 17
+          component: legacy_prototype_host
+          event: |
+            Shellshock exploitation of the legacy prototype host begins, followed by AWS API activity from that host using embedded credentials.
+            User traffic continues normally at first.
+          why: |
+            The legacy host is unpatched and reachable, so the exploit yields command execution and access to stored AWS keys.
+            AWS control-plane activity is directly observable in CloudTrail; early user impact is minimal until DB access/copy starts.
+          flows: [attacker_shellshock_proto, attacker_aws_api_abuse, user_dashboard_ok_f]
+          rate_multipliers:
+            user_dashboard_slow_ok: 0.0
+            user_dashboard_500: 0.0
+            user_request_maintenance: 0.0
+            attacker_db_export: 0.0
+            attacker_ses_send: 0.0
+            monitoring.alert_db_lock: 0.0
+            monitoring.alert_unrecognized_db_ip: 0.0
+            web_frontend.web_health_degraded: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - legacy_prototype_host.shellshock_exec
+            - aws_cloudtrail.ct_event
+
+        - order: 2
+          at_min: 23
+          component: rds_database
+          event: |
+            Bulk read activity against the users table is observed and lock contention rises, producing slow queries and lock-wait timeouts.
+            Monitoring begins alerting, and user requests shift from normal to slow successes and 500s.
+            The attacker also begins sending a misleading email to a small subset of users via SES.
+          why: |
+            A large export-style read can hold or contend on table locks/metadata locks, increasing lock wait timeouts for concurrent operations.
+            This is directly observable via DB slow-query/lock-wait logs and monitoring alerts; email sending is observable via SES batch-send logs.
+          flows:
+            - attacker_db_export
+            - attacker_ses_send
+            - user_dashboard_slow_ok
+            - user_dashboard_500
+            - user_dashboard_ok_f
+          rate_multipliers:
+            user_dashboard_ok_f: 0.2
+            user_dashboard_slow_ok: 1.0
+            user_dashboard_500: 1.0
+            attacker_db_export: 2.0
+            attacker_ses_send: 1.0
+            monitoring.alert_db_lock: 6.0
+            monitoring.alert_unrecognized_db_ip: 3.0
+            web_frontend.web_health_degraded: 1.0
+          latency_multipliers:
+            user_dashboard_ok_f: {p50: 1.5, p95: 3.0}
+            user_dashboard_slow_ok: {p50: 1.2, p95: 1.5}
+            user_dashboard_500: {p50: 1.1, p95: 1.3}
+          one_shots: []
+          manifestation:
+            - monitoring.alert_db_lock
+            - rds_database.db_lock_wait
+            - rds_database.db_audit_copy
+            - email_service.ses_send_batch
+
+        - order: 3
+          at_min: 28
+          component: monitoring
+          event: |
+            On-call responds to alerts, revokes the attacker IP from the DB security group, terminates the attacker instance, deletes/revokes keys,
+            and enables maintenance mode on the web frontend.
+            Attacker activity ceases in logs while users receive 503 maintenance responses.
+          why: |
+            Removing security group ingress blocks further DB connections from the attacker, terminating the instance ends compute access,
+            and key deletion limits further AWS API calls. Maintenance mode reduces further risk while investigation proceeds.
+            These actions are directly observable via CloudTrail and the web frontend maintenance marker.
+          flows: [user_request_maintenance]
+          rate_multipliers:
+            user_dashboard_ok_f: 0.0
+            user_dashboard_slow_ok: 0.0
+            user_dashboard_500: 0.0
+            user_request_maintenance: 1.0
+            attacker_shellshock_proto: 0.0
+            attacker_aws_api_abuse: 0.0
+            attacker_db_export: 0.0
+            attacker_ses_send: 0.0
+            monitoring.alert_db_lock: 0.5
+            monitoring.alert_unrecognized_db_ip: 0.0
+            web_frontend.web_health_degraded: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.pagerduty_ack
+              count: 1
+              hosts: [mon-1]
+            - ref: aws_cloudtrail.ct_ops_revoke_sg
+              count: 1
+              hosts: [cloudtrail]
+            - ref: aws_cloudtrail.ct_ops_terminate_instance
+              count: 1
+              hosts: [cloudtrail]
+            - ref: aws_cloudtrail.ct_ops_delete_keys
+              count: 1
+              hosts: [cloudtrail]
+            - ref: web_frontend.maintenance_enabled
+              count: 1
+              hosts: [web-1]
+          manifestation:
+            - aws_cloudtrail.ct_ops_revoke_sg
+            - aws_cloudtrail.ct_ops_delete_keys
+            - web_frontend.maintenance_enabled
+            - web_frontend.http_resp_maint
+
+      steady:
+        - component: web_frontend
+          condition: |
+            Service remains in maintenance mode while security review continues; normal request handling is suspended.
+          user_impact: |
+            Users attempting to access the site receive 503 maintenance responses and cannot run sessions.
+          manifestation:
+            - web_frontend.http_resp_maint
+            - web_frontend.web_health_ok
+        - component: monitoring
+          condition: |
+            DB lock alerts subside but remain possible at low rate during recovery of in-flight contention.
+          user_impact: |
+            No direct user impact from monitoring, but operators continue to see residual signals.
+          manifestation:
+            - monitoring.metric_db_lockwait
+            - monitoring.alert_db_lock
+
+      feedback_loops:
+        - id: db_lock_to_web_backpressure
+          desc: |
+            DB lock waits increase request durations, which raises concurrent in-flight requests at the web tier and can amplify perceived slowness/errors
+            until traffic is reduced (maintenance mode) or the blocking activity ends.
+
+      flows:
+        - attacker_shellshock_proto
+        - attacker_aws_api_abuse
+        - attacker_db_export
+        - attacker_ses_send
+        - user_dashboard_ok_f
+        - user_dashboard_slow_ok
+        - user_dashboard_500
+        - user_request_maintenance
+      manifestation:
+        - legacy_prototype_host.shellshock_exec
+        - aws_cloudtrail.ct_event
+        - rds_database.db_lock_wait
+        - monitoring.alert_db_lock
+        - web_frontend.http_resp_err
+        - web_frontend.http_resp_maint
+
+  assumptions:
+    - |
+      Timeline is compressed to 34 minutes to model the causal core: exploit → AWS API abuse → DB bulk copy/lock alerts → containment → maintenance.
+    - |
+      Failure starts at minute 17 with attacker control; user-visible degradation starts at minute 23 when DB contention begins; maintenance starts at minute 28 and persists.
+    - |
+      Volume estimate (rough):
+      - Normal 0–17m: user_dashboard_ok 450 rpm * 3 logs ≈ 22,950; shellshock_probe_prod ≈ 34; background health/metrics/checkpoints ≈ 80–120.
+      - Failure 17–23m: user_dashboard_ok_f 420 rpm * 3 * 6m ≈ 7,560; attacker_shellshock_proto ≈ 48; attacker_aws_api_abuse ≈ 144; background ≈ 30–40.
+      - Failure 23–28m: ok_f reduced (0.2) ≈ 1,260 logs; slow_ok ≈ 6,400; 500 ≈ 1,600; attacker_db_export ≈ 40; attacker_ses_send ≈ 10; CloudTrail abuse ≈ 120; alerts/health ≈ 15–25.
+      - Failure 28–34m: maintenance 250 rpm * 2 * 6m ≈ 3,000; residual alerts/metrics/health ≈ 20–30; one-shots = 5.
+      Total ≈ 43k logs (target 20k–100k).
+    - |
+      Visibility rationale: CloudTrail ct_event and legacy shellshock_exec provide early trigger evidence; DB lock/slow logs plus monitoring alerts mark the progression;
+      maintenance responses and operator CloudTrail one-shots mark containment while the system remains down at scenario end.
+```

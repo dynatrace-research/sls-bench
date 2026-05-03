@@ -1,0 +1,322 @@
+```yaml
+scenario:
+  id: cirrussearch_outage_2025_07_07
+  title: EQIAD OpenSearch leader loss after rolling restart causes CirrusSearch failures until recovery and repool
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    CirrusSearch gateways serve MediaWiki search queries by querying OpenSearch clusters in EQIAD and CODFW.
+    During a rolling restart, a master-eligible EQIAD node (cirrussearch1100) restarts and rejoins with stale on-disk cluster state,
+    triggering leader loss/split-brain symptoms so EQIAD OpenSearch API calls begin failing with 503/no cluster manager.
+    EQIAD is depooled to shift user traffic to CODFW, then the bad node is stopped and its data directory wiped so it rejoins cleanly.
+    EQIAD is repooled and traffic returns to a normal split, restoring full capacity while the cluster continues to stabilize.
+
+  trigger_desc: |
+    A rolling restart step restarts master-eligible host cirrussearch1100; it comes up with outdated persisted cluster-state data
+    and attempts to participate in cluster management, leading to leader-loss symptoms across the EQIAD OpenSearch cluster.
+
+  time:
+    total_minutes: 42
+    phases:
+      n: {start_min: 0, end_min: 21}
+      f: {start_min: 21, end_min: 42}
+
+  phases:
+    n:
+      desc: |
+        The search gateways handle steady search traffic served by EQIAD and CODFW, with normal response latencies.
+        A rolling restart is in progress as routine maintenance, but the cluster remains healthy in this phase.
+        Monitoring probes EQIAD OpenSearch successfully and periodic health snapshots remain green/yellow without leader warnings.
+      flows: [search_query_eqiad_ok, search_query_codfw_ok, health_check_eqiad_ok]
+      manifestation:
+        - traffic_router.pool_state_eqiad_pooled
+        - search_gateway.worker_stats
+        - monitoring.probe_ok
+        - opensearch_eqiad.cluster_health
+
+    f:
+      desc: |
+        A restarted master-eligible EQIAD OpenSearch node returns with stale persisted cluster state, causing leader-loss/split-brain symptoms.
+        Client-facing EQIAD-routed searches start returning 503 at the gateway, while separate internal upstream-attempt logs show repeated 503s and retries.
+        EQIAD is depooled to end user impact by shifting traffic to CODFW, while operators diagnose and remove the bad node from the cluster.
+        After wiping the node's data directory it rejoins cleanly, and EQIAD is repooled so service returns to full capacity.
+
+      events:
+        - order: 1
+          at_min: 21
+          component: ops_tooling
+          event: |
+            Rolling restart restarts cirrussearch1100; shortly after startup, EQIAD OpenSearch begins failing API calls with 503/no cluster manager.
+            Gateways log client-facing 503 responses for EQIAD-routed requests and also emit internal upstream-attempt 503s with retry markers; monitoring alerts fire.
+          why: |
+            The restarted node reintroduces stale on-disk cluster state into a master-eligible population, destabilizing leader election/quorum.
+            The exact on-disk staleness is not directly observable, but its effects are observable via client-facing 503s at the gateway,
+            internal upstream-attempt failures/retries (with upstream_id), node1100 join-mismatch warnings, and leader-discovery warnings on the remaining core nodes.
+          flows: [search_query_eqiad_fail, search_query_eqiad_client_503, health_check_eqiad_fail]
+          rate_multipliers:
+            search_query_eqiad_ok_recovered: 0.0
+            health_check_eqiad_ok: 0.0
+            traffic_router.pool_state_eqiad_depooled: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tooling.rolling_restart_step
+              count: 1
+              hosts: [ops1]
+            - ref: opensearch_eqiad_node1100.node_start
+              count: 1
+              hosts: [cirrussearch1100]
+            - ref: monitoring.alert_search_timeouts
+              count: 1
+              hosts: [mon1]
+          manifestation:
+            - search_gateway.upstream_err_503_eqiad
+            - search_gateway.retrying_eqiad
+            - search_gateway.req_done_503_eqiad
+            - monitoring.alert_search_timeouts
+            - monitoring.probe_fail
+            - opensearch_eqiad.no_cluster_manager
+            - opensearch_eqiad_node1100.cluster_state_mismatch
+            - traffic_router.pool_state_eqiad_pooled
+
+        - order: 2
+          at_min: 24
+          component: traffic_router
+          event: |
+            EQIAD is depooled to end user impact by shifting search traffic away from the failing EQIAD OpenSearch cluster to CODFW.
+            CODFW takes elevated load and experiences mildly higher latencies.
+          why: |
+            Pooling controls change routing decisions so client requests stop targeting EQIAD.
+            This is directly observable in the pooling-change log and the switch from pooled to depooled periodic pool-state snapshots.
+          flows: [search_query_codfw_ok, health_check_eqiad_fail]
+          rate_multipliers:
+            search_query_eqiad_fail: 0.0
+            search_query_eqiad_client_503: 0.0
+            search_query_codfw_ok: 2.56
+            health_check_eqiad_ok: 0.0
+            traffic_router.pool_state_eqiad_pooled: 0.0
+            traffic_router.pool_state_eqiad_depooled: 1.0
+          latency_multipliers:
+            search_query_codfw_ok: {p50: 1.1, p95: 1.4}
+          one_shots:
+            - ref: traffic_router.pool_change
+              count: 1
+              hosts: [router1]
+            - ref: ops_tooling.cmd_depool_eqiad
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - traffic_router.pool_change
+            - traffic_router.pool_state_eqiad_depooled
+            - search_gateway.upstream_ok_codfw
+
+        - order: 3
+          at_min: 28
+          component: ops_tooling
+          event: |
+            Investigation identifies evidence of stale persisted cluster state on cirrussearch1100 (UUID mismatch compared to the current cluster).
+          why: |
+            Operators inspect node-local logs/state and observe mismatched identifiers, indicating this node is not aligned with the active cluster state.
+            This is partially observable: the operator note is logged here, while the underlying disk contents are not directly logged by the system.
+          flows: [health_check_eqiad_fail]
+          rate_multipliers:
+            health_check_eqiad_ok: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tooling.investigation_uuid
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - ops_tooling.investigation_uuid
+            - opensearch_eqiad_node1100.cluster_state_mismatch
+
+        - order: 4
+          at_min: 37
+          component: opensearch_eqiad_node1100
+          event: |
+            OpenSearch is stopped on cirrussearch1100 so it no longer attempts to join with bad data; the remaining core nodes regain quorum
+            and elect a cluster-manager. Probe failures drop sharply and successful probes begin to dominate.
+          why: |
+            Removing the stale master-eligible node eliminates split-brain pressure and allows leader election among the remaining nodes.
+            This is directly observable via the node stop marker, cluster-manager election log from a core node, and the shift from probe_fail to probe_ok.
+          flows: [health_check_eqiad_fail, health_check_eqiad_ok]
+          rate_multipliers:
+            opensearch_eqiad_node1100.cluster_health: 0.0
+            opensearch_eqiad_node1100.no_cluster_manager: 0.0
+            opensearch_eqiad_node1100.cluster_state_mismatch: 0.0
+            opensearch_eqiad.no_cluster_manager: 0.2
+            health_check_eqiad_fail: 0.2
+            health_check_eqiad_ok: 0.8
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tooling.cmd_stop_opensearch
+              count: 1
+              hosts: [ops1]
+            - ref: opensearch_eqiad_node1100.node_stop
+              count: 1
+              hosts: [cirrussearch1100]
+            - ref: opensearch_eqiad.cluster_manager_elected
+              count: 1
+              hosts: [cirrussearch1101]
+          manifestation:
+            - opensearch_eqiad_node1100.node_stop
+            - opensearch_eqiad.cluster_manager_elected
+            - monitoring.probe_ok
+            - monitoring.probe_fail
+
+        - order: 5
+          at_min: 40
+          component: opensearch_eqiad_node1100
+          event: |
+            The data directory on cirrussearch1100 is removed and the node is started again; it joins the cluster cleanly.
+            Monitoring probes stop returning 503/no-cluster-manager errors.
+          why: |
+            Wiping the persisted data removes stale cluster metadata, forcing the node to bootstrap from the current cluster state on join.
+            This is directly observable via the data wipe marker, node start/join logs, and the disappearance of probe_fail.
+          flows: [health_check_eqiad_fail, health_check_eqiad_ok]
+          rate_multipliers:
+            opensearch_eqiad_node1100.cluster_health: 1.0
+            opensearch_eqiad_node1100.no_cluster_manager: 0.0
+            opensearch_eqiad_node1100.cluster_state_mismatch: 0.0
+            opensearch_eqiad.no_cluster_manager: 0.05
+            health_check_eqiad_fail: 0.0
+            health_check_eqiad_ok: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tooling.cmd_wipe_datadir
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tooling.cmd_start_opensearch
+              count: 1
+              hosts: [ops1]
+            - ref: opensearch_eqiad_node1100.data_wipe
+              count: 1
+              hosts: [cirrussearch1100]
+            - ref: opensearch_eqiad_node1100.node_start
+              count: 1
+              hosts: [cirrussearch1100]
+            - ref: opensearch_eqiad_node1100.node_join
+              count: 1
+              hosts: [cirrussearch1100]
+          manifestation:
+            - opensearch_eqiad_node1100.node_join
+            - monitoring.probe_ok
+
+        - order: 6
+          at_min: 41
+          component: traffic_router
+          event: |
+            EQIAD is repooled after the clean rejoin; search traffic returns to a normal split between EQIAD and CODFW, restoring full capacity.
+            Residual leader-discovery warnings cease.
+          why: |
+            Repooling changes routing so requests can target EQIAD again, and the cluster remains stable after the stale-node cleanup.
+            This is directly observable via the repool marker, the switch back to pooled periodic pool-state snapshots, and the return of EQIAD 200 responses at the gateway.
+          flows: [search_query_eqiad_ok_recovered, search_query_codfw_ok, health_check_eqiad_ok]
+          rate_multipliers:
+            search_query_eqiad_ok_recovered: 1.0
+            search_query_codfw_ok: 1.0
+            search_query_eqiad_fail: 0.0
+            search_query_eqiad_client_503: 0.0
+            opensearch_eqiad.no_cluster_manager: 0.0
+            traffic_router.pool_state_eqiad_pooled: 1.0
+            traffic_router.pool_state_eqiad_depooled: 0.0
+          latency_multipliers:
+            search_query_codfw_ok: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: traffic_router.repool_change
+              count: 1
+              hosts: [router1]
+            - ref: ops_tooling.cmd_repool_eqiad
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - traffic_router.repool_change
+            - traffic_router.pool_state_eqiad_pooled
+            - search_gateway.upstream_ok_eqiad
+            - search_gateway.req_done_200
+            - opensearch_eqiad.cluster_health
+
+      steady:
+        - component: traffic_router
+          condition: |
+            EQIAD is repooled and routing is back to a normal multi-datacenter split.
+          user_impact: |
+            Search is served at full capacity with restored redundancy.
+          manifestation:
+            - traffic_router.pool_state_eqiad_pooled
+        - component: search_gateway
+          condition: |
+            Gateways serve both EQIAD and CODFW traffic successfully; EQIAD 503 responses and internal EQIAD retry activity remain absent.
+          user_impact: |
+            Users see successful search results; tail latency returns close to normal.
+          manifestation:
+            - search_gateway.upstream_ok_eqiad
+            - search_gateway.upstream_ok_codfw
+            - search_gateway.worker_stats
+        - component: opensearch_eqiad
+          condition: |
+            Cluster-manager election is stable and the cluster reports at least yellow health while replicas/shards finish stabilizing after the node rejoin.
+          user_impact: |
+            No direct user impact; operators may observe transient stabilization activity.
+          manifestation:
+            - opensearch_eqiad.cluster_health
+
+      feedback_loops:
+        - id: retry_load_amplification
+          desc: |
+            When EQIAD OpenSearch returns 503/timeouts, internal gateway retries increase concurrent work and latency.
+            This can prolong perceived unavailability until routing is changed (depool) or the stale node is removed.
+
+      flows:
+        - search_query_eqiad_fail
+        - search_query_eqiad_client_503
+        - search_query_eqiad_ok_recovered
+        - search_query_codfw_ok
+        - health_check_eqiad_fail
+        - health_check_eqiad_ok
+      manifestation:
+        - traffic_router.pool_change
+        - traffic_router.repool_change
+        - traffic_router.pool_state_eqiad_pooled
+        - traffic_router.pool_state_eqiad_depooled
+        - monitoring.probe_fail
+        - opensearch_eqiad.no_cluster_manager
+        - opensearch_eqiad_node1100.cluster_state_mismatch
+        - search_gateway.retrying_eqiad
+        - search_gateway.req_done_503_eqiad
+        - search_gateway.upstream_ok_eqiad
+
+  assumptions:
+    - |-
+      Repair: ensured monitoring.probe_ok cannot appear during early failure by explicitly setting health_check_eqiad_ok rate_multipliers to 0.0
+      at the failure start event (and keeping it 0.0 through events 2-3), then shifting probes from FAIL->OK beginning at event 4.
+    - |-
+      Repair: probe traffic volume during failure is kept approximately constant by setting health_check_eqiad_fail and health_check_eqiad_ok
+      multipliers that sum to ~1.0 (e.g., 0.2/0.8) rather than using large multipliers that would inflate total probe RPM.
+    - |-
+      The original multi-hour timeline is compressed into a 42-minute scenario while preserving ordering and causal beats
+      (restart -> leader loss -> depool -> diagnosis -> stop bad node -> wipe data/join -> repool).
+    - |-
+      Identity/correlation: attempt-level gateway logs use upstream_id while client-facing logs use req_id; this avoids implying
+      a single correlated lifecycle across distinct simplified flow families.
+    - |-
+      Repooling is represented by a dedicated router one-shot (traffic_router.repool_change) plus enabling a failure-state success flow (search_query_eqiad_ok_recovered)
+      that is suppressed until the repool event; this captures the post-mortem’s restoration while keeping the two-phase (n/f) scenario structure.
+    - |-
+      Traffic split is modeled as ~140 rpm EQIAD and ~90 rpm CODFW under normal conditions; during depool, CODFW absorbs traffic via a multiplier (~2.56x) and EQIAD-targeting failure flows drop to zero.
+    - |-
+      Failure visibility rationale: in the first minutes of failure, gateway client-facing 503s (req_done_503_eqiad), internal upstream-attempt 503s/retries (upstream_err_503_eqiad/retrying_eqiad),
+      and probe_fail (monitoring) are frequent; depool is visible via pool_change plus the switch to pool_state_eqiad_depooled; stale node evidence is visible via node1100 cluster_state_mismatch until it is stopped;
+      recovery is visible via cluster_manager_elected plus a shift in probes from probe_fail to probe_ok; repool is visible via repool_change plus the switch back to pool_state_eqiad_pooled and the return of EQIAD 200s at the gateway.
+    - |-
+      Piecewise volume estimate (rough, including background):
+      Normal 21 min: ~14.8k logs (dominated by gateway per-request logs at ~700 logs/min).
+      Failure 21 min: ~15.5k logs:
+        - 3 min pre-depool: ~2.7k logs (client 503s plus internal upstream-attempt retries and OpenSearch leader warnings; probe_ok suppressed),
+        - 13 min post-depool/pre-stop: ~9.4k logs (CODFW traffic dominates; EQIAD probes keep failing; OpenSearch leader warnings continue),
+        - 3 min after stopping bad node: ~2.1k logs (probes mostly OK; node1100 warnings suppressed; remaining leader warnings reduced),
+        - 1 min after wipe/join (still depooled): ~0.7k logs (probes OK only),
+        - 1 min after repool: ~0.7k logs (EQIAD and CODFW 200s at normal split).
+      One-shots: 16 total across events.
+      Total estimated logs: ~30.3k (within 20k..100k target).
+```

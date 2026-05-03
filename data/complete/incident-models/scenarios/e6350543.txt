@@ -1,0 +1,167 @@
+```yaml
+scenario:
+  id: incident_2025_02_19_maps_tls_san
+  title: Low-volume 502s from ATS due to missing maps.wikimedia.org SAN on Kubernetes Kartotherian cert
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Maps tile traffic is served by ATS, which forwards origin requests through an L4 LVS service to Kartotherian origins.
+    During a traffic-shift step, Kubernetes workers were pooled back into the LVS service even though their TLS certificate
+    did not include the maps.wikimedia.org SAN. ATS used maps.wikimedia.org as SNI and rejected the certificate, producing
+    a small but persistent stream of 502s visible in the Webrequest 50X dashboard, until operators depooled the Kubernetes workers.
+
+  trigger_desc: |
+    An operator pools Kubernetes Kartotherian backends into the LVS service (after a previous depool), unintentionally
+    routing a small fraction of ATS origin connections to backends whose TLS certificate does not validate for maps.wikimedia.org.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        ATS forwards origin requests for map tiles normally. Requests are proxied through LVS to the bare-metal Kartotherian
+        origins and return 200 responses. The Webrequest 5xx dashboard metric stays near zero, and the LVS pool snapshots
+        show Kubernetes backends not in use.
+      flows: [tile_request_ok]
+      manifestation:
+        - edge_ats.webrequest_ok
+        - edge_ats.conn_summary_ok
+        - lvs_kart.pool_status
+        - logstash.webrequest_5xx_rate_ok
+
+    f:
+      desc: |
+        After Kubernetes workers are pooled back into the LVS service, ATS can establish TCP connections to them but fails
+        TLS verification when using maps.wikimedia.org as SNI because the certificate is missing that SAN. Only the subset of
+        origin requests routed to those workers fails, so the 502 stream is subtle and does not trigger an immediate alarm.
+        Operators later consult the 5xx dashboard and depool Kubernetes workers, eliminating user-facing errors but leaving Kubernetes
+        capacity unusable until the certificate is fixed (outside this scenario window).
+
+      events:
+        - order: 1
+          at_min: 20
+          component: lvs_kart
+          event: |
+            Kubernetes Kartotherian workers are pooled back into the LVS service. ATS begins returning a small stream of 502
+            responses for maps.wikimedia.org when requests land on those workers, and dashboard/edge origin summaries reflect the new 5xx.
+          why: |
+            LVS only validates TCP reachability, so the Kubernetes backends appear usable. ATS performs TLS verification using
+            the request Host as SNI, and the Kubernetes certificate lacks maps.wikimedia.org in its SANs, causing hostname
+            mismatch and origin handshake failures (directly observable via ATS TLS-failure logs and webrequest 502s).
+          flows: [tile_request_tls_502, tile_request_ok]
+          rate_multipliers:
+            edge_ats.conn_summary_ok: 0.0
+            edge_ats.conn_summary_elevated: 1.0
+            logstash.webrequest_5xx_rate_ok: 0.0
+            logstash.webrequest_5xx_rate_elevated: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: lvs_kart.pool_k8s_backend
+              count: 1
+              hosts: [lvs-a]
+            - ref: ops_tooling.sal_pool_k8s_backends
+              count: 1
+              hosts: [sre-bastion1]
+          manifestation:
+            - lvs_kart.pool_k8s_backend
+            - edge_ats.origin_tls_handshake_fail
+            - edge_ats.webrequest_502
+            - logstash.webrequest_5xx_rate_elevated
+
+        - order: 2
+          at_min: 29
+          component: ops_tooling
+          event: |
+            Operators consult the Webrequest 50X dashboard, correlate the 502s with recently pooled Kubernetes backends,
+            and depool the Kubernetes workers from LVS. Client-facing 502s stop as traffic falls back to bare metal only.
+          why: |
+            Removing Kubernetes backends eliminates ATS attempts to connect to the misconfigured certificate endpoints, so the
+            TLS handshake failure path is no longer exercised by user traffic. This is directly observable as a sharp drop of
+            ATS 502 webrequests and a return of dashboard/edge origin summaries to near-zero 5xx.
+          flows: [tile_request_ok]
+          rate_multipliers:
+            tile_request_tls_502: 0.0
+            tile_request_ok: 1.02
+            edge_ats.conn_summary_ok: 1.0
+            edge_ats.conn_summary_elevated: 0.0
+            logstash.webrequest_5xx_rate_ok: 1.0
+            logstash.webrequest_5xx_rate_elevated: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tooling.sal_check_5xx_dashboard
+              count: 1
+              hosts: [sre-bastion1]
+            - ref: lvs_kart.depool_k8s_backend
+              count: 1
+              hosts: [lvs-a]
+            - ref: ops_tooling.sal_depool_k8s_backends
+              count: 1
+              hosts: [sre-bastion1]
+          manifestation:
+            - ops_tooling.sal_check_5xx_dashboard
+            - lvs_kart.depool_k8s_backend
+            - logstash.webrequest_5xx_rate_ok
+
+        - order: 3
+          at_min: 30
+          component: ops_tooling
+          event: |
+            An operator runs a direct TLS probe against a Kubernetes Kartotherian backend using maps.wikimedia.org as SNI and
+            observes hostname verification failure, confirming the missing-SAN hypothesis. No certificate fix is applied within
+            this scenario window.
+          why: |
+            The probe reproduces ATS's verification behavior (SNI=maps.wikimedia.org) and returns a hostname mismatch result.
+            This is directly observable in the probe output but remains external to LVS health checks (which are TCP-only).
+          flows: []
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tooling.openssl_probe
+              count: 1
+              hosts: [sre-bastion1]
+            - ref: ops_tooling.sal_verify_tls_san_issue
+              count: 1
+              hosts: [sre-bastion1]
+          manifestation:
+            - ops_tooling.openssl_probe
+            - ops_tooling.sal_verify_tls_san_issue
+
+      steady:
+        - component: lvs_kart
+          condition: |
+            Kubernetes Kartotherian backends remain depooled because their TLS certificate is not valid for maps.wikimedia.org,
+            so they cannot be safely used behind ATS with SNI=maps.wikimedia.org.
+          user_impact: |
+            User-visible 502s are eliminated after depooling, but the service runs without the intended Kubernetes capacity and
+            redundancy; migration/traffic-shift work is blocked until the certificate is corrected.
+          manifestation:
+            - lvs_kart.pool_status
+            - logstash.webrequest_5xx_rate_ok
+            - edge_ats.conn_summary_ok
+
+      feedback_loops:
+        - id: l4_health_masks_tls
+          desc: |
+            Because LVS health and pooling operate at TCP (L4), a backend with a reachable TCP port is considered usable even if
+            its TLS certificate is invalid for the SNI ATS will use. This allows misconfigured backends to remain pooled and
+            continue causing intermittent 5xx until a human observes higher-layer signals and depools them.
+
+      flows: [tile_request_ok, tile_request_tls_502]
+      manifestation:
+        - edge_ats.origin_tls_handshake_fail
+        - edge_ats.webrequest_502
+        - logstash.webrequest_5xx_rate_elevated
+        - lvs_kart.pool_status
+
+  assumptions:
+    - 'Timeline is compressed: 09:09->14:25 becomes minutes 20->29 while preserving the key beats (pooling triggers subtle 5xx; later dashboard-based detection; rapid depool rollback).'
+    - 'Piecewise failure breakdown (expected): minutes 20-29 use base failure rates (~788 rpm OK + ~12 rpm 502) with elevated dashboard/edge origin summaries; minutes 29-50 suppress tile_request_tls_502 to 0 and slightly raise OK rate via multiplier 1.02 while switching summaries back to OK variants.'
+    - 'One-shots per event: event1=2 (pool_k8s_backend + SAL pool), event2=3 (SAL check dashboard + depool_k8s_backend + SAL depool), event3=2 (openssl_probe + SAL verify).'
+    - 'Visibility rationale: each failed origin request produces both an ATS TLS-handshake failure log and a 502 webrequest log, while logstash emits a per-minute 5xx dashboard metric and ATS emits per-host origin summaries; these ensure the incident is diagnosable even though the 5xx fraction is small.'
+    - 'Estimated total logs over 50 minutes: ~40k ATS webrequest logs (origin-forwarded only) + ~250 background metric/status logs + 7 one-shots, within the 20k–100k target.'
+```

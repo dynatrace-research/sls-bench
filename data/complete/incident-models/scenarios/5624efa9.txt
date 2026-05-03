@@ -1,0 +1,234 @@
+```yaml
+scenario:
+  id: incident_2016_07_20_homepage_regex_cpu_outage
+  title: Malformed post triggers expensive whitespace trim; LB health checks eject all backends
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The site serves user traffic via a load balancer to multiple web frontends, and the LB uses the home page ("/")
+    as its health check target. A malformed post displayed on the home page causes the whitespace-trimming routine
+    to run extremely slowly and consume CPU on the web frontends. As home page responses exceed the LB health check
+    timeout, the LB marks all web servers unhealthy and returns 503 for all endpoints, making the entire site appear down.
+
+  trigger_desc: |
+    A post containing an unusually long run of whitespace (tens of thousands of characters) is included in the home page list,
+    causing home page rendering to repeatedly execute a very slow whitespace-trimming operation.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        User requests for the home page and question pages are routed to any of the four web frontends and complete quickly.
+        The load balancer health checks GET / on each backend and keeps all backends in rotation. Monitoring probes report OK.
+      flows: [homepage_view_ok, question_view_ok, lb_healthcheck_ok]
+      manifestation:
+        - load_balancer.lb_pool_status
+        - monitoring.mon_probe
+        - web_frontend.web_req_completed
+        - load_balancer.lb_req_ok
+
+    f:
+      desc: |
+        Home page rendering becomes CPU-bound due to slow whitespace trimming on a malformed post. Health checks to "/"
+        begin timing out and the load balancer progressively removes backends until it has no healthy upstreams for routing,
+        at which point it returns 503 for all user requests. During the early slow phase, monitoring may raise a homepage-latency
+        alert; once the LB is fast-failing 503s, the dominant monitoring signal becomes the all-backends-unhealthy alert.
+        Health checks continue probing the unhealthy backends to detect recovery. Later, an in-progress hotfix rollout restores
+        limited capacity, but most requests still fail and the incident remains ongoing by the end of the scenario.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: web_frontend
+          event: |
+            The home page handler starts spending very large CPU time trimming whitespace from a snippet, causing "/" responses
+            (including LB health checks) to overrun the proxy timeout and fail.
+          why: |
+            The trimming uses a backtracking regex-like routine that becomes O(n^2) on long whitespace runs not positioned at end-of-string.
+            This is directly observable via slow-trim threshold warnings (elapsed time exceeded) and edge timeouts; additional asynchronous
+            abort logs can appear when the app detects client disconnects after timeouts.
+          flows: [homepage_slow_timeout, healthcheck_timeout, question_view_ok_f]
+          rate_multipliers:
+            site_req_no_backend: 0.0
+            site_req_ok_degraded: 0.0
+            healthcheck_ok_degraded: 0.0
+            monitoring.mon_alert_all_backends_unhealthy: 0.0
+            monitoring.mon_alert_homepage_latency: 5.0
+            load_balancer.lb_pool_status: 1.0
+            load_balancer.lb_pool_status_all_unhealthy: 0.0
+          latency_multipliers:
+            question_view_ok_f: {p50: 1.5, p95: 2.0}
+          one_shots:
+            - ref: monitoring.mon_incident_update
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - web_frontend.web_trim_slow
+            - load_balancer.lb_healthcheck_fail_timeout
+            - load_balancer.lb_req_upstream_timeout
+            - monitoring.mon_alert_homepage_latency
+            - web_frontend.web_req_aborted
+            - load_balancer.lb_pool_status
+
+        - order: 2
+          at_min: 24
+          component: load_balancer
+          event: |
+            After repeated timeouts on the "/" health check, the load balancer marks all web frontends unhealthy for routing
+            and begins returning 503 for user traffic because no healthy upstreams remain.
+          why: |
+            The LB's routing pool membership is directly driven by health check success; using "/" as the health check couples a home-page-only
+            regression to full site availability at the edge. When the LB fast-fails 503 due to no healthy upstreams, end-user latency typically
+            drops while availability collapses; the homepage-latency alert is therefore suppressed and the all-backends-unhealthy alert becomes primary.
+          flows: [site_req_no_backend, healthcheck_timeout]
+          rate_multipliers:
+            homepage_slow_timeout: 0.0
+            question_view_ok_f: 0.0
+            healthcheck_timeout: 1.0
+            healthcheck_ok_degraded: 0.0
+            site_req_no_backend: 1.0
+            site_req_ok_degraded: 0.0
+            monitoring.mon_alert_all_backends_unhealthy: 1.0
+            monitoring.mon_alert_homepage_latency: 0.0
+            load_balancer.lb_pool_status: 0.0
+            load_balancer.lb_pool_status_all_unhealthy: 1.0
+            web_frontend.web_req_aborted: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: load_balancer.lb_backend_marked_unhealthy
+              count: 4
+              hosts: [lb-1]
+            - ref: monitoring.mon_incident_update
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - load_balancer.lb_backend_marked_unhealthy
+            - load_balancer.lb_req_no_backend
+            - load_balancer.lb_healthcheck_fail_timeout
+            - load_balancer.lb_pool_status_all_unhealthy
+            - monitoring.mon_alert_all_backends_unhealthy
+
+        - order: 3
+          at_min: 34
+          component: web_frontend
+          event: |
+            A hotfix rollout starts on part of the web pool, and the LB begins seeing some backends pass health checks again.
+            Some requests succeed, but the majority still receive 503 due to insufficient healthy capacity and pool instability.
+          why: |
+            The code change is an operational action (deploy marker). As some backends start responding to GET / within the health check timeout,
+            the LB marks at least one backend healthy again; however, most user traffic still fails fast at the edge due to limited healthy capacity.
+          flows: [site_req_ok_degraded, site_req_no_backend, healthcheck_ok_degraded, healthcheck_timeout]
+          rate_multipliers:
+            site_req_no_backend: 0.8
+            site_req_ok_degraded: 0.2
+            healthcheck_timeout: 0.5
+            healthcheck_ok_degraded: 0.5
+            monitoring.mon_alert_all_backends_unhealthy: 0.5
+            monitoring.mon_alert_homepage_latency: 0.0
+            load_balancer.lb_pool_status: 1.0
+            load_balancer.lb_pool_status_all_unhealthy: 0.3
+            web_frontend.web_req_aborted: 0.3
+          latency_multipliers:
+            site_req_ok_degraded: {p50: 1.8, p95: 2.5}
+            healthcheck_ok_degraded: {p50: 1.5, p95: 2.0}
+          one_shots:
+            - ref: web_frontend.web_deploy
+              count: 1
+              hosts: [web-2]
+            - ref: load_balancer.lb_backend_marked_healthy
+              count: 1
+              hosts: [lb-1]
+          manifestation:
+            - web_frontend.web_deploy
+            - load_balancer.lb_backend_marked_healthy
+            - load_balancer.lb_req_no_backend
+            - load_balancer.lb_req_ok
+            - load_balancer.lb_healthcheck_ok
+            - load_balancer.lb_pool_status
+
+      steady:
+        - component: load_balancer
+          condition: |
+            The LB remains in a degraded state where most requests fail fast due to no healthy upstreams for routing, with intermittent brief periods
+            where one backend passes health checks and some requests succeed.
+          user_impact: |
+            Users see widespread 503 errors and an effectively unavailable site; a minority of requests may intermittently load.
+          manifestation:
+            - load_balancer.lb_req_no_backend
+            - load_balancer.lb_req_ok
+            - load_balancer.lb_pool_status
+            - load_balancer.lb_pool_status_all_unhealthy
+            - monitoring.mon_alert_all_backends_unhealthy
+
+        - component: web_frontend
+          condition: |
+            Some web nodes remain under abnormal CPU/queue pressure from the expensive whitespace trimming behavior; when health checks hit an affected node,
+            slow-trim warnings can occur. On nodes where the hotfix is deployed, requests are more likely to complete.
+          user_impact: |
+            If routed to a frontend, the home page may be extremely slow or fail; otherwise the edge returns 503 before reaching the app.
+          manifestation:
+            - web_frontend.web_cpu_metric
+            - web_frontend.web_trim_slow
+            - web_frontend.web_req_aborted
+
+      feedback_loops:
+        - id: homepage_healthcheck_coupling
+          desc: |
+            The LB uses GET / as the health check; when "/" becomes slow due to CPU-bound rendering, health checks fail and remove backends.
+            Once backends are removed for routing, all endpoints fail at the edge even if non-homepage endpoints would otherwise work.
+
+      flows:
+        - homepage_slow_timeout
+        - healthcheck_timeout
+        - site_req_no_backend
+        - site_req_ok_degraded
+        - healthcheck_ok_degraded
+      manifestation:
+        - load_balancer.lb_req_upstream_timeout
+        - load_balancer.lb_req_no_backend
+        - load_balancer.lb_pool_status
+        - load_balancer.lb_pool_status_all_unhealthy
+        - load_balancer.lb_healthcheck_fail_timeout
+        - load_balancer.lb_healthcheck_ok
+        - web_frontend.web_trim_slow
+        - web_frontend.web_req_aborted
+        - monitoring.mon_alert_homepage_latency
+        - monitoring.mon_alert_all_backends_unhealthy
+
+  assumptions:
+    - |
+        The real incident lasted ~34 minutes; this scenario is kept at 40 minutes total (20 normal + 20 failure) so the failure begins near mid-scenario,
+        and it ends while still degraded (partial recovery) to satisfy the "scenario ends in failure" requirement.
+    - |
+        Failure progression is simplified into three beats: (1) CPU-bound "/" rendering causing edge timeouts, (2) LB ejects all backends for routing and serves 503,
+        (3) partial rollout yields intermittent success but continued major outage.
+    - |
+        Successful modeled endpoints always return HTTP 200 (no 302 redirects) to keep web_frontend.web_req_completed and load_balancer.lb_req_ok semantically consistent.
+    - |
+        web_frontend.web_trim_slow is treated as a threshold warning (elapsed time exceeded) emitted before request completion; its elapsed_ms domain is kept below the LB timeout range
+        so timeout flow log order (app warning then LB timeout) remains chronologically plausible.
+    - |
+        The deploy one-shot is intended to represent the start of the hotfix rollout; the system model constrains web_deploy.stage to 'start' to prevent contradictory emissions.
+    - |
+        Homepage-latency alerting is modeled as present primarily during the initial slow-timeout phase and suppressed once the LB is fast-failing 503s, aligning alerting with symptom change.
+    - |
+        Piecewise volume estimate (order-of-magnitude):
+        - Normal (0–20, 20 min): ~1488 flow-logs/min + ~7 background/min ≈ ~29.9k logs
+        - Failure seg1 (20–24, 4 min): ~1248 flow-logs/min + ~16 background/min ≈ ~5.1k logs
+        - Failure seg2 (24–34, 10 min): ~768 flow-logs/min + ~7.2 background/min ≈ ~7.8k logs
+        - Failure seg3 (34–40, 6 min): ~912 flow-logs/min + ~10.1 background/min ≈ ~5.5k logs
+        Total ≈ ~48.2k logs (+ ~8 one-shots), within 20k–100k.
+    - |
+        One-shot counts per event: event1=1 incident_update; event2=4 backend_marked_unhealthy + 1 incident_update; event3=1 deploy + 1 backend_marked_healthy.
+    - |
+        Visibility rationale: slow-trim warnings (web_trim_slow) plus LB healthcheck timeout logs are frequent early in failure; a brief burst of homepage-latency alerts is likely due to
+        the elevated multiplier during 20–24. The transition to total ejection is corroborated by backend_marked_unhealthy, pool_status_all_unhealthy, and the 503 surge; partial recovery
+        is visible as a mix of 503s and occasional 200s plus health checks that sometimes succeed (lb_healthcheck_ok) and a backend_marked_healthy marker. Pool snapshots are constrained
+        to be physically coherent with 4 total backends. Monitoring probes are allowed to be either slow (timeout-like) or fast (immediate 503) depending on LB routing state.
+```

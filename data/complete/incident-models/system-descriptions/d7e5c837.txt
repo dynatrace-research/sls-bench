@@ -1,0 +1,672 @@
+```yaml
+sys:
+  id: chrome_sync_quota_throttle_crash
+  desc: >
+    A simplified model of Chrome Sync: desktop Chrome clients periodically send sync cycles to a Sync Server
+    to upload local changes and fetch updates. The Sync Server consults a backend Quota Service to decide
+    per-datatype throttling and then persists sync metadata to a storage layer. During the incident, a faulty
+    load-balancer configuration overloaded the Quota Service; Sync Servers reacted by telling clients to
+    throttle all datatypes (including ones older clients did not recognize), triggering a SyncThread crash
+    due to a client-side parsing/enum-set bug. Crash reports were also intermittently unable to upload.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: chrome_client
+    name: Chrome Desktop Client
+    svc: null
+    hosts: [mac_01, mac_02, mac_03, mac_04, mac_05, win_01, win_02, win_03, linux_01, linux_02]
+    desc: >
+      End-user browsers running the sync engine. They schedule sync jobs, POST sync protobufs to the Sync
+      Server, interpret throttling instructions, and apply updates. In failure, some responses contain
+      unrecognized throttled datatype identifiers, which can trigger an unhandled std::out_of_range on the
+      sync thread and crash the process. The client also attempts to upload crash reports to the crash
+      collector; during the incident these uploads may fail.
+    to:
+      - dst: sync_server
+        proto: https
+        desc: Sync protocol requests and responses over HTTPS.
+      - dst: crash_collector
+        proto: https
+        desc: Crash report uploads over HTTPS.
+    logs:
+      browser_heartbeat:
+        desc: Periodic client heartbeat emitted regardless of sync activity.
+        lvl: INFO
+        msg: "Browser heartbeat: version={version} os={os} uptime_s={uptime_s}"
+        vars:
+          version: {k: ch, v: ["25.0.1354.0", "25.0.1357.0", "24.0.1312.0", "23.0.1271.0"]}
+          os: {k: ch, v: ["macos", "windows", "linux"]}
+          uptime_s: {k: i, v: [60, 172800]}
+      sync_job_start:
+        desc: Sync scheduler starts a sync job/session.
+        lvl: INFO
+        msg: "Sync job started: profile={profile} source={source} session={session_id} trace={trace_id}"
+        vars:
+          profile: {k: hex, v: 8}
+          source: {k: ch, v: ["startup", "periodic", "local_change"]}
+          session_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      sync_request:
+        desc: Client is about to POST a sync request payload.
+        lvl: DEBUG
+        msg: "Posting sync request: server={server} types={type_count} bytes={bytes} session={session_id} trace={trace_id}"
+        vars:
+          server: {k: ch, v: ["https://sync.example.com/sync"]}
+          type_count: {k: i, v: [1, 25]}
+          bytes: {k: i, v: [200, 75000]}
+          session_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      sync_response:
+        desc: Client received a response and decoded the high-level status and throttling list.
+        lvl: INFO
+        msg: "Sync response received: status={status} throttled_types={throttled_types} session={session_id} trace={trace_id}"
+        vars:
+          session_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            status: {k: ch, v: ["OK", "OK_NOOP"]}
+            throttled_types: {k: ch, v: ["[]", "[SESSIONS]", "[PASSWORDS]"]}
+          f:
+            status: {k: ch, v: ["OK", "THROTTLED_ALL", "HTTP_503", "HTTP_500"]}
+            throttled_types: {k: ch, v: ["[]", "[BOOKMARKS,PASSWORDS,SESSIONS,AUTOFILL]", "[ALL_TYPES]", "[ALL_TYPES,UNKNOWN_TYPE]"]}
+      throttle_parse_warning:
+        desc: Client encountered an unknown datatype identifier while interpreting throttling instructions.
+        lvl: WARN
+        msg: "Unknown specifics field number {field_no} in throttle response; mapping to UNSPECIFIED session={session_id} trace={trace_id}"
+        vars:
+          field_no: {k: i, v: [0, 4096]}
+          session_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      sync_exception:
+        desc: Unhandled exception on sync thread shortly before crash.
+        lvl: ERROR
+        msg: "Unhandled exception in SyncThread: ex={ex} what={what} session={session_id} trace={trace_id}"
+        vars:
+          ex: {k: ch, v: ["std::out_of_range", "std::exception"]}
+          what: {k: ch, v: ["bitset::set: __position (which is 18446744073709551615) >= this->size()", "vector::_M_range_check: __n (which is -1) >= this->size()"]}
+          session_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      chrome_crash:
+        desc: Crash marker for the browser process after abort/terminate on the sync thread.
+        lvl: CRITICAL
+        msg: "Process crash: thread=Chrome_SyncThread signal={signal} reason={reason} report_id={report_id}"
+        vars:
+          signal: {k: ch, v: ["SIGABRT"]}
+          reason: {k: ch, v: ["uncaught_exception", "terminate_called"]}
+          report_id: {k: hex, v: 16}
+      sync_retry_scheduled:
+        desc: Client schedules a retry of the full sync cycle after a recoverable failure.
+        lvl: WARN
+        msg: "Scheduling sync retry: session={session_id} attempt={attempt} backoff_ms={backoff_ms} trace={trace_id}"
+        vars:
+          session_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 4]}
+          backoff_ms: {k: i, v: [100, 60000]}
+          trace_id: {k: hex, v: 32}
+      crash_upload_attempt:
+        desc: Client attempts to upload a crash report to the crash collector.
+        lvl: INFO
+        msg: "Crash report upload attempt: report_id={report_id} endpoint={endpoint} attempt={attempt}"
+        vars:
+          report_id: {k: hex, v: 16}
+          endpoint: {k: ch, v: ["https://crash.example.com/upload", "https://crash.corp.example.com/upload"]}
+          attempt: {k: i, v: [1, 3]}
+      crash_upload_done:
+        desc: Client finishes crash upload attempt with a summarized outcome.
+        lvl: INFO
+        msg: "Crash report upload finished: report_id={report_id} result={result} http_status={http_status}"
+        vars:
+          report_id: {k: hex, v: 16}
+        state_vars:
+          n:
+            result: {k: ch, v: ["success"]}
+            http_status: {k: ch, v: ["200"]}
+          f:
+            result: {k: ch, v: ["success", "failed", "dropped"]}
+            http_status: {k: ch, v: ["200", "503", "429", "0"]}
+      crash_upload_retry_scheduled:
+        desc: Client schedules a retry for crash upload after a failure.
+        lvl: WARN
+        msg: "Scheduling crash upload retry: report_id={report_id} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          report_id: {k: hex, v: 16}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [200, 60000]}
+    beh:
+      n:
+        desc: Clients are stable; sync jobs mostly succeed with low latency. Occasional heartbeats are emitted.
+        emit:
+          - id: browser_heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Clients continue emitting heartbeats, but a subset crash in the sync thread during response parsing.
+        emit:
+          - id: browser_heartbeat
+            per_min: 1.0
+            scope: per_host
+
+  - id: sync_server
+    name: Chrome Sync Server
+    svc: chrome-sync
+    hosts: [sync_01, sync_02, sync_03]
+    desc: >
+      Frontend service that handles /sync requests, consults the Quota Service for per-datatype limits,
+      and reads/writes sync metadata in storage. In normal state it returns 200 responses with small commit
+      batches and minimal throttling. In failure it experiences slow/failed quota lookups and may switch
+      to a fail-closed behavior that replies with throttle-all instructions.
+    to:
+      - dst: quota_service
+        proto: grpc
+        desc: RPC used to evaluate quota and throttling decisions per client and datatype.
+      - dst: sync_storage
+        proto: grpc
+        desc: Reads/writes sync metadata and commits.
+      - dst: chrome_client
+        proto: https
+        desc: HTTPS responses back to clients.
+    logs:
+      health_ok:
+        desc: Periodic service health line with basic resource usage.
+        lvl: INFO
+        msg: "Health OK: cpu={cpu} mem_mb={mem_mb} open_fds={open_fds}"
+        vars:
+          cpu: {k: f, v: [0.05, 0.95]}
+          mem_mb: {k: i, v: [256, 8192]}
+          open_fds: {k: i, v: [200, 20000]}
+      quota_rpc_slow:
+        desc: Warning when quota RPC latency is high.
+        lvl: WARN
+        msg: "Quota RPC latency high: p95_ms={p95_ms} in_flight={in_flight}"
+        vars:
+          p95_ms: {k: i, v: [50, 20000]}
+          in_flight: {k: i, v: [1, 5000]}
+      sync_req_received:
+        desc: Access log for incoming sync request.
+        lvl: INFO
+        msg: "Incoming /sync: client={client_id} session={session_id} bytes={bytes} trace={trace_id}"
+        vars:
+          client_id: {k: hex, v: 12}
+          session_id: {k: uuid, v: null}
+          bytes: {k: i, v: [200, 75000]}
+          trace_id: {k: hex, v: 32}
+      quota_check_ok:
+        desc: Server-side record that quota call succeeded and allowed the request.
+        lvl: INFO
+        msg: "Quota OK: client={client_id} allowed_types={allowed_types} trace={trace_id}"
+        vars:
+          client_id: {k: hex, v: 12}
+          allowed_types: {k: ch, v: ["ALL", "MOST", "LIMITED"]}
+          trace_id: {k: hex, v: 32}
+      quota_check_timeout:
+        desc: Quota call failed or timed out; server will decide how to respond.
+        lvl: ERROR
+        msg: "Quota check failed: err={err} timeout_ms={timeout_ms} client={client_id} trace={trace_id}"
+        vars:
+          err: {k: ch, v: ["DEADLINE_EXCEEDED", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]}
+          timeout_ms: {k: i, v: [200, 20000]}
+          client_id: {k: hex, v: 12}
+          trace_id: {k: hex, v: 32}
+      sync_resp_200:
+        desc: Successful sync response.
+        lvl: INFO
+        msg: "Responded /sync: http_status=200 commit_count={commit_count} throttled_types={throttled_types} trace={trace_id}"
+        vars:
+          commit_count: {k: i, v: [0, 50]}
+          throttled_types: {k: ch, v: ["[]", "[SESSIONS]", "[PASSWORDS]"]}
+          trace_id: {k: hex, v: 32}
+      sync_resp_throttle_all:
+        desc: Throttle-all response when server is in fail-closed mode.
+        lvl: WARN
+        msg: "Responded /sync: http_status=429 throttle_mode=ALL throttled_types={throttled_types} trace={trace_id}"
+        vars:
+          throttled_types: {k: ch, v: ["[ALL_TYPES]", "[ALL_TYPES,UNKNOWN_TYPE]", "[BOOKMARKS,PASSWORDS,SESSIONS,AUTOFILL]"]}
+          trace_id: {k: hex, v: 32}
+      sync_resp_503:
+        desc: Server returns a 503 due to dependency outage or overload.
+        lvl: ERROR
+        msg: "Responded /sync: http_status=503 reason={reason} trace={trace_id}"
+        vars:
+          reason: {k: ch, v: ["quota_unavailable", "upstream_timeout", "over_capacity"]}
+          trace_id: {k: hex, v: 32}
+      fail_closed_enabled:
+        desc: Operational marker indicating fail-closed throttle-all mode was enabled.
+        lvl: INFO
+        msg: "Fail-closed mode enabled: action=throttle_all reason={reason}"
+        vars:
+          reason: {k: ch, v: ["quota_service_degraded", "safety_fallback"]}
+    beh:
+      n:
+        desc: Sync servers are healthy; quota latency is low and responses are mostly 200.
+        emit:
+          - id: health_ok
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: Sync servers log slow quota dependencies and intermittently return throttle-all or 503 responses.
+        emit:
+          - id: health_ok
+            per_min: 2.0
+            scope: per_host
+          - id: quota_rpc_slow
+            per_min: 1.0
+            scope: per_host
+
+  - id: quota_service
+    name: Quota Service
+    svc: quota-service
+    hosts: [quota_01, quota_02]
+    desc: >
+      Backend service that determines per-datatype sync quotas/throttles for clients. Under normal load it
+      responds quickly and returns well-formed throttling data. During failure it becomes overloaded and
+      exhibits high latency and deadline exceeded errors; Sync Servers may react by throttling all types.
+    to:
+      - dst: sync_server
+        proto: grpc
+        desc: Returns quota evaluation results to Sync Servers over gRPC.
+    logs:
+      health_ok:
+        desc: Periodic health/telemetry line.
+        lvl: INFO
+        msg: "Health OK: qps={qps} p95_ms={p95_ms} queue_depth={queue_depth}"
+        vars:
+          qps: {k: i, v: [0, 200000]}
+          p95_ms: {k: i, v: [1, 20000]}
+          queue_depth: {k: i, v: [0, 500000]}
+      overload_warn:
+        desc: Warning that the service is overloaded and shedding/queuing.
+        lvl: WARN
+        msg: "Overload: state={state} queue_depth={queue_depth} drop_rate={drop_rate}"
+        vars:
+          state: {k: ch, v: ["OK", "DEGRADED", "OVERLOADED"]}
+          queue_depth: {k: i, v: [1000, 500000]}
+          drop_rate: {k: f, v: [0.0, 1.0]}
+      rpc_deadline_exceeded:
+        desc: Per-request log when a quota RPC misses its deadline.
+        lvl: ERROR
+        msg: "RPC deadline exceeded: method=CheckQuota client={client_id} elapsed_ms={elapsed_ms} trace={trace_id}"
+        vars:
+          client_id: {k: hex, v: 12}
+          elapsed_ms: {k: i, v: [200, 20000]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: Quota evaluations are fast; overload warnings are rare.
+        emit:
+          - id: health_ok
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Sustained overload produces frequent overload warnings and poor tail latency.
+        emit:
+          - id: health_ok
+            per_min: 1.0
+            scope: per_host
+          - id: overload_warn
+            per_min: 3.0
+            scope: per_host
+
+  - id: traffic_lb
+    name: Traffic Load Balancer / Config Plane
+    svc: edge-lb
+    hosts: [lb_01]
+    desc: >
+      Represents the infrastructure load balancer and its configuration pipeline. It routes Sync Server
+      traffic to the Quota Service backends. In failure, a faulty configuration change causes skewed or
+      unhealthy routing, concentrating traffic and contributing to quota-service overload.
+    to:
+      - dst: quota_service
+        proto: tcp
+        desc: Routes traffic toward quota-service backends.
+    logs:
+      config_change_applied:
+        desc: A routing/load-balancing configuration change was applied.
+        lvl: INFO
+        msg: "LB config applied: change_id={change_id} target=quota-service rule={rule}"
+        vars:
+          change_id: {k: hex, v: 10}
+          rule: {k: ch, v: ["backend_weight_update", "health_check_tweak", "hash_ring_change"]}
+      config_change_no_comment:
+        desc: Change applied without a human-readable comment.
+        lvl: WARN
+        msg: "LB config change {change_id} has no comment"
+        vars:
+          change_id: {k: hex, v: 10}
+      pool_imbalance:
+        desc: Periodic warning when backend distribution becomes skewed.
+        lvl: WARN
+        msg: "Backend pool imbalance: pool=quota-service skew={skew} unhealthy_backends={unhealthy}"
+        vars:
+          skew: {k: f, v: [0.0, 1.0]}
+          unhealthy: {k: i, v: [0, 50]}
+    beh:
+      n:
+        desc: LB is stable; only occasional pool-imbalance checks log.
+        emit:
+          - id: pool_imbalance
+            per_min: 0.1
+            scope: global
+      f:
+        desc: LB emits frequent pool imbalance warnings as routing skew increases.
+        emit:
+          - id: pool_imbalance
+            per_min: 1.0
+            scope: global
+
+  - id: sync_storage
+    name: Sync Metadata Storage
+    svc: sync-storage
+    hosts: [store_01, store_02]
+    desc: >
+      Storage backing for sync metadata and commit state (modeled as a single logical service). Under normal
+      conditions it serves reads/writes quickly. During this incident it is mostly healthy; any observed
+      slowdown is secondary due to upstream retries and request bursts.
+    to:
+      - dst: sync_server
+        proto: grpc
+        desc: Returns read/write results to the Sync Server.
+      - dst: crash_collector
+        proto: grpc
+        desc: Acknowledges crash-report persistence operations.
+    logs:
+      health_ok:
+        desc: Periodic storage health metric line.
+        lvl: INFO
+        msg: "Storage health: p95_ms={p95_ms} open_conns={open_conns}"
+        vars:
+          p95_ms: {k: i, v: [1, 5000]}
+          open_conns: {k: i, v: [1, 20000]}
+      write_commit:
+        desc: Commit metadata write for a sync cycle.
+        lvl: INFO
+        msg: "Write commit: commit_id={commit_id} bytes={bytes} trace={trace_id}"
+        vars:
+          commit_id: {k: hex, v: 12}
+          bytes: {k: i, v: [50, 200000]}
+          trace_id: {k: hex, v: 32}
+      write_slow:
+        desc: Warning when storage writes are slow.
+        lvl: WARN
+        msg: "Slow write: op=write_commit p95_ms={p95_ms} trace={trace_id}"
+        vars:
+          p95_ms: {k: i, v: [50, 20000]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: Storage is healthy with stable latency.
+        emit:
+          - id: health_ok
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Storage remains mostly healthy; occasional slow-write warnings appear due to upstream bursts.
+        emit:
+          - id: health_ok
+            per_min: 1.0
+            scope: per_host
+          - id: write_slow
+            per_min: 0.2
+            scope: per_host
+
+  - id: crash_collector
+    name: Crash Collector Service
+    svc: crash-collector
+    hosts: [crash_01, crash_02]
+    desc: >
+      Receives crash uploads from clients and persists them to storage for later symbolization/inspection.
+      Normally it accepts uploads quickly and returns 200. During the incident it may return 429/503 due to
+      shared infrastructure strain and increased crash volume, which can lead to missing crash entries on
+      clients.
+    to:
+      - dst: sync_storage
+        proto: grpc
+        desc: Writes crash payload metadata to storage.
+      - dst: chrome_client
+        proto: https
+        desc: HTTPS responses back to the client.
+    logs:
+      health_ok:
+        desc: Periodic crash collector health line.
+        lvl: INFO
+        msg: "Crash collector health: in_flight={in_flight} p95_ms={p95_ms}"
+        vars:
+          in_flight: {k: i, v: [0, 20000]}
+          p95_ms: {k: i, v: [1, 20000]}
+      upload_received:
+        desc: Crash upload request received.
+        lvl: INFO
+        msg: "Crash upload received: report_id={report_id} client={client_id} bytes={bytes}"
+        vars:
+          report_id: {k: hex, v: 16}
+          client_id: {k: hex, v: 12}
+          bytes: {k: i, v: [2000, 5000000]}
+      upload_failed:
+        desc: Crash upload rejected or failed at the collector.
+        lvl: ERROR
+        msg: "Crash upload failed: report_id={report_id} http_status={http_status} err={err}"
+        vars:
+          report_id: {k: hex, v: 16}
+          http_status: {k: ch, v: ["429", "503", "500"]}
+          err: {k: ch, v: ["over_capacity", "upstream_timeout", "rate_limited"]}
+    beh:
+      n:
+        desc: Collector is healthy and rarely rejects uploads.
+        emit:
+          - id: health_ok
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Collector remains up but intermittently rejects uploads due to bursty crash traffic and infra strain.
+        emit:
+          - id: health_ok
+            per_min: 1.0
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [chrome_client]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Clients run periodic sync cycles that are accepted by the Sync Server. The server checks quota,
+      writes commit metadata, and responds with 200 and (usually) an empty throttled list. Crash uploads
+      occur at a low background rate.
+    req:
+      - id: sync_cycle_success
+        desc: Successful sync cycle with quota check OK and commit persisted.
+        rpm: 160.0
+        path: [chrome_client, sync_server, quota_service, sync_server, sync_storage, sync_server, chrome_client]
+        emit:
+          - chrome_client.sync_job_start
+          - chrome_client.sync_request
+          - sync_server.sync_req_received
+          - sync_server.quota_check_ok
+          - sync_storage.write_commit
+          - sync_server.sync_resp_200
+          - chrome_client.sync_response
+        latency_ms:
+          - [0, 1]
+          - [20, 70]
+          - [15, 60]
+          - [10, 45]
+          - [20, 90]
+          - [5, 25]
+          - [10, 40]
+        trace: true
+
+      - id: crash_report_upload_success
+        desc: Occasional successful crash upload (unrelated background noise).
+        rpm: 2.0
+        path: [chrome_client, crash_collector, chrome_client]
+        emit:
+          - chrome_client.crash_upload_attempt
+          - crash_collector.upload_received
+          - chrome_client.crash_upload_done
+        latency_ms:
+          - [0, 1]
+          - [80, 350]
+          - [10, 40]
+        trace: true
+
+  f:
+    desc: >
+      Quota-service degradation causes Sync Servers to return throttle-all or 503 responses. Some clients
+      survive by throttling known types, while others crash when parsing unrecognized throttled types due
+      to a client-side bug. Clients experiencing 503s perform retries with backoff, and crash uploads may
+      fail due to increased volume and shared infra strain.
+    req:
+      - id: sync_cycle_ok_degraded
+        desc: Sync still succeeds but with higher latency while dependencies are strained.
+        rpm: 150.0
+        path: [chrome_client, sync_server, quota_service, sync_server, sync_storage, sync_server, chrome_client]
+        emit:
+          - chrome_client.sync_job_start
+          - chrome_client.sync_request
+          - sync_server.sync_req_received
+          - sync_server.quota_check_ok
+          - sync_storage.write_commit
+          - sync_server.sync_resp_200
+          - chrome_client.sync_response
+        latency_ms:
+          - [0, 1]
+          - [30, 120]
+          - [20, 120]
+          - [25, 250]
+          - [35, 400]
+          - [10, 80]
+          - [15, 100]
+        trace: true
+
+      - id: sync_cycle_throttle_known
+        desc: Server responds with throttle-all for known types; client applies throttle and does not crash.
+        rpm: 80.0
+        path: [chrome_client, sync_server, quota_service, sync_server, chrome_client]
+        emit:
+          - chrome_client.sync_job_start
+          - chrome_client.sync_request
+          - sync_server.sync_req_received
+          - sync_server.sync_resp_throttle_all
+          - chrome_client.sync_response
+        latency_ms:
+          - [0, 1]
+          - [25, 100]
+          - [20, 120]
+          - [40, 300]
+          - [10, 60]
+        trace: true
+
+      - id: sync_cycle_throttle_unknown_crash
+        desc: Throttle-all includes an unrecognized datatype identifier; client hits out_of_range and crashes.
+        rpm: 50.0
+        path: [chrome_client, sync_server, quota_service, sync_server, chrome_client]
+        emit:
+          - chrome_client.sync_job_start
+          - chrome_client.sync_request
+          - sync_server.sync_req_received
+          - sync_server.sync_resp_throttle_all
+          - chrome_client.sync_response
+          - chrome_client.throttle_parse_warning
+          - chrome_client.sync_exception
+          - chrome_client.chrome_crash
+        latency_ms:
+          - [0, 1]
+          - [25, 100]
+          - [20, 120]
+          - [40, 300]
+          - [5, 30]
+          - [2, 10]
+          - [1, 5]
+          - [1, 5]
+        trace: true
+
+      - id: sync_cycle_quota_timeout_retry
+        desc: Quota RPC times out; server returns 503; client retries the entire sync cycle with backoff.
+        rpm: 40.0
+        path: [chrome_client, sync_server, quota_service, sync_server, chrome_client]
+        emit:
+          - chrome_client.sync_job_start
+          - chrome_client.sync_request
+          - sync_server.sync_req_received
+          - quota_service.rpc_deadline_exceeded
+          - sync_server.quota_check_timeout
+          - sync_server.sync_resp_503
+          - chrome_client.sync_response
+        latency_ms:
+          - [0, 1]
+          - [25, 120]
+          - [20, 120]
+          - [300, 4000]
+          - [1, 10]
+          - [5, 40]
+          - [10, 60]
+        retry:
+          max_attempts: 4
+          expected_attempts: 2.5
+          emit_per_retry: [chrome_client.sync_retry_scheduled]
+          backoff_ms:
+            - [200, 800]
+            - [400, 1500]
+            - [800, 3000]
+        trace: true
+
+      - id: crash_report_upload_fail_retry
+        desc: Crash upload attempts fail (429/503) and are retried with backoff; some are ultimately dropped.
+        rpm: 30.0
+        path: [chrome_client, crash_collector, chrome_client]
+        emit:
+          - chrome_client.crash_upload_attempt
+          - crash_collector.upload_failed
+          - chrome_client.crash_upload_done
+        latency_ms:
+          - [0, 1]
+          - [100, 1200]
+          - [10, 60]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.0
+          emit_per_retry: [chrome_client.crash_upload_retry_scheduled]
+          backoff_ms:
+            - [500, 2000]
+            - [1500, 8000]
+        trace: true
+
+assumptions:
+  - >
+    The post-mortem is mapped to a minimal causal architecture: Chrome clients -> Sync Server -> Quota Service,
+    plus a separate Crash Collector. The "faulty load balancing configuration change" is represented as a
+    one-shot LB config log, and the Sync Server's conservative reaction is represented as throttle-all responses.
+  - >
+    The client crash mechanism (unknown specifics field number mapped to UNSPECIFIED, then negative offset in
+    an EnumSet/bitset leading to std::out_of_range and abort) is modeled via chrome_client.throttle_parse_warning
+    followed by chrome_client.sync_exception and chrome_client.chrome_crash within the same flow variant.
+  - >
+    Fleet scale is approximated by a small host list (10 client hosts, a few backend hosts) while request rates
+    (rpm) represent aggregated traffic across many clients. This is intended to produce realistic log volume
+    without modeling thousands of distinct hosts.
+  - >
+    Estimated normal logs/min:
+    flows: sync_cycle_success 160 rpm * 7 logs = 1120; crash_report_upload_success 2 rpm * 3 logs = 6;
+    background ~ (chrome 10 + sync 6 + quota 2 + lb 0.1 + storage 2 + crash 2) ~= 22;
+    total ~= 1148 logs/min over 15 min => ~17,220 lines.
+  - >
+    Failure base (before event multipliers) logs/min:
+    ok_degraded 150*7=1050; throttle_known 80*5=400; throttle_unknown_crash 50*8=400;
+    quota_timeout_retry 40*(2.5*7 + 1.5*1)=40*(17.5+1.5)=760;
+    crash_upload_fail_retry 30*(2.0*3 + 1.0*1)=30*(6+1)=210;
+    background ~= 30-60; total base ~= ~2,850-2,900 logs/min.
+  - >
+    Scenario piecewise failure estimate (using scenario multipliers):
+    [15-18): ~1,240/min * 3 = ~3,720;
+    [18-20): ~2,082/min * 2 = ~4,164;
+    [20-23): ~2,852/min * 3 = ~8,556;
+    [23-30): ~3,014/min * 7 = ~21,098;
+    failure total ~= ~37,538 plus one-shots (~2) => ~37,540.
+    Overall estimated total ~= ~17,220 + ~37,540 = ~54,760 (within 20k..100k).
+  - >
+    Storage is modeled as mostly healthy because the post-mortem centers on quota-service overload and client
+    parsing logic; storage warnings are included only as occasional secondary noise during bursty retries.
+```

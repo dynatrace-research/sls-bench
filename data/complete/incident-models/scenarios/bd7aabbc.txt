@@ -1,0 +1,211 @@
+```yaml
+scenario:
+  id: use1_lambda_frontend_scale_threshold_bug
+  title: Lambda cell degradation from frontend scaling threshold causing capacity utilization gap
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A Lambda cell in us-east-1 normally handles synchronous invocations and asynchronous event deliveries with low error rates.
+    When the Lambda Frontend fleet scales beyond a previously untested size for that cell, a latent defect is triggered and the cell
+    allocates execution environments but cannot supply enough ready capacity, causing sync invocation retries, errors, and elevated latency.
+    Asynchronous sources accumulate backlog and delivery lag; a dependent STS-like SAML federation path later enables throttling as upstream errors persist.
+
+  trigger_desc: |
+    The Lambda Frontend fleet in the affected cell scales up to handle a routine traffic increase and crosses a cell capacity threshold
+    that triggers a latent software defect, leading to execution environments being allocated but not effectively utilized.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        The cell serves steady synchronous invoke traffic and processes asynchronous events with low lag.
+        Invocation manager pool stats show adequate ready capacity, frontend metrics show low error rate and stable p95 latency,
+        and STS SAML federation requests complete successfully.
+      flows: [sync_invoke_ok_n, async_event_delivery_ok_n, sts_saml_federation_ok_n]
+      manifestation:
+        - lambda_frontend.frontend_metrics
+        - invocation_manager.pool_stats
+        - lambda_frontend.invoke_success
+        - event_router.queue_stats
+        - event_router.delivery_success
+        - sts_gateway.saml_ok
+
+    f:
+      desc: |
+        The affected cell enters a degraded state: allocation continues but ready/in-use capacity collapses relative to allocated capacity.
+        Synchronous invokes experience retries and higher error rates/latencies, while the event router accumulates backlog and increasing delivery lag.
+        Engineers later mitigate by scaling the frontend down below the triggering threshold, improving sync success rates, but async backlog persists
+        and drains slowly; downstream STS throttling appears as federation requests continue to encounter upstream Lambda errors.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: lambda_frontend
+          event: |
+            The frontend fleet crosses a new per-cell scaling threshold; shortly afterward sync invocations begin retrying and failing
+            with elevated tail latency, and queue backlog indicators for async sources become meaningfully elevated.
+          why: |
+            Crossing the untested scaling size triggers a latent defect in the cell's capacity/utilization path: environments are allocated,
+            but few become ready/in-use, so the frontend cannot obtain sufficient ready environments. This is directly observable via
+            increased invoke errors/latency and pool stats showing allocated rising while ready/in-use stays low.
+          flows: [sync_invoke_f_err, sync_invoke_f_ok, async_event_delivery_f_fail]
+          rate_multipliers:
+            async_event_delivery_f_ok: 0.0
+            sts_saml_federation_f: 0.0
+            invocation_manager.pool_stats: 1.3
+            event_router.queue_stats: 1.3
+            sts_gateway.throttle_metric: 0.0
+          latency_multipliers:
+            sync_invoke_f_err: {p50: 2.0, p95: 4.0}
+            sync_invoke_f_ok: {p50: 1.6, p95: 2.6}
+            async_event_delivery_f_fail: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: lambda_frontend.scaling_threshold_crossed
+              count: 1
+              hosts: [lf-2]
+            - ref: invocation_manager.capacity_gap_snapshot
+              count: 1
+              hosts: [im-1]
+            - ref: event_router.queue_lag_snapshot
+              count: 1
+              hosts: [er-1]
+          manifestation:
+            - lambda_frontend.scaling_threshold_crossed
+            - lambda_frontend.invoke_error
+            - invocation_manager.provision_blocked
+            - invocation_manager.pool_stats
+            - event_router.queue_stats
+
+        - order: 2
+          at_min: 35
+          component: lambda_frontend
+          event: |
+            Engineers initiate a mitigation by scaling the frontend fleet down below the triggering size; sync invocation error volume decreases,
+            and successful sync invokes become more common, though latency remains elevated and async backlog continues to grow.
+          why: |
+            Reducing the frontend fleet size removes the cell condition that triggers the latent defect, allowing more effective use of existing
+            environments and improved readiness. This is directly observable as fewer invoke errors/retries and improving pool readiness.
+          flows: [sync_invoke_f_err, sync_invoke_f_ok, async_event_delivery_f_fail]
+          rate_multipliers:
+            sync_invoke_f_err: 0.5
+            sync_invoke_f_ok: 1.3
+            async_event_delivery_f_fail: 0.9
+            invocation_manager.pool_stats: 1.1
+            event_router.queue_stats: 1.2
+          latency_multipliers:
+            sync_invoke_f_err: {p50: 1.3, p95: 2.0}
+            sync_invoke_f_ok: {p50: 1.2, p95: 1.6}
+          one_shots:
+            - ref: lambda_frontend.scale_down_initiated
+              count: 1
+              hosts: [lf-1]
+          manifestation:
+            - lambda_frontend.scale_down_initiated
+            - lambda_frontend.invoke_error
+            - lambda_frontend.frontend_metrics
+            - invocation_manager.pool_stats
+
+        - order: 3
+          at_min: 45
+          component: event_router
+          event: |
+            With sync capacity largely improved, the event router begins delivering backlog successfully (still with high lag),
+            while some deliveries continue to fail and be retried; STS enables throttling and federation errors become visible.
+          why: |
+            As the cell becomes more capable of serving new sync invokes, async sources can resume delivery attempts and start draining
+            accumulated backlog. Lag remains high because queued events are older. STS throttling is an operational response to persistent
+            upstream errors to protect the service; it is observable through STS metrics and failed federation outcomes.
+          flows: [async_event_delivery_f_ok, async_event_delivery_f_fail, sts_saml_federation_f, sync_invoke_f_err, sync_invoke_f_ok]
+          rate_multipliers:
+            sync_invoke_f_err: 0.2
+            sync_invoke_f_ok: 1.5
+            async_event_delivery_f_fail: 0.6
+            async_event_delivery_f_ok: 1.0
+            sts_saml_federation_f: 1.0
+            sts_gateway.throttle_metric: 1.0
+            event_router.queue_stats: 1.2
+            invocation_manager.pool_stats: 1.0
+          latency_multipliers:
+            sync_invoke_f_ok: {p50: 1.0, p95: 1.2}
+            async_event_delivery_f_ok: {p50: 1.0, p95: 1.3}
+          one_shots:
+            - ref: event_router.queue_lag_snapshot
+              count: 2
+              hosts: [er-1, er-2]
+          manifestation:
+            - lambda_frontend.async_accepted
+            - event_router.delivery_success
+            - event_router.queue_stats
+            - sts_gateway.throttle_metric
+            - sts_gateway.saml_throttled
+
+      steady:
+        - component: event_router
+          condition: |
+            Asynchronous event backlog remains elevated and some deliveries are still retried; successful deliveries carry high lag.
+          user_impact: |
+            Customers relying on async/streaming event sources see delayed processing and increased end-to-end event latency.
+          manifestation:
+            - event_router.queue_stats
+            - event_router.delivery_retry
+            - event_router.delivery_attempt
+
+        - component: lambda_frontend
+          condition: |
+            Synchronous invocations are mostly successful again but sporadic NoCapacity/timeout errors remain under load.
+          user_impact: |
+            Some customers still see intermittent invocation failures and elevated tail latency in the affected cell.
+          manifestation:
+            - lambda_frontend.frontend_metrics
+            - lambda_frontend.invoke_error
+            - invocation_manager.provision_blocked
+
+        - component: sts_gateway
+          condition: |
+            STS throttling for SAML federation is active due to upstream Lambda instability.
+          user_impact: |
+            New SAML federations intermittently fail or are throttled; existing sessions are not modeled here.
+          manifestation:
+            - sts_gateway.throttle_metric
+            - sts_gateway.saml_throttled
+
+      feedback_loops:
+        - id: retry_pressure_loop
+          desc: |
+            Frontend retries increase concurrent demand on scarce ready environments, which can further raise latency and error rates,
+            prolonging the time before async backlog can drain.
+
+        - id: backlog_lag_loop
+          desc: |
+            As async backlog grows, event lag increases and more delivery attempts overlap with ongoing capacity instability, sustaining retries.
+
+      flows:
+        - sync_invoke_f_err
+        - sync_invoke_f_ok
+        - async_event_delivery_f_fail
+        - async_event_delivery_f_ok
+        - sts_saml_federation_f
+      manifestation:
+        - lambda_frontend.invoke_error
+        - invocation_manager.pool_stats
+        - invocation_manager.provision_blocked
+        - event_router.queue_stats
+        - lambda_frontend.async_accepted
+        - sts_gateway.throttle_metric
+
+  assumptions:
+    - "Timeline is compressed to 50 minutes while preserving the post-mortem beats (threshold-triggered degradation, mitigation via scale-down, sync recovery preceding async backlog draining)."
+    - |
+      Failure-phase piecewise breakdown (approx, including retries):
+      - Minutes 25-35 (10m): heavy sync failures and growing async backlog; ~2.1k logs/min + ~10 background logs/min; one-shots=3 at minute 25.
+      - Minutes 35-45 (10m): mitigation reduces sync failures; ~1.5k logs/min + ~9 background logs/min; one-shots=1 at minute 35.
+      - Minutes 45-50 (5m): async drain begins and STS throttling appears; ~1.1k logs/min + ~9 background logs/min; one-shots=2 at minute 45.
+    - "Total log estimate is ~65k-75k logs (normal ~26k, failure ~42k, background and one-shots under ~1k), within the 20k-100k target."
+    - "Visibility rationale: repeated high-rate signals (lambda_frontend.invoke_error, invocation_manager.provision_blocked, invocation_manager.pool_stats, event_router.queue_stats, and lambda_frontend.async_accepted during draining) make the trigger, mitigation, and remaining backlog diagnosable; mitigation markers and queue snapshots are one-shots to pin phase boundaries."
+```

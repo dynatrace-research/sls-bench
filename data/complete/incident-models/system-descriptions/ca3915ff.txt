@@ -1,0 +1,807 @@
+```yaml
+sys:
+  id: gcp_backbone_corridor_convergence_incident
+  desc: >
+    A simplified Google Cloud networking corridor connects a central US gateway campus to multiple edge regions and
+    carries customer traffic for Cloud Storage, Cloud SQL, Messages, Cloud VPN, and Cloud Interconnect.
+    The backbone uses automated traffic engineering to reroute around link and bandwidth failures.
+    During the incident, a fiber-path component failure reduced available bandwidth and triggered a prolonged reconvergence
+    because the intended second-best path was still under augmentation, forcing some traffic onto a third-best path.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_edge_uscentral
+    name: API Edge (us-central)
+    svc: api-edge
+    hosts: [edge-uc1-a, edge-uc1-b]
+    desc: Terminates customer API requests and forwards them over the backbone to regional backends.
+    to:
+      - dst: backbone_gateway_central
+        proto: https
+        desc: Forwards requests into the backbone gateway campus.
+    logs:
+      edge_health:
+        desc: Periodic edge health snapshot.
+        lvl: INFO
+        msg: "edge health ok active_conns={active_conns} cpu_pct={cpu_pct}"
+        vars:
+          active_conns: {k: i, v: [800, 9000]}
+          cpu_pct: {k: i, v: [10, 85]}
+      edge_req_gcs:
+        desc: Customer request for Cloud Storage via the edge.
+        lvl: INFO
+        msg: "recv gcs op={op} bucket={bucket} client_ip={client_ip} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [list, get, put, delete]}
+          bucket: {k: ch, v: [photos-prod, logs-archive, backups]}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          req_id: {k: uuid, v: null}
+      edge_resp_gcs_ok:
+        desc: Successful edge response for Cloud Storage request.
+        lvl: INFO
+        msg: "resp gcs status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [15, 8000]}
+          req_id: {k: uuid, v: null}
+      edge_resp_gcs_err:
+        desc: Failed edge response for Cloud Storage request.
+        lvl: WARN
+        msg: "resp gcs status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [upstream_timeout, connection_reset, internal_error]}
+          dur_ms: {k: i, v: [50, 12000]}
+          req_id: {k: uuid, v: null}
+      edge_req_sql:
+        desc: Customer request for Cloud SQL operation via the edge.
+        lvl: INFO
+        msg: "recv cloudsql op={op} instance={instance} client_ip={client_ip} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [export, update, delete]}
+          instance: {k: ch, v: [orders-db, billing-db, users-db]}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          req_id: {k: uuid, v: null}
+      edge_resp_sql_ok:
+        desc: Successful edge response for Cloud SQL request.
+        lvl: INFO
+        msg: "resp cloudsql status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [30, 12000]}
+          req_id: {k: uuid, v: null}
+      edge_resp_sql_err:
+        desc: Failed edge response for Cloud SQL request.
+        lvl: WARN
+        msg: "resp cloudsql status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [upstream_timeout, unavailable, deadline_exceeded]}
+          dur_ms: {k: i, v: [100, 20000]}
+          req_id: {k: uuid, v: null}
+      edge_req_msg:
+        desc: Customer request to publish a message via the edge.
+        lvl: INFO
+        msg: "recv messages op=publish topic={topic} client_ip={client_ip} req_id={req_id}"
+        vars:
+          topic: {k: ch, v: [events, alerts, audit]}
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          req_id: {k: uuid, v: null}
+      edge_resp_msg_ok:
+        desc: Successful edge response for message publish.
+        lvl: INFO
+        msg: "resp messages status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [5, 6000]}
+          req_id: {k: uuid, v: null}
+      edge_resp_msg_err:
+        desc: Failed edge response for message publish.
+        lvl: WARN
+        msg: "resp messages status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [upstream_timeout, unavailable]}
+          dur_ms: {k: i, v: [50, 12000]}
+          req_id: {k: uuid, v: null}
+    beh:
+      n:
+        desc: Edge emits periodic health logs.
+        emit:
+          - id: edge_health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Edge health continues during incident.
+        emit:
+          - id: edge_health
+            per_min: 0.8
+            scope: per_host
+
+  - id: backbone_gateway_central
+    name: Backbone Gateway Router (central US campus)
+    svc: backbone-gw
+    hosts: [gw-uc1-r1, gw-uc1-r2]
+    desc: Aggregates backbone traffic from the central US gateway campus toward edge regions.
+    to:
+      - dst: backbone_pop_west
+        proto: tcp
+        desc: High-capacity corridor from central gateway to west edge POP.
+      - dst: api_edge_uscentral
+        proto: https
+        desc: Returns traffic back to the edge after backend responses.
+    logs:
+      link_state_change:
+        desc: Interface state transition on the backbone router (modeled as the incident link-down marker).
+        lvl: ERROR
+        msg: "if={iface} peer={peer} state={state} reason={reason}"
+        vars:
+          iface: {k: ch, v: [xe-2/0/0, xe-3/0/0]}
+          peer: {k: ch, v: [pop-uw1-r1]}
+          state: {k: ch, v: [down]}
+          reason: {k: ch, v: [signal_loss, remote_fault]}
+      iface_stats:
+        desc: Periodic interface statistics for the corridor.
+        lvl: INFO
+        msg: "if={iface} tx_gbps={tx_gbps} rx_gbps={rx_gbps} drop_ppm={drop_ppm}"
+        vars:
+          iface: {k: ch, v: [xe-2/0/0, xe-3/0/0]}
+          tx_gbps: {k: i, v: [10, 120]}
+          rx_gbps: {k: i, v: [10, 120]}
+        state_vars:
+          n:
+            drop_ppm: {k: i, v: [0, 30]}
+          f:
+            drop_ppm: {k: i, v: [0, 6000]}
+      rib_update:
+        desc: Routing table processing during reconvergence.
+        lvl: INFO
+        msg: "rib update prefix_count={prefix_count} dur_ms={dur_ms}"
+        vars:
+          prefix_count: {k: i, v: [200, 5000]}
+          dur_ms: {k: i, v: [5, 800]}
+    beh:
+      n:
+        desc: Periodic interface statistics in normal conditions.
+        emit:
+          - id: iface_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Higher interface/stat churn during reconvergence.
+        emit:
+          - id: iface_stats
+            per_min: 2.0
+            scope: per_host
+          - id: rib_update
+            per_min: 0.6
+            scope: per_host
+
+  - id: backbone_pop_west
+    name: Backbone Edge POP Router (us-west)
+    svc: backbone-pop
+    hosts: [pop-uw1-r1]
+    desc: Terminates the corridor in the west and forwards to west-region services.
+    to:
+      - dst: backbone_gateway_central
+        proto: tcp
+        desc: Returns corridor traffic back toward the central gateway and edge.
+      - dst: gcs_api_west
+        proto: https
+        desc: Reaches Cloud Storage API backend in the west region.
+      - dst: cloud_sql_west
+        proto: https
+        desc: Reaches Cloud SQL API backend in the west region.
+      - dst: messages_west
+        proto: https
+        desc: Reaches Messages backend in the west region.
+    logs:
+      iface_stats:
+        desc: Periodic interface statistics at the west POP.
+        lvl: INFO
+        msg: "if={iface} rx_gbps={rx_gbps} drop_ppm={drop_ppm}"
+        vars:
+          iface: {k: ch, v: [et-0/0/0]}
+          rx_gbps: {k: i, v: [10, 120]}
+        state_vars:
+          n:
+            drop_ppm: {k: i, v: [0, 25]}
+          f:
+            drop_ppm: {k: i, v: [0, 6000]}
+    beh:
+      n:
+        desc: Normal west POP interface stats.
+        emit:
+          - id: iface_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Elevated drops during corridor degradation.
+        emit:
+          - id: iface_stats
+            per_min: 2.0
+            scope: per_host
+
+  - id: te_controller
+    name: Traffic Engineering Controller
+    svc: te-controller
+    hosts: [te-ctrl-1]
+    desc: Automated control plane that detects bandwidth reductions and moves traffic to alternate paths.
+    to:
+      - dst: backbone_gateway_central
+        proto: grpc
+        desc: Programs routing/TE changes onto backbone routers.
+    logs:
+      ctrl_tick:
+        desc: Periodic controller loop heartbeat.
+        lvl: INFO
+        msg: "te tick corridor={corridor} pending_changes={pending_changes}"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1", "us-central1<>europe-west1"]}
+          pending_changes: {k: i, v: [0, 50]}
+      reconv_start:
+        desc: Marker that reconvergence has started.
+        lvl: WARN
+        msg: "reconvergence started corridor={corridor} trigger={trigger}"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1", "us-central1<>europe-west1"]}
+          trigger: {k: ch, v: [bandwidth_drop, link_down]}
+      path_selected:
+        desc: Selection of an alternate path rank for the corridor (modeled as third-best during this incident).
+        lvl: WARN
+        msg: "alternate path selected corridor={corridor} path_rank={path_rank}"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1"]}
+          path_rank: {k: i, v: [3, 3]}
+      reconv_progress:
+        desc: Periodic reconvergence progress.
+        lvl: INFO
+        msg: "reconvergence progress corridor={corridor} pct={pct} pending_flows={pending_flows}"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1"]}
+          pct: {k: i, v: [5, 99]}
+          pending_flows: {k: i, v: [50, 5000]}
+      reconv_complete:
+        desc: Marker that reconvergence has completed for the corridor.
+        lvl: INFO
+        msg: "reconvergence completed corridor={corridor} duration_s={duration_s}"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1"]}
+          duration_s: {k: i, v: [300, 2400]}
+    beh:
+      n:
+        desc: Controller ticks in steady state.
+        emit:
+          - id: ctrl_tick
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Controller continues emitting ticks and progress during incident.
+        emit:
+          - id: ctrl_tick
+            per_min: 1.0
+            scope: global
+          - id: reconv_progress
+            per_min: 1.0
+            scope: global
+
+  - id: netmon
+    name: Network Telemetry / Detection
+    svc: netmon
+    hosts: [netmon-1]
+    desc: Produces corridor health metrics and raises alarms on sustained packet loss.
+    to:
+      - dst: backbone_gateway_central
+        proto: grpc
+        desc: Collects telemetry from central campus routers.
+      - dst: backbone_pop_west
+        proto: grpc
+        desc: Collects telemetry from west POP routers.
+    logs:
+      corridor_health:
+        desc: Periodic corridor health metric.
+        lvl: INFO
+        msg: "corridor={corridor} loss_pct={loss_pct} rtt_ms={rtt_ms} avail_bw_gbps={avail_bw_gbps}"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1", "us-central1<>europe-west1"]}
+        state_vars:
+          n:
+            loss_pct: {k: f, v: [0.0, 0.3]}
+            rtt_ms: {k: i, v: [20, 45]}
+            avail_bw_gbps: {k: i, v: [80, 140]}
+          f:
+            loss_pct: {k: f, v: [0.2, 8.0]}
+            rtt_ms: {k: i, v: [30, 160]}
+            avail_bw_gbps: {k: i, v: [20, 110]}
+      loss_alarm:
+        desc: Alarm emitted when packet loss exceeds threshold over a minute window.
+        lvl: WARN
+        msg: "ALARM packet_loss corridor={corridor} loss_pct={loss_pct} window_s=60"
+        vars:
+          corridor: {k: ch, v: ["us-central1<>us-west1", "us-central1<>europe-west1"]}
+          loss_pct: {k: f, v: [1.0, 12.0]}
+    beh:
+      n:
+        desc: Normal telemetry metrics with negligible loss.
+        emit:
+          - id: corridor_health
+            per_min: 2.0
+            scope: global
+      f:
+        desc: More frequent metrics and loss alarms during corridor instability.
+        emit:
+          - id: corridor_health
+            per_min: 4.0
+            scope: global
+          - id: loss_alarm
+            per_min: 2.0
+            scope: global
+
+  - id: cloud_router_cp
+    name: Cloud Router Control Plane
+    svc: cloud-router
+    hosts: [cr-cp-1]
+    desc: Propagates global routing updates; delays increase when backbone control-plane convergence slows.
+    to:
+      - dst: backbone_gateway_central
+        proto: grpc
+        desc: Exchanges routing state with the backbone gateway.
+    logs:
+      route_update_delay:
+        desc: Periodic measure of routing propagation delay for global routing.
+        lvl: INFO
+        msg: "global routing update delay_ms={delay_ms} affected_peers={affected_peers}"
+        vars:
+          affected_peers: {k: i, v: [1, 30]}
+        state_vars:
+          n:
+            delay_ms: {k: i, v: [100, 900]}
+          f:
+            delay_ms: {k: i, v: [400, 15000]}
+    beh:
+      n:
+        desc: Normal global routing propagation delay.
+        emit:
+          - id: route_update_delay
+            per_min: 0.8
+            scope: global
+      f:
+        desc: Elevated propagation delay during reconvergence.
+        emit:
+          - id: route_update_delay
+            per_min: 1.2
+            scope: global
+
+  - id: connectivity_gateway
+    name: Connectivity Gateway (VPN + Interconnect)
+    svc: connectivity-gw
+    hosts: [conn-uc1-1, conn-uc1-2]
+    desc: Represents Cloud VPN and Cloud Interconnect data-plane health from the central region.
+    to:
+      - dst: backbone_gateway_central
+        proto: udp
+        desc: Sends encrypted VPN and Interconnect control probes over the backbone.
+    logs:
+      gw_stats:
+        desc: Periodic connectivity health snapshot.
+        lvl: INFO
+        msg: "conn stats vpn_loss_pct={vpn_loss_pct} ic_loss_pct={ic_loss_pct}"
+        vars: {}
+        state_vars:
+          n:
+            vpn_loss_pct: {k: f, v: [0.0, 0.3]}
+            ic_loss_pct: {k: f, v: [0.0, 0.3]}
+          f:
+            vpn_loss_pct: {k: f, v: [0.2, 10.0]}
+            ic_loss_pct: {k: f, v: [0.2, 10.0]}
+      vpn_keepalive_ok:
+        desc: VPN keepalive succeeded.
+        lvl: INFO
+        msg: "vpn keepalive ok tunnel={tunnel} rtt_ms={rtt_ms}"
+        vars:
+          tunnel: {k: ch, v: [tunnel-1, tunnel-2, tunnel-3]}
+          rtt_ms: {k: i, v: [10, 300]}
+      vpn_keepalive_timeout:
+        desc: VPN keepalive timed out.
+        lvl: WARN
+        msg: "vpn keepalive timeout tunnel={tunnel} timeout_ms={timeout_ms}"
+        vars:
+          tunnel: {k: ch, v: [tunnel-1, tunnel-2, tunnel-3]}
+          timeout_ms: {k: i, v: [800, 6000]}
+      bfd_ok:
+        desc: Interconnect BFD probe succeeded.
+        lvl: INFO
+        msg: "interconnect bfd ok circuit={circuit} rtt_ms={rtt_ms}"
+        vars:
+          circuit: {k: ch, v: [ic-1, ic-2]}
+          rtt_ms: {k: i, v: [1, 80]}
+      bfd_timeout:
+        desc: Interconnect BFD probe timed out.
+        lvl: WARN
+        msg: "interconnect bfd timeout circuit={circuit} timeout_ms={timeout_ms}"
+        vars:
+          circuit: {k: ch, v: [ic-1, ic-2]}
+          timeout_ms: {k: i, v: [200, 2000]}
+    beh:
+      n:
+        desc: Normal connectivity stats.
+        emit:
+          - id: gw_stats
+            per_min: 0.8
+            scope: per_host
+      f:
+        desc: Higher loss observed during corridor packet loss.
+        emit:
+          - id: gw_stats
+            per_min: 1.2
+            scope: per_host
+
+  - id: gcs_api_west
+    name: Cloud Storage API (us-west)
+    svc: gcs-api
+    hosts: [gcs-uw1-1, gcs-uw1-2]
+    desc: Handles Cloud Storage API requests; sensitive to network loss and reconnection churn.
+    to:
+      - dst: backbone_pop_west
+        proto: https
+        desc: Returns responses back via the west POP to the corridor.
+    logs:
+      gcs_ok:
+        desc: Successful storage request completion.
+        lvl: INFO
+        msg: "gcs done op={op} bucket={bucket} status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [list, get, put, delete]}
+          bucket: {k: ch, v: [photos-prod, logs-archive, backups]}
+          dur_ms: {k: i, v: [10, 9000]}
+          req_id: {k: uuid, v: null}
+      gcs_err:
+        desc: Storage request failed due to transient transport/service issues.
+        lvl: ERROR
+        msg: "gcs done op={op} bucket={bucket} status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [list, get, put, delete]}
+          bucket: {k: ch, v: [photos-prod, logs-archive, backups]}
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [upstream_timeout, connection_reset, internal_error]}
+          dur_ms: {k: i, v: [50, 20000]}
+          req_id: {k: uuid, v: null}
+      gcs_health:
+        desc: Periodic API health.
+        lvl: INFO
+        msg: "gcs health ok inflight={inflight}"
+        vars:
+          inflight: {k: i, v: [10, 2000]}
+    beh:
+      n:
+        desc: Normal health emission.
+        emit:
+          - id: gcs_health
+            per_min: 0.4
+            scope: per_host
+      f:
+        desc: Health continues; inflight tends higher during retries/timeouts.
+        emit:
+          - id: gcs_health
+            per_min: 0.7
+            scope: per_host
+
+  - id: cloud_sql_west
+    name: Cloud SQL API + Replication (us-west)
+    svc: cloudsql
+    hosts: [sql-uw1-1]
+    desc: Handles Cloud SQL operations and monitors cross-region replication lag.
+    to:
+      - dst: backbone_pop_west
+        proto: https
+        desc: Returns API responses back through the west POP.
+    logs:
+      sql_ok:
+        desc: Successful Cloud SQL operation completion.
+        lvl: INFO
+        msg: "cloudsql done op={op} instance={instance} status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [export, update, delete]}
+          instance: {k: ch, v: [orders-db, billing-db, users-db]}
+          dur_ms: {k: i, v: [20, 15000]}
+          req_id: {k: uuid, v: null}
+      sql_err:
+        desc: Cloud SQL operation failed due to transient connectivity/unavailability.
+        lvl: ERROR
+        msg: "cloudsql done op={op} instance={instance} status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          op: {k: ch, v: [export, update, delete]}
+          instance: {k: ch, v: [orders-db, billing-db, users-db]}
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [unavailable, deadline_exceeded, transport_error]}
+          dur_ms: {k: i, v: [100, 25000]}
+          req_id: {k: uuid, v: null}
+      replication_lag_warn:
+        desc: Replication lag warning for us-west region replicas.
+        lvl: WARN
+        msg: "replication lag region=us-west1 lag_s={lag_s}"
+        vars:
+          lag_s: {k: i, v: [5, 1800]}
+      sql_health:
+        desc: Periodic SQL service health.
+        lvl: INFO
+        msg: "cloudsql health ok inflight={inflight}"
+        vars:
+          inflight: {k: i, v: [5, 800]}
+    beh:
+      n:
+        desc: Normal health; lag warnings effectively absent.
+        emit:
+          - id: sql_health
+            per_min: 0.6
+            scope: global
+      f:
+        desc: Health continues; replication lag warnings may appear after sustained disruption.
+        emit:
+          - id: sql_health
+            per_min: 0.8
+            scope: global
+          - id: replication_lag_warn
+            per_min: 0.6
+            scope: global
+
+  - id: messages_west
+    name: Messages Service (us-west)
+    svc: messages
+    hosts: [msg-uw1-1]
+    desc: Publishes and delivers messages; sensitive to network partitions and backend timeouts.
+    to:
+      - dst: backbone_pop_west
+        proto: https
+        desc: Returns publish responses back through the west POP.
+    logs:
+      msg_ok:
+        desc: Successful publish completion.
+        lvl: INFO
+        msg: "messages publish topic={topic} status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          topic: {k: ch, v: [events, alerts, audit]}
+          dur_ms: {k: i, v: [5, 8000]}
+          req_id: {k: uuid, v: null}
+      msg_err:
+        desc: Publish failed due to upstream timeout/unavailability.
+        lvl: ERROR
+        msg: "messages publish topic={topic} status={status} err={err} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          topic: {k: ch, v: [events, alerts, audit]}
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [upstream_timeout, unavailable]}
+          dur_ms: {k: i, v: [50, 20000]}
+          req_id: {k: uuid, v: null}
+      backlog_warn:
+        desc: Warning when backlog/ack latency grows.
+        lvl: WARN
+        msg: "messages backlog elevated backlog_msgs={backlog_msgs} ack_lag_s={ack_lag_s}"
+        vars:
+          backlog_msgs: {k: i, v: [1000, 500000]}
+          ack_lag_s: {k: i, v: [5, 900]}
+      msg_health:
+        desc: Periodic service health.
+        lvl: INFO
+        msg: "messages health ok inflight={inflight}"
+        vars:
+          inflight: {k: i, v: [10, 5000]}
+    beh:
+      n:
+        desc: Normal health; backlog warnings are rare.
+        emit:
+          - id: msg_health
+            per_min: 0.8
+            scope: global
+      f:
+        desc: Health continues; backlog warnings can appear during outage.
+        emit:
+          - id: msg_health
+            per_min: 1.0
+            scope: global
+          - id: backlog_warn
+            per_min: 0.6
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Customer requests traverse the edge and west backends over a healthy corridor; connectivity probes succeed.
+    req:
+      - id: gcs_api_call_n
+        desc: Cloud Storage API request succeeds.
+        rpm: 90.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, gcs_api_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_gcs, gcs_api_west.gcs_ok, api_edge_uscentral.edge_resp_gcs_ok]
+        latency_ms: [[0, 2], [25, 180], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: cloudsql_op_n
+        desc: Cloud SQL operation succeeds.
+        rpm: 30.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, cloud_sql_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_sql, cloud_sql_west.sql_ok, api_edge_uscentral.edge_resp_sql_ok]
+        latency_ms: [[0, 2], [40, 350], [3, 15]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: messages_publish_n
+        desc: Messages publish succeeds.
+        rpm: 60.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, messages_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_msg, messages_west.msg_ok, api_edge_uscentral.edge_resp_msg_ok]
+        latency_ms: [[0, 2], [10, 120], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: vpn_keepalive_n
+        desc: VPN keepalive succeeds.
+        rpm: 40.0
+        path: [connectivity_gateway, backbone_gateway_central, backbone_pop_west]
+        emit: [connectivity_gateway.vpn_keepalive_ok]
+        latency_ms: [[10, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: interconnect_bfd_n
+        desc: Interconnect BFD probe succeeds.
+        rpm: 30.0
+        path: [connectivity_gateway, backbone_gateway_central, backbone_pop_west]
+        emit: [connectivity_gateway.bfd_ok]
+        latency_ms: [[1, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Packet loss and reduced bandwidth on the corridor cause timeouts, elevated latency, and transient errors; convergence is prolonged.
+    req:
+      - id: gcs_api_call_ok_f
+        desc: Cloud Storage requests that still succeed but are slower.
+        rpm: 80.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, gcs_api_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_gcs, gcs_api_west.gcs_ok, api_edge_uscentral.edge_resp_gcs_ok]
+        latency_ms: [[0, 2], [120, 1800], [5, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: gcs_api_call_err_f
+        desc: Cloud Storage requests that fail with 5xx/transient errors.
+        rpm: 10.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, gcs_api_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_gcs, gcs_api_west.gcs_err, api_edge_uscentral.edge_resp_gcs_err]
+        latency_ms: [[0, 2], [600, 6000], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: cloudsql_op_ok_f
+        desc: Cloud SQL operations that succeed but are slower.
+        rpm: 27.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, cloud_sql_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_sql, cloud_sql_west.sql_ok, api_edge_uscentral.edge_resp_sql_ok]
+        latency_ms: [[0, 2], [200, 3000], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: cloudsql_op_err_f
+        desc: Cloud SQL operations that fail during disruption.
+        rpm: 3.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, cloud_sql_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_sql, cloud_sql_west.sql_err, api_edge_uscentral.edge_resp_sql_err]
+        latency_ms: [[0, 2], [800, 12000], [5, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: messages_publish_ok_f
+        desc: Messages publishes that still succeed but are slower.
+        rpm: 58.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, messages_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_msg, messages_west.msg_ok, api_edge_uscentral.edge_resp_msg_ok]
+        latency_ms: [[0, 2], [80, 1400], [5, 50]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: messages_publish_err_f
+        desc: Messages publishes that fail during the availability issue window.
+        rpm: 12.0
+        path: [api_edge_uscentral, backbone_gateway_central, backbone_pop_west, messages_west, backbone_pop_west, backbone_gateway_central, api_edge_uscentral]
+        emit: [api_edge_uscentral.edge_req_msg, messages_west.msg_err, api_edge_uscentral.edge_resp_msg_err]
+        latency_ms: [[0, 2], [400, 6000], [5, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: vpn_keepalive_ok_f
+        desc: VPN keepalives that succeed but with higher RTT.
+        rpm: 34.0
+        path: [connectivity_gateway, backbone_gateway_central, backbone_pop_west]
+        emit: [connectivity_gateway.vpn_keepalive_ok]
+        latency_ms: [[15, 450]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: vpn_keepalive_fail_f
+        desc: VPN keepalives that time out due to packet loss.
+        rpm: 6.0
+        path: [connectivity_gateway, backbone_gateway_central, backbone_pop_west]
+        emit: [connectivity_gateway.vpn_keepalive_timeout]
+        latency_ms: [[800, 6000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: interconnect_bfd_ok_f
+        desc: Interconnect BFD probes that still succeed.
+        rpm: 26.0
+        path: [connectivity_gateway, backbone_gateway_central, backbone_pop_west]
+        emit: [connectivity_gateway.bfd_ok]
+        latency_ms: [[2, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: interconnect_bfd_fail_f
+        desc: Interconnect BFD probes that time out due to packet loss.
+        rpm: 4.0
+        path: [connectivity_gateway, backbone_gateway_central, backbone_pop_west]
+        emit: [connectivity_gateway.bfd_timeout]
+        latency_ms: [[200, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "The model focuses on a single representative corridor (us-central1<>us-west1) while allowing telemetry to mention a second corridor to reflect 'multiple regions'."
+  - "The fiber-path component failure is represented by a backbone interface-down one-shot plus elevated loss alarms and increased interface drop_ppm metrics."
+  - "Convergence delay due to incomplete augmentation is represented as TE selecting path_rank=3 and continuing reconvergence progress logs."
+  - "Cloud Router, VPN, and Interconnect impacts are modeled via routing-delay metrics and probe/keepalive timeouts rather than detailed protocol-specific logs."
+  - "Connectivity gateway loss percentages in conn stats are state-dependent (near-zero in normal, elevated in failure) so normal-phase logs cannot resemble incident packet loss."
+  - "Probe flow latency_ms hints were aligned to the rtt_ms/timeout_ms domains so completion/timeout outcomes are only emitted after the relevant waiting time."
+  - "Normal-phase volume estimate: ~620 logs/min (dominated by API request/response logs; background telemetry adds ~10–15 logs/min)."
+  - "Total scenario log estimate (using the scenario timing): ~30k–45k logs, within the 20k–100k target while keeping key failure signals frequent enough for diagnosis (loss alarms, TE progress, service errors, and probe failures)."
+```

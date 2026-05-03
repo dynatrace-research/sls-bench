@@ -1,0 +1,161 @@
+```yaml
+scenario:
+  id: rtm_crash_reconnect_db_overload
+  title: RTM crash triggers reconnect storm; cache-cleared clients overload DB history reads
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system provides real-time messaging via WebSockets (RTM) and message history via HTTP APIs.
+    A latent build bug causes a heavily-used RTM host to crash, forcing many connected users to reconnect at once.
+    Shortly after, clients reconnecting also reload full history due to a prior cache-clear behavior change, spiking history reads.
+    The combined reconnections and bulk history queries saturate database capacity, leading to session validation timeouts and elevated 503/504s.
+
+  trigger_desc: |
+    An RTM server process (rtm-3) crashes due to a latent build bug, dropping many active WebSocket connections and initiating a reconnection storm.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Traffic is steady: clients maintain WebSocket connections to RTM servers, periodically fetch history over HTTP,
+        and post messages in real time. Database pool snapshots remain low and stable, and monitoring is quiet.
+      flows: [ws_connect, api_fetch_history, rtm_post_message]
+      manifestation: [edge_gateway.ws_upgrade_ok, app_api.history_ok, db_cluster.pool_stats, monitor.healthcheck]
+
+    f:
+      desc: |
+        The failure begins with an RTM crash that forces many users to reconnect simultaneously. Early symptoms are dominated
+        by WebSocket upgrade failures targeting the crashed RTM host, while DB-backed APIs are initially mostly functional.
+        As reconnecting clients begin bulk history reloads, DB pool saturation appears and API timeouts rise; session validation
+        starts failing for some reconnect attempts and availability degrades for a subset of users.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: rtm_server
+          event: |
+            RTM host rtm-3 crashes, dropping connections and triggering a reconnection surge; edge starts logging upgrade failures to the dead target.
+            DB overload signals are not yet prominent in this first window.
+          why: |
+            A latent build bug can crash an RTM process once at an unpredictable time (not directly observable until the crash log appears).
+            The immediate user-visible effect is mass reconnect attempts; early failures are dominated by connection refused/reset to rtm-3.
+          flows: [ws_connect_ok_f, ws_connect_fail_rtm_f]
+          rate_multipliers:
+            ws_connect_fail_db_f: 0.0
+            api_fetch_history_timeout_f: 0.0
+            db_cluster.pool_stats_overload: 0.0
+            monitor.alert_rtm_down: 8.0
+          latency_multipliers:
+            ws_connect_ok_f: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: rtm_server.crash
+              count: 1
+              hosts: [rtm-3]
+            - ref: monitor.page_oncall
+              count: 1
+              hosts: [mon-1]
+          manifestation: [rtm_server.crash, edge_gateway.ws_upgrade_fail_rtm, monitor.alert_rtm_down, monitor.page_oncall]
+
+        - order: 2
+          at_min: 27
+          component: edge_gateway
+          event: |
+            Reconnecting clients begin reloading full message history, sharply increasing history API traffic; DB pool saturation appears
+            and API timeouts rise, and some session validations start timing out.
+          why: |
+            A prior client behavior change clears local caches and reloads history from scratch on reconnect; this amplifies read load exactly when
+            reconnect churn is already high. DB saturation is directly observable via overload pool snapshots and API timeouts, but the client cache behavior is external.
+          flows: [api_fetch_history_ok_f, api_fetch_history_timeout_f, ws_connect_fail_db_f]
+          rate_multipliers:
+            api_fetch_history_ok_f: 3.0
+            api_fetch_history_timeout_f: 4.0
+            ws_connect_fail_db_f: 1.0
+            db_cluster.pool_stats_overload: 3.0
+            app_api.threadpool_warn: 3.0
+          latency_multipliers:
+            api_fetch_history_ok_f: {p50: 2.0, p95: 3.0}
+            ws_connect_ok_f: {p50: 1.5, p95: 2.5}
+          one_shots: []
+          manifestation: [db_cluster.pool_stats_overload, app_api.history_timeout, edge_gateway.http_503, app_api.session_validate_timeout]
+
+        - order: 3
+          at_min: 34
+          component: db_cluster
+          event: |
+            Operators add DB capacity and restart the crashed RTM host; RTM-target connection failures and DB overload symptoms drop but remain elevated under load.
+          why: |
+            Increasing DB connection/query capacity reduces pool waiting and timeouts, improving both history reads and session validation.
+            Restarting rtm-3 reduces direct RTM-target connection failures, but reconnect and history reload traffic is still high enough to keep partial degradation.
+          flows: [ws_connect_fail_rtm_f, api_fetch_history_timeout_f, ws_connect_fail_db_f]
+          rate_multipliers:
+            api_fetch_history_ok_f: 2.0
+            api_fetch_history_timeout_f: 1.5
+            ws_connect_fail_rtm_f: 0.6
+            ws_connect_fail_db_f: 0.7
+            db_cluster.pool_stats_overload: 1.5
+            monitor.alert_rtm_down: 2.0
+            app_api.threadpool_warn: 1.5
+          latency_multipliers:
+            api_fetch_history_ok_f: {p50: 1.4, p95: 1.8}
+            ws_connect_ok_f: {p50: 1.2, p95: 1.6}
+          one_shots:
+            - ref: db_cluster.capacity_added
+              count: 1
+              hosts: [db-1]
+            - ref: rtm_server.start
+              count: 1
+              hosts: [rtm-3]
+            - ref: monitor.status_update
+              count: 1
+              hosts: [mon-1]
+          manifestation: [db_cluster.capacity_added, rtm_server.start, db_cluster.pool_stats_overload, edge_gateway.http_503]
+
+      steady:
+        - component: db_cluster
+          condition: |
+            DB overload persists intermittently: overload snapshots continue and timeouts occur under sustained reconnect + history reload load.
+          user_impact: |
+            A subset of users experiences slow loads and intermittent failures, especially when loading history on reconnect.
+          manifestation: [db_cluster.pool_stats_overload, app_api.history_timeout, edge_gateway.http_503]
+        - component: edge_gateway
+          condition: |
+            Elevated reconnect churn persists; some WebSocket upgrades still fail either to RTM targets or due to auth/session validation timeouts.
+          user_impact: |
+            Users may be repeatedly disconnected and struggle to re-establish stable connections; some are locked out longer than others.
+          manifestation: [edge_gateway.ws_upgrade_fail_rtm, edge_gateway.ws_upgrade_fail_auth, app_api.session_validate_timeout]
+
+      feedback_loops:
+        - id: reconnect_db_saturation_loop
+          desc: |
+            Dropped connections cause mass reconnect attempts; reconnects trigger history reloads; history reloads saturate DB; saturated DB slows auth/session
+            validation and history APIs; slow/failed reconnects lead to more retries and churn.
+
+      flows:
+        - ws_connect_ok_f
+        - ws_connect_fail_rtm_f
+        - ws_connect_fail_db_f
+        - api_fetch_history_ok_f
+        - api_fetch_history_timeout_f
+        - rtm_post_message_f
+      manifestation:
+        - rtm_server.crash
+        - edge_gateway.ws_upgrade_fail_rtm
+        - db_cluster.pool_stats_overload
+        - app_api.history_timeout
+        - app_api.session_validate_timeout
+        - monitor.alert_rtm_down
+
+  assumptions:
+    - "Timeline is compressed to 40 minutes while preserving the causal sequence: RTM crash → reconnect storm → cache-driven bulk history reload → DB saturation → partial mitigation."
+    - "Failure-onset cleanliness: DB/auth/history timeout flows are explicitly suppressed in event 1 (multipliers 0.0) and enabled starting at minute 27; severe DB saturation is likewise suppressed early via db_cluster.pool_stats_overload=0.0 then activated later."
+    - "Failure-phase piecewise volume estimate: minutes 20-27 (7m) ≈ 1180 flow logs/min + ~12 bg logs/min ≈ 8.3k; minutes 27-34 (7m) ≈ 1910 flow logs/min + ~17 bg logs/min ≈ 13.6k; minutes 34-40 (6m) ≈ 1470 flow logs/min + ~12 bg logs/min ≈ 8.9k; plus ~5 one-shot logs."
+    - "Normal-phase estimate (20 min): ~690 logs/min → ~13.8k logs."
+    - "Total scenario estimate: ~44k–50k logs, within the 20k–100k target."
+    - "Visibility rationale: the crash is guaranteed via one-shot; the reconnection symptom is visible via elevated ws upgrade failures; the later DB overload step-change is visible via appearance of db pool overload snapshots plus history/session timeouts and increased 503/504 access logs; mitigation is visible via capacity_added/start markers and reduced multipliers."
+```

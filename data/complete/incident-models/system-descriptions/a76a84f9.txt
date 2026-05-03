@@ -1,0 +1,420 @@
+```yaml
+sys:
+  id: git_hosting_stack_dec22
+  desc: >
+    A Git hosting web application serves git-over-HTTP operations and relies on a
+    highly available fileserver fleet for repository storage. Fileservers are
+    deployed as active/passive pairs managed by Pacemaker/Heartbeat with DRBD
+    replication and STONITH fencing to prevent split-brain. Rack access switches
+    uplink to an aggregation-switch pair using MLAG; disruptive MLAG failover can
+    cause L2 churn and briefly block east/west traffic, impacting cluster heartbeats.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: web_app
+    name: Git Web Application
+    svc: git-web
+    hosts: [web-1, web-2]
+    desc: >
+      Handles user git-over-HTTP requests and issues storage RPC/NFS-like calls to the fileserver fleet.
+      Can be placed into maintenance mode to quickly return 503 without touching storage.
+    to:
+      - dst: fileserver_cluster
+        proto: tcp
+        desc: Repository reads/writes and metadata operations.
+    logs:
+      storage_call:
+        desc: Start of an upstream storage operation issued by the web app.
+        lvl: INFO
+        msg: "storage call op={op} repo={repo} server={fs_host} timeout_ms={timeout_ms} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [read_pack, write_pack, list_refs]}
+          repo: {k: ch, v: [octo/app, octo/lib, octo/site]}
+          timeout_ms: {k: i, v: [800, 6000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            fs_host: {k: ch, v: [fs-a1, fs-b1]}
+          f:
+            fs_host: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+      upstream_timeout:
+        desc: Upstream storage call timed out or could not be completed.
+        lvl: ERROR
+        msg: "storage timeout op={op} repo={repo} waited_ms={waited_ms} server={fs_host} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [read_pack, write_pack, list_refs]}
+          repo: {k: ch, v: [octo/app, octo/lib, octo/site]}
+          waited_ms: {k: i, v: [900, 6000]}
+          fs_host: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+          trace_id: {k: hex, v: 32}
+      access_ok:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: "request completed status=200 method={method} route={route} repo={repo} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/git]}
+          repo: {k: ch, v: [octo/app, octo/lib, octo/site]}
+          dur_ms: {k: i, v: [20, 450]}
+          trace_id: {k: hex, v: 32}
+      access_error:
+        desc: Request failed after upstream storage error/timeout.
+        lvl: WARN
+        msg: "request failed status={status} route={route} repo={repo} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          status: {k: ch, v: [500, 504]}
+          route: {k: ch, v: [/git]}
+          repo: {k: ch, v: [octo/app, octo/lib, octo/site]}
+          dur_ms: {k: i, v: [600, 8000]}
+          trace_id: {k: hex, v: 32}
+      access_maintenance:
+        desc: Request rejected due to maintenance mode.
+        lvl: INFO
+        msg: "request blocked by maintenance status=503 route={route} repo={repo} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          route: {k: ch, v: [/git]}
+          repo: {k: ch, v: [octo/app, octo/lib, octo/site]}
+          dur_ms: {k: i, v: [2, 60]}
+          trace_id: {k: hex, v: 32}
+      maintenance_mode_enabled:
+        desc: Maintenance mode flag applied to the web tier.
+        lvl: WARN
+        msg: "maintenance mode enabled={enabled} reason={reason} actor={actor}"
+        vars:
+          enabled: {k: ch, v: ["true"]}
+          reason: {k: ch, v: [fileserver_recovery, widespread_storage_errors]}
+          actor: {k: ch, v: [ops]}
+      app_health:
+        desc: Periodic application health summary.
+        lvl: INFO
+        msg: "health workers_busy={busy} queue_depth={q} mem_mb={mem}"
+        vars:
+          busy: {k: i, v: [0, 32]}
+          q: {k: i, v: [0, 80]}
+          mem: {k: i, v: [900, 2400]}
+    beh:
+      n:
+        desc: Mostly quiet aside from periodic health summaries.
+        emit:
+          - id: app_health
+            per_min: 0.2
+      f:
+        desc: Health summaries continue during the incident while request outcomes change.
+        emit:
+          - id: app_health
+            per_min: 0.3
+
+  - id: fileserver_cluster
+    name: Fileserver HA Pairs (Pacemaker/Heartbeat/DRBD)
+    svc: repo-storage
+    hosts: [fs-a1, fs-a2, fs-b1, fs-b2]
+    desc: >
+      Active/passive storage nodes replicate via DRBD and coordinate via Heartbeat/Pacemaker.
+      STONITH fencing is used to avoid concurrent mounts; loss of cluster messaging can trigger fencing races.
+    to:
+      - dst: agg_switch_pair
+        proto: l2
+        desc: Cluster traffic and DRBD replication traverse the switching fabric.
+      - dst: web_app
+        proto: tcp
+        desc: Returns storage RPC results and errors back to the web application.
+    logs:
+      storage_op_ok:
+        desc: Storage operation completed on the active node.
+        lvl: INFO
+        msg: "storage op ok op={op} repo={repo} node={node} bytes={bytes} dur_ms={dur_ms}"
+        vars:
+          op: {k: ch, v: [read_pack, write_pack, list_refs]}
+          repo: {k: ch, v: [octo/app, octo/lib, octo/site]}
+          node: {k: ch, v: [fs-a1, fs-b1]}
+          bytes: {k: i, v: [512, 8000000]}
+          dur_ms: {k: i, v: [5, 300]}
+      drbd_replication_ok:
+        desc: Periodic DRBD replication status snapshot.
+        lvl: INFO
+        msg: "drbd status res={res} role={role} peer={peer} link={link} lag_kb={lag_kb}"
+        vars:
+          res: {k: ch, v: [repo-volume-a, repo-volume-b]}
+          role: {k: ch, v: [Primary, Secondary]}
+          peer: {k: ch, v: [fs-a2, fs-b2]}
+          link: {k: ch, v: [Connected]}
+          lag_kb: {k: i, v: [0, 20480]}
+      heartbeat_timeout:
+        desc: Heartbeat messages were not received within the timeout window.
+        lvl: WARN
+        msg: "heartbeat timeout res={res} peer={peer} elapsed_ms={elapsed_ms} local={local}"
+        vars:
+          res: {k: ch, v: [repo-volume-a, repo-volume-b]}
+          peer: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+          elapsed_ms: {k: i, v: [1500, 20000]}
+          local: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+      stonith_sent:
+        desc: STONITH fence request issued to ensure a single active writer.
+        lvl: WARN
+        msg: "stonith request target={target} fence={fence} reason={reason} local={local}"
+        vars:
+          target: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+          fence: {k: ch, v: [ipmi, pdu]}
+          reason: {k: ch, v: [heartbeat_lost, peer_unresponsive]}
+          local: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+      stonith_ack_timeout:
+        desc: Fence acknowledgement was not received (e.g., messages lost during network disruption).
+        lvl: ERROR
+        msg: "stonith ack timeout target={target} fence={fence} waited_ms={waited_ms} local={local}"
+        vars:
+          target: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+          fence: {k: ch, v: [ipmi, pdu]}
+          waited_ms: {k: i, v: [5000, 60000]}
+          local: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+      resource_stop:
+        desc: Pacemaker stops a resource due to fencing uncertainty or role conflicts.
+        lvl: WARN
+        msg: "pacemaker stopping resource={res} node={node} reason={reason}"
+        vars:
+          res: {k: ch, v: [repo-volume-a, repo-volume-b]}
+          node: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+          reason: {k: ch, v: [fencing_pending, role_conflict, quorum_lost]}
+      resource_start:
+        desc: Pacemaker starts resources as part of recovery.
+        lvl: INFO
+        msg: "pacemaker starting resource={res} node={node} mode={mode}"
+        vars:
+          res: {k: ch, v: [repo-volume-a, repo-volume-b]}
+          node: {k: ch, v: [fs-a1, fs-a2, fs-b1, fs-b2]}
+          mode: {k: ch, v: [recover_readonly, promote_primary]}
+    beh:
+      n:
+        desc: Normal cluster health and DRBD replication telemetry.
+        emit:
+          - id: drbd_replication_ok
+            per_min: 0.25
+      f:
+        desc: During network instability the cluster logs heartbeat timeouts, fencing, and stop/start churn.
+        emit:
+          - id: drbd_replication_ok
+            per_min: 0.2
+          - id: heartbeat_timeout
+            per_min: 0.5
+          - id: stonith_sent
+            per_min: 0.3
+          - id: stonith_ack_timeout
+            per_min: 0.1
+          - id: resource_stop
+            per_min: 0.2
+          - id: resource_start
+            per_min: 0.1
+
+  - id: agg_switch_pair
+    name: Aggregation Switch Pair (MLAG)
+    svc: net-agg
+    hosts: [agg-1, agg-2]
+    desc: >
+      Pair of aggregation switches presenting as a single logical device to access switches via MLAG.
+      Under certain conditions, heartbeat loss with links still up causes a disruptive fallback to standalone behavior,
+      triggering spanning-tree reconvergence and traffic interruption.
+    to:
+      - dst: web_app
+        proto: l2
+        desc: Provides L2/L3 connectivity for the web tier.
+      - dst: fileserver_cluster
+        proto: l2
+        desc: Provides L2/L3 connectivity for fileserver HA and DRBD replication.
+    logs:
+      upgrade_step:
+        desc: Maintenance upgrade progress marker on the aggregation switches.
+        lvl: INFO
+        msg: "isssu step={step} switch={sw} target_version={ver}"
+        vars:
+          step: {k: ch, v: [upload_image, set_boot, reload, postcheck]}
+          sw: {k: ch, v: [agg-1, agg-2]}
+          ver: {k: ch, v: [v9.2.1, v9.1.7]}
+      agent_state_dump:
+        desc: Vendor/operator terminates an internal agent to force a state dump.
+        lvl: WARN
+        msg: "terminating agent={agent} for state dump pid={pid} sw={sw}"
+        vars:
+          agent: {k: ch, v: [mlag-agent]}
+          pid: {k: i, v: [1200, 9800]}
+          sw: {k: ch, v: [agg-1]}
+      mlag_heartbeat_missed:
+        desc: MLAG heartbeat missed while the peer link remains electrically up.
+        lvl: WARN
+        msg: "mlag heartbeat missed peer={peer} missed={missed} peer_link={peer_link}"
+        vars:
+          peer: {k: ch, v: [agg-1, agg-2]}
+          missed: {k: i, v: [1, 12]}
+          peer_link: {k: ch, v: [up]}
+      mlag_mode_change:
+        desc: MLAG behavior mode changes (e.g., fallback to standalone).
+        lvl: ERROR
+        msg: "mlag mode change new_mode={mode} reason={reason} sw={sw}"
+        vars:
+          mode: {k: ch, v: [standalone]}
+          reason: {k: ch, v: [peer_heartbeat_timeout_link_up]}
+          sw: {k: ch, v: [agg-2]}
+      stp_topology_change:
+        desc: Spanning-tree reconvergence/topology change chatter.
+        lvl: INFO
+        msg: "stp topology change vlan={vlan} root={root} ports_blocked={ports}"
+        vars:
+          vlan: {k: i, v: [1, 120]}
+          root: {k: ch, v: [agg-1, agg-2]}
+          ports: {k: i, v: [5, 180]}
+      l2_forwarding_pause:
+        desc: L2 forwarding paused/blocked during reconvergence.
+        lvl: ERROR
+        msg: "l2 forwarding paused duration_ms={duration_ms} cause={cause}"
+        vars:
+          duration_ms: {k: i, v: [60000, 120000]}
+          cause: {k: ch, v: [stp_reconvergence_mlag_fallback]}
+      mlag_peer_ok:
+        desc: Periodic MLAG peer health marker.
+        lvl: INFO
+        msg: "mlag peer ok peer={peer} rtt_ms={rtt}"
+        vars:
+          peer: {k: ch, v: [agg-1, agg-2]}
+          rtt: {k: i, v: [1, 8]}
+      rollback_completed:
+        desc: Aggregation switch software rollback completed.
+        lvl: INFO
+        msg: "software rollback completed target_version={ver} sw={sw}"
+        vars:
+          ver: {k: ch, v: [v9.1.7]}
+          sw: {k: ch, v: [agg-1, agg-2]}
+    beh:
+      n:
+        desc: Normal MLAG peer health plus low-rate maintenance upgrade progress logs.
+        emit:
+          - id: mlag_peer_ok
+            per_min: 0.5
+          - id: upgrade_step
+            per_min: 0.05
+      f:
+        desc: During the incident, heartbeat misses and spanning-tree churn are elevated.
+        emit:
+          - id: mlag_heartbeat_missed
+            per_min: 1.0
+          - id: stp_topology_change
+            per_min: 1.0
+
+  - id: ops_control
+    name: Operations Control Plane
+    svc: ops
+    hosts: [ops-1]
+    desc: >
+      Operator actions (paging, toggling maintenance mode, and switch rollback coordination).
+      Emits an incident progress trail.
+    to:
+      - dst: web_app
+        proto: https
+        desc: Sets maintenance-mode configuration on the web tier.
+      - dst: agg_switch_pair
+        proto: ssh
+        desc: Performs switch rollback and verification actions.
+    logs:
+      page_allhands:
+        desc: Paging escalation marker.
+        lvl: WARN
+        msg: "paging group={group} incident={incident}"
+        vars:
+          group: {k: ch, v: [operations_all]}
+          incident: {k: ch, v: [net_mlag_churn_fileserver_ha]}
+      rollback_initiated:
+        desc: Rollback action started for aggregation switches.
+        lvl: INFO
+        msg: "initiating agg rollback target_version={ver} reason={reason}"
+        vars:
+          ver: {k: ch, v: [v9.1.7]}
+          reason: {k: ch, v: [mlag_instability]}
+      recovery_progress:
+        desc: Periodic recovery tracking note while fileserver pairs are being brought back safely.
+        lvl: INFO
+        msg: "recovery progress pairs_remaining={pairs} action={action}"
+        vars:
+          pairs: {k: i, v: [0, 40]}
+          action: {k: ch, v: [identify_last_primary, start_resources, verify_drbd_sync]}
+    beh:
+      n:
+        desc: Mostly quiet outside incident work.
+        emit: []
+      f:
+        desc: Incident progress notes continue while service remains degraded.
+        emit:
+          - id: recovery_progress
+            per_min: 0.8
+            scope: global
+
+tracing:
+  on: true
+  origins: [web_app]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal git-over-HTTP operations with successful storage reads/writes.
+    req:
+      - id: git_request_ok
+        desc: A user git operation completes successfully and reads/writes repository data.
+        rpm: 300.0
+        path: [web_app, fileserver_cluster, web_app]
+        emit: [web_app.storage_call, fileserver_cluster.storage_op_ok, web_app.access_ok]
+        latency_ms: [[5, 20], [5, 120], [10, 260]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: During the incident, many storage calls time out and the site later shifts to maintenance-mode responses.
+    req:
+      - id: git_request_storage_timeout
+        desc: A git operation attempts a storage call but times out due to network/fileserver HA disruption.
+        rpm: 300.0
+        path: [web_app, fileserver_cluster, web_app]
+        emit: [web_app.storage_call, web_app.upstream_timeout, web_app.access_error]
+        latency_ms: [[10, 80], [900, 5500], [20, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: maintenance_request
+        desc: Requests short-circuit in maintenance mode and return 503 quickly.
+        rpm: 300.0
+        path: [web_app]
+        emit: [web_app.access_maintenance]
+        latency_ms: [[2, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Names and host counts are simplified; the model focuses on MLAG-induced L2 churn cascading into Pacemaker/DRBD fencing races.
+  - |
+    A reverse logical edge fileserver_cluster->web_app is included to make request paths that return results to the web tier traversable for log generation.
+  - |
+    Only one primary user flow family (git-over-HTTP) is modeled; other product features are omitted as they do not change the causal core here.
+  - |
+    To keep per-trace routing identity coherent in normal operation, web_app.storage_call.fs_host is constrained in state n to the active nodes
+    that can emit fileserver_cluster.storage_op_ok (fs-a1/fs-b1). In failure it broadens to include either node of a pair.
+  - |
+    web_app.storage_call.timeout_ms is widened to cover multi-second upstream waits seen during the incident so that flow latency hints and timeout logs
+    remain coherent without requiring extreme latency multipliers.
+  - |
+    agg_switch_pair.mlag_heartbeat_missed.peer_link is constrained to [up] so the log unambiguously represents the incident’s edge case:
+    heartbeat missed while the peer link remains physically/electrically up.
+  - |
+    Normal traffic is modeled at ~300 rpm with 3 logs/request (~900 logs/min) to keep volume in-range without unrealistic per-request logging elsewhere.
+  - |
+    Key diagnostic anchors intended to be visible: agg_switch_pair.mlag_heartbeat_missed and agg_switch_pair.stp_topology_change spikes;
+    fileserver_cluster.heartbeat_timeout and fileserver_cluster.stonith_ack_timeout increases; web_app access logs shifting from 200 to 5xx then to 503.
+  - |
+    Estimated total logs over a ~40 minute scenario are ~28k-35k (flows dominate; background switch/HA logs add ~1k-2k), within the 20k..100k target.
+```

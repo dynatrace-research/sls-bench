@@ -1,0 +1,236 @@
+```yaml
+scenario:
+  id: incident_2025_02_17_maps_kartotherian_migration
+  title: "Kartotherian migration: pooled k8s backends unreachable + bare-metal depool triggers overload"
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Kartotherian serves map rendering traffic via ATS -> LVS -> backend pool. During a migration, Kubernetes workers were added to the LVS pool
+    but were missing the required LVS loopback/VIP configuration, so they could not complete connections or pass health checks. Initially user impact
+    was largely avoided because ATS discarded failed origin connection attempts and kept using existing long-lived connections to bare-metal. After several
+    bare-metal nodes were depooled, remaining capacity overloaded, health checks failed, and ATS returned elevated 5xx/timeouts until capacity was repooled
+    and bare-metal was restarted; the underlying k8s reachability issue remained.
+
+  trigger_desc: |
+    Kubernetes workers are pooled into the Kartotherian LVS service without the LVS loopback/VIP configured on those nodes, making them unable to
+    respond to health checks or successfully complete TCP/TLS connections.
+
+  time:
+    total_minutes: 36
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 36}
+
+  phases:
+    n:
+      desc: |
+        Map render requests are handled by the bare-metal Kartotherian hosts through the LVS VIP. Prometheus summaries show only the bare-metal pool
+        active (k8s_targets=0), and ATS transactions are predominantly HTTP 200 with typical latencies.
+      flows: [map_tile_render_bm]
+      manifestation:
+        - prometheus.scrape_summary
+        - kartotherian_bm.krt_access_200
+        - ats_edge.ats_txn_200
+
+    f:
+      desc: |
+        Kubernetes workers are added to the LVS pool but cannot complete connections due to missing LVS loopback/VIP configuration. This creates a latent
+        failure: PyBal marks k8s servers down while pooled, Prometheus shows k8s targets present but k8s_rps=0, and ATS logs discarded origin connection
+        failures—yet most client traffic still succeeds via bare-metal because ATS prefers established connections. Later, bare-metal nodes are depooled,
+        forcing remaining backends into overload; health checks fail and ATS 5xx/timeouts rise sharply. Repooling and restarting the bare-metal backends
+        relieves overload and ends the acute outage, while k8s backends remain unusable.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: ops_console
+          event: |
+            Four Kubernetes workers are pooled into the Kartotherian LVS service. PyBal begins marking the k8s servers down while still pooled, and ATS logs
+            discarded origin connection failures toward the k8s pool, but client-visible errors remain minimal as most traffic continues via bare-metal.
+          why: |
+            The k8s workers are missing the LVS loopback/VIP configuration, so they cannot correctly receive/answer traffic for the VIP. This is directly
+            observable via PyBal CRITICAL backend-down logs, periodic k8s VIP presence check failures, Prometheus showing k8s_targets=4 with k8s_rps=0,
+            and ATS origin-pool connection failures that are discarded (not immediately user-visible).
+          flows: [map_tile_ok_bm]
+          rate_multipliers:
+            map_tile_k8s_connect_fail: 0.0
+            map_tile_bm_overload_timeout: 0.0
+            alertmanager.alert_firing: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_console.ops_change
+              count: 1
+              hosts: [ops01.eqiad.wmnet]
+          manifestation:
+            - ops_console.ops_change
+            - prometheus.scrape_summary
+            - pybal.pybal_backend_down
+            - kartotherian_k8s.vip_presence_check
+            - ats_edge.ats_origin_pool_connect_fail
+
+        - order: 2
+          at_min: 22
+          component: ops_console
+          event: |
+            A configuration/deployment change is applied to Kartotherian on Kubernetes, increasing expected capacity, but connectivity to the LVS service
+            remains broken and no k8s traffic is observed in metrics.
+          why: |
+            The deployment affects pods/service configuration but does not address the missing LVS loopback/VIP on the nodes. The continued k8s_targets=4
+            with k8s_rps=0 is directly observable, along with continued PyBal down marks and k8s VIP presence check failures.
+          flows: [map_tile_ok_bm]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_console.ops_change
+              count: 1
+              hosts: [ops01.eqiad.wmnet]
+          manifestation:
+            - ops_console.ops_change
+            - prometheus.scrape_summary
+            - pybal.pybal_backend_down
+
+        - order: 3
+          at_min: 24
+          component: ops_console
+          event: |
+            Several bare-metal maps hosts are depooled from LVS, reducing healthy capacity. ATS begins to churn more origin connections and a subset of
+            client requests now fail when connection attempts land on the broken k8s pool; remaining bare-metal backends also show rising load signals.
+          why: |
+            Removing bare-metal capacity increases load and increases the need for new/shifted origin connections; with k8s still unreachable, more attempts
+            fail, and some become client-visible. This is observable via the start of ATS client-visible k8s failures, increased ATS discarded origin
+            connection failures, and higher Kartotherian queue metrics.
+          flows: [map_tile_ok_bm, map_tile_k8s_connect_fail, map_tile_bm_overload_timeout]
+          rate_multipliers:
+            map_tile_ok_bm: 0.85
+            map_tile_k8s_connect_fail: 10.0
+            map_tile_bm_overload_timeout: 0.6
+            ats_edge.ats_origin_pool_connect_fail: 2.5
+            kartotherian_bm.krt_worker_queue: 1.4
+          latency_multipliers:
+            map_tile_ok_bm: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: ops_console.ops_change
+              count: 1
+              hosts: [ops01.eqiad.wmnet]
+          manifestation:
+            - ops_console.ops_change
+            - ats_edge.ats_txn_fail_k8s
+            - kartotherian_bm.krt_worker_queue
+            - ats_edge.ats_origin_pool_connect_fail
+
+        - order: 4
+          at_min: 28
+          component: alertmanager
+          event: |
+            The remaining bare-metal backends reach a tipping point: request timeouts rise, PyBal marks additional backends down, and ATS 5xx becomes sustained.
+            Alerts start firing for both elevated ATS backend errors and PyBal backend health critical.
+          why: |
+            Overload drives longer render times and failures; health checks begin failing which further reduces effective capacity, amplifying overload-induced
+            timeouts and ATS 5xx. This is directly observable via ATS 5xx logs, Kartotherian timeout logs, PyBal CRITICAL backend-down logs, and alert firings.
+          flows: [map_tile_ok_bm, map_tile_k8s_connect_fail, map_tile_bm_overload_timeout]
+          rate_multipliers:
+            map_tile_ok_bm: 0.5
+            map_tile_k8s_connect_fail: 25.0
+            map_tile_bm_overload_timeout: 10.0
+            ats_edge.ats_origin_pool_connect_fail: 6.0
+            pybal.pybal_backend_down: 6.0
+            kartotherian_bm.krt_worker_queue: 2.2
+            alertmanager.alert_firing: 10.0
+          latency_multipliers:
+            map_tile_ok_bm: {p50: 1.6, p95: 2.2}
+            map_tile_bm_overload_timeout: {p50: 1.6, p95: 2.3}
+          one_shots: []
+          manifestation:
+            - alertmanager.alert_firing
+            - kartotherian_bm.krt_render_timeout
+            - ats_edge.ats_txn_fail_bm
+            - pybal.pybal_backend_down
+
+        - order: 5
+          at_min: 33
+          component: ops_console
+          event: |
+            Bare-metal capacity is repooled and a rolling restart is performed on the bare-metal Kartotherian hosts. Overload timeouts drop sharply and
+            alert firing stops, while k8s backends remain unusable and still show as down.
+          why: |
+            Restoring bare-metal backends relieves pressure and reduces overload-induced timeouts; this is observable via fewer Kartotherian timeouts and
+            fewer ATS 5xx from bare-metal. The missing LVS loopback/VIP on k8s remains unchanged, so PyBal continues to report k8s down, Prometheus still
+            shows k8s_rps=0, and ATS may still log discarded origin connection failures toward k8s.
+          flows: [map_tile_ok_bm, map_tile_k8s_connect_fail, map_tile_bm_overload_timeout]
+          rate_multipliers:
+            map_tile_ok_bm: 0.95
+            map_tile_k8s_connect_fail: 0.3
+            map_tile_bm_overload_timeout: 0.3
+            ats_edge.ats_origin_pool_connect_fail: 0.7
+            pybal.pybal_backend_down: 2.0
+            kartotherian_bm.krt_worker_queue: 1.05
+            alertmanager.alert_firing: 0.0
+          latency_multipliers:
+            map_tile_ok_bm: {p50: 1.05, p95: 1.15}
+            map_tile_bm_overload_timeout: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: ops_console.ops_change
+              count: 2
+              hosts: [ops01.eqiad.wmnet]
+            - ref: kartotherian_bm.krt_restart
+              count: 4
+              hosts: [maps1005.eqiad.wmnet, maps1006.eqiad.wmnet, maps1007.eqiad.wmnet, maps1010.eqiad.wmnet]
+          manifestation:
+            - ops_console.ops_change
+            - kartotherian_bm.krt_restart
+            - prometheus.scrape_summary
+            - pybal.pybal_backend_down
+
+      steady:
+        - component: kartotherian_k8s
+          condition: |
+            Kubernetes workers remain pooled but cannot complete connections to the LVS VIP due to missing LVS loopback/VIP configuration, so they do not
+            carry production traffic (k8s_rps remains 0).
+          user_impact: |
+            After bare-metal capacity is restored, sustained user impact is gone; ATS generally avoids the broken k8s pool via its connection handling,
+            while operators still see k8s backends as down.
+          manifestation:
+            - prometheus.scrape_summary
+            - kartotherian_k8s.vip_presence_check
+            - pybal.pybal_backend_down
+            - ats_edge.ats_origin_pool_connect_fail
+
+        - component: kartotherian_bm
+          condition: |
+            Bare-metal backends are stabilized after repooling/restarts; remaining elevated queue signals and timeouts are reduced to low levels.
+          user_impact: |
+            Mostly normal map loads, with occasional slow requests or isolated 503/504 if brief load spikes occur.
+          manifestation:
+            - kartotherian_bm.krt_worker_queue
+            - kartotherian_bm.krt_render_timeout
+            - ats_edge.ats_txn_fail_bm
+
+      feedback_loops:
+        - id: capacity_loss_healthcheck_spiral
+          desc: |
+            Depooling reduces capacity, which increases per-host load and latency. Longer response times cause more health-check failures and backend down-marking,
+            which further reduces effective capacity and amplifies overload-induced timeouts and ATS 5xx.
+
+      flows: [map_tile_ok_bm, map_tile_k8s_connect_fail, map_tile_bm_overload_timeout]
+      manifestation:
+        - ops_console.ops_change
+        - prometheus.scrape_summary
+        - pybal.pybal_backend_down
+        - kartotherian_k8s.vip_presence_check
+        - ats_edge.ats_origin_pool_connect_fail
+        - ats_edge.ats_txn_fail_bm
+        - kartotherian_bm.krt_render_timeout
+
+  assumptions:
+    - "Timeline is compressed to 36 minutes while preserving the key ordering: k8s pooled (latent failure) -> k8s deploy (no fix) -> bare-metal depool -> overload/alerts -> repool/restart (acute outage ends) with k8s still broken."
+    - "Normal phase volume estimate: 18 min * 600 rpm * 3 logs/req ≈ 32,400 flow logs; plus background (Prometheus ~18, PyBal ~1, alert noise ~0–1, LVS GC ~3, bm queue metrics ~43) ≈ ~70 logs."
+    - "Failure phase piecewise breakdown (effective rates after multipliers, approximate):"
+    - "  - 18-24 (latent): ok_bm ≈580 rpm; client-visible k8s failures suppressed to 0; overload suppressed to 0; ATS origin-pool connect failures ≈ ~1.2/min across ATS hosts; PyBal CRITICALs present."
+    - "  - 24-28 (capacity reduced): ok_bm ≈493 rpm; client-visible k8s failures begin (≈20 rpm); overload starts low (≈12 rpm); ATS origin-pool connect failures increase; bm queue metrics elevated."
+    - "  - 28-33 (outage): overload timeouts dominate (≈200 rpm); client-visible k8s failures increase (≈50 rpm); PyBal CRITICALs and alerts are frequent."
+    - "  - 33-36 (mitigation): ok_bm ≈551 rpm; overload reduced (≈6 rpm); client-visible k8s failures drop to near-zero (≈0.6 rpm); alerts stop; PyBal still reports some backends down (primarily k8s)."
+    - "One-shots per event: event1=1 (pool k8s), event2=1 (deploy), event3=1 (pool_out bm), event4=0, event5=2 ops changes + 4 host restarts."
+    - "Visibility rationale: Prometheus scrape_summary appears every minute; PyBal backend-down is elevated and amplified during the tipping-point window; ATS discarded origin pool connection failures provide early evidence of k8s reachability issues without requiring early user-visible 5xx; ATS/Kartotherian timeout logs become frequent during the outage window."
+    - "Total estimated logs: ~32k normal + ~29–31k failure flow logs + ~0.5–2k background/metrics/queue/vip checks + one-shots => ~62k–66k (within 20k–100k)."
+```

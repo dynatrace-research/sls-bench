@@ -1,0 +1,593 @@
+```yaml
+sys:
+  id: cirrussearch_eqiad_opensearch
+  desc: >
+    CirrusSearch serves MediaWiki search queries by routing them to OpenSearch clusters in multiple datacenters.
+    A traffic router can depool/repool a datacenter to shift user traffic away during incidents or maintenance.
+    The incident modeled here is a split-brain/leader-loss condition in the EQIAD OpenSearch cluster after a rolling restart
+    of a master-eligible node that rejoined with stale on-disk cluster state, causing API failures (503/no cluster leader).
+
+states: {n: normal, f: failure}
+
+components:
+  - id: traffic_router
+    name: Traffic Router / Pooling
+    svc: traffic-router
+    hosts: [router1]
+    desc: Routes MediaWiki search traffic to a datacenter and supports depool/repool actions.
+    to:
+      - dst: search_gateway
+        proto: https
+        desc: Forwards requests to a CirrusSearch API frontend in the selected datacenter.
+    logs:
+      pool_state_eqiad_pooled:
+        desc: Periodic record that EQIAD is pooled (traffic eligible).
+        lvl: INFO
+        msg: "pool state eqiad=true codfw=true"
+        vars: {}
+      pool_state_eqiad_depooled:
+        desc: Periodic record that EQIAD is depooled (traffic not eligible).
+        lvl: INFO
+        msg: "pool state eqiad=false codfw=true"
+        vars: {}
+      pool_change:
+        desc: Operator depools EQIAD during incident mitigation.
+        lvl: WARN
+        msg: "pool change dc=eqiad pooled=false actor=inflatador reason=incident_mitigation"
+        vars: {}
+      repool_change:
+        desc: Operator repools EQIAD after recovery.
+        lvl: WARN
+        msg: "pool change dc=eqiad pooled=true actor=inflatador reason=restore_service"
+        vars: {}
+    beh:
+      n:
+        desc: Router periodically emits pooled state for observability.
+        emit:
+          - id: pool_state_eqiad_pooled
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Router continues emitting pooled state during incidents; which state log is active is controlled by scenario multipliers.
+        emit:
+          - id: pool_state_eqiad_pooled
+            per_min: 1.0
+            scope: global
+          - id: pool_state_eqiad_depooled
+            per_min: 1.0
+            scope: global
+
+  - id: search_gateway
+    name: CirrusSearch API Gateway
+    svc: cirrussearch-api
+    hosts: [cirrussearch-api1, cirrussearch-api2]
+    desc: Receives MediaWiki search requests and queries OpenSearch in the routed datacenter.
+    to:
+      - dst: opensearch_eqiad
+        proto: https
+        desc: Sends search requests to the EQIAD OpenSearch cluster.
+      - dst: opensearch_codfw
+        proto: https
+        desc: Sends search requests to the CODFW OpenSearch cluster.
+    logs:
+      req_in_eqiad:
+        desc: Incoming MediaWiki search request routed to EQIAD.
+        lvl: INFO
+        msg: "request GET /w/api.php q={q} req_id={req_id} dc=eqiad"
+        vars:
+          q: {k: str, v: "search term"}
+          req_id: {k: hex, v: 16}
+      req_in_codfw:
+        desc: Incoming MediaWiki search request routed to CODFW.
+        lvl: INFO
+        msg: "request GET /w/api.php q={q} req_id={req_id} dc=codfw"
+        vars:
+          q: {k: str, v: "search term"}
+          req_id: {k: hex, v: 16}
+      upstream_ok_eqiad:
+        desc: Successful upstream OpenSearch (EQIAD) response observed by the gateway (attempt-level).
+        lvl: INFO
+        msg: "opensearch eqiad responded status=200 upstream_id={upstream_id} dur_ms={dur_ms}"
+        vars:
+          upstream_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 300]}
+      upstream_ok_codfw:
+        desc: Successful upstream OpenSearch (CODFW) response observed by the gateway (attempt-level).
+        lvl: INFO
+        msg: "opensearch codfw responded status=200 upstream_id={upstream_id} dur_ms={dur_ms}"
+        vars:
+          upstream_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 350]}
+      upstream_err_503_eqiad:
+        desc: Upstream OpenSearch EQIAD error observed by the gateway (leader loss / timeouts, attempt-level).
+        lvl: ERROR
+        msg: "opensearch eqiad error status=503 err={err} upstream_id={upstream_id} dur_ms={dur_ms}"
+        vars:
+          err: {k: ch, v: [no_cluster_manager, timeout_waiting_for_cluster_state]}
+          upstream_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [800, 7000]}
+      retrying_eqiad:
+        desc: Gateway retry marker for an upstream attempt to EQIAD.
+        lvl: WARN
+        msg: "retrying opensearch eqiad attempt={attempt} upstream_id={upstream_id} backoff_ms={backoff_ms}"
+        vars:
+          attempt: {k: i, v: [2, 3]}
+          upstream_id: {k: hex, v: 16}
+          backoff_ms: {k: i, v: [50, 600]}
+      req_done_200:
+        desc: Client-facing request handling completed successfully.
+        lvl: INFO
+        msg: "response status=200 req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [10, 500]}
+      req_done_503_eqiad:
+        desc: Client-facing request handling completed with upstream failure for EQIAD-routed traffic.
+        lvl: WARN
+        msg: "response status=503 req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [900, 9000]}
+      worker_stats:
+        desc: Periodic worker health snapshot from the gateway.
+        lvl: INFO
+        msg: "worker stats in_flight={in_flight} p95_ms={p95_ms}"
+        vars: {}
+        state_vars:
+          n:
+            in_flight: {k: i, v: [0, 80]}
+            p95_ms: {k: i, v: [20, 400]}
+          f:
+            in_flight: {k: i, v: [10, 220]}
+            p95_ms: {k: i, v: [80, 9000]}
+    beh:
+      n:
+        desc: Gateways emit periodic worker stats during normal request processing.
+        emit:
+          - id: worker_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During incidents, worker stats reflect elevated in-flight and latency due to upstream instability and retries.
+        emit:
+          - id: worker_stats
+            per_min: 1.0
+            scope: per_host
+
+  - id: opensearch_eqiad
+    name: OpenSearch Cluster (EQIAD - core nodes)
+    svc: opensearch
+    hosts: [cirrussearch1101, cirrussearch1102, cirrussearch1103, cirrussearch1104]
+    desc: >
+      EQIAD OpenSearch core nodes; leader loss prevents serving API requests.
+      Node cirrussearch1100 is modeled separately to allow stop/start suppression of its background logs.
+    to: []
+    logs:
+      cluster_health:
+        desc: Periodic cluster health snapshot as observed by a core node.
+        lvl: INFO
+        msg: "cluster health status={status} active_nodes={active} master={master}"
+        vars:
+          active: {k: i, v: [3, 5]}
+          master: {k: ch, v: [cirrussearch1100, cirrussearch1101, cirrussearch1102, cirrussearch1103, cirrussearch1104]}
+        state_vars:
+          n:
+            status: {k: ch, v: [green, yellow]}
+          f:
+            status: {k: ch, v: [yellow, red]}
+      no_cluster_manager:
+        desc: Node cannot discover/elect a cluster-manager (leader) and keeps retrying.
+        lvl: WARN
+        msg: "cluster_manager not discovered yet, retrying; node={node} elapsed_s={elapsed_s}"
+        vars:
+          node: {k: ch, v: [cirrussearch1101, cirrussearch1102, cirrussearch1103, cirrussearch1104]}
+          elapsed_s: {k: i, v: [5, 180]}
+      cluster_manager_elected:
+        desc: A cluster-manager is elected after quorum is restored.
+        lvl: INFO
+        msg: "elected cluster_manager node={node} term={term}"
+        vars:
+          node: {k: ch, v: [cirrussearch1101, cirrussearch1102, cirrussearch1103, cirrussearch1104]}
+          term: {k: i, v: [100, 250]}
+    beh:
+      n:
+        desc: Cluster emits low-rate health snapshots under normal conditions.
+        emit:
+          - id: cluster_health
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: During leader loss symptoms, core nodes emit repeated leader-discovery warnings and health snapshots.
+        emit:
+          - id: cluster_health
+            per_min: 0.2
+            scope: per_host
+          - id: no_cluster_manager
+            per_min: 3.0
+            scope: per_host
+
+  - id: opensearch_eqiad_node1100
+    name: OpenSearch Node cirrussearch1100 (EQIAD - master eligible)
+    svc: opensearch
+    hosts: [cirrussearch1100]
+    desc: >
+      The restarted master-eligible node that returns with stale on-disk cluster state.
+      It is separately modeled so that stopping OpenSearch on this host suppresses its background warnings until it is started again.
+    to: []
+    logs:
+      cluster_health:
+        desc: Periodic cluster health snapshot emitted by cirrussearch1100 while running.
+        lvl: INFO
+        msg: "cluster health status={status} active_nodes={active} master={master}"
+        vars:
+          active: {k: i, v: [3, 5]}
+          master: {k: ch, v: [cirrussearch1100, cirrussearch1101, cirrussearch1102, cirrussearch1103, cirrussearch1104]}
+        state_vars:
+          n:
+            status: {k: ch, v: [green, yellow]}
+          f:
+            status: {k: ch, v: [yellow, red]}
+      no_cluster_manager:
+        desc: cirrussearch1100 cannot discover/elect a cluster-manager and keeps retrying.
+        lvl: WARN
+        msg: "cluster_manager not discovered yet, retrying; node=cirrussearch1100 elapsed_s={elapsed_s}"
+        vars:
+          elapsed_s: {k: i, v: [5, 180]}
+      cluster_state_mismatch:
+        desc: Join attempt sees mismatched persisted cluster state UUIDs (stale data / split-brain symptom).
+        lvl: WARN
+        msg: "cluster state mismatch on join; node=cirrussearch1100 local_uuid={local_uuid} remote_uuid={remote_uuid}"
+        vars:
+          local_uuid: {k: uuid, v: null}
+          remote_uuid: {k: uuid, v: null}
+      node_start:
+        desc: OpenSearch process starts on cirrussearch1100.
+        lvl: INFO
+        msg: "starting OpenSearch node=cirrussearch1100 data_path={data_path}"
+        vars:
+          data_path: {k: ch, v: [/srv/opensearch]}
+      node_stop:
+        desc: OpenSearch process stops on cirrussearch1100.
+        lvl: INFO
+        msg: "stopping OpenSearch node=cirrussearch1100 reason=operator_stop"
+        vars: {}
+      data_wipe:
+        desc: Data directory is removed to force a clean join.
+        lvl: WARN
+        msg: "removed data path {data_path} on node=cirrussearch1100"
+        vars:
+          data_path: {k: ch, v: [/srv/opensearch]}
+      node_join:
+        desc: Node successfully joins the cluster after clean start.
+        lvl: INFO
+        msg: "node joined cluster node=cirrussearch1100 cluster_uuid={cluster_uuid}"
+        vars:
+          cluster_uuid: {k: uuid, v: null}
+    beh:
+      n:
+        desc: Node emits low-rate health snapshots under normal conditions.
+        emit:
+          - id: cluster_health
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: During leader loss/split-brain symptoms, this node emits leader-discovery and join-mismatch warnings while running.
+        emit:
+          - id: cluster_health
+            per_min: 0.2
+            scope: per_host
+          - id: no_cluster_manager
+            per_min: 3.0
+            scope: per_host
+          - id: cluster_state_mismatch
+            per_min: 1.0
+            scope: per_host
+
+  - id: opensearch_codfw
+    name: OpenSearch Cluster (CODFW)
+    svc: opensearch
+    hosts: [cirrussearch2100, cirrussearch2101, cirrussearch2102, cirrussearch2103, cirrussearch2104]
+    desc: CODFW OpenSearch cluster continues to serve traffic and absorbs load when EQIAD is depooled.
+    to: []
+    logs:
+      cluster_health:
+        desc: Periodic cluster health snapshot.
+        lvl: INFO
+        msg: "cluster health status={status} active_nodes={active} master={master}"
+        vars:
+          status: {k: ch, v: [green, yellow]}
+          active: {k: i, v: [4, 5]}
+          master: {k: ch, v: [cirrussearch2100, cirrussearch2101, cirrussearch2102, cirrussearch2103, cirrussearch2104]}
+    beh:
+      n:
+        desc: Cluster emits low-rate health snapshots.
+        emit:
+          - id: cluster_health
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: Cluster remains healthy while serving elevated traffic.
+        emit:
+          - id: cluster_health
+            per_min: 0.3
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring / Alerting
+    svc: monitoring
+    hosts: [mon1]
+    desc: Probes OpenSearch EQIAD and alerts when search backend is unavailable.
+    to:
+      - dst: opensearch_eqiad
+        proto: https
+        desc: Periodic probes to EQIAD OpenSearch endpoints.
+    logs:
+      probe_ok:
+        desc: Successful probe response.
+        lvl: INFO
+        msg: "probe opensearch_eqiad OK status=200 latency_ms={lat_ms}"
+        vars:
+          lat_ms: {k: i, v: [5, 120]}
+      probe_fail:
+        desc: Failed probe response (leader loss).
+        lvl: WARN
+        msg: "probe opensearch_eqiad FAIL status=503 err={err} latency_ms={lat_ms}"
+        vars:
+          err: {k: ch, v: [no_cluster_manager]}
+          lat_ms: {k: i, v: [800, 5000]}
+      alert_search_timeouts:
+        desc: Alert fired for elevated failures/timeouts to EQIAD backend.
+        lvl: CRITICAL
+        msg: "ALERT SearchBackendUnavailable dc=eqiad error=upstream_503_no_cluster_manager firing=true"
+        vars: {}
+      scrape:
+        desc: Periodic scrape of gateway metrics (background noise).
+        lvl: INFO
+        msg: "scrape search_gateway metrics success=true targets={targets}"
+        vars:
+          targets: {k: i, v: [10, 20]}
+    beh:
+      n:
+        desc: Monitoring scrapes service metrics routinely.
+        emit:
+          - id: scrape
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Monitoring continues scraping during incidents.
+        emit:
+          - id: scrape
+            per_min: 0.5
+            scope: global
+
+  - id: ops_tooling
+    name: Operator Tooling / SAL Notes
+    svc: ops-tooling
+    hosts: [ops1]
+    desc: Represents operator-driven actions and recorded notes during the incident response.
+    to:
+      - dst: traffic_router
+        proto: https
+        desc: Operators change pooling state via router controls.
+      - dst: opensearch_eqiad_node1100
+        proto: tcp
+        desc: Operators execute commands on cirrussearch1100.
+    logs:
+      rolling_restart_step:
+        desc: A step in the rolling restart touches a specific host.
+        lvl: INFO
+        msg: "rolling restart step host=cirrussearch1100 action=restart svc=opensearch"
+        vars: {}
+      investigation_uuid:
+        desc: Operator records observed cluster UUID mismatch evidence.
+        lvl: INFO
+        msg: "investigation: host=cirrussearch1100 local_cluster_uuid={local_uuid} cluster_uuid={remote_uuid}"
+        vars:
+          local_uuid: {k: uuid, v: null}
+          remote_uuid: {k: uuid, v: null}
+      cmd_depool_eqiad:
+        desc: Operator depools EQIAD in the router.
+        lvl: INFO
+        msg: "operator command 'depool eqiad' target=traffic_router"
+        vars: {}
+      cmd_repool_eqiad:
+        desc: Operator repools EQIAD in the router.
+        lvl: INFO
+        msg: "operator command 'repool eqiad' target=traffic_router"
+        vars: {}
+      cmd_stop_opensearch:
+        desc: Operator stops OpenSearch on the bad node.
+        lvl: INFO
+        msg: "operator command 'systemctl stop opensearch' target=cirrussearch1100"
+        vars: {}
+      cmd_wipe_datadir:
+        desc: Operator wipes the OpenSearch data directory on the bad node.
+        lvl: INFO
+        msg: "operator command 'rm -rf /srv/opensearch/*' target=cirrussearch1100"
+        vars: {}
+      cmd_start_opensearch:
+        desc: Operator starts OpenSearch on the node after wipe.
+        lvl: INFO
+        msg: "operator command 'systemctl start opensearch' target=cirrussearch1100"
+        vars: {}
+      sal_heartbeat:
+        desc: Low-rate operational note/heartbeat (noise).
+        lvl: INFO
+        msg: "SAL note: {note}"
+        vars:
+          note: {k: ch, v: ["rolling restart in progress", "incident mitigation ongoing"]}
+    beh:
+      n:
+        desc: Occasional operational notes.
+        emit:
+          - id: sal_heartbeat
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Occasional operational notes.
+        emit:
+          - id: sal_heartbeat
+            per_min: 0.05
+            scope: global
+
+tracing:
+  on: true
+  origins: [search_gateway, monitoring]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      MediaWiki search traffic is served by CirrusSearch gateways, which query the local OpenSearch cluster for the selected datacenter.
+      Monitoring probes EQIAD OpenSearch and typically succeeds.
+    req:
+      - id: search_query_eqiad_ok
+        desc: User search query served via EQIAD; gateway receives 200 from OpenSearch and returns 200.
+        rpm: 140.0
+        path: [search_gateway, opensearch_eqiad]
+        emit: [search_gateway.req_in_eqiad, search_gateway.upstream_ok_eqiad, search_gateway.req_done_200]
+        latency_ms: [[1, 3], [25, 120], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: search_query_codfw_ok
+        desc: User search query served via CODFW; gateway receives 200 from OpenSearch and returns 200.
+        rpm: 90.0
+        path: [search_gateway, opensearch_codfw]
+        emit: [search_gateway.req_in_codfw, search_gateway.upstream_ok_codfw, search_gateway.req_done_200]
+        latency_ms: [[1, 3], [30, 140], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: health_check_eqiad_ok
+        desc: Monitoring probe to EQIAD OpenSearch succeeds.
+        rpm: 6.0
+        path: [monitoring, opensearch_eqiad]
+        emit: [monitoring.probe_ok]
+        latency_ms: [[10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      EQIAD OpenSearch experiences leader loss/split-brain symptoms. Gateways emit both client-facing 503 outcomes for EQIAD-routed
+      searches and separate upstream-attempt logs (with their own upstream IDs) representing internal retries/attempts to EQIAD.
+      After EQIAD is depooled, user traffic shifts to CODFW while monitoring continues to probe EQIAD.
+      After the bad node is cleaned and EQIAD is repooled, EQIAD traffic returns via a success flow variant within the failure phase.
+    req:
+      - id: search_query_eqiad_fail
+        desc: Internal gateway upstream call attempts targeting EQIAD fail due to missing cluster-manager; attempts are retried up to 3 times.
+        rpm: 140.0
+        path: [search_gateway, opensearch_eqiad]
+        emit: [search_gateway.upstream_err_503_eqiad]
+        latency_ms: [[2000, 6500]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [search_gateway.retrying_eqiad]
+          backoff_ms: [[100, 300], [200, 600]]
+        trace: true
+      - id: search_query_eqiad_client_503
+        desc: Client-facing gateway log lines for EQIAD-routed searches that return 503.
+        rpm: 140.0
+        path: [search_gateway, opensearch_eqiad]
+        emit: [search_gateway.req_in_eqiad, search_gateway.req_done_503_eqiad]
+        latency_ms: [[1, 3], [900, 9000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: search_query_eqiad_ok_recovered
+        desc: After recovery and repooling, user search query served successfully via EQIAD (modeled within failure phase).
+        rpm: 140.0
+        path: [search_gateway, opensearch_eqiad]
+        emit: [search_gateway.req_in_eqiad, search_gateway.upstream_ok_eqiad, search_gateway.req_done_200]
+        latency_ms: [[1, 3], [25, 140], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: search_query_codfw_ok
+        desc: User search query served successfully by CODFW while absorbing shifted traffic.
+        rpm: 90.0
+        path: [search_gateway, opensearch_codfw]
+        emit: [search_gateway.req_in_codfw, search_gateway.upstream_ok_codfw, search_gateway.req_done_200]
+        latency_ms: [[1, 3], [35, 180], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: health_check_eqiad_fail
+        desc: Monitoring probe to EQIAD OpenSearch fails with 503/no cluster manager.
+        rpm: 6.0
+        path: [monitoring, opensearch_eqiad]
+        emit: [monitoring.probe_fail]
+        latency_ms: [[900, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: health_check_eqiad_ok
+        desc: Monitoring probe to EQIAD OpenSearch succeeds (used during partial recovery within the failure phase).
+        rpm: 6.0
+        path: [monitoring, opensearch_eqiad]
+        emit: [monitoring.probe_ok]
+        latency_ms: [[10, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |-
+    Repair: changed flows.f.health_check_eqiad_ok.rpm from 0.2 to 6.0, and rely on scenario multipliers to keep it at 0.0 from f.start_min
+    until recovery; this prevents early probe_ok logs while still allowing probes to shift from FAIL->OK later without inflating total probe volume.
+  - |-
+    Names are genericized; "OpenSearch cluster-manager" corresponds to the leader/master role mentioned in the post-mortem.
+  - |-
+    Node cirrussearch1100 is modeled as a separate component (opensearch_eqiad_node1100) so that after a stop action its failure-state
+    background emissions can be driven to 0 and later restored on start.
+  - |-
+    Router periodic pooling-state snapshots are modeled as two distinct background logs (pooled vs depooled) and scenario multipliers
+    ensure only one is active at a time, preventing contradictory snapshots during depool/repool transitions.
+  - |-
+    To avoid modeling the same user request lifecycle twice with an uncorrelatable req_id, the gateway emits two distinct flow families in failure:
+    (a) client-facing search requests (search_query_eqiad_client_503) identified by req_id, and
+    (b) internal upstream attempt activity (search_query_eqiad_fail) identified by upstream_id and retry markers.
+    These IDs are intentionally not correlatable in this simplified model.
+  - |-
+    Recovery and repooling are modeled within the failure phase by adding a failure-state success flow (search_query_eqiad_ok_recovered)
+    that is suppressed early and enabled only after the repool event; this keeps the required two-phase structure while capturing the incident resolution.
+  - |-
+    The split-brain mechanism is represented by EQIAD core-node leader warnings (opensearch_eqiad.no_cluster_manager),
+    the bad node's join mismatch warnings (opensearch_eqiad_node1100.cluster_state_mismatch), and gateway-observed upstream 503s plus monitoring probe failures.
+  - |-
+    OpenSearch per-query logs are not modeled; user-visible failures are represented by gateway client-facing 503 logs and monitoring probes/alerts.
+  - |-
+    Cluster health snapshots always report a concrete master node name (never "none"); leaderless conditions are modeled via explicit
+    no_cluster_manager warnings and gateway/probe 503s, preventing accidental leaderless signals during healthy/recovered moments.
+  - |-
+    Traffic volume is scaled to keep total logs in the 20k..100k target range while keeping key signals frequent enough to be visible.
+  - |-
+    Estimated total volume at modeled rates over the scenario is ~30k logs (dominant contributor is per-request gateway logs, plus internal upstream-attempt logs during the failure onset).
+```

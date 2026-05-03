@@ -1,0 +1,520 @@
+```yaml
+sys:
+  id: circleci_build_queue_platform
+  desc: >
+    A CI/CD platform receives GitHub webhooks and customer API traffic, enqueues builds into a database-backed scheduler queue,
+    and continuously dequeues runnable builds onto a builder fleet. Queueing must enforce customer plan capacity and usage rules,
+    so scheduler operations are DB-heavy. This incident models a webhook delivery pause followed by a sustained surge that pushes
+    the shared database into lock/contention, stalling dequeueing and creating a large backlog that requires operational intervention and queue draining.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: edge-lb
+    hosts: [lb1, lb2]
+    desc: Terminates inbound HTTPS, routes requests to the API service, and can be reconfigured to throttle/limit traffic.
+    to:
+      - dst: api_service
+        proto: https
+        desc: Routes GitHub webhook and customer API traffic to the API service.
+    logs:
+      access:
+        desc: HTTP access log emitted after a request completes at the LB (status and dur_ms are final).
+        lvl: INFO
+        msg: "{method} {route} -> {status} upstream={upstream} req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/hooks/github, /api/v2/me, /api/v2/project]}
+          status: {k: ch, v: [200, 500, 503, 504]}
+          upstream: {k: ch, v: [api_service, none]}
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [1, 15000]}
+      capacity_throttle:
+        desc: Operator-driven LB throttling intended to reduce inbound hook pressure.
+        lvl: WARN
+        msg: "Adjusted LB capacity mode=throttled max_inflight={max_inflight} note=protect_db"
+        vars:
+          max_inflight: {k: i, v: [50, 300]}
+      capacity_rollback:
+        desc: Operator-driven rollback of prior LB throttling to restore customer access.
+        lvl: WARN
+        msg: "Adjusted LB capacity mode=normal max_inflight={max_inflight} note=rollback"
+        vars:
+          max_inflight: {k: i, v: [500, 2000]}
+    beh:
+      n: {desc: No periodic LB background logs are modeled., emit: []}
+      f: {desc: No periodic LB background logs are modeled., emit: []}
+
+  - id: api_service
+    name: API Service
+    svc: circle-api
+    hosts: [api1, api2, api3]
+    desc: Accepts GitHub webhooks and customer API requests, and writes build queue records to the database.
+    to:
+      - dst: postgres_db
+        proto: jdbc
+        desc: Performs enqueue writes and DB reads for customer API requests.
+      - dst: edge_lb
+        proto: https
+        desc: Returns HTTP responses to the load balancer after request completion.
+    logs:
+      webhook_received:
+        desc: Records receipt of a GitHub webhook delivery.
+        lvl: INFO
+        msg: "Received GitHub hook delivery={delivery_id} event={gh_event} repo={repo}"
+        vars:
+          delivery_id: {k: uuid, v: null}
+          gh_event: {k: ch, v: [push, pull_request]}
+          repo: {k: ch, v: [acme/api, acme/web, beta/mobile, gamma/data]}
+      enqueue_ok:
+        desc: Build was successfully enqueued into the DB-backed run queue.
+        lvl: INFO
+        msg: "Enqueued build build_id={build_id} repo={repo} queue={queue} db_ms={db_ms}"
+        vars:
+          build_id: {k: uuid, v: null}
+          repo: {k: ch, v: [acme/api, acme/web, beta/mobile, gamma/data]}
+          queue: {k: ch, v: [run]}
+          db_ms: {k: i, v: [5, 3000]}
+      enqueue_timeout:
+        desc: Enqueue failed due to DB timeout/lock contention.
+        lvl: ERROR
+        msg: "Failed to enqueue build repo={repo} error=db_timeout db_ms={db_ms}"
+        vars:
+          repo: {k: ch, v: [acme/api, acme/web, beta/mobile, gamma/data]}
+          db_ms: {k: i, v: [500, 8000]}
+      api_req_ok:
+        desc: Successful customer API request with DB time included.
+        lvl: INFO
+        msg: "HTTP {method} {endpoint} -> 200 user={user_id} db_ms={db_ms} dur_ms={dur_ms}"
+        vars:
+          method: {k: ch, v: [GET]}
+          endpoint: {k: ch, v: [/api/v2/me, /api/v2/project]}
+          user_id: {k: i, v: [1000, 9000]}
+          db_ms: {k: i, v: [1, 4000]}
+          dur_ms: {k: i, v: [5, 12000]}
+      api_req_error:
+        desc: Failed customer API request, typically due to DB unavailability.
+        lvl: ERROR
+        msg: "HTTP {method} {endpoint} -> {status} user={user_id} err={err} db_ms={db_ms} dur_ms={dur_ms}"
+        vars:
+          method: {k: ch, v: [GET]}
+          endpoint: {k: ch, v: [/api/v2/me, /api/v2/project]}
+          status: {k: i, v: [500, 503]}
+          user_id: {k: i, v: [1000, 9000]}
+          err: {k: ch, v: [db_timeout, db_overloaded]}
+          db_ms: {k: i, v: [100, 8000]}
+          dur_ms: {k: i, v: [100, 12000]}
+    beh:
+      n: {desc: No important API background logs are modeled., emit: []}
+      f: {desc: No important API background logs are modeled., emit: []}
+
+  - id: scheduler_service
+    name: Build Scheduler
+    svc: build-scheduler
+    hosts: [sched1, sched2]
+    desc: Maintains a DB-backed queue with plan/usage constraints; dequeues runnable builds and dispatches them to builders.
+    to:
+      - dst: postgres_db
+        proto: jdbc
+        desc: Reads/writes queue state, plan usage, and build transitions.
+      - dst: builder_fleet
+        proto: https
+        desc: Dispatches build start commands to builders.
+    logs:
+      dequeue_ok:
+        desc: Successfully dequeued a build for execution.
+        lvl: INFO
+        msg: "Dequeued build build_id={build_id} db_ms={db_ms} run_q={run_q} usage_q={usage_q}"
+        vars:
+          build_id: {k: uuid, v: null}
+          db_ms: {k: i, v: [2, 8000]}
+          run_q: {k: i, v: [0, 20000]}
+          usage_q: {k: i, v: [0, 30000]}
+      dequeue_timeout:
+        desc: Dequeue poll attempt timed out due to DB contention/locks.
+        lvl: WARN
+        msg: "Dequeue poll timed out tx={tx_id} timeout_ms={timeout_ms} run_q={run_q} usage_q={usage_q}"
+        vars:
+          tx_id: {k: hex, v: 12}
+          timeout_ms: {k: i, v: [500, 8000]}
+          run_q: {k: i, v: [0, 20000]}
+          usage_q: {k: i, v: [0, 30000]}
+      db_retry:
+        desc: Retry marker when the scheduler retries a dequeue transaction.
+        lvl: WARN
+        msg: "Retrying dequeue tx={tx_id} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          tx_id: {k: hex, v: 12}
+          attempt: {k: i, v: [2, 2]}
+          backoff_ms: {k: i, v: [100, 1500]}
+      queue_stats:
+        desc: Periodic queue health snapshot used for dashboards/alerts (rates are approximate, not exact accounting).
+        lvl: INFO
+        msg: "Queue stats run_q={run_q} usage_q={usage_q} dequeue_rps={dequeue_rps} reenqueue_rps={reenqueue_rps}"
+        vars: {}
+        state_vars:
+          n:
+            run_q: {k: i, v: [0, 2000]}
+            usage_q: {k: i, v: [0, 4000]}
+            dequeue_rps: {k: f, v: [1.0, 3.5]}
+            reenqueue_rps: {k: f, v: [0.0, 0.05]}
+          f:
+            run_q: {k: i, v: [0, 20000]}
+            usage_q: {k: i, v: [0, 30000]}
+            dequeue_rps: {k: f, v: [0.0, 3.5]}
+            reenqueue_rps: {k: f, v: [0.0, 3.0]}
+      queue_pressure:
+        desc: An elevated-pressure snapshot emitted during severe backlog/low dequeue throughput.
+        lvl: WARN
+        msg: "Queue pressure run_q={run_q} usage_q={usage_q} dequeue_rps={dequeue_rps} note={note}"
+        vars:
+          run_q: {k: i, v: [5000, 20000]}
+          usage_q: {k: i, v: [8000, 30000]}
+          dequeue_rps: {k: f, v: [0.0, 0.5]}
+          note: {k: ch, v: [dequeue_slow, backlog_growing]}
+      reenqueue_build:
+        desc: A build was re-enqueued after an infrastructure/scheduler disruption.
+        lvl: WARN
+        msg: "Re-enqueued build build_id={build_id} reason={reason}"
+        vars:
+          build_id: {k: uuid, v: null}
+          reason: {k: ch, v: [infra_failure, db_failover, runner_lost]}
+    beh:
+      n:
+        desc: Periodic queue statistics and rare re-enqueue noise.
+        emit:
+          - id: queue_stats
+            per_min: 1.0
+            scope: per_host
+          - id: reenqueue_build
+            per_min: 0.1
+            scope: per_host
+      f:
+        desc: Queue stats continue; re-enqueue rate can spike during failover/stepdown and exacerbate DB load.
+        emit:
+          - id: queue_stats
+            per_min: 1.0
+            scope: per_host
+          - id: queue_pressure
+            per_min: 1.0
+            scope: per_host
+          - id: reenqueue_build
+            per_min: 30.0
+            scope: per_host
+
+  - id: postgres_db
+    name: Primary Database (PostgreSQL)
+    svc: postgres
+    hosts: [db1, db2]
+    desc: Shared OLTP database storing queue state, plan usage, and build transitions; becomes the contention point under surge.
+    to:
+      - dst: scheduler_service
+        proto: jdbc
+        desc: Serves scheduler queries and returns results (modeled as a logical response edge for path connectivity).
+      - dst: api_service
+        proto: jdbc
+        desc: Serves API queries and returns results (modeled as a logical response edge for path connectivity).
+    logs:
+      pool_stats:
+        desc: Periodic connection/lock pressure snapshot.
+        lvl: INFO
+        msg: "DB pool active={active} waiting={waiting} locks_waiting={locks_waiting} cpu_pct={cpu_pct}"
+        vars: {}
+        state_vars:
+          n:
+            active: {k: i, v: [10, 80]}
+            waiting: {k: i, v: [0, 5]}
+            locks_waiting: {k: i, v: [0, 2]}
+            cpu_pct: {k: i, v: [5, 60]}
+          f:
+            active: {k: i, v: [10, 150]}
+            waiting: {k: i, v: [0, 250]}
+            locks_waiting: {k: i, v: [0, 120]}
+            cpu_pct: {k: i, v: [5, 100]}
+      lock_alert:
+        desc: Lock-wait saturation indicator used during contention episodes.
+        lvl: WARN
+        msg: "High lock waits waiting={waiting} locks_waiting={locks_waiting} top_client={top_client} window_s={window_s}"
+        vars:
+          waiting: {k: i, v: [50, 250]}
+          locks_waiting: {k: i, v: [20, 120]}
+          top_client: {k: ch, v: [api_service, scheduler_service]}
+          window_s: {k: i, v: [30, 60]}
+      query_timeout:
+        desc: Statement timeouts observed by the DB under contention.
+        lvl: WARN
+        msg: "Statement timeout stmt={stmt} client={client} timeout_ms={timeout_ms}"
+        vars:
+          stmt: {k: ch, v: [insert_build, select_next_build, usage_check]}
+          client: {k: ch, v: [api_service, scheduler_service]}
+          timeout_ms: {k: i, v: [500, 8000]}
+      slow_query:
+        desc: Slow query log lines; typically empty in healthy periods.
+        lvl: WARN
+        msg: "Slow query stmt={stmt} client={client} dur_ms={dur_ms} lock_wait_ms={lock_wait_ms} rows={rows}"
+        vars:
+          stmt: {k: ch, v: [insert_build, select_next_build, usage_check]}
+          client: {k: ch, v: [api_service, scheduler_service]}
+          dur_ms: {k: i, v: [500, 30000]}
+          lock_wait_ms: {k: i, v: [0, 30000]}
+          rows: {k: i, v: [0, 20000]}
+    beh:
+      n:
+        desc: DB is healthy; slow queries and timeouts are typically absent.
+        emit:
+          - id: pool_stats
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: Under surge, lock contention produces timeouts and slow queries; pool stats show high waiting/locks.
+        emit:
+          - id: pool_stats
+            per_min: 3.0
+            scope: per_host
+          - id: lock_alert
+            per_min: 1.0
+            scope: per_host
+          - id: query_timeout
+            per_min: 20.0
+            scope: per_host
+          - id: slow_query
+            per_min: 10.0
+            scope: per_host
+
+  - id: builder_fleet
+    name: Builder Fleet
+    svc: builder
+    hosts: [b01, b02, b03, b04, b05, b06, b07, b08, b09, b10, b11, b12]
+    desc: Executes builds; in this incident operators terminate builders to reduce activity while the DB is overloaded.
+    to: []
+    logs:
+      build_started:
+        desc: Builder begins executing a build.
+        lvl: INFO
+        msg: "Builder {builder_host} started build build_id={build_id}"
+        vars:
+          builder_host: {k: ch, v: [b01, b02, b03, b04, b05, b06, b07, b08, b09, b10, b11, b12]}
+          build_id: {k: uuid, v: null}
+      heartbeat:
+        desc: Periodic builder heartbeat with coarse capacity info.
+        lvl: INFO
+        msg: "Heartbeat slots_free={slots_free} running={running}"
+        vars:
+          slots_free: {k: i, v: [0, 8]}
+          running: {k: i, v: [0, 8]}
+    beh:
+      n:
+        desc: Builders emit heartbeats while available.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Builders still emit heartbeats unless terminated as part of mitigation.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+
+  - id: ops_repl
+    name: Ops Tooling (Live Patch / Scripts)
+    svc: ops-repl
+    hosts: [ops1]
+    desc: Operator tooling used for live patching, DB failover actions, and queue-draining scripts.
+    to:
+      - dst: postgres_db
+        proto: jdbc
+        desc: Runs administrative queries/scripts to drain queues and inspect DB state.
+    logs:
+      db_stepdown:
+        desc: Operator-initiated DB stepdown/promote-secondary action.
+        lvl: WARN
+        msg: "Requested DB stepdown from {from_host} to {to_host}"
+        vars:
+          from_host: {k: ch, v: [db1, db2]}
+          to_host: {k: ch, v: [db1, db2]}
+      repl_patch:
+        desc: Live patch applied to reduce load (e.g., disabling expensive queries or behaviors).
+        lvl: WARN
+        msg: "Applied live patch patch={patch} actor={actor}"
+        vars:
+          patch: {k: ch, v: [disable_auto_reenqueue, disable_hot_usage_query]}
+          actor: {k: ch, v: [oncall1, oncall2]}
+      auto_reenqueue_disabled:
+        desc: Operator disables automatic build re-enqueueing on infrastructure failures.
+        lvl: WARN
+        msg: "Set auto_reenqueue=false"
+        vars: {}
+      terminate_builders:
+        desc: Operator terminates builder instances to reduce system load.
+        lvl: WARN
+        msg: "Terminated builders count={count} reason={reason}"
+        vars:
+          count: {k: i, v: [5, 20]}
+          reason: {k: ch, v: [reduce_db_load]}
+      collect_slow_queries:
+        desc: Operator collects/inspects slow query logs over a time window.
+        lvl: INFO
+        msg: "Collected slow query logs window_s={window_s}"
+        vars:
+          window_s: {k: i, v: [300, 1800]}
+      drain_script_start:
+        desc: Operator starts a queue-drain script for a specific queue.
+        lvl: INFO
+        msg: "Started drain script queue={queue} batch_size={batch_size}"
+        vars:
+          queue: {k: ch, v: [usage, run]}
+          batch_size: {k: i, v: [1000, 5000]}
+      drain_progress:
+        desc: Periodic progress log from an active drain script.
+        lvl: INFO
+        msg: "Drain progress queue={queue} remaining={remaining} deleted={deleted} rate_per_min={rate_per_min}"
+        vars:
+          queue: {k: ch, v: [usage, run]}
+          remaining: {k: i, v: [0, 500000]}
+          deleted: {k: i, v: [0, 500000]}
+          rate_per_min: {k: i, v: [5000, 60000]}
+    beh:
+      n:
+        desc: Ops tooling is not continuously emitting logs during normal operation.
+        emit: []
+      f:
+        desc: Drain progress appears only once queue-drain scripts are started (suppressed earlier by scenario controls).
+        emit:
+          - id: drain_progress
+            per_min: 3.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_lb, api_service]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation for this incident window includes customer API traffic, low background scheduling, and an upstream GitHub webhook delivery pause
+      (modeled as near-zero webhook requests while the platform itself is otherwise healthy).
+    req:
+      - id: github_webhook_enqueue_ok
+        desc: GitHub webhook reaches the API and enqueues a build successfully (near-zero during webhook pause).
+        rpm: 0.0
+        path: [edge_lb, api_service, postgres_db, api_service, edge_lb]
+        emit: [api_service.webhook_received, api_service.enqueue_ok, edge_lb.access]
+        latency_ms: [[2, 12], [10, 80], [1, 15]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: customer_api_ok
+        desc: Customer interacts with the CircleCI API/UI successfully.
+        rpm: 160.0
+        path: [edge_lb, api_service, postgres_db, api_service, edge_lb]
+        emit: [api_service.api_req_ok, edge_lb.access]
+        latency_ms: [[10, 120], [1, 20]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: scheduler_dequeue_ok
+        desc: Scheduler dequeues a runnable build and starts it on a builder.
+        rpm: 20.0
+        path: [scheduler_service, postgres_db, scheduler_service, builder_fleet]
+        emit: [scheduler_service.dequeue_ok, builder_fleet.build_started]
+        latency_ms: [[10, 80], [30, 150]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.1
+          emit_per_retry: [scheduler_service.db_retry]
+          backoff_ms: [[50, 250]]
+        trace: false
+  f:
+    desc: Failure begins with a webhook surge; DB contention later forces timeouts, stalls dequeueing, and causes operational interventions.
+    req:
+      - id: github_webhook_enqueue_ok
+        desc: Webhook reaches the API and enqueues, but may be slower under contention.
+        rpm: 180.0
+        path: [edge_lb, api_service, postgres_db, api_service, edge_lb]
+        emit: [api_service.webhook_received, api_service.enqueue_ok, edge_lb.access]
+        latency_ms: [[3, 30], [50, 2500], [2, 60]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: github_webhook_enqueue_timeout
+        desc: Webhook reaches the API but enqueue fails due to DB timeout/locks.
+        rpm: 120.0
+        path: [edge_lb, api_service, postgres_db, api_service, edge_lb]
+        emit: [api_service.webhook_received, api_service.enqueue_timeout, edge_lb.access]
+        latency_ms: [[3, 50], [800, 8000], [2, 80]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: github_webhook_lb_503
+        desc: LB rejects webhook traffic before it reaches the API during throttling attempts.
+        rpm: 150.0
+        path: [edge_lb]
+        emit: [edge_lb.access]
+        latency_ms: [[1, 30]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: customer_api_ok
+        desc: Customer API requests still reach the API, but are slower under DB pressure.
+        rpm: 160.0
+        path: [edge_lb, api_service, postgres_db, api_service, edge_lb]
+        emit: [api_service.api_req_ok, edge_lb.access]
+        latency_ms: [[30, 3000], [2, 80]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: customer_api_backend_500
+        desc: Customer API requests reach the API but fail due to DB overload/timeouts.
+        rpm: 40.0
+        path: [edge_lb, api_service, postgres_db, api_service, edge_lb]
+        emit: [api_service.api_req_error, edge_lb.access]
+        latency_ms: [[200, 12000], [2, 120]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: customer_api_lb_503
+        desc: LB rejects customer requests during an ill-advised throttling attempt.
+        rpm: 120.0
+        path: [edge_lb]
+        emit: [edge_lb.access]
+        latency_ms: [[1, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: scheduler_dequeue_ok
+        desc: Successful dequeue (becomes rare once the DB locks).
+        rpm: 120.0
+        path: [scheduler_service, postgres_db, scheduler_service, builder_fleet]
+        emit: [scheduler_service.dequeue_ok, builder_fleet.build_started]
+        latency_ms: [[20, 5000], [40, 300]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.4
+          emit_per_retry: [scheduler_service.db_retry]
+          backoff_ms: [[100, 1200]]
+        trace: false
+      - id: scheduler_dequeue_timeout
+        desc: Dequeue poll attempts timing out due to DB contention.
+        rpm: 120.0
+        path: [scheduler_service, postgres_db]
+        emit: [scheduler_service.dequeue_timeout]
+        latency_ms: [[800, 8000]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.8
+          emit_per_retry: [scheduler_service.db_retry]
+          backoff_ms: [[200, 1500]]
+        trace: false
+
+assumptions:
+  - "GitHub is modeled as traffic entering at the load balancer; the webhook delivery pause then surge is represented by github_webhook_enqueue_ok having 0 rpm in normal and high rpm in failure."
+  - "API request paths include an explicit api_service return hop before edge_lb to keep path connectivity without modeling a DB->LB edge."
+  - "Failure-onset cleanliness: failure-only background signals and failure-only error flows are suppressed in early failure minutes via scenario controls so 'initially coping' is not contradicted before DB contention starts."
+  - "Normal-phase scheduler activity is kept non-zero (20 rpm) to represent manual/scheduled builds and background queue processing even while webhook delivery is paused."
+  - "The nonlinear DB degradation is represented by activating postgres_db.lock_alert/postgres_db.query_timeout/postgres_db.slow_query plus increased enqueue/dequeue latencies and a scheduler_service.queue_pressure snapshot stream."
+  - "LB operational one-shots are split into edge_lb.capacity_throttle vs edge_lb.capacity_rollback to prevent generated logs from contradicting event-time actions."
+  - "Auto re-enqueue disable is modeled as a dedicated one-shot ops_repl.auto_reenqueue_disabled (fixed semantics) to prevent contradictory values during the mitigation event."
+  - "The post-mortem step of pulling slow query logs is represented by ops_repl.collect_slow_queries as a one-shot action marker, separate from postgres_db.slow_query background emission."
+  - "The complex usage/run queue state is represented via scheduler_service.queue_stats (run_q/usage_q) plus ops_repl drain script logs rather than distinct storage subsystems."
+  - "Retry semantics for webhook delivery are modeled as separate inbound requests (RPM), not as in-request retries; therefore webhook flows have max_attempts=1."
+  - "LB access logging is modeled as completion-style and emitted after API completion; response-return hops are represented by repeating api_service then edge_lb at the end of API-request paths."
+  - "Normal-phase volume estimate (with the scenario rates): ~330–370 logs/min (dominated by customer_api_ok, scheduler_dequeue_ok, and builder heartbeats)."
+  - "Whole-scenario total log estimate (for the scenario timing/rates): ~33k–50k logs, staying within the 20k..100k target by using 1–3 lines per request and moderate failure RPMs."
+  - "Key diagnostic anchors are emission-backed and likely visible: scheduler dequeue_timeouts and collapsing dequeue_ok rate, postgres_db lock_alert/query_timeout/slow_query turning on, LB access 503s during throttling, and ops one-shots for stepdown/patch/drain actions."
+```

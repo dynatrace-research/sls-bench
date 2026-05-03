@@ -1,0 +1,407 @@
+```yaml
+sys:
+  id: incident_app_heroku_pubsub_poison_pill
+  desc: >
+    A Go monolith running on Heroku serves customer web/Slack interactions and consumes async jobs from GCP Pub/Sub,
+    persisting state in Heroku Postgres. Pub/Sub handlers are treated as best-effort: failures lead to redelivery with
+    backoff. The incident modeled here is a crash-loop caused by an unhandled panic inside a Pub/Sub handler goroutine,
+    producing intermittent downtime and degraded async behavior until responders purge the offending subscription.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: heroku_runtime
+    name: Heroku Router + Dyno Manager
+    svc: heroku
+    hosts: [router-1, dyno-manager-1]
+    desc: >
+      Heroku routing layer emits request logs and H10 "App crashed" errors when the dyno process is not running.
+      Dyno manager restarts the process after crashes and can apply crash-loop cooloff. Logplex may drop or rate-limit
+      app stdout/stderr during high-volume panic output.
+    to:
+      - dst: incident_app
+        proto: https
+        desc: Routes HTTP requests to the application dyno.
+    logs:
+      router_200:
+        desc: Heroku router log for successful requests routed to a running dyno.
+        lvl: INFO
+        msg: "heroku-router: method={method} path={path} status=200 service={service_ms}ms dyno=web.1 request_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          path: {k: ch, v: [/slack/actions, /api/v1/incidents, /dashboard]}
+          service_ms: {k: i, v: [5, 1200]}
+          req_id: {k: hex, v: 16}
+      router_h10:
+        desc: Heroku router log when requests arrive but the dyno has crashed (H10).
+        lvl: ERROR
+        msg: "heroku-router: code=H10 desc=\"App crashed\" method={method} path={path} status=503 request_id={req_id} dyno=web.1"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          path: {k: ch, v: [/slack/actions, /api/v1/incidents, /dashboard]}
+          req_id: {k: hex, v: 16}
+      dyno_exit:
+        desc: Dyno manager log indicating the app process exited unexpectedly.
+        lvl: ERROR
+        msg: "heroku-dyno: Process exited status={exit_status} signal={signal} dyno=web.1"
+        vars:
+          exit_status: {k: i, v: [1, 137]}
+          signal: {k: ch, v: [SIGABRT, SIGKILL, SIGSEGV]}
+      dyno_start:
+        desc: Dyno manager log when the app process is started.
+        lvl: INFO
+        msg: "heroku-dyno: Starting process dyno=web.1 release={release}"
+        vars:
+          release: {k: ch, v: [v2022.11.18.2]}
+      crash_loop_backoff:
+        desc: Dyno manager applies cooloff after repeated crashes.
+        lvl: WARN
+        msg: "heroku-dyno: Crash loop detected; applying restart cooloff={cooloff_s}s dyno=web.1"
+        vars:
+          cooloff_s: {k: i, v: [60, 1200]}
+      logplex_dropped:
+        desc: Logplex buffer overflow leads to dropped application log lines (common during huge panic stack dumps).
+        lvl: WARN
+        msg: "logplex: buffer overflow; dropped={dropped_lines} lines source=app/web.1"
+        vars:
+          dropped_lines: {k: i, v: [200, 20000]}
+      log_rate_limited:
+        desc: Logplex rate limiting suppresses application log lines near crash time.
+        lvl: WARN
+        msg: "logplex: rate-limited; suppressed={suppressed_lines} lines source=app/web.1"
+        vars:
+          suppressed_lines: {k: i, v: [50, 5000]}
+    beh:
+      n:
+        desc: Mostly clean router/dyno environment with rare restarts and occasional background logplex noise.
+        emit:
+          - id: dyno_start
+            per_min: 0.01
+            scope: global
+          - id: logplex_dropped
+            per_min: 0.02
+            scope: global
+          - id: log_rate_limited
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Crash-loop conditions produce frequent dyno restarts and elevated dropping/rate limiting around panics.
+        emit:
+          - id: dyno_start
+            per_min: 2.0
+            scope: global
+          - id: logplex_dropped
+            per_min: 0.2
+            scope: global
+          - id: log_rate_limited
+            per_min: 0.1
+            scope: global
+
+  - id: incident_app
+    name: Incident App (Go monolith)
+    svc: incident-app
+    hosts: [web.1]
+    desc: >
+      Single Go binary serving HTTP requests and consuming Pub/Sub subscriptions within the same dyno.
+      Pub/Sub Receive starts child goroutines; if a handler panics in a child goroutine without a local recover,
+      the whole process exits and the dyno crashes.
+    to:
+      - dst: postgres
+        proto: tcp
+        desc: Primary relational database for incidents and users.
+      - dst: gcp_pubsub
+        proto: grpc
+        desc: Pull/stream Pub/Sub messages for async work.
+      - dst: heroku_runtime
+        proto: ipc
+        desc: Process lifecycle is observed by the Heroku dyno manager when the app exits and restarts.
+    logs:
+      http_200:
+        desc: Application request completion log for successful responses.
+        lvl: INFO
+        msg: "http: {method} {route} status=200 dur={dur_ms}ms user={user_id} request_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/slack/actions, /api/v1/incidents, /dashboard]}
+          dur_ms: {k: i, v: [10, 3000]}
+          user_id: {k: hex, v: 8}
+          req_id: {k: hex, v: 16}
+      worker_msg_received:
+        desc: Generic Pub/Sub handler receives a message.
+        lvl: INFO
+        msg: "pubsub: received subscription={sub} msg_id={msg_id} delivery_attempt={attempt}"
+        vars:
+          sub: {k: ch, v: [events-sub, inc-nudges-sub]}
+          msg_id: {k: hex, v: 24}
+          attempt: {k: i, v: [1, 50]}
+      welcome_msg_received:
+        desc: Welcome-message subscription receives a message (the one involved in the incident).
+        lvl: INFO
+        msg: "pubsub: received subscription=inc-welcome-sub msg_id={msg_id} delivery_attempt={attempt}"
+        vars:
+          msg_id: {k: hex, v: 24}
+          attempt: {k: i, v: [1, 50]}
+      worker_msg_acked:
+        desc: Pub/Sub handler finishes successfully and acks the message.
+        lvl: INFO
+        msg: "pubsub: acked subscription={sub} msg_id={msg_id} dur={dur_ms}ms"
+        vars:
+          sub: {k: ch, v: [events-sub, inc-nudges-sub]}
+          msg_id: {k: hex, v: 24}
+          dur_ms: {k: i, v: [5, 5000]}
+      panic_runtime:
+        desc: Unhandled panic header emitted to stderr just before process exit (full stack often dropped by logplex).
+        lvl: CRITICAL
+        msg: "panic: runtime error={panic} goroutines={goroutines}"
+        vars:
+          panic: {k: ch, v: ["invalid memory address or nil pointer dereference", "index out of range"]}
+          goroutines: {k: i, v: [150, 400]}
+      health_tick:
+        desc: Lightweight heartbeat indicating the process is alive (stops during crash loops).
+        lvl: DEBUG
+        msg: "health: tick uptime_s={uptime_s} goroutines={goroutines}"
+        vars:
+          uptime_s: {k: i, v: [5, 200000]}
+          goroutines: {k: i, v: [120, 400]}
+    beh:
+      n:
+        desc: The dyno is stable; periodic heartbeat is present.
+        emit:
+          - id: health_tick
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Heartbeat becomes intermittent due to repeated process exits and restarts.
+        emit:
+          - id: health_tick
+            per_min: 1.0
+            scope: per_host
+
+  - id: gcp_pubsub
+    name: GCP Pub/Sub
+    svc: pubsub
+    hosts: [pubsub-1]
+    desc: >
+      Async message queue. Messages not acked are redelivered with backoff; in this incident a poison message
+      repeatedly crashes the subscriber process when delivered.
+    to:
+      - dst: incident_app
+        proto: grpc
+        desc: Delivers messages to the subscriber via client library Receive goroutines.
+    logs:
+      deliver_msg:
+        desc: Pub/Sub delivers a message to a subscriber callback.
+        lvl: INFO
+        msg: "pubsub: deliver subscription={sub} msg_id={msg_id} attempt={attempt}"
+        vars:
+          sub: {k: ch, v: [inc-welcome-sub, events-sub, inc-nudges-sub]}
+          msg_id: {k: hex, v: 24}
+          attempt: {k: i, v: [1, 50]}
+    beh:
+      n: {desc: No background Pub/Sub logs modeled., emit: []}
+      f: {desc: No background Pub/Sub logs modeled., emit: []}
+
+  - id: postgres
+    name: Heroku Postgres
+    svc: postgres
+    hosts: [pg-primary-1]
+    desc: Primary database. Not the source of the incident; included for topology completeness and light background noise.
+    to: []
+    logs:
+      checkpoint_complete:
+        desc: Periodic checkpoint completion log.
+        lvl: INFO
+        msg: "postgres: checkpoint complete write_ms={write_ms} buffers={buffers}"
+        vars:
+          write_ms: {k: i, v: [50, 2000]}
+          buffers: {k: i, v: [1000, 200000]}
+    beh:
+      n:
+        desc: Normal low-rate database maintenance logs.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Database continues normal maintenance logging.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.05
+            scope: global
+
+  - id: monitoring
+    name: Monitoring & Dashboards
+    svc: monitoring
+    hosts: [monitor-1]
+    desc: >
+      External monitoring polls Pub/Sub subscription stats and emits summary logs used during investigation.
+      This remains available even while the app dyno is down.
+    to:
+      - dst: gcp_pubsub
+        proto: https
+        desc: Reads subscription metrics (unacked backlog and oldest message age).
+    logs:
+      pubsub_welcome_backlog_ok:
+        desc: Normal Pub/Sub backlog signal for the welcome subscription.
+        lvl: INFO
+        msg: "metrics: pubsub subscription=inc-welcome-sub unacked={unacked} oldest_age_s={oldest_s}"
+        vars:
+          unacked: {k: i, v: [0, 3]}
+          oldest_s: {k: i, v: [0, 30]}
+      pubsub_welcome_backlog_elevated:
+        desc: Elevated backlog for the welcome subscription, indicating stuck/unacked poison message(s).
+        lvl: WARN
+        msg: "metrics: pubsub subscription=inc-welcome-sub unacked={unacked} oldest_age_s={oldest_s}"
+        vars:
+          unacked: {k: i, v: [50, 500]}
+          oldest_s: {k: i, v: [300, 2400]}
+    beh:
+      n:
+        desc: Backlog is normally near-zero for the welcome subscription.
+        emit:
+          - id: pubsub_welcome_backlog_ok
+            per_min: 1.0
+            scope: global
+          - id: pubsub_welcome_backlog_elevated
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Both normal and elevated backlog templates exist; incident events toggle which one is effectively emitted.
+        emit:
+          - id: pubsub_welcome_backlog_ok
+            per_min: 1.0
+            scope: global
+          - id: pubsub_welcome_backlog_elevated
+            per_min: 1.0
+            scope: global
+
+  - id: ops_console
+    name: Operator Console
+    svc: ops
+    hosts: [oncall-laptop-1]
+    desc: Human operator actions (manual dyno reboot, purging subscriptions, disabling non-critical features).
+    to:
+      - dst: heroku_runtime
+        proto: https
+        desc: Manual dyno management actions via Heroku console/API.
+      - dst: gcp_pubsub
+        proto: https
+        desc: Administrative actions on Pub/Sub subscriptions (purge).
+    logs:
+      manual_dyno_reboot:
+        desc: Operator manually reboots the dyno to avoid extended crash-loop cooloff downtime.
+        lvl: INFO
+        msg: "ops: manual dyno reboot app=incident-app dyno=web.1 actor={actor} reason={reason}"
+        vars:
+          actor: {k: ch, v: [oncall, responder]}
+          reason: {k: ch, v: [H10_app_crashed, crash_loop]}
+      purge_subscription:
+        desc: Operator purges a subscription to remove unacked poison messages.
+        lvl: WARN
+        msg: "ops: purged pubsub subscription={sub} removed_messages={removed} actor={actor}"
+        vars:
+          sub: {k: ch, v: [inc-welcome-sub, inc-nudges-sub]}
+          removed: {k: i, v: [1, 500]}
+          actor: {k: ch, v: [oncall, responder]}
+      disable_feature:
+        desc: Operator disables a non-critical feature that produces async work.
+        lvl: INFO
+        msg: "ops: set feature_flag={flag} enabled=false actor={actor}"
+        vars:
+          flag: {k: ch, v: [incident_nudges, welcome_messages]}
+          actor: {k: ch, v: [oncall, responder]}
+    beh:
+      n: {desc: No background operator actions., emit: []}
+      f: {desc: No background operator actions., emit: []}
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation serves interactive HTTP traffic while consuming Pub/Sub jobs successfully.
+      Pub/Sub backlog for the welcome subscription stays near zero.
+    req:
+      - id: web_interaction_ok
+        desc: Successful user interaction (Slack/web) served by the monolith.
+        rpm: 500.0
+        path: [heroku_runtime, incident_app, heroku_runtime]
+        emit: [incident_app.http_200, heroku_runtime.router_200]
+        latency_ms: [[60, 300], [5, 30]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: pubsub_consume_ok
+        desc: Successful consumption of non-welcome Pub/Sub messages (normal async workload).
+        rpm: 60.0
+        path: [gcp_pubsub, incident_app]
+        emit: [gcp_pubsub.deliver_msg, incident_app.worker_msg_received, incident_app.worker_msg_acked]
+        latency_ms: [[1, 5], [2, 10], [20, 250]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      The app repeatedly crashes due to an unhandled panic while processing a welcome-message Pub/Sub delivery.
+      Each crash produces a panic header and dyno exit marker; dyno restarts appear as Heroku background dyno_start logs.
+      Router returns intermittent H10/503 during down windows and Logplex may drop/rate-limit logs around panics.
+    req:
+      - id: web_interaction_ok_degraded
+        desc: Successful user interaction during the incident when the dyno is briefly up.
+        rpm: 350.0
+        path: [heroku_runtime, incident_app, heroku_runtime]
+        emit: [incident_app.http_200, heroku_runtime.router_200]
+        latency_ms: [[120, 700], [5, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: web_interaction_h10
+        desc: User interaction arriving while dyno is crashed; router returns H10/503.
+        rpm: 150.0
+        path: [heroku_runtime]
+        emit: [heroku_runtime.router_h10]
+        latency_ms: [[2, 15]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: pubsub_consume_ok_f
+        desc: Reduced successful consumption of other Pub/Sub messages during instability.
+        rpm: 20.0
+        path: [gcp_pubsub, incident_app]
+        emit: [gcp_pubsub.deliver_msg, incident_app.worker_msg_received, incident_app.worker_msg_acked]
+        latency_ms: [[1, 8], [2, 15], [30, 800]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: pubsub_welcome_consume_panics
+        desc: A welcome-message delivery triggers an unhandled panic and crashes the dyno; message remains unacked.
+        rpm: 2.5
+        path: [gcp_pubsub, incident_app, heroku_runtime]
+        emit:
+          - gcp_pubsub.deliver_msg
+          - incident_app.welcome_msg_received
+          - incident_app.panic_runtime
+          - heroku_runtime.dyno_exit
+        latency_ms: [[1, 8], [2, 10], [5, 40], [1, 5]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - |-
+    Names, releases, and subscription IDs are simplified; the causal core is a poison Pub/Sub welcome message causing
+    an unhandled panic in a child goroutine started by the Pub/Sub client library.
+  - |-
+    Corologix/Sentry are not modeled as separate components; missing crash visibility is represented by Heroku Logplex
+    drop/rate-limit logs plus short panic headers.
+  - |-
+    Heroku router success logs are modeled as response-completion logs (status/service time known), so web flows emit the app completion log first,
+    then the router log; the flow path includes a coarse "return hop" back to heroku_runtime to keep the emission order traversable.
+  - |-
+    Dyno restarts are modeled as Heroku background dyno_start logs in failure (rather than being embedded in the poison-message flow),
+    while each poison-message delivery still emits a dyno_exit marker as the terminal step of that crash-causing attempt.
+  - |-
+    Normal traffic volume assumption: ~500 rpm interactive HTTP (2 logs/req) plus ~60 rpm Pub/Sub messages (3 logs/msg),
+    plus ~2–3 background logs/min. This yields ~1.1k–1.3k logs/min in normal.
+  - |-
+    Scenario log volume is intentionally dominated by Heroku router + app request completion logs to keep the incident
+    diagnosable from user-facing symptoms (H10) while still showing key internal corroborators (panic header, backlog metrics, log drops, crash-loop backoff marker, operator actions).
+```

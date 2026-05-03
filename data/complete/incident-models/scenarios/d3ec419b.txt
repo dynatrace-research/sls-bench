@@ -1,0 +1,292 @@
+```yaml
+scenario:
+  id: consul_streaming_boltdb_outage
+  title: Consul watcher streaming stalls followed by slow-leader instability from Raft log store overhead
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A microservices stack depends on a single Consul cluster for discovery, KV, and coordination, with Vault and Nomad layered on top.
+    Under unusually high read+write churn, enabling Consul's streaming-based watchers produces severe watch delivery lag and pushes KV apply latency into seconds.
+    Operators attempt to recover by blocking traffic and restoring from a snapshot, but the cluster degrades again once internal service load returns.
+    Disabling streaming restores much of Consul's write throughput and many internal operations begin succeeding again, yet intermittent slow Raft leaders
+    associated with Raft log store overhead reintroduce stalls and keep the platform in an outage/maintenance state.
+
+  trigger_desc: |
+    A configuration rollout enables streaming-based Consul watchers for a high-churn routing workload, increasing concurrent streams while writes remain high.
+    Under these combined conditions, server-side watch delivery falls behind and KV/Raft write latency spikes.
+
+  time:
+    total_minutes: 30
+    phases:
+      n: {start_min: 0, end_min: 15}
+      f: {start_min: 15, end_min: 30}
+
+  phases:
+    n:
+      desc: |
+        Players can join and start sessions through the edge gateway. The game service uses Consul to discover dependencies and uses Vault
+        to read auth/session secrets. Internal health checks update Consul KV at a steady cadence and Nomad scheduling is routine. Consul
+        periodic metrics show low KV apply latency and stable Raft commit times.
+      flows: [player_login, healthcheck_kv_put_ok, nomad_schedule_ok]
+      manifestation:
+        - consul_cluster.kv_metric_ok
+        - edge_gateway.resp_ok
+        - game_service.consul_lookup_ok
+        - vault.resp_ok
+
+    f:
+      desc: |
+        Consul becomes unhealthy and acts as a single point of failure: service discovery and health check KV writes time out, Vault storage
+        requests slow down or fail, and Nomad cannot reliably coordinate. An attempted snapshot restore with iptables blocking temporarily
+        reduces pressure but does not address the underlying watch-delivery stalls; load reintroduction causes degradation again. Disabling
+        streaming later improves KV apply latency and allows many internal writes/reads to succeed, but a remaining slow-leader condition
+        (later attributed to BoltDB behavior in the Raft log store) causes renewed stalls by the end of the scenario.
+
+      events:
+        - order: 1
+          at_min: 15
+          component: ops_control
+          event: |
+            Streaming-based watchers are enabled for a high-churn routing workload, and Consul KV/Raft latency rapidly degrades under load.
+          why: |
+            With many watchers and frequent updates, the server falls behind delivering watch updates and internal work queues back up, which
+            correlates with KV apply delays and client timeouts. This is directly observable via degraded KV latency metrics and watch delivery lag;
+            the deeper internal mechanism is not obvious without profiling.
+          flows: [player_login_fail, healthcheck_kv_put_timeout, vault_read_secret_fail, maintenance_page]
+          rate_multipliers:
+            consul_cluster.kv_metric_ok: 0.0
+            consul_cluster.kv_metric_bad: 1.0
+            consul_cluster.raft_append_slow: 0.0
+            consul_cluster.raft_log_store_pressure: 0.0
+            healthcheck_kv_put_ok_recover: 0.0
+            vault_read_secret_ok: 0.0
+          latency_multipliers:
+            player_login_fail: {p50: 1.0, p95: 1.0}
+            healthcheck_kv_put_timeout: {p50: 1.0, p95: 1.0}
+            vault_read_secret_fail: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_control.streaming_enable
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_control.streaming_enable
+            - consul_cluster.kv_metric_bad
+            - consul_cluster.watch_delivery_stall
+            - game_service.consul_lookup_fail
+            - telemetry_collector.discovery_fail
+
+        - order: 2
+          at_min: 19
+          component: ops_control
+          event: |
+            Operators block traffic to Consul with iptables and restore Consul state from a snapshot to attempt a controlled restart.
+          why: |
+            Blocking access reduces reconnect storms and write pressure while restoring from a known-good snapshot. This is directly observable
+            through iptables/snapshot action markers and an immediate drop in Consul-driven request flows, but it does not fix the underlying
+            performance problem when traffic is later reintroduced.
+          flows: [healthcheck_kv_put_timeout, maintenance_page]
+          rate_multipliers:
+            player_login_fail: 0.0
+            healthcheck_kv_put_timeout: 0.2
+            vault_read_secret_fail: 0.3
+            telemetry_collector.discovery_fail: 2.0
+          latency_multipliers:
+            healthcheck_kv_put_timeout: {p50: 0.85, p95: 0.95}
+            vault_read_secret_fail: {p50: 0.85, p95: 0.95}
+          one_shots:
+            - ref: ops_control.iptables_block
+              count: 2
+              hosts: [ops-1]
+            - ref: ops_control.consul_snapshot_restore
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_control.iptables_block
+            - ops_control.consul_snapshot_restore
+            - telemetry_collector.discovery_fail
+            - consul_cluster.kv_metric_bad
+
+        - order: 3
+          at_min: 23
+          component: ops_control
+          event: |
+            The iptables block is removed to reintroduce internal service traffic; Consul performance degrades again under returning load.
+          why: |
+            Internal services resume discovery/health writes immediately after the block is lifted. Because the underlying backlog condition remains,
+            KV latency stays high and timeouts return. This is directly observable as rising healthcheck timeouts and persistent degraded KV metrics.
+          flows: [healthcheck_kv_put_timeout, vault_read_secret_fail, maintenance_page]
+          rate_multipliers:
+            healthcheck_kv_put_timeout: 1.0
+            vault_read_secret_fail: 1.0
+            telemetry_collector.discovery_fail: 1.0
+          latency_multipliers:
+            healthcheck_kv_put_timeout: {p50: 1.0, p95: 1.0}
+            vault_read_secret_fail: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_control.iptables_unblock
+              count: 2
+              hosts: [ops-1]
+          manifestation:
+            - ops_control.iptables_unblock
+            - consul_cluster.watch_delivery_stall
+            - game_service.health_put_timeout
+            - consul_cluster.kv_metric_bad
+
+        - order: 4
+          at_min: 26
+          component: ops_control
+          event: |
+            Operators disable Consul streaming; KV apply latency drops toward normal and a majority of internal KV writes and Vault reads begin succeeding again,
+            while the platform remains in maintenance as recovery continues cautiously.
+          why: |
+            Disabling streaming changes how watchers are serviced and reduces the server-side backlog, improving write progress.
+            This is directly observable via the switch to healthy KV latency metrics and the reappearance of successful healthcheck commits/Vault reads.
+          flows: [healthcheck_kv_put_ok_recover, vault_read_secret_ok, healthcheck_kv_put_timeout, vault_read_secret_fail, maintenance_page]
+          rate_multipliers:
+            consul_cluster.kv_metric_ok: 1.0
+            consul_cluster.kv_metric_bad: 0.0
+            consul_cluster.watch_delivery_stall: 0.1
+            telemetry_collector.discovery_fail: 0.1
+            telemetry_collector.scrape_ok: 2.0
+            healthcheck_kv_put_timeout: 0.15
+            vault_read_secret_fail: 0.25
+            healthcheck_kv_put_ok_recover: 1.0
+            vault_read_secret_ok: 1.0
+          latency_multipliers:
+            healthcheck_kv_put_timeout: {p50: 0.7, p95: 0.85}
+            vault_read_secret_fail: {p50: 0.75, p95: 0.9}
+            healthcheck_kv_put_ok_recover: {p50: 0.9, p95: 1.0}
+            vault_read_secret_ok: {p50: 0.9, p95: 1.0}
+          one_shots:
+            - ref: ops_control.streaming_disable
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_control.streaming_disable
+            - consul_cluster.kv_metric_ok
+            - game_service.health_put_ok
+            - vault.resp_ok
+            - telemetry_collector.scrape_ok
+
+        - order: 5
+          at_min: 28
+          component: ops_control
+          event: |
+            Slow Raft appends begin appearing on elected leaders; operators force a leader stepdown as leader churn increases and KV/Raft latency worsens again.
+          why: |
+            A remaining storage/replication bottleneck causes some leaders to append and replicate Raft logs slowly, which surfaces as TCP backpressure and
+            stalls seen by clients. This is partially observable via raft-append slow warnings and Raft log store pressure stats; the deeper file-format
+            mechanism (later traced to BoltDB freelist behavior) typically requires deeper post-incident analysis/tooling.
+          flows: [healthcheck_kv_put_ok_recover, vault_read_secret_ok, healthcheck_kv_put_timeout, vault_read_secret_fail, maintenance_page]
+          rate_multipliers:
+            consul_cluster.kv_metric_ok: 0.0
+            consul_cluster.kv_metric_bad: 0.8
+            consul_cluster.raft_append_slow: 1.0
+            consul_cluster.raft_log_store_pressure: 1.0
+            consul_cluster.raft_leader_change: 2.0
+            telemetry_collector.discovery_fail: 0.6
+            telemetry_collector.alert_gap: 1.5
+            healthcheck_kv_put_timeout: 0.4
+            vault_read_secret_fail: 0.7
+            healthcheck_kv_put_ok_recover: 0.6
+            vault_read_secret_ok: 0.5
+          latency_multipliers:
+            healthcheck_kv_put_timeout: {p50: 1.0, p95: 1.0}
+            vault_read_secret_fail: {p50: 1.0, p95: 1.0}
+            healthcheck_kv_put_ok_recover: {p50: 1.05, p95: 1.2}
+            vault_read_secret_ok: {p50: 1.0, p95: 1.3}
+          one_shots:
+            - ref: ops_control.leader_stepdown
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_control.leader_stepdown
+            - consul_cluster.raft_append_slow
+            - consul_cluster.raft_log_store_pressure
+            - consul_cluster.raft_leader_change
+            - consul_cluster.kv_metric_bad
+
+      steady:
+        - component: consul_cluster
+          condition: |
+            Streaming remains disabled, but intermittent slow Raft leaders and leader churn persist alongside Raft log store pressure,
+            keeping KV/Raft latency elevated.
+          user_impact: |
+            Platform bootstrapping remains unsafe: discovery/health writes and coordination intermittently stall, preventing broad service recovery.
+          manifestation:
+            - consul_cluster.kv_metric_bad
+            - consul_cluster.raft_append_slow
+            - consul_cluster.raft_log_store_pressure
+            - consul_cluster.raft_leader_change
+        - component: vault
+          condition: |
+            Vault requests intermittently fail when Consul-backed storage operations stall behind slow Raft appends, even though many reads succeed.
+          user_impact: |
+            Services that require secrets/tokens cannot authenticate reliably, contributing to continued outage.
+          manifestation:
+            - vault.resp_ok
+            - vault.storage_latency
+            - vault.resp_fail
+        - component: telemetry_collector
+          condition: |
+            Telemetry/alerting partially recovers after streaming is disabled, but discovery and alert delivery degrade again during slow-leader periods.
+          user_impact: |
+            Operators have reduced visibility and delayed alerts while trying to diagnose and recover.
+          manifestation:
+            - telemetry_collector.discovery_fail
+            - telemetry_collector.alert_gap
+            - telemetry_collector.scrape_ok
+
+      feedback_loops:
+        - id: reconnect_storm
+          desc: |
+            As Consul degrades, more services retry discovery/health operations, increasing read+write pressure and prolonging the backlog condition.
+        - id: observability_dependency
+          desc: |
+            Monitoring relies on Consul-based discovery; when Consul is unhealthy, fewer diagnostics/alerts are available, slowing triage.
+
+      flows:
+        - maintenance_page
+        - player_login_fail
+        - healthcheck_kv_put_timeout
+        - healthcheck_kv_put_ok_recover
+        - vault_read_secret_fail
+        - vault_read_secret_ok
+        - nomad_schedule_fail
+      manifestation:
+        - consul_cluster.kv_metric_bad
+        - consul_cluster.watch_delivery_stall
+        - consul_cluster.kv_metric_ok
+        - consul_cluster.raft_append_slow
+        - consul_cluster.raft_log_store_pressure
+        - game_service.health_put_timeout
+        - game_service.health_put_ok
+        - telemetry_collector.discovery_fail
+
+  assumptions:
+    - |
+      The 73-hour outage is represented as a 30-minute compressed incident with the same ordering:
+      watch/stream-related stalls → failed recovery attempts → streaming disabled (partial internal recovery) → remaining slow-leader pathology.
+    - |
+      Latency multipliers were constrained so that hinted p95 latencies for timeout-style flows do not exceed the modeled timeout-style field caps
+      (e.g., waited_ms and edge dur_ms domains capped at 6000ms), improving narrative/control coherence for log generation.
+    - |
+      External player traffic is represented primarily by maintenance_page; a smaller set of player_login_fail exists early in failure but is
+      driven to ~0 once external access is blocked during recovery actions.
+    - |
+      Failure-phase piecewise volume estimate (rough, after multipliers; excludes small background noise):
+      - 15-19 (4m): ~1.45k logs/min + 1 streaming_enable one-shot.
+      - 19-23 (4m): ~0.45k logs/min + 2 iptables_block one-shots + 1 snapshot_restore one-shot.
+      - 23-26 (3m): ~1.15k logs/min + 2 iptables_unblock one-shots.
+      - 26-28 (2m): ~0.93k logs/min + 1 streaming_disable one-shot (timeouts drop; ok flows appear; kv_metric_ok replaces kv_metric_bad).
+      - 28-30 (2m): ~0.97k logs/min + 1 leader_stepdown one-shot (slow-leader symptoms appear; kv_metric_bad returns).
+    - |
+      Normal-phase volume estimate is ~1.5k logs/min for 15 minutes. Total scenario volume estimate is ~40k–45k logs,
+      within the 20k..100k target.
+    - |
+      Visibility rationale: kv_metric_bad and watch_delivery_stall appear repeatedly early; ops one-shots timestamp recovery actions;
+      the post-change appearance of health_put_ok and vault.resp_ok makes the streaming mitigation visible; later raft_log_store_pressure and
+      raft_append_slow plus increased raft_leader_change distinguish the remaining storage-related instability; telemetry discovery_fail/alert_gap
+      provide evidence of the observability dependency on Consul.
+```

@@ -1,0 +1,254 @@
+```yaml
+scenario:
+  id: elb_state_data_logical_delete_us_east_2012_12_24
+  title: ELB control-plane state deletion leads to API failures and partial LB misconfiguration
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The ELB service normally routes customer application traffic through data plane load balancers while a
+    control plane manages configuration stored in a central state database. A maintenance job is accidentally
+    run against production state, logically deleting part of ELB state data. Control-plane API calls to manage
+    existing load balancers become slow and error-prone; later, reconciliation/config pushes apply empty backend
+    sets to a subset of load balancers, causing elevated 503/504 responses for those LBs.
+
+  trigger_desc: |
+    A privileged maintenance process is inadvertently executed against the production ELB state store, logically
+    deleting a portion of ELB state needed by the control plane for managing existing load balancers.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 30}
+      f: {start_min: 30, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Customer traffic is steadily proxied by load balancer nodes with mostly 200 responses. Customers can
+        create and modify load balancers through the public API, and the control plane performs periodic
+        autoscaling reconciliation that reads state and pushes config updates successfully.
+      flows: [client_request_ok, api_create_lb, api_modify_lb_ok, cp_autoscale_reconcile]
+      manifestation:
+        - elb_data_plane.access_ok
+        - elb_api.api_modify_ok
+        - elb_control_plane.workflow_metrics
+        - elb_state_store.db_metrics
+        - elb_data_plane.healthcheck_summary
+
+    f:
+      desc: |
+        After state loss, the control plane struggles to read required configuration for existing load balancers.
+        Early on, this affects management APIs but does not immediately disrupt ongoing request handling for
+        running load balancers. As the control plane later attempts reconciliation/config pushes for some LBs,
+        it can apply configs with empty backend sets, degrading request handling for a subset of load balancers.
+        Operators then gate off workflows to prevent further propagation while an initial restore attempt later
+        fails to produce a usable snapshot within the modeled window.
+
+      events:
+        - order: 1
+          at_min: 30
+          component: elb_state_store
+          event: |
+            A maintenance deletion is executed against the production ELB state store, and control-plane reads
+            for existing load balancers begin returning not-found/slow results. Customer Modify operations start
+            failing, while steady request handling continues unaffected initially.
+          why: |
+            The control plane depends on state records (backend maps, listener/policy maps) to service Modify
+            and other management operations. Logical deletion causes missing keys and slower reads; this is
+            directly observable via DB read logs and control-plane missing-state errors. No immediate data plane
+            impact occurs because running LBs can continue with their currently loaded config; healthcheck noise
+            from misconfiguration is suppressed until bad config pushes begin.
+          flows: [api_modify_lb_fail_state, api_create_lb, client_request_healthy]
+          rate_multipliers:
+            client_request_healthy: 1.05
+            client_request_impacted: 0.0
+            cp_reconcile_push_config: 0.0
+            api_modify_lb_rejected: 0.0
+            elb_control_plane.workflow_gate_status: 0.0
+            elb_data_plane.healthcheck_summary: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: elb_state_store.audit_delete
+              count: 1
+              hosts: [elb-db-1]
+          manifestation:
+            - elb_state_store.audit_delete
+            - elb_state_store.db_read_state_notfound
+            - elb_control_plane.cp_state_missing
+            - elb_api.api_modify_err_state
+            - elb_control_plane.workflow_metrics
+
+        - order: 2
+          at_min: 40
+          component: elb_control_plane
+          event: |
+            Control-plane reconciliation begins pushing configuration changes for some running load balancers,
+            and because backend membership state is missing, some config pushes apply empty backend sets. A
+            subset of load balancers starts returning 503/504 with higher latency and more healthcheck failures.
+          why: |
+            When the control plane attempts to recompute and push LB configuration (autoscaling or other internal
+            reconciliation), missing backend maps can be interpreted as empty membership and pushed to the data
+            plane. This is partially observable: config push/application logs show backend_count dropping to 0,
+            and data plane access logs show elevated 503/504 for impacted LBs.
+          flows: [cp_reconcile_push_config, client_request_impacted, client_request_healthy]
+          rate_multipliers:
+            client_request_healthy: 1.0
+            client_request_impacted: 1.0
+            cp_reconcile_push_config: 1.0
+            elb_data_plane.healthcheck_summary: 1.5
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - elb_state_store.db_read_backend_map_notfound
+            - elb_control_plane.cp_push_config_reconcile
+            - elb_data_plane.dp_config_applied_reconcile
+            - elb_data_plane.access_err
+            - elb_data_plane.healthcheck_summary
+
+        - order: 3
+          at_min: 50
+          component: elb_control_plane
+          event: |
+            Operators disable key control-plane workflows (including scaling/descaling) to prevent additional
+            running load balancers from being affected. Modify requests transition from slow state-read failures
+            to fast rejections, and reconcile-driven config pushes largely stop. In parallel, on-call begins an
+            initial point-in-time restore attempt to recover the missing ELB state.
+          why: |
+            Workflow gating is an operational mitigation to stop propagation: fewer reconcile/config pushes means
+            fewer chances to apply empty backend sets to additional load balancers. This is directly observable
+            via the workflow gate action marker, subsequent periodic "gate status enabled=false" logs, and the shift
+            from state-read failure path to rejection logs. The restore attempt is directly observable via ops
+            recovery tooling logs.
+          flows: [api_modify_lb_rejected, api_modify_lb_fail_state, cp_reconcile_push_config, client_request_impacted]
+          rate_multipliers:
+            api_modify_lb_fail_state: 0.25
+            api_modify_lb_rejected: 0.75
+            cp_reconcile_push_config: 0.1
+            elb_control_plane.workflow_gate_status: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: elb_control_plane.workflow_gate_disabled
+              count: 1
+              hosts: [elb-cp-2]
+            - ref: ops_recovery.restore_start
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - elb_control_plane.workflow_gate_disabled
+            - elb_control_plane.workflow_gate_status
+            - elb_api.api_modify_err_disabled
+            - elb_control_plane.workflow_metrics
+            - ops_recovery.restore_start
+
+        - order: 4
+          at_min: 55
+          component: ops_recovery
+          event: |
+            The initial point-in-time restore approach fails to produce a usable snapshot after several minutes,
+            prolonging control-plane impairment and leaving workflows gated.
+          why: |
+            Recovery depends on restoring a consistent snapshot of the state store. The initial approach fails
+            (e.g., incomplete/corrupt snapshot or timeout), which is directly observable via ops restore logs.
+            Ongoing DB strain and high not-found rates remain visible in DB metrics while the system stays degraded.
+          flows: [api_modify_lb_rejected, client_request_impacted]
+          rate_multipliers:
+            elb_state_store.db_metrics: 2.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_recovery.restore_failed
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_recovery.restore_failed
+            - elb_state_store.db_metrics
+            - elb_control_plane.workflow_metrics
+
+      steady:
+        - component: elb_control_plane
+          condition: |
+            Control plane cannot reliably manage existing load balancers due to missing state; key workflows
+            remain gated off to prevent further propagation.
+          user_impact: |
+            Customers are unable to modify existing load balancers (requests are rejected), and scaling actions
+            are largely unavailable during the mitigation window.
+          manifestation:
+            - elb_control_plane.workflow_gate_status
+            - elb_api.api_modify_err_disabled
+            - elb_control_plane.workflow_metrics
+
+        - component: elb_data_plane
+          condition: |
+            A subset of running load balancers has applied an empty backend set from reconcile-driven config pushes.
+          user_impact: |
+            Requests routed through impacted load balancers intermittently fail with 503/504 and higher latency,
+            while unaffected load balancers continue serving normally.
+          manifestation:
+            - elb_data_plane.dp_config_applied_reconcile
+            - elb_data_plane.access_err
+            - elb_data_plane.healthcheck_summary
+
+        - component: elb_state_store
+          condition: |
+            Central ELB state remains logically incomplete (pre-restore), sustaining high not-found rates and elevated latency.
+          user_impact: |
+            Control-plane operations that depend on historical/central state continue to fail or degrade, delaying recovery.
+          manifestation:
+            - elb_state_store.db_metrics
+            - elb_state_store.db_read_state_notfound
+            - elb_state_store.db_read_backend_map_notfound
+
+      feedback_loops:
+        - id: state_loss_retry_pressure
+          desc: |
+            Missing state causes repeated/slow reads and increased control-plane work per API request, adding load
+            to the state store and increasing tail latency, which further increases the probability of timeouts and errors.
+        - id: misconfig_persists_until_corrected
+          desc: |
+            Once a load balancer has applied an empty backend set, it continues to return 503/504 until a correct
+            config is pushed, so customer-facing errors persist even after workflow gating reduces new propagation.
+
+      flows:
+        - api_create_lb
+        - api_modify_lb_fail_state
+        - api_modify_lb_rejected
+        - cp_reconcile_push_config
+        - client_request_healthy
+        - client_request_impacted
+      manifestation:
+        - elb_state_store.audit_delete
+        - elb_control_plane.workflow_metrics
+        - elb_state_store.db_metrics
+        - elb_control_plane.cp_state_missing
+        - elb_data_plane.dp_config_applied_reconcile
+        - elb_data_plane.access_err
+        - elb_control_plane.workflow_gate_status
+        - ops_recovery.restore_failed
+
+  assumptions:
+    - >
+      Timeline is compressed to 60 minutes: normal for 30 minutes, then failure for 30 minutes. This preserves
+      the causal progression (state deletion → API degradation → some LBs misconfigured → workflows gated →
+      restore attempt fails) without modeling the full overnight recovery.
+    - >
+      Failure-phase piecewise breakdown (effective rates are approximate):
+      minutes 30–40: client_request_healthy ~399 rpm, client_request_impacted 0 rpm, cp_reconcile_push_config 0 rpm,
+      api_modify_lb_fail_state ~20 rpm; background: workflow_metrics ~6/min, db_metrics ~1/min, hc_summary 0/min (suppressed),
+      gate_status 0/min.
+      minutes 40–50: client_request_healthy 380 rpm, client_request_impacted 20 rpm, cp_reconcile_push_config 6 rpm;
+      hc_summary multiplier 1.5 (≈6/min total across hosts).
+      minutes 50–55: reconcile reduced (~0.6 rpm), modify shifts to mostly rejected (≈15 rpm rejected + 5 rpm state-read fail);
+      gate_status enabled at ~3/min across CP hosts; restore_start one-shot at minute 50.
+      minutes 55–60: db_metrics doubled (≈2/min) to reflect restore-induced load/measurement; restore_failed one-shot at minute 55.
+    - >
+      One-shot counts: event1 audit_delete=1; event3 workflow_gate_disabled=1 and restore_start=1; event4 restore_failed=1.
+    - >
+      Total log volume estimate: ~33k–42k logs. Dominant driver is client access logging (~400 logs/min). Failure visibility is
+      ensured by high-rate modify API failures/rejections, periodic cp/db metrics, and the config-applied + 503/504 access logs
+      once misconfiguration begins; workflow gating is visible via both the one-shot action marker and the subsequent periodic
+      gate-status background logs, and the restore attempt is visible via start/fail one-shots separated in time with a consistent
+      waited_min value for the compressed scenario.
+    - >
+      The db_metrics.qps values are intentionally modeled in a low range (single-digit to low double-digit) to be compatible with
+      the modeled request-driven DB query logs while still allowing some unmodeled internal/background DB activity.
+```

@@ -1,0 +1,581 @@
+```yaml
+sys:
+  id: simpledb_use1_cluster
+  desc: >
+    A SimpleDB-like distributed datastore providing APIs to read/write items in customer Domains and to manage Domains.
+    Data is replicated across storage nodes and coordinated by metadata nodes that track replica placement and authorize node rejoin.
+    All nodes periodically handshake with an internal replicated lock service to confirm responsibility.
+    In the modeled incident, a datacenter power event triggers lock-service overload, increasing handshake latency and causing timeouts that lead nodes to self-remove, producing API 500s.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_frontend
+    name: SimpleDB API Frontend
+    svc: simpledb-api
+    hosts: [api-1, api-2]
+    desc: >
+      Public-facing API layer handling customer calls. It routes to metadata and storage nodes and returns HTTP responses.
+      In this model, API calls do not perform explicit client-visible retries; the main retries occur in internal lock handshakes.
+    to:
+      - dst: metadata_node
+        proto: https
+        desc: Resolves domain placement and serves domain-management operations.
+      - dst: storage_node
+        proto: https
+        desc: Performs reads and writes against the selected replica.
+    logs:
+      read_in:
+        desc: API request received for an eventually consistent read.
+        lvl: INFO
+        msg: "recv GetAttributes domain={domain} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          request_id: {k: uuid, v: null}
+      write_in:
+        desc: API request received for a write.
+        lvl: INFO
+        msg: "recv PutAttributes domain={domain} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          request_id: {k: uuid, v: null}
+      domain_in:
+        desc: API request received for CreateDomain/DeleteDomain.
+        lvl: INFO
+        msg: "recv {op} domain={domain} request_id={request_id}"
+        vars:
+          op: {k: ch, v: [CreateDomain, DeleteDomain]}
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          request_id: {k: uuid, v: null}
+      read_200:
+        desc: Successful read response returned to the client.
+        lvl: INFO
+        msg: "respond 200 op=GetAttributes domain={domain} latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          latency_ms: {k: i, v: [2, 800]}
+          request_id: {k: uuid, v: null}
+      read_500:
+        desc: Failed read response returned to the client.
+        lvl: ERROR
+        msg: "respond 500 op=GetAttributes error=InternalError latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          latency_ms: {k: i, v: [50, 2500]}
+          request_id: {k: uuid, v: null}
+      write_200:
+        desc: Successful write response returned to the client.
+        lvl: INFO
+        msg: "respond 200 op=PutAttributes domain={domain} latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          latency_ms: {k: i, v: [3, 1200]}
+          request_id: {k: uuid, v: null}
+      write_500:
+        desc: Failed write response returned to the client.
+        lvl: ERROR
+        msg: "respond 500 op=PutAttributes error=InternalError latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          latency_ms: {k: i, v: [50, 3000]}
+          request_id: {k: uuid, v: null}
+      domain_200:
+        desc: Successful CreateDomain/DeleteDomain response.
+        lvl: INFO
+        msg: "respond 200 op={op} domain={domain} latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          op: {k: ch, v: [CreateDomain, DeleteDomain]}
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          latency_ms: {k: i, v: [5, 5000]}
+          request_id: {k: uuid, v: null}
+      domain_500:
+        desc: Failed CreateDomain/DeleteDomain response.
+        lvl: ERROR
+        msg: "respond 500 op={op} error=InternalError latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          op: {k: ch, v: [CreateDomain, DeleteDomain]}
+          latency_ms: {k: i, v: [50, 4000]}
+          request_id: {k: uuid, v: null}
+      domain_503_throttled:
+        desc: CreateDomain/DeleteDomain rejected due to throttling.
+        lvl: WARN
+        msg: "respond 503 op={op} error=Throttled limit_rps={limit_rps} request_id={request_id}"
+        vars:
+          op: {k: ch, v: [CreateDomain, DeleteDomain]}
+          limit_rps: {k: f, v: [0.01, 0.05]}
+          request_id: {k: uuid, v: null}
+    beh:
+      n:
+        desc: API frontend emits no periodic background logs in this model.
+        emit: []
+      f:
+        desc: API frontend emits no periodic background logs in this model.
+        emit: []
+
+  - id: metadata_node
+    name: Metadata Node
+    svc: simpledb-metadata
+    hosts: [meta-1, meta-2, meta-3]
+    desc: >
+      Stores domain metadata (replica placement and authorization decisions) and serves domain-management operations.
+      Periodically handshakes with the lock service to confirm responsibility; on repeated timeouts it may remove itself.
+    to:
+      - dst: lock_service
+        proto: grpc
+        desc: Periodic handshake to confirm responsibility epochs.
+      - dst: storage_node
+        proto: https
+        desc: Contacts storage nodes when coordinating some metadata-driven actions (simplified).
+      - dst: api_frontend
+        proto: https
+        desc: Returns placement/mutation results to the API frontend (modeled as a call edge for path connectivity).
+    logs:
+      lookup_ok:
+        desc: Domain placement resolved for routing.
+        lvl: INFO
+        msg: "resolved domain={domain} replicas={replicas} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          replicas: {k: str, v: "comma-separated host ids (e.g., stor-1,stor-2,stor-3)"}
+          request_id: {k: uuid, v: null}
+      domain_mutation_ok:
+        desc: Domain create/delete applied on metadata node.
+        lvl: INFO
+        msg: "domain {op} applied domain={domain} latency_ms={latency_ms} request_id={request_id}"
+        vars:
+          op: {k: ch, v: [CreateDomain, DeleteDomain]}
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          latency_ms: {k: i, v: [10, 6000]}
+          request_id: {k: uuid, v: null}
+      handshake_ok:
+        desc: Successful periodic handshake with lock service.
+        lvl: DEBUG
+        msg: "lock handshake ok epoch={epoch} latency_ms={latency_ms}"
+        vars:
+          epoch: {k: i, v: [1000, 5000]}
+          latency_ms: {k: i, v: [5, 200]}
+      handshake_timeout_pre:
+        desc: Handshake attempt timed out under the pre-mitigation (low) handshake deadline.
+        lvl: WARN
+        msg: "lock handshake timed out elapsed_ms={elapsed_ms} deadline_ms={deadline_ms} attempt={attempt}"
+        vars:
+          elapsed_ms: {k: i, v: [420, 2000]}
+          deadline_ms: {k: i, v: [150, 400]}
+          attempt: {k: i, v: [1, 6]}
+      handshake_timeout_post:
+        desc: Handshake attempt timed out after the handshake deadline was increased.
+        lvl: WARN
+        msg: "lock handshake timed out elapsed_ms={elapsed_ms} deadline_ms={deadline_ms} attempt={attempt}"
+        vars:
+          elapsed_ms: {k: i, v: [1250, 3500]}
+          deadline_ms: {k: i, v: [800, 1200]}
+          attempt: {k: i, v: [1, 6]}
+      leave_cluster:
+        desc: Node removes itself from cluster after repeated handshake failures.
+        lvl: ERROR
+        msg: "removing self from cluster after {timeouts} handshake timeouts"
+        vars:
+          timeouts: {k: i, v: [3, 10]}
+      process_start:
+        desc: Metadata node process start (used as a restart marker).
+        lvl: INFO
+        msg: "metadata node started version={version}"
+        vars:
+          version: {k: ch, v: ["1.42.0"]}
+      authorize_storage:
+        desc: Metadata node authorizes a storage node to rejoin.
+        lvl: INFO
+        msg: "authorized storage node={storage_id} for domain={domain} epoch={epoch}"
+        vars:
+          storage_id: {k: ch, v: [stor-1, stor-2, stor-3, stor-4, stor-5, stor-6]}
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          epoch: {k: i, v: [1000, 6000]}
+    beh:
+      n:
+        desc: Handshakes complete quickly under normal lock-service load.
+        emit:
+          - id: handshake_ok
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: Under lock-service overload, handshake timeouts occur frequently; after mitigation, any remaining timeouts use the larger deadline.
+        emit:
+          - id: handshake_timeout_pre
+            per_min: 4.0
+            scope: per_host
+          - id: handshake_timeout_post
+            per_min: 2.0
+            scope: per_host
+
+  - id: storage_node
+    name: Storage Node
+    svc: simpledb-storage
+    hosts: [stor-1, stor-2, stor-3, stor-4, stor-5, stor-6]
+    desc: >
+      Stores replicated customer item data. Serves reads and writes for assigned replicas.
+      Periodically handshakes with lock service; repeated timeouts can lead to self-removal from the production cluster.
+      Rejoining requires authorization by metadata nodes to avoid serving stale replicas.
+    to:
+      - dst: lock_service
+        proto: grpc
+        desc: Periodic handshake confirming responsibility for replica ranges.
+      - dst: metadata_node
+        proto: https
+        desc: Requests authorization to rejoin after removal (simplified).
+      - dst: api_frontend
+        proto: https
+        desc: Returns read/write results to the API frontend (modeled as a call edge for path connectivity).
+    logs:
+      read_ok:
+        desc: Successful read served by a storage replica.
+        lvl: INFO
+        msg: "read ok domain={domain} bytes={bytes} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          bytes: {k: i, v: [200, 20000]}
+          request_id: {k: uuid, v: null}
+      write_ok:
+        desc: Successful write applied by a storage replica.
+        lvl: INFO
+        msg: "write ok domain={domain} items={items} request_id={request_id}"
+        vars:
+          domain: {k: ch, v: [orders, users, catalog, sessions, metrics]}
+          items: {k: i, v: [1, 25]}
+          request_id: {k: uuid, v: null}
+      handshake_ok:
+        desc: Successful periodic handshake with lock service.
+        lvl: DEBUG
+        msg: "lock handshake ok epoch={epoch} latency_ms={latency_ms}"
+        vars:
+          epoch: {k: i, v: [1000, 5000]}
+          latency_ms: {k: i, v: [5, 200]}
+      handshake_timeout_pre:
+        desc: Handshake attempt timed out under the pre-mitigation (low) handshake deadline.
+        lvl: WARN
+        msg: "lock handshake timed out elapsed_ms={elapsed_ms} deadline_ms={deadline_ms} attempt={attempt}"
+        vars:
+          elapsed_ms: {k: i, v: [420, 2200]}
+          deadline_ms: {k: i, v: [150, 400]}
+          attempt: {k: i, v: [1, 6]}
+      handshake_timeout_post:
+        desc: Handshake attempt timed out after the handshake deadline was increased.
+        lvl: WARN
+        msg: "lock handshake timed out elapsed_ms={elapsed_ms} deadline_ms={deadline_ms} attempt={attempt}"
+        vars:
+          elapsed_ms: {k: i, v: [1250, 3800]}
+          deadline_ms: {k: i, v: [800, 1200]}
+          attempt: {k: i, v: [1, 6]}
+      leave_cluster:
+        desc: Storage node removes itself from cluster after repeated handshake failures.
+        lvl: ERROR
+        msg: "storage node leaving cluster after {timeouts} handshake timeouts"
+        vars:
+          timeouts: {k: i, v: [3, 10]}
+      rejoin_success:
+        desc: Storage node rejoined the cluster after receiving authorization.
+        lvl: INFO
+        msg: "storage node rejoined after authorization epoch={epoch}"
+        vars:
+          epoch: {k: i, v: [1000, 6000]}
+    beh:
+      n:
+        desc: Regular handshakes confirm storage node responsibility.
+        emit:
+          - id: handshake_ok
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: Handshake timeouts occur due to elevated lock-service latency; after mitigation, any remaining timeouts use the larger deadline.
+        emit:
+          - id: handshake_timeout_pre
+            per_min: 3.0
+            scope: per_host
+          - id: handshake_timeout_post
+            per_min: 1.5
+            scope: per_host
+
+  - id: lock_service
+    name: Lock Service
+    svc: internal-locksvc
+    hosts: [lock-1, lock-2, lock-3]
+    desc: >
+      Internal replicated lock/lease service used by metadata and storage nodes to determine responsibility epochs.
+      Under high churn (mass deregistration), handshake latency increases, leading to downstream timeouts.
+    to: []
+    logs:
+      stats:
+        desc: Periodic lock-service stats (inflight and latency).
+        lvl: INFO
+        msg: "locksvc stats inflight={inflight} p95_ms={p95_ms} dc={dc}"
+        vars:
+          inflight: {k: i, v: [0, 50000]}
+          p95_ms: {k: i, v: [20, 5000]}
+          dc: {k: ch, v: [use1a, use1b, use1c]}
+      queue_warn:
+        desc: Warning that handshake requests are queueing and latency is high.
+        lvl: WARN
+        msg: "locksvc handshake queueing inflight={inflight} p95_ms={p95_ms} dc={dc}"
+        vars:
+          inflight: {k: i, v: [500, 80000]}
+          p95_ms: {k: i, v: [200, 5000]}
+          dc: {k: ch, v: [use1a, use1b, use1c]}
+      deregister_batch:
+        desc: Batch deregistration of failed nodes from replication groups.
+        lvl: INFO
+        msg: "deregistered failed nodes dc={dc} count={count}"
+        vars:
+          dc: {k: ch, v: [use1a, use1b, use1c]}
+          count: {k: i, v: [10, 500]}
+    beh:
+      n:
+        desc: Lock service operates with low latency and modest inflight counts.
+        emit:
+          - id: stats
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: During the incident, high churn and handshake load cause queueing and frequent deregistration batches.
+        emit:
+          - id: queue_warn
+            per_min: 4.0
+            scope: per_host
+          - id: deregister_batch
+            per_min: 2.0
+            scope: global
+
+  - id: control_plane_ops
+    name: Operations Control Plane
+    svc: ops-control
+    hosts: [ops-1]
+    desc: >
+      Represents operator actions and control mechanisms such as config changes and API throttling.
+      Emits periodic throttle metrics once throttling is enabled.
+    to:
+      - dst: api_frontend
+        proto: https
+        desc: Applies throttling configuration to the API frontend.
+      - dst: metadata_node
+        proto: https
+        desc: Pushes configuration and triggers controlled restarts of metadata nodes.
+    logs:
+      config_change:
+        desc: Handshake timeout configuration was changed.
+        lvl: INFO
+        msg: "updated handshake_timeout_ms from {old_ms} to {new_ms}"
+        vars:
+          old_ms: {k: i, v: [150, 400]}
+          new_ms: {k: i, v: [800, 1200]}
+      throttle_enabled:
+        desc: Throttling for domain-management APIs was enabled.
+        lvl: WARN
+        msg: "enabled throttling for domain ops limit_rps={limit_rps}"
+        vars:
+          limit_rps: {k: f, v: [0.01, 0.05]}
+      throttle_status:
+        desc: Periodic throttle status/metrics.
+        lvl: INFO
+        msg: "throttle status domain_ops in_flight={inflight} rejected_last_min={rejected}"
+        vars:
+          inflight: {k: i, v: [0, 30]}
+          rejected: {k: i, v: [0, 20]}
+    beh:
+      n:
+        desc: No throttling metrics are emitted in normal operation in this model.
+        emit: []
+      f:
+        desc: Throttle status is emitted only when throttling is enabled (suppressed early in failure by scenario multipliers).
+        emit:
+          - id: throttle_status
+            per_min: 1.0
+            scope: global
+
+  - id: facility_monitor
+    name: Facility Monitor
+    svc: facility-monitor
+    hosts: [fac-1]
+    desc: Emits infrastructure event alerts (used to mark the datacenter power-loss trigger).
+    to:
+      - dst: control_plane_ops
+        proto: https
+        desc: Sends facility alerts to operations tooling.
+    logs:
+      power_loss:
+        desc: Power event affecting a set of hosts in one availability zone/datacenter.
+        lvl: CRITICAL
+        msg: "facility power event dc={dc} affected_hosts={affected_hosts}"
+        vars:
+          dc: {k: ch, v: [use1a]}
+          affected_hosts: {k: str, v: "host-id list summary"}
+    beh:
+      n:
+        desc: No periodic logs for facility monitoring in this model.
+        emit: []
+      f:
+        desc: No periodic logs for facility monitoring in this model.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal API traffic with successful routing via metadata nodes to storage replicas, and periodic lock handshakes.
+    req:
+      - id: api_read_ok
+        desc: Eventually consistent read succeeds.
+        rpm: 240.0
+        path: [api_frontend, metadata_node, storage_node, api_frontend]
+        emit: [api_frontend.read_in, metadata_node.lookup_ok, storage_node.read_ok, api_frontend.read_200]
+        latency_ms: [[1, 5], [2, 15], [2, 30], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_write_ok
+        desc: Write succeeds.
+        rpm: 90.0
+        path: [api_frontend, metadata_node, storage_node, api_frontend]
+        emit: [api_frontend.write_in, metadata_node.lookup_ok, storage_node.write_ok, api_frontend.write_200]
+        latency_ms: [[1, 5], [2, 15], [3, 40], [1, 15]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_domain_ok
+        desc: CreateDomain/DeleteDomain succeeds via metadata nodes.
+        rpm: 6.0
+        path: [api_frontend, metadata_node, api_frontend]
+        emit: [api_frontend.domain_in, metadata_node.domain_mutation_ok, api_frontend.domain_200]
+        latency_ms: [[1, 5], [20, 200], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: Failure traffic includes widespread 500s due to nodes leaving the cluster after lock-handshake timeouts; later, reads/writes recover but domain operations are throttled.
+    req:
+      - id: api_read_ok
+        desc: Read succeeds during partial service availability.
+        rpm: 240.0
+        path: [api_frontend, metadata_node, storage_node, api_frontend]
+        emit: [api_frontend.read_in, metadata_node.lookup_ok, storage_node.read_ok, api_frontend.read_200]
+        latency_ms: [[1, 10], [5, 80], [5, 120], [1, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_read_500
+        desc: Read fails due to cluster unavailability/upstream timeouts.
+        rpm: 240.0
+        path: [api_frontend, metadata_node, api_frontend]
+        emit: [api_frontend.read_in, api_frontend.read_500]
+        latency_ms: [[1, 10], [80, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_write_ok
+        desc: Write succeeds after recovery actions restore cluster membership.
+        rpm: 90.0
+        path: [api_frontend, metadata_node, storage_node, api_frontend]
+        emit: [api_frontend.write_in, metadata_node.lookup_ok, storage_node.write_ok, api_frontend.write_200]
+        latency_ms: [[1, 10], [5, 100], [10, 200], [1, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_write_500
+        desc: Write fails during the outage window.
+        rpm: 90.0
+        path: [api_frontend, metadata_node, api_frontend]
+        emit: [api_frontend.write_in, api_frontend.write_500]
+        latency_ms: [[1, 10], [80, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_domain_ok_slow
+        desc: A small fraction of domain operations succeed slowly under throttling/recovery.
+        rpm: 6.0
+        path: [api_frontend, metadata_node, api_frontend]
+        emit: [api_frontend.domain_in, metadata_node.domain_mutation_ok, api_frontend.domain_200]
+        latency_ms: [[1, 10], [200, 2500], [1, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_domain_500
+        desc: Domain operations fail with 500 during the full outage.
+        rpm: 6.0
+        path: [api_frontend, metadata_node, api_frontend]
+        emit: [api_frontend.domain_in, api_frontend.domain_500]
+        latency_ms: [[1, 10], [100, 1800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: api_domain_throttled_503
+        desc: Domain operations are rejected at the frontend due to throttling.
+        rpm: 6.0
+        path: [api_frontend]
+        emit: [api_frontend.domain_in, api_frontend.domain_503_throttled]
+        latency_ms: [[1, 10], [1, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Timeline is compressed into a 50-minute scenario while preserving key beats: power-loss trigger, lock-service overload,
+    handshake timeouts causing nodes to self-remove, manual timeout increase plus metadata restarts enabling storage rejoin,
+    then throttling of CreateDomain/DeleteDomain.
+  - |
+    The model uses one API-frontend service, a metadata cluster, a storage cluster, an internal lock service, an ops control plane,
+    and a facility monitor; other AWS infrastructure is omitted.
+  - |
+    Handshake timeout logs are split into pre- and post-mitigation variants so their deadline_ms values cannot contradict the
+    ops config_change marker; scenario events suppress/activate the appropriate variant over time.
+  - |
+    Timeout log domains are constrained so elapsed_ms is always >= deadline_ms (to prevent contradictory "timeout" logs where
+    elapsed is less than the deadline).
+  - |
+    API-layer retries are not modeled (max_attempts=1) to keep response-return logs (respond 500/200/503) unambiguously once-per-request;
+    the post-mortem's "retries" are represented in the internal lock-handshake attempt fields and repeated timeout logs.
+  - |
+    Request rates are simplified to ~336 RPM total in normal (reads 240, writes 90, domain ops 6).
+    Failure uses the same entry rates but shifts traffic between success/error/throttled variants via scenario multipliers.
+  - |
+    Throttling numeric domains are modeled to be consistent with low domain-ops volume: throttle limits are sub-0.1 rps and
+    rejected_last_min ranges match the expected single-digit rejected requests per minute.
+  - |
+    Normal-phase log volume is approximately 1.34k flow logs per minute plus ~24 background logs per minute (~1.36k per minute).
+  - |
+    Total scenario log volume estimate is approximately ~58k–62k logs, within the 20k–100k target.
+  - |
+    Key diagnostic visibility comes from lock_service.queue_warn and lock_service.deregister_batch (overload),
+    metadata_node/storage_node handshake_timeout_pre (propagation pre-mitigation),
+    leave_cluster one-shots (cascade),
+    control_plane_ops.config_change plus handshake_timeout_post suppression (mitigation),
+    and API 500/503 responses (customer impact and remaining impairment).
+```

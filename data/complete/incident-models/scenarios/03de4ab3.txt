@@ -1,0 +1,209 @@
+```yaml
+scenario:
+  id: stackegg_enablement_haproxy_maxconn_outage
+  title: StackEgg rollout drives HAProxy to maxconn, causing queued connects and timeouts
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally serves page views through HAProxy to the web tier with stable concurrency.
+    A feature flag rollout enables StackEgg for logged-in users, adding an extra AJAX call for game state after page loads.
+    With HTTP keep-alive set to 15 seconds, the added request volume increases concurrent sessions on HAProxy until it hits the configured session cap,
+    producing queued TCP connects and client-facing timeouts that are also reflected in external monitoring.
+
+  trigger_desc: |
+    StackEgg is enabled network-wide via a feature-flag update, causing logged-in clients to begin calling /stackegg/state on page loads.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Users browse normally. HAProxy session counts remain well below the configured cap and connection queuing is absent.
+        Page views are served with low latency and monitoring checks remain OK.
+      flows: [page_view]
+      manifestation:
+        - haproxy_lb.stats_sample_40k
+        - web_app.http_resp_200
+        - monitor_pingdom.check_ok
+
+    f:
+      desc: |
+        After StackEgg is enabled, page loads begin triggering additional asynchronous /stackegg/state requests.
+        Because the frontend uses a long HTTP keep-alive (15s), transient requests translate into a larger pool of concurrent sessions.
+        HAProxy approaches its maxconn threshold; once reached, new TCP connects are queued, producing highly variable latencies and then client connect timeouts.
+        External monitoring flips from OK checks to DOWN checks during the outage window.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: feature_flag_db
+          event: |
+            StackEgg is enabled via a feature flag update; logged-in clients start issuing /stackegg/state AJAX requests after page loads.
+            Session counts rise toward the HAProxy maxconn cap, but the frontend is not yet consistently pinned at the cap and widespread client TCP connect timeouts are not present.
+          why: |
+            The rollout is directly observable via the feature-flag audit log. The resulting extra request stream is visible as StackEgg endpoint
+            traffic in web logs, while the initial concurrency rise (below the cap with little queuing) is observable via HAProxy periodic stats snapshots.
+          flows: [stackegg_state_ajax, page_view_ok_slow]
+          rate_multipliers:
+            stackegg_state_ajax: 1.2
+            page_view_connect_timeout: 0.0
+            haproxy_lb.maxconn_queue_warn_40k: 0.0
+            haproxy_lb.maxconn_queue_warn_60k: 0.0
+            haproxy_lb.stats_sample_40k: 1.0
+            haproxy_lb.stats_sample_40k_cap: 0.0
+            haproxy_lb.stats_sample_60k: 0.0
+            monitor_pingdom.check_fail: 0.0
+          latency_multipliers:
+            stackegg_state_ajax: {p50: 1.2, p95: 1.3}
+            page_view_ok_slow: {p50: 1.2, p95: 1.4}
+          one_shots:
+            - ref: feature_flag_db.flag_update
+              count: 1
+              hosts: [db-1]
+          manifestation:
+            - feature_flag_db.flag_update
+            - web_app.stackegg_req
+            - haproxy_lb.stats_sample_40k
+            - monitor_pingdom.check_ok
+
+        - order: 2
+          at_min: 22
+          component: haproxy_lb
+          event: |
+            HAProxy reaches its configured session ceiling and begins queuing new inbound connections.
+            Client TCP connect waits become long enough that a portion of requests time out, and monitoring reports the site as down.
+          why: |
+            The session cap and queuing are observable via HAProxy stats (cur_sess at/near maxconn, queued rising) and via maxconn warnings.
+            End-user impact occurs when queued connects exceed client timeouts, producing connect-timeout errors; monitoring shows DOWN checks and opens an alert.
+          flows: [page_view_connect_timeout, page_view_ok_slow, stackegg_state_ajax]
+          rate_multipliers:
+            stackegg_state_ajax: 1.3
+            page_view_connect_timeout: 1.6
+            page_view_ok_slow: 0.9
+            haproxy_lb.maxconn_queue_warn_40k: 1.0
+            haproxy_lb.maxconn_queue_warn_60k: 0.0
+            haproxy_lb.stats_sample_40k: 0.0
+            haproxy_lb.stats_sample_40k_cap: 1.0
+            haproxy_lb.stats_sample_60k: 0.0
+            monitor_pingdom.check_ok: 0.0
+            monitor_pingdom.check_fail: 1.0
+          latency_multipliers:
+            stackegg_state_ajax: {p50: 2.0, p95: 3.0}
+            page_view_ok_slow: {p50: 2.5, p95: 3.5}
+          one_shots:
+            - ref: monitor_pingdom.check_alert
+              count: 1
+              hosts: [pingdom]
+          manifestation:
+            - haproxy_lb.stats_sample_40k_cap
+            - haproxy_lb.maxconn_queue_warn_40k
+            - haproxy_lb.frontend_connect_timeout
+            - monitor_pingdom.check_fail
+            - monitor_pingdom.check_alert
+
+        - order: 3
+          at_min: 30
+          component: ops_puppet
+          event: |
+            Operators apply an HAProxy configuration change to raise maxconn, and the StackEgg request pattern is reduced.
+            Queuing and connect timeouts decrease, and monitoring returns to OK checks, but concurrency remains elevated due to keep-alive and residual StackEgg traffic.
+          why: |
+            The config change is directly observable via Puppet and HAProxy reload markers. The maxconn increase is visible in post-change HAProxy stats.
+            Reduced StackEgg load is observable as a lower rate of /stackegg/state requests and fewer queue warnings; however, keep-alive continues to sustain
+            a large concurrent session pool.
+          flows: [stackegg_state_ajax, page_view_connect_timeout, page_view_ok_slow]
+          rate_multipliers:
+            stackegg_state_ajax: 0.6
+            page_view_connect_timeout: 0.5
+            page_view_ok_slow: 1.0
+            haproxy_lb.stats_sample_40k: 0.0
+            haproxy_lb.stats_sample_40k_cap: 0.0
+            haproxy_lb.stats_sample_60k: 1.0
+            haproxy_lb.maxconn_queue_warn_40k: 0.0
+            haproxy_lb.maxconn_queue_warn_60k: 0.5
+            monitor_pingdom.check_ok: 1.0
+            monitor_pingdom.check_fail: 0.0
+          latency_multipliers:
+            stackegg_state_ajax: {p50: 1.3, p95: 1.8}
+            page_view_ok_slow: {p50: 1.5, p95: 2.0}
+          one_shots:
+            - ref: ops_puppet.puppet_change
+              count: 1
+              hosts: [puppet-1]
+            - ref: haproxy_lb.reload_applied
+              count: 2
+              hosts: [lb-a, lb-b]
+          manifestation:
+            - ops_puppet.puppet_change
+            - haproxy_lb.reload_applied
+            - haproxy_lb.stats_sample_60k
+            - monitor_pingdom.check_ok
+
+      steady:
+        - component: haproxy_lb
+          condition: |
+            Frontend concurrency remains high relative to normal due to long keep-alive and remaining StackEgg AJAX traffic.
+            With maxconn raised, queuing is reduced, but intermittent bursts still cause occasional queued connects.
+          user_impact: |
+            Most requests succeed but users intermittently see slow loads and occasional connection timeouts, especially during traffic spikes.
+            External monitoring is mostly OK after the mitigation, with the outage window having ended.
+          manifestation:
+            - haproxy_lb.stats_sample_60k
+            - haproxy_lb.maxconn_queue_warn_60k
+            - haproxy_lb.frontend_connect_timeout
+            - monitor_pingdom.check_ok
+
+      feedback_loops:
+        - id: keepalive_amplifies_concurrency
+          desc: |
+            Long HTTP keep-alive keeps many client connections open, so a short-lived extra AJAX request stream expands into a large pool of
+            concurrent sessions; once queuing starts, longer waits further inflate observed concurrency and increase timeout likelihood.
+
+      flows: [page_view_ok_slow, page_view_connect_timeout, stackegg_state_ajax]
+      manifestation:
+        - haproxy_lb.stats_sample_40k
+        - haproxy_lb.stats_sample_40k_cap
+        - haproxy_lb.maxconn_queue_warn_40k
+        - haproxy_lb.frontend_connect_timeout
+        - haproxy_lb.stats_sample_60k
+        - monitor_pingdom.check_fail
+
+  assumptions:
+    - >
+      The real incident lasted hours with multiple rollout toggles; this scenario compresses to a single
+      enablement → maxconn saturation/outage → partial mitigation sequence while keeping the causal core intact.
+    - >
+      Quantitative scaling: request rpm are scaled down for log volume, and HAProxy cur_sess/queued/maxconn are scaled down to match
+      those rpms while preserving the same qualitative behavior (rising concurrency, saturation at cap, then relief after raising the cap).
+      Concretely, maxconn=140 represents the real-world ~40k cap and maxconn=210 represents the raised cap (real-world ~60k).
+    - >
+      To keep maxconn time-consistent (and avoid the raised cap appearing before the mitigation), HAProxy emits separate
+      pre-change and post-change stats/queue-warning logs; event 3 switches emission from *_40k to *_60k using rate multipliers.
+      Additionally, initial-cap stats are split into pre-saturation (stats_sample_40k) vs at-cap (stats_sample_40k_cap) templates,
+      and event 2 switches between them to align with the saturation boundary.
+    - >
+      HAProxy stats semantics: cur_sess is bounded by maxconn; overload beyond maxconn is represented by queued increasing while cur_sess
+      stays at/near the cap.
+    - >
+      Piecewise failure-phase breakdown (effective rates after multipliers):
+      Minutes 18–22 (4m): stackegg_state_ajax ~360 rpm; page_view_ok_slow ~220 rpm; page_view_connect_timeout ~0 rpm;
+      stats_sample_40k active (rising, low queued); stats_sample_40k_cap suppressed; monitoring emits OK checks only.
+      Minutes 22–30 (8m): stackegg_state_ajax ~390 rpm; page_view_ok_slow ~198 rpm; page_view_connect_timeout ~128 rpm;
+      stats_sample_40k_cap active (at-cap, queued); maxconn queue warnings active (~6/min); monitoring emits DOWN checks only.
+      Minutes 30–40 (10m): stackegg_state_ajax ~180 rpm; page_view_ok_slow ~220 rpm; page_view_connect_timeout ~40 rpm;
+      raised-cap stats active; raised-cap queue warnings reduced (~3/min); monitoring returns to OK checks only.
+    - >
+      One-shot counts per event: event1=1 (flag update), event2=1 (monitor alert), event3=3 (puppet change + 2 HAProxy reload markers).
+    - >
+      Normal-phase logs/min estimate: ~1000–1010 logs/min (page_view requests dominate). Failure-phase logs/min estimate: ~1600–2600 logs/min
+      depending on the interval (added StackEgg requests and, after saturation, timeout errors), plus ~3–12 background logs/min (HAProxy stats/warnings and monitoring).
+    - >
+      Total log volume estimate across 40 minutes: ~60k–70k logs. Visibility rationale: per-minute HAProxy stats switching from rising (stats_sample_40k)
+      to at-cap (stats_sample_40k_cap) to post-change (stats_sample_60k), activated maxconn queue warnings during saturation, and per-request connect-timeout logs
+      plus monitoring DOWN checks/alert make phase boundaries clear without requiring unrealistic concurrency numbers for the scaled traffic.
+```

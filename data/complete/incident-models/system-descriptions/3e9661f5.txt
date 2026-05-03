@@ -1,0 +1,456 @@
+```yaml
+sys:
+  id: filestore_control_plane
+  desc: >
+    A managed file service control-plane exposes read-only and mutate APIs (console/gcloud/API) to manage instances
+    and long-running operations. A global throttling layer protects the Filestore API from overload by enforcing a
+    global quota on read-only API requests. In this incident model, an internal project-management service malfunctions
+    and floods the read-only APIs, pushing the system over the global read limit and causing customer read-only calls to
+    fail with 429 while mutate calls continue to succeed.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: filestore_api
+    name: Filestore API Frontend
+    svc: filestore-api
+    hosts: [fs-api-1, fs-api-2, fs-api-3]
+    desc: Terminates customer and internal control-plane API calls, applies quota decisions via the global quota gate, and dispatches allowed mutate operations to the operations manager.
+    to:
+      - dst: global_quota
+        proto: grpc
+        desc: Checks global read/write quota buckets for each API request.
+      - dst: filestore_ops
+        proto: grpc
+        desc: For allowed mutate requests, creates and manages long-running operations via the operations manager.
+    logs:
+      access_list_instances_ok:
+        desc: Access log for successful ListInstances calls.
+        lvl: INFO
+        msg: "request_id={request_id} caller={caller} rpc=ListInstances quota_bucket=read_global status=200 page_size={page_size} latency_ms={latency_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          caller: {k: ch, v: [console_user, gcloud_user, api_client, svc_project_manager]}
+          page_size: {k: i, v: [20, 1000]}
+          latency_ms: {k: i, v: [15, 250]}
+          trace_id: {k: hex, v: 32}
+
+      access_list_instances_429:
+        desc: Access log for throttled ListInstances calls rejected by global read quota.
+        lvl: WARN
+        msg: "request_id={request_id} caller={caller} rpc=ListInstances quota_bucket=read_global status=429 reason=RESOURCE_EXHAUSTED latency_ms={latency_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          caller: {k: ch, v: [console_user, gcloud_user, api_client, svc_project_manager]}
+          latency_ms: {k: i, v: [5, 80]}
+          trace_id: {k: hex, v: 32}
+
+      access_get_operation_ok:
+        desc: Access log for successful GetOperation calls.
+        lvl: INFO
+        msg: "request_id={request_id} caller={caller} rpc=GetOperation op_id={op_id} quota_bucket=read_global status=200 latency_ms={latency_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          caller: {k: ch, v: [console_user, gcloud_user, api_client]}
+          op_id: {k: hex, v: 16}
+          latency_ms: {k: i, v: [10, 220]}
+          trace_id: {k: hex, v: 32}
+
+      access_get_operation_429:
+        desc: Access log for throttled GetOperation calls rejected by global read quota.
+        lvl: WARN
+        msg: "request_id={request_id} caller={caller} rpc=GetOperation op_id={op_id} quota_bucket=read_global status=429 reason=RESOURCE_EXHAUSTED latency_ms={latency_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          caller: {k: ch, v: [console_user, gcloud_user, api_client]}
+          op_id: {k: hex, v: 16}
+          latency_ms: {k: i, v: [5, 90]}
+          trace_id: {k: hex, v: 32}
+
+      create_instance_received:
+        desc: Mutate request accepted for processing and forwarded to operations manager.
+        lvl: INFO
+        msg: "request_id={request_id} caller={caller} rpc=CreateInstance project={project} inst_id={inst_id} quota_bucket=write_global accepted=true trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          caller: {k: ch, v: [console_user, gcloud_user, api_client]}
+          project: {k: ch, v: [p-alpha, p-beta, p-gamma, p-delta]}
+          inst_id: {k: ch, v: [fs-1, fs-2, fs-3, fs-4]}
+          trace_id: {k: hex, v: 32}
+
+      access_create_instance_accepted:
+        desc: Access log for CreateInstance returning an operation (mutate succeeds).
+        lvl: INFO
+        msg: "request_id={request_id} caller={caller} rpc=CreateInstance quota_bucket=write_global status=202 op_id={op_id} latency_ms={latency_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          caller: {k: ch, v: [console_user, gcloud_user, api_client]}
+          op_id: {k: hex, v: 16}
+          latency_ms: {k: i, v: [60, 2500]}
+          trace_id: {k: hex, v: 32}
+
+      api_server_metrics:
+        desc: Per-host periodic server health metrics.
+        lvl: INFO
+        msg: "metric=api_server in_flight={in_flight} cpu_pct={cpu_pct} p95_handler_ms={p95_handler_ms}"
+        vars:
+          in_flight: {k: i, v: [0, 450]}
+          cpu_pct: {k: i, v: [5, 95]}
+          p95_handler_ms: {k: i, v: [10, 3000]}
+    beh:
+      n:
+        desc: Normal background server metrics.
+        emit:
+          - id: api_server_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Metrics continue during overload/throttling.
+        emit:
+          - id: api_server_metrics
+            per_min: 1.0
+            scope: per_host
+
+  - id: global_quota
+    name: Global Quota / Throttling Gate
+    svc: filestore-quota
+    hosts: [quota-1]
+    desc: Enforces global request limits (not per-region) and drives throttling decisions for the read-only bucket.
+    to:
+      - dst: filestore_api
+        proto: grpc
+        desc: Returns quota allow/deny decisions to the API frontend (modeled as the response hop).
+      - dst: filestore_ops
+        proto: grpc
+        desc: When allowed, the API frontend proceeds to the operations manager after the quota check (modeled as a forward hop).
+    logs:
+      quota_metrics:
+        desc: Periodic summary of global quota usage; in failure it reflects sustained over-limit demand and near-total throttling.
+        lvl: INFO
+        msg: "metric=global_quota bucket=read_global limit_rpm={limit_rpm} observed_rpm={observed_rpm} throttled_rpm={throttled_rpm}"
+        vars:
+          limit_rpm: {k: i, v: [800, 800]}
+        state_vars:
+          n:
+            observed_rpm: {k: i, v: [400, 700]}
+            throttled_rpm: {k: i, v: [0, 30]}
+          f:
+            observed_rpm: {k: i, v: [2200, 2300]}
+            throttled_rpm: {k: i, v: [2200, 2300]}
+
+      throttle_gate_open:
+        desc: Warning emitted while enforcing global throttling on the read bucket.
+        lvl: WARN
+        msg: "global_throttle active=true bucket=read_global limit_rpm={limit_rpm} observed_rpm={observed_rpm}"
+        vars:
+          limit_rpm: {k: i, v: [800, 800]}
+          observed_rpm: {k: i, v: [2100, 2400]}
+    beh:
+      n:
+        desc: Quota stays under the global read limit.
+        emit:
+          - id: quota_metrics
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Global throttling is active from the start of failure and metrics reflect heavy read pressure.
+        emit:
+          - id: quota_metrics
+            per_min: 1.0
+            scope: global
+          - id: throttle_gate_open
+            per_min: 1.0
+            scope: global
+
+  - id: filestore_ops
+    name: Filestore Operations Manager
+    svc: filestore-ops
+    hosts: [fs-ops-1, fs-ops-2]
+    desc: Creates and tracks long-running operations for mutate requests; read-only GetOperation queries are served by this component when not throttled upstream.
+    to:
+      - dst: filestore_api
+        proto: grpc
+        desc: Returns operation create/status results to the API frontend (modeled as the response hop).
+    logs:
+      op_created:
+        desc: An operation record is created for a mutate request.
+        lvl: INFO
+        msg: "op_created op_id={op_id} kind={kind} project={project} inst_id={inst_id}"
+        vars:
+          op_id: {k: hex, v: 16}
+          kind: {k: ch, v: [CreateInstance, UpdateInstance, CreateBackup]}
+          project: {k: ch, v: [p-alpha, p-beta, p-gamma, p-delta]}
+          inst_id: {k: ch, v: [fs-1, fs-2, fs-3, fs-4]}
+
+      op_status_fetched:
+        desc: Operation state fetched for a GetOperation request.
+        lvl: DEBUG
+        msg: "op_status op_id={op_id} state={state} age_s={age_s}"
+        vars:
+          op_id: {k: hex, v: 16}
+          state: {k: ch, v: [PENDING, RUNNING, DONE]}
+          age_s: {k: i, v: [0, 7200]}
+
+      ops_heartbeat:
+        desc: Worker heartbeat indicating the ops subsystem is running.
+        lvl: INFO
+        msg: "metric=ops_worker heartbeat=true queue_depth={queue_depth}"
+        vars:
+          queue_depth: {k: i, v: [0, 2000]}
+    beh:
+      n:
+        desc: Normal periodic worker heartbeats.
+        emit:
+          - id: ops_heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Heartbeats continue during read-only throttling.
+        emit:
+          - id: ops_heartbeat
+            per_min: 1.0
+            scope: per_host
+
+  - id: internal_project_manager
+    name: Internal Project Management Service
+    svc: project-manager-internal
+    hosts: [proj-mgr-1, proj-mgr-2]
+    desc: Internal service that periodically scans many projects and calls Filestore read-only APIs; in failure it malfunctions and generates excessive calls.
+    to:
+      - dst: filestore_api
+        proto: https
+        desc: Issues read-only control-plane calls (e.g., listing instances) across many projects.
+    logs:
+      sweep_cycle:
+        desc: Periodic sweep cycle log showing how many Filestore API calls were issued during that cycle.
+        lvl: INFO
+        msg: "sweep_cycle job_id={job_id} projects_scanned={projects_scanned} filestore_api_calls={api_calls}"
+        vars:
+          job_id: {k: uuid, v: null}
+        state_vars:
+          n:
+            projects_scanned: {k: i, v: [80, 250]}
+            api_calls: {k: i, v: [15, 25]}
+          f:
+            projects_scanned: {k: i, v: [800, 1800]}
+            api_calls: {k: i, v: [110, 150]}
+
+      rapid_reconcile_entered:
+        desc: Marker indicating the service entered an abnormal rapid reconcile loop.
+        lvl: WARN
+        msg: "abnormal_loop entered=true job_id={job_id} reason={reason}"
+        vars:
+          job_id: {k: uuid, v: null}
+          reason: {k: ch, v: [scheduler_bug, stuck_retry, project_inventory_corruption]}
+
+      pause_internal_service:
+        desc: Operator action to pause the internal service to reduce load.
+        lvl: INFO
+        msg: "operator_action action=pause_service service=project-manager-internal requested_by={requested_by} ticket={ticket}"
+        vars:
+          requested_by: {k: ch, v: [oncall_sre, control_plane_eng]}
+          ticket: {k: ch, v: [INC-1842, INC-1843, INC-1844]}
+    beh:
+      n:
+        desc: Low-frequency background sweeps in normal conditions.
+        emit:
+          - id: sweep_cycle
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Malfunction causes rapid repeated sweeps and many API calls.
+        emit:
+          - id: sweep_cycle
+            per_min: 6.0
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring / Alerting
+    svc: control-plane-monitoring
+    hosts: [mon-1]
+    desc: Runs synthetic probes and raises alerts when read-only calls are failing or throttling is high.
+    to:
+      - dst: filestore_api
+        proto: https
+        desc: Runs synthetic read-only API checks (e.g., ListInstances).
+    logs:
+      synthetic_check_ok:
+        desc: Synthetic probe succeeded.
+        lvl: INFO
+        msg: "synthetic_check check_id={check_id} rpc=ListInstances status=200 latency_ms={latency_ms}"
+        vars:
+          check_id: {k: ch, v: [ro_list_instances_global]}
+          latency_ms: {k: i, v: [20, 300]}
+
+      synthetic_check_fail_429:
+        desc: Synthetic probe failed due to throttling.
+        lvl: ERROR
+        msg: "synthetic_check check_id={check_id} rpc=ListInstances status=429 error=RESOURCE_EXHAUSTED latency_ms={latency_ms}"
+        vars:
+          check_id: {k: ch, v: [ro_list_instances_global]}
+          latency_ms: {k: i, v: [5, 120]}
+
+      alert_throttle_high:
+        desc: Alert fired indicating sustained high throttling on the global read bucket.
+        lvl: CRITICAL
+        msg: "alert name=filestore_read_throttling_high bucket=read_global severity=critical"
+        vars: {}
+    beh:
+      n:
+        desc: Synthetic probes run continuously and typically succeed.
+        emit:
+          - id: synthetic_check_ok
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Synthetic probes continue and observe throttling.
+        emit:
+          - id: synthetic_check_fail_429
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [filestore_api, internal_project_manager]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Customer read-only calls succeed; mutate calls create operations; internal project manager runs occasional sweeps.
+    req:
+      - id: list_instances_ok
+        desc: Customer ListInstances read-only request succeeds.
+        rpm: 200.0
+        path: [filestore_api, global_quota, filestore_api]
+        emit: [filestore_api.access_list_instances_ok]
+        latency_ms: [[20, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: get_operation_ok
+        desc: Customer polls operation status via GetOperation and receives operation state.
+        rpm: 250.0
+        path: [filestore_api, global_quota, filestore_api, filestore_ops, filestore_api]
+        emit: [filestore_ops.op_status_fetched, filestore_api.access_get_operation_ok]
+        latency_ms: [[5, 25], [15, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: create_instance_mutate
+        desc: Customer CreateInstance succeeds by returning a long-running operation after passing the global write quota check.
+        rpm: 30.0
+        path: [filestore_api, global_quota, filestore_api, filestore_ops, filestore_api]
+        emit: [filestore_api.create_instance_received, filestore_ops.op_created, filestore_api.access_create_instance_accepted]
+        latency_ms: [[5, 25], [10, 60], [80, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_project_sync_ok
+        desc: Internal project manager performs a low-rate sweep calling ListInstances across projects.
+        rpm: 20.0
+        path: [internal_project_manager, filestore_api, global_quota, filestore_api]
+        emit: [filestore_api.access_list_instances_ok]
+        latency_ms: [[25, 160]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: Global read throttling causes all read-only APIs to return 429; mutate operations continue to work but clients cannot poll operation status.
+    req:
+      - id: list_instances_429
+        desc: Customer ListInstances read-only request is rejected with 429 due to global read throttling.
+        rpm: 200.0
+        path: [filestore_api, global_quota, filestore_api]
+        emit: [filestore_api.access_list_instances_429]
+        latency_ms: [[8, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: get_operation_429
+        desc: Customer GetOperation poll is rejected with 429; clients cannot check progress of mutate operations.
+        rpm: 250.0
+        path: [filestore_api, global_quota, filestore_api]
+        emit: [filestore_api.access_get_operation_429]
+        latency_ms: [[8, 70]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: create_instance_mutate
+        desc: Mutate requests still succeed and return operations after passing the global write quota check, though processing latency increases under load.
+        rpm: 30.0
+        path: [filestore_api, global_quota, filestore_api, filestore_ops, filestore_api]
+        emit: [filestore_api.create_instance_received, filestore_ops.op_created, filestore_api.access_create_instance_accepted]
+        latency_ms: [[8, 40], [15, 90], [120, 1800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_project_sync_429
+        desc: Internal project manager floods ListInstances; most calls are rejected but still contribute to sustained read load.
+        rpm: 1500.0
+        path: [internal_project_manager, filestore_api, global_quota, filestore_api]
+        emit: [filestore_api.access_list_instances_429]
+        latency_ms: [[6, 50]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    The modeled "global quota" is simplified to a single global read bucket (limit 800 rpm) that can throttle all regions;
+    mutate traffic uses a separate write bucket and is not throttled in this incident.
+  - |
+    Customer-visible impact is represented primarily by 429s on ListInstances and GetOperation; other read-only calls are omitted for compactness.
+  - |
+    quota_metrics is modeled as a rolling/aggregated global RPM summary that can include additional read-only RPCs not explicitly modeled
+    (e.g., other list/get methods), so its observed/throttled values are kept consistent with (and not below) the modeled read-only attempt rate.
+    Failure domains are tightened so throttled_rpm cannot contradict observed_rpm and stays near-total.
+  - |
+    internal_project_manager.sweep_cycle is treated as a periodic "cycle summary" whose api_calls roughly correspond to the internal
+    ListInstances request volume. The sweep_cycle per-minute rates and api_calls domains are tuned so that implied calls/min are consistent
+    with internal_project_sync_ok (20 rpm) and internal_project_sync_429 (1500 rpm) without requiring exact conservation.
+  - |
+    The internal project-management service is modeled as a distinct traffic source whose request volume increases sharply at failure start;
+    its own logs are included as if visible to operators investigating the incident.
+  - |
+    Tracing is enabled and allowed to originate from the API frontend and the internal project-management service, so internal traffic can
+    carry trace_ids into the Filestore API access logs.
+  - |
+    In the paired scenario (20 min normal, 30 min failure), normal-phase volume estimate: ~16.2k flow logs + ~0.16k background logs = ~16.36k.
+  - |
+    In the paired scenario, failure-phase baseline (before scenario multipliers) volume estimate: ~61.2k flow logs + ~0.60k background logs
+    + a few one-shots = ~61.8k.
+  - |
+    Total estimated logs remain within ~20k-100k. Key diagnostics are likely visible: API 429 access logs, global quota metrics,
+    synthetic check failures, internal sweep-cycle logs, and operator/alert one-shots.
+```

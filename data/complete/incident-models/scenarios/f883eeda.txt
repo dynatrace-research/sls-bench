@@ -1,0 +1,218 @@
+```yaml
+scenario:
+  id: quay_app_registry_connection_storm_may28
+  title: Quay outage from App Registry traffic surge causing MySQL connection storm and lock waits
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Quay serves registry pulls/pushes and an App Registry API. A surge of App Registry traffic drives slow,
+    read-heavy code paths that hold MySQL connections longer, causing concurrent connection usage to spike
+    toward the DB limit and InnoDB lock waits to appear. Clients see intermittent 502s on pulls and App
+    Registry calls; pushes fail and are later forced into 503 read-only mode as SRE mitigations cap DB
+    connections and disable non-essential features.
+
+  trigger_desc: |
+    A sudden increase in OperatorHub/App Registry requests (from many OpenShift clusters) hits the
+    /appregistry list-packages and get-blobs endpoints, amplifying slow DB reads and inflating concurrent
+    DB connection usage.
+
+  time:
+    total_minutes: 44
+    phases:
+      n: {start_min: 0, end_min: 22}
+      f: {start_min: 22, end_min: 44}
+
+  phases:
+    n:
+      desc: |
+        The service operates normally: image pulls dominate traffic, pushes occur steadily, and App Registry
+        usage is small. MySQL stays within typical connection levels and lock waits are rare.
+      flows: [docker_pull_ok_n, docker_push_ok_n, appreg_list_packages_ok_n, appreg_get_blobs_ok_n]
+      manifestation: [mysql_rds.conn_stats_n, quay_app.worker_metric, ingress_router.http_access]
+
+    f:
+      desc: |
+        App Registry traffic surges and slow endpoints inflate DB time per request. With many concurrent
+        gevent tasks, DB connections accumulate until MySQL begins refusing new connections and lock waits
+        dominate. Restarts do not help while the load pattern persists. Mitigations cap max_connections,
+        disable namespace GC, and force read-only mode; 502s reduce but do not disappear, and pushes remain
+        blocked.
+
+      events:
+        - order: 1
+          at_min: 22
+          component: quay_app
+          event: |
+            OperatorHub-driven App Registry traffic spikes; App Registry requests become slow and begin
+            consuming a large share of DB connection capacity.
+          why: |
+            Inefficient App Registry query paths under heavy load increase per-request DB time, keeping
+            connections open longer and raising concurrency. The traffic surge is directly observable via
+            increased appreg_* flow volume and slower db_query timings.
+          flows: [appreg_list_packages_slow_f, appreg_get_blobs_slow_f, appreg_502_f, appreg_502_conn_refused_f]
+          rate_multipliers:
+            mysql_rds.conn_stats_high: 1.0
+            mysql_rds.conn_stats_capped: 0.0
+            mysql_rds.lock_wait: 0.05
+            mysql_rds.too_many_conn: 0.05
+            quay_app.gc_run: 1.0
+            docker_push_503_readonly_f: 0.0
+            appreg_502_f: 0.5
+            appreg_502_conn_refused_f: 0.3
+            docker_pull_502_f: 0.4
+            docker_pull_502_conn_refused_f: 0.3
+            docker_push_502_db_f: 0.4
+            docker_push_502_conn_refused_f: 0.3
+          latency_multipliers:
+            appreg_list_packages_slow_f: {p50: 1.0, p95: 1.0}
+            appreg_get_blobs_slow_f: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation: [quay_app.db_query, mysql_rds.conn_stats_high, ingress_router.http_access]
+
+        - order: 2
+          at_min: 28
+          component: mysql_rds
+          event: |
+            As more app workers come up and concurrency increases, DB connection usage spikes toward the
+            configured limit; lock waits and connection refusals rise sharply and 502s worsen across App
+            Registry and pulls.
+          why: |
+            More active workers means more concurrent DB acquisition attempts. With slow queries, connection
+            hold times increase, raising concurrent connections and threads. This yields InnoDB lock wait
+            timeouts and refused connections that propagate back as 502 errors. This is directly observable
+            in MySQL lock_wait/too_many_conn and in Quay request failures (post-query lock timeouts vs
+            pre-query connection refusals).
+          flows: [appreg_502_f, appreg_502_conn_refused_f, docker_pull_502_f, docker_pull_502_conn_refused_f, docker_push_502_db_f, docker_push_502_conn_refused_f]
+          rate_multipliers:
+            appreg_502_f: 1.6
+            appreg_502_conn_refused_f: 1.8
+            docker_pull_502_f: 1.4
+            docker_pull_502_conn_refused_f: 1.6
+            docker_push_502_db_f: 1.3
+            docker_push_502_conn_refused_f: 1.4
+            mysql_rds.lock_wait: 2.0
+            mysql_rds.too_many_conn: 2.5
+          latency_multipliers:
+            appreg_list_packages_slow_f: {p50: 1.6, p95: 1.3}
+            appreg_get_blobs_slow_f: {p50: 1.7, p95: 1.2}
+            docker_pull_ok_f: {p50: 1.5, p95: 1.4}
+            docker_pull_502_f: {p50: 1.5, p95: 1.6}
+          one_shots:
+            - ref: quay_app.pod_restart
+              count: 8
+              hosts: [quay-1, quay-2, quay-3, quay-4, quay-5, quay-6, quay-7, quay-8]
+            - ref: mysql_rds.instance_restart
+              count: 1
+              hosts: [rds-1]
+          manifestation: [mysql_rds.lock_wait, mysql_rds.too_many_conn, quay_app.req_error_db, quay_app.req_error]
+
+        - order: 3
+          at_min: 35
+          component: quay_app
+          event: |
+            SRE applies mitigation: cap MySQL max_connections, disable namespace GC, and force the site into
+            read-only mode while also applying a Quay-side DB connection cap via configuration.
+          why: |
+            Capping reduces peak concurrent DB connections, lowering lock waits and connection refusals.
+            Disabling GC removes avoidable DB load. Read-only mode blocks writes so the service can remain
+            partially available. The Quay-side connection cap is evidenced by the config marker rather than
+            per-request acquire logs.
+          flows: [docker_push_503_readonly_f, docker_pull_ok_f, appreg_list_packages_slow_f]
+          rate_multipliers:
+            mysql_rds.conn_stats_high: 0.0
+            mysql_rds.conn_stats_capped: 1.0
+            mysql_rds.lock_wait: 0.2
+            mysql_rds.too_many_conn: 0.3
+            quay_app.gc_run: 0.0
+            appreg_502_f: 0.4
+            appreg_502_conn_refused_f: 0.2
+            docker_pull_502_f: 0.6
+            docker_pull_502_conn_refused_f: 0.2
+            docker_push_502_db_f: 0.0
+            docker_push_502_conn_refused_f: 0.0
+            docker_push_503_readonly_f: 1.0
+          latency_multipliers:
+            appreg_list_packages_slow_f: {p50: 1.2, p95: 1.1}
+            appreg_get_blobs_slow_f: {p50: 1.3, p95: 1.1}
+            docker_pull_ok_f: {p50: 1.2, p95: 1.2}
+          one_shots:
+            - ref: mysql_rds.set_max_connections
+              count: 1
+              hosts: [rds-1]
+            - ref: quay_app.mode_changed
+              count: 1
+              hosts: [quay-1]
+          manifestation: [mysql_rds.conn_stats_capped, quay_app.mode_changed, quay_app.req_error, ingress_router.http_access]
+
+      steady:
+        - component: quay_app
+          condition: |
+            Service remains degraded but stable: read-only mode stays enabled, App Registry traffic remains
+            heavy and slow, and some requests still fail due to residual DB contention or refused connections.
+          user_impact: |
+            Image pushes are blocked (503). Image pulls work intermittently (mix of 200 and 502). App Registry
+            calls are slow, and some return 502 under load.
+          manifestation: [quay_app.req_error, quay_app.req_error_db, ingress_router.http_access]
+
+        - component: mysql_rds
+          condition: |
+            Max connections are capped and the DB avoids hard lockups, but elevated threads and occasional
+            lock waits/connection refusals persist at a reduced level during the sustained traffic surge.
+          user_impact: |
+            Reduced but continuing 502s and elevated latency for read-heavy endpoints.
+          manifestation: [mysql_rds.lock_wait, mysql_rds.too_many_conn, mysql_rds.conn_stats_capped]
+
+      feedback_loops:
+        - id: slow_query_connection_pileup
+          desc: |
+            Slow App Registry requests hold DB connections longer, increasing concurrent connections and
+            threads. Higher concurrency increases lock waits and connection refusals, which further slows
+            request completion and increases client retry pressure (modeled as increased error flow volume).
+
+      flows:
+        - appreg_list_packages_slow_f
+        - appreg_get_blobs_slow_f
+        - appreg_502_f
+        - appreg_502_conn_refused_f
+        - docker_pull_ok_f
+        - docker_pull_502_f
+        - docker_pull_502_conn_refused_f
+        - docker_push_502_db_f
+        - docker_push_502_conn_refused_f
+        - docker_push_503_readonly_f
+      manifestation:
+        - mysql_rds.conn_stats_high
+        - mysql_rds.lock_wait
+        - mysql_rds.too_many_conn
+        - quay_app.db_acquire
+        - quay_app.req_error
+        - quay_app.req_error_db
+        - ingress_router.http_access
+
+  assumptions:
+    - |
+      This scenario models the May 28-style outage window and ends while the system is still degraded (read-only),
+      rather than after full recovery, to satisfy the "ends in failure" requirement.
+    - |
+      To avoid contradictory per-request sequences, request failures are split into:
+      - quay_app.req_error_db for post-query failures (lock waits/timeouts), and
+      - quay_app.req_error for pre-query failures (connection refused/pool exhaustion/read-only).
+      Correspondingly, error flows are split into post-query vs pre-query variants.
+    - |
+      Connection metrics (mysql current_conns/max_conns and quay open_conns) are scaled down to be quantitatively
+      consistent with the modeled request rate and latency envelopes; the diagnostic meaning is the relative spike
+      toward capacity plus lock_wait and too_many_conn errors.
+    - |
+      Failure-phase breakdown (22 minutes total), approximate effective volume:
+      - min 22-28 (6m): surge begins; errors and DB warnings suppressed early; ~1.7k logs/min.
+      - min 28-35 (7m): lock waits/refusals spike; ~2.4k logs/min.
+      - min 35-44 (9m): mitigated read-only + capped max_connections; ~1.7k logs/min.
+    - |
+      One-shots expected: 8 pod_restart + 1 instance_restart + 1 set_max_connections + 1 mode_changed = 11.
+    - |
+      Key failure signals are likely-visible due to high appreg_* request volume plus elevated MySQL warning rates
+      (lock_wait, too_many_conn) after min 28, and the explicit mitigation markers (set_max_connections, mode_changed).
+    - |
+      Estimated baseline normal logs/min ≈ 600 (flows) + ~13 (background); total estimated logs ≈ 56k across 44 minutes.
+```

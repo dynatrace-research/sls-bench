@@ -1,0 +1,529 @@
+```yaml
+sys:
+  id: dynamodb_membership_us_east
+  desc: >
+    A simplified model of Amazon DynamoDB in one region, focusing on how storage nodes
+    periodically renew their partition membership via an internal metadata service and how
+    customer API requests are routed to storage nodes. Storage nodes self-disqualify from
+    serving traffic when they cannot renew membership within a deadline, which can raise
+    customer error rates. The incident models a retry storm against the metadata service
+    caused by larger membership payloads (driven by GSI adoption) plus a brief network
+    disruption that synchronizes renewals.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_frontend
+    name: DynamoDB API Frontend
+    svc: dynamodb-api
+    hosts: [api-01, api-02]
+    desc: >
+      Front door for DynamoDB customer APIs. It routes requests to a storage node and
+      returns the response to the caller. In this model it logs one entry and one terminal
+      response per request.
+
+    to:
+      - dst: storage_node
+        proto: grpc
+        desc: Routes customer operations to storage nodes.
+
+    logs:
+      req_in:
+        desc: Customer request received by the API frontend.
+        lvl: INFO
+        msg: "req {trace_id} op={op} table={table} key_hash={key_hash}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          op: {k: ch, v: [GetItem, PutItem, UpdateItem, Query]}
+          table: {k: ch, v: [users, orders, sessions, inventory]}
+          key_hash: {k: hex, v: 16}
+
+      resp_ok:
+        desc: Successful response sent to the customer.
+        lvl: INFO
+        msg: "resp {trace_id} status=200 dur_ms={dur_ms} bytes={bytes} storage={storage}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          dur_ms: {k: i, v: [2, 60]}
+          bytes: {k: i, v: [200, 8000]}
+          storage: {k: ch, v: [stor-01, stor-02, stor-03, stor-04]}
+
+      resp_err:
+        desc: Error response sent to the customer (typically due to storage unavailability).
+        lvl: ERROR
+        msg: "resp {trace_id} status={status} err={err} dur_ms={dur_ms} storage={storage}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          status: {k: ch, v: [500, 503, 504]}
+          err: {k: ch, v: [StorageUnavailable, UpstreamTimeout, InternalError]}
+          dur_ms: {k: i, v: [2, 2500]}
+          storage: {k: ch, v: [stor-01, stor-02, stor-03, stor-04]}
+
+      access_summary:
+        desc: Periodic request summary for the frontend host.
+        lvl: INFO
+        msg: "access_summary rps={rps} err_pct={err_pct}"
+        vars:
+          rps: {k: f, v: [2.0, 12.0]}
+        state_vars:
+          n:
+            err_pct: {k: f, v: [0.0, 2.0]}
+          f:
+            err_pct: {k: f, v: [5.0, 80.0]}
+
+    beh:
+      n:
+        desc: Low-rate periodic summaries in healthy operation.
+        emit:
+          - id: access_summary
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Summaries remain but reflect higher error percentages during the incident.
+        emit:
+          - id: access_summary
+            per_min: 1.0
+            scope: per_host
+
+  - id: storage_node
+    name: DynamoDB Storage Node
+    svc: dynamodb-storage
+    hosts: [stor-01, stor-02, stor-03, stor-04]
+    desc: >
+      Stores table partitions and serves reads/writes. Each node periodically renews its
+      "membership" by calling the metadata service. If it cannot renew within a deadline,
+      it disqualifies itself from serving customer requests and retries membership renewal.
+
+    to:
+      - dst: api_frontend
+        proto: grpc
+        desc: Returns operation results to the API frontend over the request connection.
+      - dst: metadata_service
+        proto: grpc
+        desc: Requests membership assignments from the metadata service.
+
+    logs:
+      serve_ok:
+        desc: Storage node served a customer operation successfully.
+        lvl: INFO
+        msg: "served {trace_id} op={op} table={table} part={part} dur_ms={dur_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          op: {k: ch, v: [GetItem, PutItem, UpdateItem, Query]}
+          table: {k: ch, v: [users, orders, sessions, inventory]}
+          part: {k: i, v: [0, 2047]}
+          dur_ms: {k: i, v: [1, 40]}
+
+      serve_reject:
+        desc: Storage node rejected a customer operation because it is not eligible to serve traffic.
+        lvl: WARN
+        msg: "reject {trace_id} op={op} reason=membership_unavailable"
+        vars:
+          trace_id: {k: hex, v: 32}
+          op: {k: ch, v: [GetItem, PutItem, UpdateItem, Query]}
+
+      membership_req:
+        desc: Storage node started a membership fetch/renewal request.
+        lvl: INFO
+        msg: "membership_fetch_start req_id={req_id} reason={reason} meta={meta}"
+        vars:
+          req_id: {k: uuid, v: null}
+          reason: {k: ch, v: [periodic, net_recover, startup]}
+          meta: {k: ch, v: [meta-01, meta-02]}
+
+      membership_applied:
+        desc: Storage node successfully applied a membership assignment.
+        lvl: INFO
+        msg: "membership_applied req_id={req_id} partitions={partitions} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          partitions: {k: i, v: [50, 2500]}
+          dur_ms: {k: i, v: [5, 120]}
+
+      membership_retry:
+        desc: Storage node is retrying a membership fetch due to prior timeout.
+        lvl: WARN
+        msg: "membership_fetch_retry req_id={req_id} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 4]}
+          backoff_ms: {k: i, v: [50, 1500]}
+
+      membership_timeout:
+        desc: Storage node timed out waiting for membership and disqualified itself.
+        lvl: ERROR
+        msg: "membership_fetch_timeout req_id={req_id} waited_ms={waited_ms} deadline_ms={deadline_ms} disqualify_for_s={disqualify_for_s}"
+        vars:
+          req_id: {k: uuid, v: null}
+          waited_ms: {k: i, v: [1500, 2200]}
+          deadline_ms: {k: i, v: [1500, 1500]}
+          disqualify_for_s: {k: i, v: [20, 240]}
+
+      net_disruption:
+        desc: Marker for a brief network disruption affecting this storage node.
+        lvl: WARN
+        msg: "network_disruption detected=true link_reset_count={link_reset_count}"
+        vars:
+          link_reset_count: {k: i, v: [1, 20]}
+
+      heartbeat:
+        desc: Periodic node health heartbeat.
+        lvl: INFO
+        msg: "heartbeat ok=true eligible={eligible}"
+        vars: {}
+        state_vars:
+          n:
+            eligible: {k: ch, v: [true]}
+          f:
+            eligible: {k: ch, v: [true, false]}
+
+    beh:
+      n:
+        desc: Periodic heartbeats show nodes eligible to serve.
+        emit:
+          - id: heartbeat
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: Heartbeats continue; some nodes show eligible=false due to membership failures.
+        emit:
+          - id: heartbeat
+            per_min: 0.3
+            scope: per_host
+
+  - id: metadata_service
+    name: DynamoDB Metadata Service
+    svc: dynamodb-metadata
+    hosts: [meta-01, meta-02]
+    desc: >
+      Replicated internal service that computes and returns membership assignments to storage nodes.
+      It reads membership state from an internal store and builds a response message. Under heavy
+      load or with very large membership payloads, build times can exceed the deadline enforced
+      by storage nodes.
+
+    to:
+      - dst: metadata_kvstore
+        proto: jdbc
+        desc: Reads membership/partition metadata from an internal store.
+      - dst: storage_node
+        proto: grpc
+        desc: Returns membership assignment responses to requesting storage nodes.
+
+    logs:
+      queue_metrics:
+        desc: Periodic load indicator for the metadata service.
+        lvl: INFO
+        msg: "load queue_depth={queue_depth} inflight={inflight} p95_build_ms={p95_build_ms}"
+        vars: {}
+        state_vars:
+          n:
+            queue_depth: {k: i, v: [0, 30]}
+            inflight: {k: i, v: [0, 20]}
+            p95_build_ms: {k: i, v: [40, 350]}
+          f:
+            queue_depth: {k: i, v: [5, 300]}
+            inflight: {k: i, v: [2, 80]}
+            p95_build_ms: {k: i, v: [200, 3000]}
+
+      membership_resp:
+        desc: Successful membership response built and returned to a storage node.
+        lvl: INFO
+        msg: "membership_resp req_id={req_id} storage={storage} bytes={bytes} build_ms={build_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          storage: {k: ch, v: [stor-01, stor-02, stor-03, stor-04]}
+        state_vars:
+          n:
+            bytes: {k: i, v: [20000, 120000]}
+            build_ms: {k: i, v: [40, 300]}
+          f:
+            bytes: {k: i, v: [120000, 700000]}
+            build_ms: {k: i, v: [150, 1600]}
+
+      slow_build:
+        desc: In-progress marker that a membership build is running unusually long (may still be building when the caller times out).
+        lvl: WARN
+        msg: "slow_membership_build req_id={req_id} storage={storage} bytes={bytes} elapsed_ms={elapsed_ms} partitions={partitions}"
+        vars:
+          req_id: {k: uuid, v: null}
+          storage: {k: ch, v: [stor-01, stor-02, stor-03, stor-04]}
+          bytes: {k: i, v: [200000, 1200000]}
+          elapsed_ms: {k: i, v: [600, 1500]}
+          partitions: {k: i, v: [200, 3000]}
+
+      admin_api_err:
+        desc: Administrative API request failed due to overload.
+        lvl: ERROR
+        msg: "admin_api action={action} status={status} reason={reason}"
+        vars:
+          action: {k: ch, v: [scale_capacity]}
+          status: {k: ch, v: [503, 504]}
+          reason: {k: ch, v: [overloaded, timeout]}
+
+      admin_api_ok:
+        desc: Administrative API request succeeded.
+        lvl: INFO
+        msg: "admin_api action={action} status=200 new_capacity={new_capacity}"
+        vars:
+          action: {k: ch, v: [scale_capacity]}
+          new_capacity: {k: i, v: [6, 16]}
+
+    beh:
+      n:
+        desc: Periodic metrics show low queue depth and fast membership builds.
+        emit:
+          - id: queue_metrics
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: Load metrics are elevated and emitted more frequently from the start of failure.
+        emit:
+          - id: queue_metrics
+            per_min: 6.0
+            scope: per_host
+
+  - id: metadata_kvstore
+    name: Metadata KV Store
+    svc: dynamodb-metadata-store
+    hosts: [meta-db-01]
+    desc: >
+      Internal persistence for the metadata service. Not modeled per-request; emits periodic
+      latency snapshots that can degrade under heavy metadata service load.
+
+    to: []
+
+    logs:
+      latency_metrics:
+        desc: Periodic store latency snapshot.
+        lvl: INFO
+        msg: "kv_latency p95_ms={p95_ms} read_qps={read_qps}"
+        vars: {}
+        state_vars:
+          n:
+            p95_ms: {k: i, v: [2, 15]}
+            read_qps: {k: i, v: [50, 600]}
+          f:
+            p95_ms: {k: i, v: [5, 80]}
+            read_qps: {k: i, v: [50, 3000]}
+
+    beh:
+      n:
+        desc: Healthy store latency and moderate load.
+        emit:
+          - id: latency_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Higher read rates and worse tail latency during the incident.
+        emit:
+          - id: latency_metrics
+            per_min: 2.0
+            scope: per_host
+
+  - id: ops_control
+    name: DynamoDB Operations Control
+    svc: dynamodb-ops
+    hosts: [ops-01]
+    desc: >
+      Operator tooling used to change metadata service capacity and to temporarily pause
+      membership fetch traffic to relieve overload.
+
+    to:
+      - dst: metadata_service
+        proto: https
+        desc: Issues administrative commands to the metadata service.
+
+    logs:
+      scale_capacity_cmd:
+        desc: Operator issued a scale-capacity command.
+        lvl: WARN
+        msg: "operator_cmd action=scale_capacity from={from_cap} to={to_cap} req_id={req_id}"
+        vars:
+          from_cap: {k: i, v: [2, 8]}
+          to_cap: {k: i, v: [6, 16]}
+          req_id: {k: uuid, v: null}
+
+      scale_capacity_applied:
+        desc: Operator confirmed scale-capacity completed.
+        lvl: INFO
+        msg: "operator_done action=scale_capacity from={from_cap} to={to_cap}"
+        vars:
+          from_cap: {k: i, v: [2, 8]}
+          to_cap: {k: i, v: [6, 16]}
+
+      pause_membership_requests:
+        desc: Operator paused storage-node membership fetches to reduce retry load.
+        lvl: WARN
+        msg: "operator_action action=pause_membership_fetch duration_min={duration_min}"
+        vars:
+          duration_min: {k: i, v: [5, 60]}
+
+      audit:
+        desc: Low-rate audit log marker.
+        lvl: INFO
+        msg: "audit actor=oncall activity={activity}"
+        vars:
+          activity: {k: ch, v: [review_metrics, runbook_step, open_ticket]}
+
+    beh:
+      n:
+        desc: Occasional audit markers.
+        emit:
+          - id: audit
+            per_min: 0.1
+            scope: per_host
+      f:
+        desc: Occasional audit markers during incident response.
+        emit:
+          - id: audit
+            per_min: 0.2
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [api_frontend]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Customers submit read/write APIs to the frontend which routes to an eligible storage node.
+      Storage nodes periodically renew membership from the metadata service; renewals normally complete
+      well within the deadline and do not affect customer traffic.
+    req:
+      - id: customer_rw
+        desc: Customer read/write API request that succeeds.
+        rpm: 350.0
+        path: [api_frontend, storage_node, api_frontend]
+        emit: [api_frontend.req_in, storage_node.serve_ok, api_frontend.resp_ok]
+        latency_ms: [[1, 2], [4, 15], [1, 2]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: membership_renewal
+        desc: Periodic membership renewal from storage node to metadata service (successful).
+        rpm: 120.0
+        path: [storage_node, metadata_service, storage_node]
+        emit: [storage_node.membership_req, metadata_service.membership_resp, storage_node.membership_applied]
+        latency_ms: [[1, 2], [80, 250], [5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      A synchronized membership-renewal surge (triggered by a brief network disruption) hits the metadata service.
+      Larger membership payloads cause longer build times; some exceed the storage deadline, leading nodes to
+      self-disqualify and customer requests to fail. Storage nodes retry membership fetches, sustaining load on
+      the metadata service and blocking administrative scaling until traffic is reduced.
+    req:
+      - id: customer_rw_ok_f
+        desc: Customer read/write API request that succeeds (some storage nodes remain eligible).
+        rpm: 175.0
+        path: [api_frontend, storage_node, api_frontend]
+        emit: [api_frontend.req_in, storage_node.serve_ok, api_frontend.resp_ok]
+        latency_ms: [[1, 2], [6, 35], [1, 2]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: customer_rw_err_f
+        desc: Customer read/write API request routed to a disqualified storage node and fails.
+        rpm: 175.0
+        path: [api_frontend, storage_node, api_frontend]
+        emit: [api_frontend.req_in, storage_node.serve_reject, api_frontend.resp_err]
+        latency_ms: [[1, 2], [1, 5], [2, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: membership_renewal_success_f
+        desc: Membership renewal that succeeds but is slower due to elevated load and larger payloads.
+        rpm: 140.0
+        path: [storage_node, metadata_service, storage_node]
+        emit: [storage_node.membership_req, metadata_service.membership_resp, storage_node.membership_applied]
+        latency_ms: [[1, 2], [250, 1200], [10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: membership_renewal_timeout_f
+        desc: Membership renewal that times out; node disqualifies itself and retries.
+        rpm: 220.0
+        path: [storage_node, metadata_service, storage_node]
+        emit: [storage_node.membership_req, metadata_service.slow_build, storage_node.membership_timeout]
+        latency_ms: [[1, 2], [700, 1200], [800, 1000]]
+        retry:
+          max_attempts: 4
+          expected_attempts: 2.0
+          emit_per_retry: [storage_node.membership_retry]
+          backoff_ms: [[100, 300], [300, 900], [600, 1500]]
+        trace: false
+
+      - id: admin_scale_attempt_fail_f
+        desc: Operator attempts to scale metadata service but the admin call fails due to overload.
+        rpm: 0.2
+        path: [ops_control, metadata_service]
+        emit: [ops_control.scale_capacity_cmd, metadata_service.admin_api_err]
+        latency_ms: [[5, 20], [100, 800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    The model focuses on the DynamoDB internal membership renewal path and the retry-driven overload;
+    downstream AWS services (SQS/CloudWatch/AutoScaling/Console) and the later Monday cleanup issue are omitted
+    to keep one causal core with strong log observability.
+  - >
+    The "large membership size due to GSI adoption" is represented by larger membership_resp bytes/build_ms in failure
+    and by frequent slow_membership_build markers (bytes/elapsed_ms/partitions) during timeout-prone requests.
+  - >
+    slow_membership_build is modeled as an in-progress warning (elapsed_ms) so it can appear before the storage node
+    logs a timeout; membership_resp remains the completion-bearing log that carries build_ms.
+  - >
+    membership_renewal_timeout_f latency hints were adjusted so slow_build appears before the storage deadline and the
+    subsequent gap to membership_timeout keeps total waited time within the membership_timeout waited_ms envelope.
+  - >
+    Return-path connectivity for request/response is modeled as explicit service edges (storage_node->api_frontend and
+    metadata_service->storage_node) to keep flow paths traversable for log generation.
+  - >
+    storage_node.heartbeat eligible is state-dependent so normal heartbeats consistently show eligible=true, while failure
+    allows eligible=false for disqualified nodes (aligning heartbeat semantics with the incident).
+  - >
+    api_frontend.access_summary err_pct is state-dependent so it can represent majority-error incident periods without
+    contradicting per-request resp_err volumes.
+  - >
+    Failure-state metadata_service.queue_metrics and metadata_kvstore.latency_metrics ranges are widened to allow observable
+    load relief after traffic is paused, while still permitting high-load values during the retry storm.
+  - >
+    Timeout semantics: membership_fetch_timeout waited_ms is constrained to be >= deadline_ms to avoid contradictory timeouts.
+  - >
+    queue_metrics queue_depth/inflight ranges were reduced to be consistent with the modeled membership request rates and
+    build-time envelopes (single-digit to low-double-digit rps with ~0.1–3s builds), avoiding contradictory "thousands inflight" signals.
+  - >
+    Normal-phase volume estimate (15 min): ~1050 customer logs/min + ~360 membership logs/min + ~10 background logs/min
+    => ~21k logs.
+  - >
+    Total scenario volume estimate (30 min) with failure multipliers: ~55k–65k logs (target 20k..100k),
+    driven mainly by membership renewal attempts with retries during failure.
+```

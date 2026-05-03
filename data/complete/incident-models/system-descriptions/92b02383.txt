@@ -1,0 +1,323 @@
+```yaml
+sys:
+  id: edge_waf_managed_rules
+  desc: >
+    A global edge proxy processes HTTP requests for proxied customer domains and applies Web Application Firewall (WAF)
+    managed rules on each request. A control-plane service deploys updated managed rulesets to WAF engines worldwide.
+    Under normal conditions the WAF evaluation is fast and the edge returns 200 responses. In the modeled incident, a
+    single misconfigured managed rule (a regex with catastrophic backtracking) pegs CPU on WAF workers, increasing
+    request latency and causing many requests to be returned as 502 "Bad Gateway".
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_proxy
+    name: Edge Proxy
+    svc: edge-proxy
+    hosts: [edge-sfo-1, edge-lhr-1, edge-sin-1]
+    desc: >
+      Terminates client connections, invokes the WAF engine, and returns responses. Emits one access log per request and
+      periodic PoP health summaries.
+
+    to:
+      - dst: waf_engine
+        proto: grpc
+        desc: Calls the local WAF engine for managed rules evaluation.
+
+    logs:
+      access_2xx:
+        desc: Access log for successful proxied requests.
+        lvl: INFO
+        msg: "edge_access status=200 method={method} host={host} uri={uri} dur_ms={dur_ms} bytes={bytes} cf_ray={ray} colo={colo}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [example.com, shop.example.com, api.example.net]}
+          uri: {k: ch, v: ["/", "/login", "/api/v1/items", "/static/app.js"]}
+          bytes: {k: i, v: [200, 20000]}
+          ray: {k: hex, v: 16}
+          colo: {k: ch, v: [SFO, LHR, SIN]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [10, 300]}
+          f:
+            dur_ms: {k: i, v: [50, 2500]}
+
+      access_502:
+        desc: Access log for requests returned as 502 due to internal processing failure.
+        lvl: WARN
+        msg: "edge_access status=502 method={method} host={host} uri={uri} dur_ms={dur_ms} err={err} cf_ray={ray} colo={colo}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          host: {k: ch, v: [example.com, shop.example.com, api.example.net]}
+          uri: {k: ch, v: ["/", "/login", "/api/v1/items", "/static/app.js"]}
+          dur_ms: {k: i, v: [80, 4000]}
+          err: {k: ch, v: [waf_timeout, waf_cpu_overload]}
+          ray: {k: hex, v: 16}
+          colo: {k: ch, v: [SFO, LHR, SIN]}
+
+      pop_health:
+        desc: Periodic per-PoP health summary from the edge.
+        lvl: INFO
+        msg: "pop_health colo={colo} req_rpm={req_rpm} err_5xx_pct={err_5xx_pct} worker_busy_pct={busy_pct}"
+        vars:
+          colo: {k: ch, v: [SFO, LHR, SIN]}
+          req_rpm: {k: i, v: [50, 2000]}
+          err_5xx_pct: {k: f, v: [0.0, 95.0]}
+          busy_pct: {k: f, v: [5.0, 100.0]}
+
+    beh:
+      n:
+        desc: Low-noise periodic PoP health summaries during normal operation.
+        emit:
+          - id: pop_health
+            per_min: 0.5
+      f:
+        desc: PoP health summaries continue during failure and reflect elevated 5xx and saturation.
+        emit:
+          - id: pop_health
+            per_min: 0.5
+
+  - id: waf_engine
+    name: WAF Engine
+    svc: waf-engine
+    hosts: [waf-sfo-1, waf-lhr-1, waf-sin-1]
+    desc: >
+      Evaluates WAF managed rules for each request. Exposes periodic CPU and regex evaluation statistics in logs.
+      During the incident, a single regex-heavy rule causes CPU to peg near 100% and p95 evaluation time to jump.
+
+    to:
+      - dst: edge_proxy
+        proto: grpc
+        desc: Returns evaluation decisions/metadata to the edge proxy.
+      - dst: ruleset_control_plane
+        proto: https
+        desc: Receives managed ruleset updates from the control plane.
+
+    logs:
+      managed_rules_loaded:
+        desc: Marker that a managed ruleset version was loaded on a WAF worker.
+        lvl: INFO
+        msg: "managed_rules_loaded ruleset_ver={ruleset_ver} mode={mode} top_rule_id={top_rule_id}"
+        vars:
+          ruleset_ver: {k: ch, v: [mr-2026.04.02-bad]}
+          mode: {k: ch, v: [simulate]}
+          top_rule_id: {k: ch, v: [mr_js_inline_17]}
+
+      cpu_sample:
+        desc: Per-host CPU saturation sample.
+        lvl: INFO
+        msg: "waf_cpu usage_pct={cpu_pct} runq={runq} colo={colo}"
+        vars:
+          colo: {k: ch, v: [SFO, LHR, SIN]}
+        state_vars:
+          n:
+            cpu_pct: {k: f, v: [10.0, 45.0]}
+            runq: {k: i, v: [0, 6]}
+          f:
+            cpu_pct: {k: f, v: [90.0, 100.0]}
+            runq: {k: i, v: [20, 200]}
+
+      regex_stats:
+        desc: Periodic summary of managed rule regex evaluation performance.
+        lvl: INFO
+        msg: "waf_regex_stats ruleset_ver={ruleset_ver} slow_evals={slow_evals} p95_eval_ms={p95_eval_ms} top_rule_id={top_rule_id} top_regex_id={top_regex_id} colo={colo}"
+        vars:
+          colo: {k: ch, v: [SFO, LHR, SIN]}
+        state_vars:
+          n:
+            ruleset_ver: {k: ch, v: [mr-2026.04.02-good]}
+            slow_evals: {k: i, v: [0, 20]}
+            p95_eval_ms: {k: i, v: [1, 10]}
+            top_rule_id: {k: ch, v: [mr_common_01, mr_xss_03]}
+            top_regex_id: {k: ch, v: [re_ok_01, re_ok_07]}
+          f:
+            ruleset_ver: {k: ch, v: [mr-2026.04.02-bad]}
+            slow_evals: {k: i, v: [500, 5000]}
+            p95_eval_ms: {k: i, v: [80, 1200]}
+            top_rule_id: {k: ch, v: [mr_js_inline_17]}
+            top_regex_id: {k: ch, v: [re_inline_js_catastrophic]}
+
+    beh:
+      n:
+        desc: Normal CPU and regex evaluation metrics.
+        emit:
+          - id: cpu_sample
+            per_min: 1.0
+          - id: regex_stats
+            per_min: 1.0
+      f:
+        desc: During failure, metrics remain present but values reflect saturation and slow regex evaluation.
+        emit:
+          - id: cpu_sample
+            per_min: 1.0
+          - id: regex_stats
+            per_min: 1.0
+
+  - id: ruleset_control_plane
+    name: Managed Rules Control Plane
+    svc: waf-managed-control
+    hosts: [cp-1]
+    desc: >
+      Publishes WAF Managed Ruleset changes and can request global termination of the managed rulesets.
+      Emits deploy and mitigation markers, plus brief apply-progress messages while a change is being applied.
+
+    to:
+      - dst: waf_engine
+        proto: https
+        desc: Pushes managed ruleset updates and termination commands to WAF workers.
+
+    logs:
+      deploy_ruleset:
+        desc: Marker for a managed ruleset deployment.
+        lvl: INFO
+        msg: "deploy_ruleset product=waf_managed ruleset_ver={ruleset_ver} scope={scope} mode={mode} change_id={change_id}"
+        vars:
+          ruleset_ver: {k: ch, v: [mr-2026.04.02-bad]}
+          scope: {k: ch, v: [global]}
+          mode: {k: ch, v: [simulate]}
+          change_id: {k: ch, v: [chg-9f3a1c2b]}
+
+      termination_requested:
+        desc: Marker that a global termination was requested for the managed rulesets.
+        lvl: WARN
+        msg: "termination_requested product=waf_managed scope=global reason={reason} change_id={change_id}"
+        vars:
+          reason: {k: ch, v: [cpu_exhaustion, widespread_502s]}
+          change_id: {k: ch, v: [chg-9f3a1c2b]}
+
+      apply_status:
+        desc: Periodic apply status while a change/termination is in progress.
+        lvl: INFO
+        msg: "apply_status change_id={change_id} progressed_pct={progress_pct} target={target}"
+        vars:
+          change_id: {k: ch, v: [chg-9f3a1c2b]}
+          progress_pct: {k: i, v: [0, 100]}
+          target: {k: ch, v: [waf_workers_global]}
+
+    beh:
+      n:
+        desc: No continuous background logs modeled for the control plane in normal operation.
+        emit: []
+      f:
+        desc: Apply-status logs are modeled but can be suppressed/activated by incident events.
+        emit:
+          - id: apply_status
+            per_min: 0.5
+            scope: global
+
+  - id: monitoring
+    name: Monitoring & Alerting
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Aggregates global indicators and emits alert logs when thresholds are breached. During the incident it begins
+      emitting CPU saturation and 502-rate alerts.
+
+    to:
+      - dst: ruleset_control_plane
+        proto: https
+        desc: Opens incident actions/tickets and links mitigation to a change id (modeled as log correlation only).
+
+    logs:
+      heartbeat:
+        desc: Low-rate heartbeat indicating monitoring pipeline is running.
+        lvl: INFO
+        msg: "monitor_heartbeat ok=true shard={shard}"
+        vars:
+          shard: {k: ch, v: [a, b]}
+
+      alert_cpu_global:
+        desc: Global CPU saturation alert.
+        lvl: CRITICAL
+        msg: "alert_firing name=GlobalCPUHigh value_pct={value_pct} threshold_pct={threshold_pct}"
+        vars:
+          value_pct: {k: f, v: [70.0, 100.0]}
+          threshold_pct: {k: f, v: [85.0, 95.0]}
+
+      alert_502_rate:
+        desc: Elevated 502 rate alert at the edge.
+        lvl: CRITICAL
+        msg: "alert_firing name=Edge502Rate value_pct={value_pct} threshold_pct={threshold_pct}"
+        vars:
+          value_pct: {k: f, v: [1.0, 95.0]}
+          threshold_pct: {k: f, v: [2.0, 10.0]}
+
+    beh:
+      n:
+        desc: Heartbeats only; no alerts expected in the modeled normal window.
+        emit:
+          - id: heartbeat
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Alerts are modeled as background sources that may be suppressed early and enabled later by events.
+        emit:
+          - id: heartbeat
+            per_min: 0.5
+            scope: global
+          - id: alert_cpu_global
+            per_min: 1.0
+            scope: global
+          - id: alert_502_rate
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal client request handling at the edge with fast WAF evaluation and successful responses.
+    req:
+      - id: http_request_2xx
+        desc: Typical proxied HTTP requests returning 200.
+        rpm: 1200.0
+        path: [edge_proxy, waf_engine, edge_proxy]
+        emit: [edge_proxy.access_2xx]
+        latency_ms: [[25, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: During failure, WAF CPU exhaustion increases processing time and a significant fraction of requests return 502.
+    req:
+      - id: http_request_2xx_degraded
+        desc: Requests that still return 200 but with elevated latency due to slow WAF evaluation.
+        rpm: 800.0
+        path: [edge_proxy, waf_engine, edge_proxy]
+        emit: [edge_proxy.access_2xx]
+        latency_ms: [[120, 1200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: http_request_502
+        desc: Requests that time out/overrun internal budgets while WAF is saturated and return 502.
+        rpm: 400.0
+        path: [edge_proxy, waf_engine, edge_proxy]
+        emit: [edge_proxy.access_502]
+        latency_ms: [[200, 1800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Hosts represent three illustrative PoPs for a global network; rates are scaled down but preserve proportions and symptoms."
+  - "One access log per request is modeled on the edge to keep total log volume tractable while still exposing status and latency."
+  - "WAF per-request debug logs are omitted; instead, periodic CPU and regex performance summaries provide the key diagnostic evidence."
+  - "Normal-phase estimate: ~1200 request logs/min + ~8 background logs/min across 3 PoPs and monitoring (~1208 logs/min)."
+  - "Total estimated logs for a 44-minute scenario: ~50k (request logs dominate; background/one-shots add <1k), within 20k..100k."
+  - "Semantic binding: the failure state pins regex_stats.ruleset_ver to mr-2026.04.02-bad and top_rule_id to mr_js_inline_17 to reflect the misconfigured managed rule."
+```

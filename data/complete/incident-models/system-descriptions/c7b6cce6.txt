@@ -1,0 +1,454 @@
+```yaml
+sys:
+  id: reddit_legacy_k8s_cluster
+  desc: >
+    A large Kubernetes cluster runs Reddit's legacy web stack that serves core site pages.
+    Users hit an edge gateway which proxies to the legacy app running as pods in the cluster.
+    Cluster networking is provided by Calico and policy enforcement is implemented via an OPA admission webhook.
+    During a Kubernetes control-plane upgrade, a Calico route-reflector selector mismatch can break pod-to-pod routing and in-cluster DNS, causing widespread user-facing failures.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_gateway
+    name: Edge Gateway
+    svc: edge-gw
+    hosts: [edge-1, edge-2]
+    desc: >
+      Public-facing HTTP gateway that forwards requests to the legacy app service in the cluster.
+      When backends are unhealthy or unreachable, it returns 5xx; in some cases it serves a minimal fallback shell with an empty feed.
+    to:
+      - dst: legacy_app
+        proto: https
+        desc: Proxies dynamic page requests to the legacy app service endpoints in the Kubernetes cluster.
+    logs:
+      http_request_start:
+        desc: Request received and about to be proxied/handled.
+        lvl: INFO
+        msg: "req {req_id} start GET {uri_path} ua={ua}"
+        vars:
+          req_id: {k: uuid, v: null}
+          uri_path: {k: ch, v: ["/", "/r/all", "/hot"]}
+          ua: {k: ch, v: ["web", "ios", "android"]}
+      http_access_ok:
+        desc: Successful response returned to client.
+        lvl: INFO
+        msg: "req {req_id} GET {uri_path} {status} {bytes}B in {dur_ms}ms upstream={upstream}"
+        vars:
+          req_id: {k: uuid, v: null}
+          uri_path: {k: ch, v: ["/", "/r/all", "/hot"]}
+          status: {k: ch, v: ["200"]}
+          bytes: {k: i, v: [2000, 200000]}
+          dur_ms: {k: i, v: [20, 800]}
+          upstream: {k: ch, v: ["legacy-app"]}
+      http_access_5xx:
+        desc: Error response returned due to missing endpoints or upstream connectivity/timeouts.
+        lvl: WARN
+        msg: "req {req_id} GET {uri_path} {status} {bytes}B in {dur_ms}ms upstream={upstream} upstream_status={upstream_status} err={err}"
+        vars:
+          req_id: {k: uuid, v: null}
+          uri_path: {k: ch, v: ["/", "/r/all", "/hot"]}
+          status: {k: ch, v: ["502", "503", "504"]}
+          bytes: {k: i, v: [0, 2000]}
+          dur_ms: {k: i, v: [5, 30000]}
+          upstream: {k: ch, v: ["legacy-app"]}
+          upstream_status: {k: ch, v: ["-", "502", "504"]}
+          err: {k: ch, v: ["no_endpoints", "connect_timeout", "upstream_reset"]}
+      http_access_empty:
+        desc: A minimal 200 response served by an edge-side fallback path with an empty feed body.
+        lvl: INFO
+        msg: "req {req_id} GET {uri_path} 200 {bytes}B in {dur_ms}ms upstream={upstream} note=empty_feed"
+        vars:
+          req_id: {k: uuid, v: null}
+          uri_path: {k: ch, v: ["/"]}
+          bytes: {k: i, v: [0, 900]}
+          dur_ms: {k: i, v: [10, 500]}
+          upstream: {k: ch, v: ["edge-fallback"]}
+    beh:
+      n:
+        desc: Edge emits logs primarily per request; no significant background logging modeled.
+        emit: []
+      f:
+        desc: Edge emits logs primarily per request; no significant background logging modeled.
+        emit: []
+
+  - id: legacy_app
+    name: Legacy Web App (Old Reddit)
+    svc: legacy-app
+    hosts: [app-1, app-2, app-3]
+    desc: >
+      Legacy monolith serving HTML pages and feed aggregation.
+      Depends on in-cluster DNS and pod networking for normal operation.
+    to:
+      - dst: coredns
+        proto: udp
+        desc: Uses CoreDNS for in-cluster name resolution (svc.cluster.local and service discovery).
+      - dst: edge_gateway
+        proto: https
+        desc: Returns proxied responses back to the edge gateway.
+    logs:
+      req_done:
+        desc: Request successfully handled by the legacy app.
+        lvl: INFO
+        msg: "req {req_id} {endpoint} 200 in {dur_ms}ms user={user_kind}"
+        vars:
+          req_id: {k: uuid, v: null}
+          endpoint: {k: ch, v: ["/", "/r/all", "/hot"]}
+          dur_ms: {k: i, v: [10, 1200]}
+          user_kind: {k: ch, v: ["anon", "logged_in"]}
+      req_timeout:
+        desc: Request failed due to upstream timeout/dependency stall.
+        lvl: WARN
+        msg: "req {req_id} {endpoint} 504 upstream_timeout after {dur_ms}ms"
+        vars:
+          req_id: {k: uuid, v: null}
+          endpoint: {k: ch, v: ["/", "/r/all", "/hot"]}
+          dur_ms: {k: i, v: [3000, 30000]}
+    beh:
+      n:
+        desc: Only request-scoped logs are modeled for the legacy app.
+        emit: []
+      f:
+        desc: Only request-scoped logs are modeled for the legacy app.
+        emit: []
+
+  - id: kube_apiserver
+    name: Kubernetes API Server
+    svc: kube-apiserver
+    hosts: [cp-1, cp-2, cp-3]
+    desc: >
+      Control-plane API server handling cluster writes/reads from controllers and nodes.
+      During the incident it becomes noisy with slow requests and (early) admission webhook timeouts.
+    to:
+      - dst: opa_webhook
+        proto: https
+        desc: Calls OPA validating admission webhook for cluster-wide admission checks.
+      - dst: calico_node
+        proto: https
+        desc: Serves API queries/watches used by Calico components.
+    logs:
+      apiserver_slow_request:
+        desc: A request that took unusually long to complete, typically due to internal contention or downstream delays.
+        lvl: WARN
+        msg: "slow request {verb} {resource} took {dur_ms}ms client={client} code={code}"
+        vars:
+          verb: {k: ch, v: ["POST", "PUT", "DELETE", "PATCH"]}
+          resource: {k: ch, v: ["pods", "endpoints", "nodes", "configmaps"]}
+          dur_ms: {k: i, v: [50, 60000]}
+          client: {k: ch, v: ["kube-controller-manager", "kube-scheduler", "kubelet", "calico"]}
+          code: {k: i, v: [200, 504]}
+      admission_webhook_timeout:
+        desc: Admission request blocked waiting for the OPA webhook and timed out.
+        lvl: ERROR
+        msg: "admission webhook {webhook} timed out for {verb} {resource} after {dur_ms}ms"
+        vars:
+          webhook: {k: ch, v: ["opa.k8s.policy"]}
+          verb: {k: ch, v: ["POST", "PUT", "DELETE"]}
+          resource: {k: ch, v: ["pods", "endpoints", "configmaps"]}
+          dur_ms: {k: i, v: [1000, 30000]}
+      etcd_write_timeout:
+        desc: Storage operation timed out (symptom of control-plane stress).
+        lvl: ERROR
+        msg: "etcd request {verb} key={key} failed: context deadline exceeded after {dur_ms}ms"
+        vars:
+          verb: {k: ch, v: ["PUT", "DELETE"]}
+          key: {k: str, v: "k8s/registry/..."}
+          dur_ms: {k: i, v: [200, 30000]}
+      apiserver_node_delete:
+        desc: Node delete operations (e.g., draining/terminating workers) recorded by the API server.
+        lvl: INFO
+        msg: "request {verb} nodes/w-{node_id} completed code={code} dur={dur_ms}ms"
+        vars:
+          verb: {k: ch, v: ["DELETE"]}
+          node_id: {k: i, v: [1, 4000]}
+          code: {k: ch, v: ["200", "504"]}
+          dur_ms: {k: i, v: [50, 60000]}
+    beh:
+      n:
+        desc: Low background control-plane noise from routine controllers and kubelets.
+        emit:
+          - id: apiserver_slow_request
+            per_min: 1.0
+            scope: global
+          - id: admission_webhook_timeout
+            per_min: 0.1
+            scope: global
+          - id: etcd_write_timeout
+            per_min: 0.05
+            scope: global
+          - id: apiserver_node_delete
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Elevated control-plane slow requests, webhook-related timeouts early on, and more churn during mitigation steps.
+        emit:
+          - id: apiserver_slow_request
+            per_min: 20.0
+            scope: global
+          - id: admission_webhook_timeout
+            per_min: 10.0
+            scope: global
+          - id: etcd_write_timeout
+            per_min: 5.0
+            scope: global
+          - id: apiserver_node_delete
+            per_min: 0.1
+            scope: global
+
+  - id: calico_node
+    name: Calico Node Agent
+    svc: calico-node
+    hosts: [node-cp-1, node-w-1, node-w-2, node-w-3]
+    desc: >
+      Per-node networking agent responsible for BGP peering and route programming.
+      In this incident, route reflector selection breaks during the Kubernetes upgrade and BGP routes are withdrawn broadly.
+    to:
+      - dst: kube_apiserver
+        proto: https
+        desc: Watches cluster state and programs routes based on Kubernetes resources.
+    logs:
+      route_withdraw:
+        desc: Routes withdrawn due to peering loss or reflector unavailability.
+        lvl: WARN
+        msg: "BGP route withdrawal: node={node} withdrawn={count} reason={reason}"
+        vars:
+          node: {k: ch, v: ["cp-1", "w-1", "w-2", "w-3"]}
+          count: {k: i, v: [1, 2000]}
+          reason: {k: ch, v: ["peer_down", "reflector_unreachable"]}
+      reflector_selector_zero:
+        desc: Calico detects that the route reflector selector matches zero nodes.
+        lvl: INFO
+        msg: "route reflector selector matched 0 nodes selector={selector}"
+        vars:
+          selector: {k: ch, v: ["node-role.kubernetes.io/master"]}
+    beh:
+      n:
+        desc: Occasional benign route churn; reflector selector issues should not appear.
+        emit:
+          - id: route_withdraw
+            per_min: 0.2
+          - id: reflector_selector_zero
+            per_min: 0.0
+      f:
+        desc: Sustained route withdrawals and repeated reflector selector mismatch messages.
+        emit:
+          - id: route_withdraw
+            per_min: 10.0
+          - id: reflector_selector_zero
+            per_min: 0.7
+
+  - id: coredns
+    name: CoreDNS
+    svc: coredns
+    hosts: [dns-1, dns-2]
+    desc: >
+      In-cluster DNS resolver for service discovery.
+      During the incident, internal names frequently fail while public DNS continues to resolve.
+    to:
+      - dst: kube_apiserver
+        proto: https
+        desc: Reads service/endpoints data to answer cluster.local queries.
+    logs:
+      dns_internal_servfail:
+        desc: In-cluster name resolution failed (SERVFAIL) for internal zones.
+        lvl: ERROR
+        msg: "DNS query {qname} {qtype} -> SERVFAIL upstream={upstream}"
+        vars:
+          qname: {k: ch, v: ["legacy-app.default.svc.cluster.local", "kube-dns.kube-system.svc.cluster.local", "web.service.consul"]}
+          qtype: {k: ch, v: ["A", "AAAA"]}
+          upstream: {k: ch, v: ["10.0.0.2"]}
+      dns_public_ok:
+        desc: Public name resolution succeeds.
+        lvl: INFO
+        msg: "DNS query {qname} {qtype} -> NOERROR upstream={upstream}"
+        vars:
+          qname: {k: ch, v: ["www.google.com", "aws.amazon.com", "example.com"]}
+          qtype: {k: ch, v: ["A", "AAAA"]}
+          upstream: {k: ch, v: ["8.8.8.8"]}
+    beh:
+      n:
+        desc: Mostly healthy DNS with rare internal failures.
+        emit:
+          - id: dns_internal_servfail
+            per_min: 0.2
+          - id: dns_public_ok
+            per_min: 2.0
+      f:
+        desc: Internal DNS failures increase sharply while public lookups continue to work.
+        emit:
+          - id: dns_internal_servfail
+            per_min: 6.0
+          - id: dns_public_ok
+            per_min: 2.0
+
+  - id: opa_webhook
+    name: OPA Admission Webhook
+    svc: opa-admission
+    hosts: [opa-1]
+    desc: >
+      Validating admission webhook used by the API server for policy checks on most resource writes.
+      In the incident, the webhook becomes unavailable and stops logging.
+    to: []
+    logs:
+      opa_decision:
+        desc: A policy decision log emitted when the webhook processes an admission review.
+        lvl: INFO
+        msg: "decision {decision_id} result={result} resource={resource}"
+        vars:
+          decision_id: {k: hex, v: 16}
+          result: {k: ch, v: ["allow", "deny"]}
+          resource: {k: ch, v: ["pods", "endpoints", "configmaps"]}
+    beh:
+      n:
+        desc: Regular admission decisions under normal cluster activity.
+        emit:
+          - id: opa_decision
+            per_min: 3.0
+      f:
+        desc: Webhook is effectively unavailable; decision logs stop.
+        emit:
+          - id: opa_decision
+            per_min: 0.0
+
+  - id: compute_ops
+    name: Compute Team Ops Console
+    svc: null
+    hosts: [ops-1]
+    desc: >
+      Human operator actions taken during the incident (upgrade start and mitigations) emitted as action markers.
+    to:
+      - dst: kube_apiserver
+        proto: https
+        desc: Operators use kubectl/automation against the API server during upgrades and mitigation.
+    logs:
+      ops_heartbeat:
+        desc: Low-rate operator console heartbeat/noise.
+        lvl: DEBUG
+        msg: "ops console heartbeat session={session}"
+        vars:
+          session: {k: hex, v: 8}
+      incident_opened:
+        desc: Incident declared.
+        lvl: INFO
+        msg: "incident opened cluster={cluster} severity={sev}"
+        vars:
+          cluster: {k: ch, v: ["legacy-prod"]}
+          sev: {k: ch, v: ["SEV-1"]}
+      upgrade_started:
+        desc: Control-plane upgrade initiated.
+        lvl: INFO
+        msg: "started k8s control-plane upgrade from {from_ver} to {to_ver} cluster={cluster}"
+        vars:
+          from_ver: {k: ch, v: ["1.23"]}
+          to_ver: {k: ch, v: ["1.24"]}
+          cluster: {k: ch, v: ["legacy-prod"]}
+      deleted_opa_webhook:
+        desc: OPA webhook configuration removed to unblock API server admission calls.
+        lvl: WARN
+        msg: "deleted validatingwebhookconfiguration name={name} to unblock apiserver"
+        vars:
+          name: {k: ch, v: ["opa-validating-webhook"]}
+      worker_termination_started:
+        desc: Bulk worker termination/drain begun to prepare for restore.
+        lvl: WARN
+        msg: "began draining/terminating worker nodes count={count} cluster={cluster}"
+        vars:
+          count: {k: i, v: [1000, 4000]}
+          cluster: {k: ch, v: ["legacy-prod"]}
+    beh:
+      n:
+        desc: Minimal background noise from operator tooling.
+        emit:
+          - id: ops_heartbeat
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Minimal background noise from operator tooling; discrete actions are modeled as one-shots.
+        emit:
+          - id: ops_heartbeat
+            per_min: 0.2
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal browsing traffic is served by the edge proxying to healthy legacy app pods.
+    req:
+      - id: homepage_view_ok
+        desc: User fetches the homepage or feed successfully.
+        rpm: 250.0
+        path: [edge_gateway, legacy_app, edge_gateway]
+        emit: [edge_gateway.http_request_start, legacy_app.req_done, edge_gateway.http_access_ok]
+        latency_ms: [[1, 3], [20, 250], [25, 350]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+  f:
+    desc: During the outage, many requests fail at the edge due to backend unreachability; some requests time out after reaching a degraded app pod.
+    req:
+      - id: homepage_view_edge_5xx
+        desc: Edge returns 5xx quickly because the legacy app has no reachable endpoints.
+        rpm: 220.0
+        path: [edge_gateway]
+        emit: [edge_gateway.http_request_start, edge_gateway.http_access_5xx]
+        latency_ms: [[1, 3], [5, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: homepage_view_backend_timeout
+        desc: Edge forwards to a legacy app pod but the request stalls and times out.
+        rpm: 30.0
+        path: [edge_gateway, legacy_app, edge_gateway]
+        emit: [edge_gateway.http_request_start, legacy_app.req_timeout, edge_gateway.http_access_5xx]
+        latency_ms: [[1, 3], [5000, 20000], [5000, 30000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: homepage_view_empty_200
+        desc: Edge serves a degraded 200 fallback response with an empty feed body (no backend contact).
+        rpm: 25.0
+        path: [edge_gateway]
+        emit: [edge_gateway.http_request_start, edge_gateway.http_access_empty]
+        latency_ms: [[1, 3], [10, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Names are genericized; the model represents the legacy-prod Kubernetes cluster and its edge gateway, not all of Reddit.
+  - |
+    Metrics loss is not modeled as logs; diagnosis relies on low-level component logs (API server, Calico, CoreDNS), consistent with the post-mortem.
+  - |
+    Calico route reflectors are modeled via a selector-mismatch log and increased route withdrawals; the precise BGP/reflector topology is simplified.
+  - |
+    OPA webhook unavailability is represented by API server admission timeout logs early in failure and OPA decision logs stopping entirely in failure.
+  - |
+    The "empty 200" user symptom is modeled as an edge-side fallback response (upstream=edge-fallback) so the flow does not ambiguously imply a successful backend contact.
+  - |
+    Omitted for compactness: detailed kubelet/CRI-O image-pull and pod lifecycle logs; their effects are approximated by elevated control-plane stress and user-facing timeouts.
+  - |
+    API-server node deletion logs are near-baseline in early failure and only spike when worker draining/termination begins (modeled in the scenario events).
+  - |
+    API-server node deletion logs use a numeric worker suffix (w-1..w-4000) so increased delete-churn during bulk draining does not imply repeated DELETEs of only a few fixed nodes.
+  - |
+    Normal-phase log volume estimate: ~250 rpm * 3 logs/req ≈ 750 logs/min plus ~10 logs/min background.
+  - |
+    Whole-scenario log volume estimate (used later by the scenario): ~50k logs total, within the 20k–100k target.
+```

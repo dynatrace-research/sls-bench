@@ -1,0 +1,310 @@
+```yaml
+scenario:
+  id: api_degradation_two_db_bugs_plus_config_interaction
+  title: Two outage windows from stalled-peer election bug then rollback+config CPU starvation
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The payments API normally serves POST write requests by forwarding writes through a shard router to a database shard primary.
+    The incident begins when the shard primary fails while two peers are stalled and missing replication-lag telemetry, triggering an election fault that leaves the shard without a primary and causes widespread API timeouts.
+    After operators restart the shard nodes, the API recovers; later, a rollback of the election protocol combined with a shard configuration setting causes CPU starvation and a second outage window.
+    Applying a configuration fix and restarting nodes restores the shard and the API, followed by a traffic ramp back to normal throughput.
+
+  trigger_desc: |
+    The shard primary crashes while two replicas are in a stalled state (including missing replication-lag metric reporting).
+    Under these conditions, the newer election protocol (v2) hits a rarely-triggered failover fault and cannot elect a new primary, causing write timeouts that cascade into API errors.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        The API processes a steady stream of POST writes and forwards them through the shard router to the database shard, which maintains stable leadership.
+        A subtle precursor is present: lag telemetry from two nodes is occasionally reported as stale, but active service checks still appear healthy and no alert fires.
+      flows: [api_post_write_ok]
+      manifestation:
+        - api_service.req_ok
+        - db_router.db_write_ok
+        - db_cluster.node_metrics
+        - db_cluster.repl_lag_metric_stale
+        - api_service.worker_pool_stats
+        - db_router.conn_pool_stats
+
+    f:
+      desc: |
+        The failure phase contains two severe degradation windows with a recovery interval between them.
+        First, a primary failure plus multiple stalled peers triggers an election fault (protocol v2), leaving the shard without a primary and causing write timeouts and 503/504s.
+        Operators restart shard nodes to force a clean election and recover the API. During investigation, they roll back the election protocol (v2→v1).
+        Later, the rolled-back protocol interacts with a shard configuration setting, causing CPU starvation and a second outage until the configuration is corrected and nodes are restarted.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: db_cluster
+          event: |
+            The shard primary fails and the cluster cannot quickly elect a replacement; API write timeouts surge and alerting pages on shard unavailability and elevated API write errors.
+          why: |
+            Multiple replicas are stalled (including missing lag telemetry), and the newer election protocol (v2) has a rarely-triggered fault under this condition.
+            Primary loss and election-failure logs are directly observable; the stalled-peer interaction is inferred from the combination of stale telemetry and election-failure mode.
+          flows: [api_post_write_timeout, api_post_write_slow_ok, api_post_write_recovered_ok]
+          rate_multipliers:
+            api_post_write_recovered_ok: 0.0
+            api_service.worker_pool_stats: 0.0
+            api_service.worker_pool_stats_degraded: 1.0
+            db_router.conn_pool_stats: 0.0
+            db_router.conn_pool_stats_degraded: 1.0
+            db_cluster.node_metrics_hot: 0.0
+            db_cluster.election_failed_cpu: 0.0
+            db_cluster.election_failed_stalled: 2.0
+          latency_multipliers:
+            api_post_write_timeout: {p50: 1.2, p95: 1.2}
+            api_post_write_slow_ok: {p50: 1.3, p95: 1.3}
+          one_shots:
+            - ref: db_cluster.primary_failed
+              count: 1
+              hosts: [db-1]
+            - ref: monitoring.alert_fired
+              count: 2
+              hosts: [mon-1]
+          manifestation:
+            - db_cluster.primary_failed
+            - monitoring.alert_fired
+            - db_cluster.election_failed_stalled
+            - db_router.db_write_timeout
+            - api_service.req_err
+
+        - order: 2
+          at_min: 22
+          component: monitoring
+          event: |
+            On-call acknowledges the page and begins incident response while the shard remains without a stable primary.
+          why: |
+            The acknowledgement is directly observable; continued shard unavailability is observable via ongoing election failures and API/router timeouts.
+          flows: [api_post_write_timeout, api_post_write_slow_ok]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.pager_ack
+              count: 1
+              hosts: [mon-1]
+          manifestation:
+            - monitoring.pager_ack
+            - db_cluster.election_failed_stalled
+            - api_service.worker_pool_stats_degraded
+
+        - order: 3
+          at_min: 32
+          component: operator_tool
+          event: |
+            Operators restart all shard nodes to force a clean election; a new primary is elected and API write success rates return to normal.
+          why: |
+            Restarting clears the stuck election state and forces nodes to rejoin the election protocol, allowing a stable primary to be elected.
+            The restarts and election success are directly observable via one-shot logs; reduced timeouts are observable in router/API request logs.
+          flows: [api_post_write_timeout, api_post_write_slow_ok, api_post_write_recovered_ok]
+          rate_multipliers:
+            api_post_write_timeout: 0.0
+            api_post_write_slow_ok: 0.05
+            api_post_write_recovered_ok: 1.0
+            api_service.worker_pool_stats: 1.0
+            api_service.worker_pool_stats_degraded: 0.0
+            db_router.conn_pool_stats: 1.0
+            db_router.conn_pool_stats_degraded: 0.0
+            db_cluster.election_failed_stalled: 0.0
+            db_cluster.repl_lag_metric_stale: 0.0
+          latency_multipliers:
+            api_post_write_recovered_ok: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: operator_tool.restart_node
+              count: 3
+              hosts: [ops-1]
+            - ref: db_cluster.election_succeeded
+              count: 1
+              hosts: [db-1]
+          manifestation:
+            - operator_tool.restart_node
+            - db_cluster.election_succeeded
+            - api_service.req_ok
+            - db_router.db_write_ok
+
+        - order: 4
+          at_min: 36
+          component: operator_tool
+          event: |
+            During investigation, operators roll back the election protocol from v2 to v1 across the shard; the shard remains healthy immediately after the change.
+          why: |
+            The protocol rollback is a deliberate remediation step and is directly observable via deployment logs.
+            Lack of immediate user impact is observable as continued request success and normal connection/worker snapshots.
+          flows: [api_post_write_recovered_ok]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: operator_tool.proto_rollback
+              count: 1
+              hosts: [ops-1]
+            - ref: db_cluster.proto_active
+              count: 3
+              hosts: [db-1, db-2, db-3]
+          manifestation:
+            - operator_tool.proto_rollback
+            - db_cluster.proto_active
+            - api_service.req_ok
+
+        - order: 5
+          at_min: 42
+          component: db_cluster
+          event: |
+            A second severe degradation begins: shard CPU saturates and elections fail under the rolled-back protocol; API write errors return and router timeouts spike.
+          why: |
+            The rolled-back election protocol (v1) interacts poorly with a shard configuration setting, driving CPU starvation and renewed shard unavailability.
+            CPU starvation and election failures are directly observable via node_metrics_hot and election_failed_cpu; the configuration interaction is an inferred cause from investigation.
+          flows: [api_post_write_timeout, api_post_write_slow_ok, api_post_write_recovered_ok]
+          rate_multipliers:
+            api_post_write_timeout: 1.0
+            api_post_write_slow_ok: 1.0
+            api_post_write_recovered_ok: 0.0
+            api_service.worker_pool_stats: 0.0
+            api_service.worker_pool_stats_degraded: 1.0
+            db_router.conn_pool_stats: 0.0
+            db_router.conn_pool_stats_degraded: 1.0
+            db_cluster.node_metrics_hot: 1.0
+            db_cluster.election_failed_cpu: 2.0
+            db_cluster.election_failed_stalled: 0.0
+          latency_multipliers:
+            api_post_write_timeout: {p50: 1.3, p95: 1.4}
+            api_post_write_slow_ok: {p50: 1.4, p95: 1.5}
+          one_shots:
+            - ref: monitoring.alert_fired
+              count: 2
+              hosts: [mon-1]
+          manifestation:
+            - monitoring.alert_fired
+            - db_cluster.node_metrics_hot
+            - db_cluster.election_failed_cpu
+            - db_router.db_write_timeout
+            - api_service.req_err
+
+        - order: 6
+          at_min: 55
+          component: operator_tool
+          event: |
+            Operators push a corrected shard configuration and restart nodes; CPU and election failures drop, and API requests begin recovering, though traffic is still constrained during verification.
+          why: |
+            The configuration change removes the v1/prod-config interaction that drives CPU starvation, and restarts expedite the return to stable operation.
+            Actions are directly observable via one-shots; improvement is observable via reduced hot-metrics/election failures and fewer timeouts.
+          flows: [api_post_write_timeout, api_post_write_slow_ok, api_post_write_recovered_ok]
+          rate_multipliers:
+            api_post_write_timeout: 0.35
+            api_post_write_slow_ok: 1.6
+            api_post_write_recovered_ok: 0.6
+            db_cluster.node_metrics_hot: 0.4
+            db_cluster.election_failed_cpu: 0.4
+          latency_multipliers:
+            api_post_write_timeout: {p50: 0.9, p95: 0.9}
+            api_post_write_slow_ok: {p50: 0.9, p95: 0.9}
+            api_post_write_recovered_ok: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: operator_tool.config_push
+              count: 1
+              hosts: [ops-1]
+            - ref: operator_tool.restart_node
+              count: 3
+              hosts: [ops-1]
+            - ref: db_cluster.config_applied
+              count: 3
+              hosts: [db-1, db-2, db-3]
+            - ref: db_cluster.election_succeeded
+              count: 1
+              hosts: [db-2]
+          manifestation:
+            - operator_tool.config_push
+            - db_cluster.config_applied
+            - operator_tool.restart_node
+            - db_cluster.election_succeeded
+            - api_service.req_ok
+
+        - order: 7
+          at_min: 58
+          component: api_service
+          event: |
+            After verification, traffic is ramped fully back up; API write success returns to baseline and shard hot-metrics/election failures disappear.
+          why: |
+            Once CPU starvation is removed and stable leadership is confirmed, the router and API stop timing out and can serve the full steady request rate again.
+            Recovery is directly observable via the absence of timeout/error flows and the return of normal worker/connection snapshots.
+          flows: [api_post_write_timeout, api_post_write_slow_ok, api_post_write_recovered_ok]
+          rate_multipliers:
+            api_post_write_timeout: 0.0
+            api_post_write_slow_ok: 0.05
+            api_post_write_recovered_ok: 1.0
+            api_service.worker_pool_stats: 1.0
+            api_service.worker_pool_stats_degraded: 0.0
+            db_router.conn_pool_stats: 1.0
+            db_router.conn_pool_stats_degraded: 0.0
+            db_cluster.node_metrics_hot: 0.0
+            db_cluster.election_failed_cpu: 0.0
+          latency_multipliers:
+            api_post_write_recovered_ok: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - api_service.req_ok
+            - api_service.worker_pool_stats
+            - db_router.conn_pool_stats
+            - db_cluster.node_metrics
+
+      steady:
+        - component: api_service
+          condition: |
+            API write handling is back to normal throughput with low latency; retries are rare and error responses are no longer elevated.
+          user_impact: |
+            Client POST requests succeed at baseline rates, with no widespread 503/504.
+          manifestation: [api_service.req_ok, api_service.worker_pool_stats]
+        - component: db_cluster
+          condition: |
+            The shard has a stable primary; CPU starvation is gone and elections are not failing.
+          user_impact: |
+            Writes to this shard complete normally, allowing dependent services to operate without cascading timeouts.
+          manifestation: [db_cluster.node_metrics]
+
+      feedback_loops:
+        - id: retries_amplify_upstream_pressure
+          desc: |
+            During outage windows, upstream timeouts trigger API retries, increasing inflight handlers and router connection pressure.
+            The extra contention further degrades shard responsiveness, sustaining high timeout rates until a stable primary and healthy CPU are restored.
+
+      flows: [api_post_write_timeout, api_post_write_slow_ok, api_post_write_recovered_ok]
+      manifestation:
+        - db_cluster.election_failed_stalled
+        - db_cluster.election_failed_cpu
+        - db_cluster.node_metrics_hot
+        - db_router.db_write_timeout
+        - api_service.req_err
+        - api_service.db_retry
+
+  assumptions:
+    - |
+      Wall-clock gaps between the two real degradation windows are compressed into a single 60-minute scenario while preserving ordering and causality:
+      outage1 (no primary from stalled-peer election fault) → recovery via restarts → rollback → outage2 (CPU starvation from rollback+config) → config+restart recovery → traffic ramp.
+    - |
+      Phase durations: normal 20m, failure 40m.
+      Failure piecewise behavior (effective intent):
+        - 20-32m (12m): outage window #1; recovered flow disabled; election_failed_stalled elevated; degraded worker/conn snapshots enabled; node_metrics_hot suppressed.
+        - 32-42m (10m): recovered interval; timeout flow disabled; normal worker/conn snapshots enabled; stale lag telemetry suppressed after restart.
+        - 42-55m (13m): outage window #2; recovered flow disabled; node_metrics_hot + election_failed_cpu elevated; degraded worker/conn snapshots enabled.
+        - 55-58m (3m): partial recovery while verifying; mix of slow_ok and recovered_ok; CPU/election failures reduced but not yet zero.
+        - 58-60m (2m): full recovery and traffic ramp complete; timeout flow off; hot metrics/election_failed_cpu suppressed.
+    - |
+      One-shot counts: event1=1 primary_failed + 2 alerts, event2=1 ack, event3=3 restarts + 1 election_succeeded,
+      event4=1 proto_rollback + 3 proto_active, event5=2 alerts, event6=1 config_push + 3 restarts + 3 config_applied + 1 election_succeeded, event7=0.
+    - |
+      Traffic rates are scaled down to keep log volume within limits while preserving relative proportions of success/failure and the two-window progression.
+      Expected log volume (rough): normal ~20m * (~220 rpm * 3.05 logs/req + ~8-10 bg/min) ≈ 13k-14k logs;
+      failure ~40m with outages producing retries and recovered intervals near normal ≈ 30k-65k logs;
+      total ≈ 43k-79k logs (within 20k-100k).
+    - |
+      Diagnostic visibility: outage #1 vs outage #2 is distinguishable by election_failed_stalled (with repl_lag_metric_stale preceding) versus node_metrics_hot + election_failed_cpu after the protocol rollback;
+      user impact is visible via db_write_timeout and req_err; operator actions are anchored by restart_node, proto_rollback, and config_push/config_applied.
+```

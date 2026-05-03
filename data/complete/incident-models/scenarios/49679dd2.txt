@@ -1,0 +1,311 @@
+```yaml
+scenario:
+  id: manta_outage_wraparound_autovacuum_lock_20150727
+  title: Partial Manta outage from shard-A lock pileup during wraparound autovacuum
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The object storage API normally serves requests by querying a sharded PostgreSQL metadata tier.
+    At failure start, shard A enters a degraded state where metadata queries hang and the API times out, returning 500s for a subset of requests.
+    Monitoring shows many waiting queries plus a sustained exclusive lock pending while wraparound autovacuum is active; a PostgreSQL restart and performance tweaks only provide temporary relief.
+    Near the end, operators tune PostgreSQL autovacuum thresholds and apply them via restart, which stops the lock pileup and returns the client error rate near zero while leaving a latent wraparound risk.
+
+  trigger_desc: |
+    Shard A crosses the PostgreSQL wraparound autovacuum threshold and launches a wraparound-prevention autovacuum.
+    Around the same time, a DROP TRIGGER DDL becomes a long-lived pending exclusive-lock request, which blocks new shared-lock acquisitions and causes API timeouts.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        The API serves steady traffic. Metadata lookups to shard A and shard B are fast and 2xx responses dominate.
+        Monitoring snapshots show near-zero waiting queries and no exclusive-lock pending on shard A.
+        Trigger-manager DDL is rare and completes quickly.
+      flows: [object_op_shard_a_success, object_op_shard_b_success, ensure_trigger_success]
+      manifestation: [manta_api.http_2xx, manta_api.pg_query_ok, pg_monitor.pg_stats_ok]
+
+    f:
+      desc: |
+        Shard A experiences a lock pileup: a wraparound autovacuum holds locks long enough that a concurrent DROP TRIGGER
+        (exclusive lock request) becomes a long-lived pending lock waiter. PostgreSQL blocks new shared-lock metadata
+        queries behind the older pending exclusive-lock request, causing high latency and API timeouts/500s for shard-A traffic
+        while shard B remains healthy. A restart clears the queue briefly, but the wraparound condition returns until operators
+        defer wraparound autovacuum via configuration.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: pg_shard_a
+          event: |
+            A wraparound-prevention autovacuum starts on the shard-A metadata table and a DROP TRIGGER becomes pending for an
+            exclusive table lock; shard-A metadata queries begin piling up behind the lock queue head.
+          why: |
+            Wraparound autovacuum does not back off under lock contention. The pending AccessExclusiveLock request cannot be granted
+            while autovacuum holds a conflicting lock, and PostgreSQL prevents new shared-lock acquisitions behind an older pending
+            exclusive-lock request, producing widespread waits. Observable via monitor snapshots, server lock-wait logs, and API timeouts.
+          flows: [object_op_shard_a_timeout, object_op_shard_b_success]
+          rate_multipliers:
+            ensure_trigger_ok: 0.0
+            pg_monitor.pg_stats_ok: 0.0
+            pg_monitor.pg_stats_bad: 1.0
+            pg_monitor.pg_alert: 1.0
+            pg_shard_a.query_lock_wait: 1.0
+            pg_shard_a.autovacuum_progress: 1.0
+            pg_shard_a.ddl_lock_wait_drop_trigger: 1.0
+          latency_multipliers:
+            object_op_shard_a_success: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: pg_shard_a.autovacuum_start_wraparound
+              count: 1
+              hosts: [pg-a1]
+            - ref: pg_shard_a.ddl_drop_trigger_enqueued
+              count: 1
+              hosts: [pg-a1]
+          manifestation: [manta_api.pg_query_timeout, pg_monitor.pg_stats_bad, pg_shard_a.ddl_lock_wait_drop_trigger]
+
+        - order: 2
+          at_min: 35
+          component: ops_tool
+          event: |
+            Operators capture a lock/queries snapshot and restart PostgreSQL on shard A, clearing the long-lived pending DDL and lock queue
+            and restoring shard-A request success for a short window.
+          why: |
+            Restart terminates the waiting statements and the autovacuum, removing the lock queue head and allowing shared-lock metadata
+            queries to proceed again. Snapshot capture and restart markers are directly observable via ops logs and PostgreSQL startup logs.
+          flows: [object_op_shard_a_success, ensure_trigger_ok]
+          rate_multipliers:
+            object_op_shard_a_timeout: 0.0
+            object_op_shard_a_success: 6.0
+            ensure_trigger_ok: 1.0
+            pg_monitor.pg_stats_bad: 0.0
+            pg_monitor.pg_stats_ok: 1.0
+            pg_monitor.pg_alert: 0.0
+            pg_shard_a.query_lock_wait: 0.0
+            pg_shard_a.autovacuum_progress: 0.0
+            pg_shard_a.ddl_lock_wait_drop_trigger: 0.0
+          latency_multipliers:
+            object_op_shard_a_success: {p50: 0.2, p95: 0.1}
+          one_shots:
+            - ref: ops_tool.pg_lock_snapshot_saved
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.pg_restart_cmd
+              count: 1
+              hosts: [ops1]
+            - ref: pg_shard_a.shutdown_requested
+              count: 1
+              hosts: [pg-a1]
+            - ref: pg_shard_a.startup_complete
+              count: 1
+              hosts: [pg-a1]
+          manifestation: [pg_shard_a.startup_complete, pg_monitor.pg_stats_ok, manta_api.http_2xx]
+
+        - order: 3
+          at_min: 41
+          component: pg_shard_a
+          event: |
+            After restart, shard A again launches wraparound autovacuum due to high XID age; a DROP TRIGGER again becomes pending
+            and shard-A timeouts and 500s climb back toward the degraded baseline.
+          why: |
+            The restart does not change the underlying wraparound condition; once autovacuum restarts, a pending exclusive-lock request
+            can again become the lock queue head, recreating head-of-line blocking for shared-lock queries.
+            Observable via renewed monitor "bad" snapshots and API timeouts.
+          flows: [object_op_shard_a_timeout, object_op_shard_a_success]
+          rate_multipliers:
+            object_op_shard_a_timeout: 1.0
+            object_op_shard_a_success: 1.0
+            ensure_trigger_ok: 0.0
+            pg_monitor.pg_stats_ok: 0.0
+            pg_monitor.pg_stats_bad: 1.0
+            pg_monitor.pg_alert: 1.0
+            pg_shard_a.query_lock_wait: 1.0
+            pg_shard_a.autovacuum_progress: 1.0
+            pg_shard_a.ddl_lock_wait_drop_trigger: 1.0
+          latency_multipliers:
+            object_op_shard_a_success: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: pg_shard_a.autovacuum_start_wraparound
+              count: 1
+              hosts: [pg-a1]
+            - ref: pg_shard_a.ddl_drop_trigger_enqueued
+              count: 1
+              hosts: [pg-a1]
+          manifestation: [pg_monitor.pg_alert, manta_api.pg_query_timeout, pg_shard_a.ddl_lock_wait_drop_trigger]
+
+        - order: 4
+          at_min: 47
+          component: ops_tool
+          event: |
+            Operators attempt to speed the wraparound autovacuum by prefetching table/index files and patching vacuum delay,
+            increasing the observed rate of autovacuum progress while lock waits and the pending exclusive-lock DDL remain.
+          why: |
+            Manual prefetch reduces file-level read stalls and patching reduces cost-based vacuum sleeping.
+            This improves autovacuum throughput but does not immediately remove the lock queue head; requests still wait.
+            Actions are directly observable via ops logs; progress via pg_shard_a.autovacuum_progress.
+          flows: [object_op_shard_a_timeout]
+          rate_multipliers:
+            pg_shard_a.autovacuum_progress: 4.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tool.zfs_prefetch
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.patch_vacuum_delay
+              count: 1
+              hosts: [ops1]
+          manifestation: [pg_shard_a.autovacuum_progress, pg_shard_a.ddl_lock_wait_drop_trigger]
+
+        - order: 5
+          at_min: 55
+          component: pg_shard_a
+          event: |
+            The wraparound autovacuum completes; the lock queue drains and shard-A request success returns near-normal for a short window,
+            with monitor snapshots switching back to "ok" and the pending exclusive-lock condition disappearing.
+          why: |
+            Once the autovacuum releases its locks, the pending exclusive-lock request can clear and shared-lock metadata queries can proceed
+            again. This is observable via the autovacuum completion marker and monitor snapshots switching back to "ok".
+          flows: [object_op_shard_a_success, object_op_shard_b_success, ensure_trigger_ok]
+          rate_multipliers:
+            object_op_shard_a_timeout: 0.0
+            object_op_shard_a_success: 7.0
+            ensure_trigger_ok: 1.0
+            pg_shard_a.autovacuum_progress: 0.0
+            pg_shard_a.query_lock_wait: 0.0
+            pg_shard_a.ddl_lock_wait_drop_trigger: 0.0
+            pg_monitor.pg_stats_bad: 0.0
+            pg_monitor.pg_stats_ok: 1.0
+            pg_monitor.pg_alert: 0.0
+          latency_multipliers:
+            object_op_shard_a_success: {p50: 0.2, p95: 0.1}
+          one_shots:
+            - ref: pg_shard_a.autovacuum_complete
+              count: 1
+              hosts: [pg-a1]
+          manifestation: [pg_shard_a.autovacuum_complete, pg_monitor.pg_stats_ok, manta_api.http_2xx]
+
+        - order: 6
+          at_min: 58
+          component: pg_shard_a
+          event: |
+            A new wraparound autovacuum starts shortly after completion; a new DROP TRIGGER again becomes pending and shard-A lock waits
+            and API timeouts return to the degraded baseline.
+          why: |
+            With XID age still near the wraparound thresholds, PostgreSQL re-enters the wraparound autovacuum path.
+            If an exclusive-lock request is queued during that period, it can again block new shared-lock acquisitions.
+            Observable via renewed wraparound autovacuum start, monitor "bad" snapshots, and rising 500s.
+          flows: [object_op_shard_a_timeout, object_op_shard_a_success]
+          rate_multipliers:
+            ensure_trigger_ok: 0.0
+            object_op_shard_a_timeout: 1.0
+            object_op_shard_a_success: 1.0
+            pg_monitor.pg_stats_ok: 0.0
+            pg_monitor.pg_stats_bad: 1.0
+            pg_monitor.pg_alert: 1.0
+            pg_shard_a.query_lock_wait: 1.0
+            pg_shard_a.autovacuum_progress: 2.0
+            pg_shard_a.ddl_lock_wait_drop_trigger: 1.0
+          latency_multipliers:
+            object_op_shard_a_success: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: pg_shard_a.autovacuum_start_wraparound
+              count: 1
+              hosts: [pg-a1]
+            - ref: pg_shard_a.ddl_drop_trigger_enqueued
+              count: 1
+              hosts: [pg-a1]
+          manifestation: [pg_monitor.pg_stats_bad, manta_api.pg_query_timeout, pg_shard_a.ddl_lock_wait_drop_trigger]
+
+        - order: 7
+          at_min: 59
+          component: ops_tool
+          event: |
+            Operators tune PostgreSQL autovacuum thresholds on shard A and restart PostgreSQL to apply the change, terminating
+            the in-progress wraparound autovacuum and clearing the lock queue; shard-A timeouts stop and client error rate returns near zero.
+          why: |
+            In this model the tuning is applied via restart, which ends the running autovacuum and kills long-lived waiting statements.
+            With higher thresholds configured, PostgreSQL does not immediately re-enter wraparound autovacuum on startup, so the
+            head-of-line lock condition does not re-form. The config and restart are directly observable; recovery is visible in monitor "ok"
+            snapshots and the absence of API timeouts/500s.
+          flows: [object_op_shard_a_success, object_op_shard_b_success, ensure_trigger_ok]
+          rate_multipliers:
+            object_op_shard_a_timeout: 0.0
+            object_op_shard_a_success: 7.0
+            ensure_trigger_ok: 1.0
+            pg_shard_a.query_lock_wait: 0.0
+            pg_shard_a.autovacuum_progress: 0.0
+            pg_shard_a.ddl_lock_wait_drop_trigger: 0.0
+            pg_monitor.pg_stats_bad: 0.0
+            pg_monitor.pg_stats_ok: 1.0
+            pg_monitor.pg_alert: 0.0
+          latency_multipliers:
+            object_op_shard_a_success: {p50: 0.2, p95: 0.1}
+          one_shots:
+            - ref: ops_tool.pg_autovacuum_threshold_tuned
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.pg_restart_cmd
+              count: 1
+              hosts: [ops1]
+            - ref: pg_shard_a.shutdown_requested
+              count: 1
+              hosts: [pg-a1]
+            - ref: pg_shard_a.startup_complete
+              count: 1
+              hosts: [pg-a1]
+          manifestation: [ops_tool.pg_autovacuum_threshold_tuned, pg_shard_a.startup_complete, pg_monitor.pg_stats_ok]
+
+      steady:
+        - component: manta_api
+          condition: |
+            After the autovacuum-threshold tuning and restart, shard-A metadata queries complete and the API no longer times out, so 2xx responses dominate again.
+          user_impact: |
+            Client-visible 500s drop to near zero and latency returns to typical levels for both shard-A and shard-B traffic.
+          manifestation: [manta_api.http_2xx, manta_api.api_metrics, pg_monitor.pg_stats_ok]
+
+        - component: pg_shard_a
+          condition: |
+            Wraparound-triggered autovacuum on the primary metadata table is deferred by configuration, removing the immediate lock-pileup trigger,
+            but the underlying XID-age/wraparound risk remains until manual maintenance (e.g., VACUUM FREEZE) is performed.
+          user_impact: |
+            Service is restored, but operators must follow up to ensure the shard does not approach true wraparound limits.
+          manifestation: [pg_monitor.pg_stats_ok, manta_api.api_metrics]
+
+      feedback_loops:
+        - id: lock_queue_head_of_line_blocking
+          desc: |
+            A pending AccessExclusiveLock request (DROP TRIGGER) becomes the lock queue head; PostgreSQL blocks new shared-lock
+            acquisitions behind it. During wraparound autovacuum, the exclusive lock cannot be granted quickly, so the queue grows,
+            leading to API timeouts and sustained error rates until autovacuum completes, the database is restarted, or wraparound mode is avoided.
+
+      flows: [object_op_shard_a_timeout, object_op_shard_a_success, object_op_shard_b_success, ensure_trigger_ok]
+      manifestation: [manta_api.http_5xx, manta_api.pg_query_timeout, pg_monitor.pg_stats_bad, pg_shard_a.ddl_lock_wait_drop_trigger, ops_tool.pg_autovacuum_threshold_tuned]
+
+  assumptions:
+    - >
+      Timeline is compressed: the original incident lasted ~10 hours; here it is modeled as a 35-minute failure phase with
+      representative interventions (restart, then speed-up efforts) and a final configuration change that ends customer-visible impact.
+    - >
+      The sustained exclusive-lock-pending condition is modeled as a long-lived server-side waiter via pg_shard_a.ddl_lock_wait_drop_trigger
+      background emissions (wait_s up to 30000) during degraded intervals, rather than as many short client retries/timeouts.
+    - >
+      Piecewise failure breakdown (approx effective logs/min, including background):
+      25-35 degraded baseline (~630/min), 35-41 post-restart recovery (~587/min),
+      41-47 degraded again (~630/min), 47-55 degraded with increased autovacuum progress logs (~633/min),
+      55-58 brief improvement/near-normal for shard A (~607/min), 58-59 degraded again (~632/min),
+      59-60 post-config+restart recovery (~607/min).
+    - >
+      One-shots per event: E1=2, E2=4, E3=2, E4=2, E5=1, E6=2, E7=4 (17 total).
+    - >
+      Visibility rationale: shard-A impact is evident via frequent manta_api.http_5xx and pg_query_timeout during degraded intervals;
+      sustained exclusive_pending is corroborated by pg_monitor.pg_stats_bad plus the repeated server-side ddl_lock_wait_drop_trigger lines;
+      wraparound activity is visible via autovacuum_start_wraparound/progress/complete; operational boundaries are timestamped by one-shots
+      (restart, prefetch/patch, config tuning and final restart).
+    - >
+      Total estimated log volume: ~36k-40k logs over 60 minutes (dominated by per-request API logs at ~300 rpm), within 20k..100k.
+```

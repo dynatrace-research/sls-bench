@@ -1,0 +1,205 @@
+```yaml
+scenario:
+  id: cf_route_leak_to_offline_hkg
+  title: BGP route leak attracts global Anycast traffic to offline Hong Kong POP
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system is an Anycast CDN edge where most traffic arrives via a trusted transit provider and a smaller portion via direct peers.
+    During scheduled Hong Kong maintenance, the HK site is effectively offline for inbound service, but a misapplied routing policy causes the HK router to announce CDN-wide prefixes.
+    The transit provider propagates the update, pulling most global transit traffic toward Hong Kong and causing widespread HTTP timeouts, while direct peers continue to route to healthy POPs.
+    Operators withdraw the bad routes and, within about 15 minutes of the initial leak, routing and probe success rates return to normal levels.
+
+  trigger_desc: |
+    During Hong Kong maintenance, an operator accidentally applies an outbound export policy on an inbound-facing interface, causing the HK router to originate the full CDN prefix set via BGP while the site is not serving inbound traffic.
+
+  time:
+    total_minutes: 31
+    phases:
+      n: {start_min: 0, end_min: 16}
+      f: {start_min: 16, end_min: 31}
+
+  phases:
+    n:
+      desc: |
+        Transit and direct peers route user HTTP traffic to healthy POPs (Singapore/Tokyo). Synthetic probes succeed with low latency.
+        Periodic edge stats show stable request volume and connection counts, and peering stats show steady peer-delivered traffic.
+      flows: [user_http_transit_n, user_http_peer_n, synthetic_probe_n]
+      manifestation:
+        - edge_pop_other.access_transit
+        - edge_pop_other.access_peer
+        - route_monitor.probe_ok
+        - route_monitor.rib_summary
+        - edge_pop_other.edge_stats
+        - direct_peer.peer_stats
+
+    f:
+      desc: |
+        The HK router begins advertising CDN-wide prefixes to the transit provider. Because the provider trusts the announcement, routes propagate and many
+        networks select the HK path, sending traffic to a POP that is effectively offline. Served transit traffic at non-HK POPs collapses and synthetic probes
+        increasingly time out. After operators withdraw the announcement, probe timeouts drop and transit-served traffic returns as BGP reconverges, completing
+        recovery within the incident window.
+
+      events:
+        - order: 1
+          at_min: 16
+          component: hkg_router
+          event: |
+            A misapplied policy causes the Hong Kong router to announce a large set of CDN prefixes to the trusted transit provider, and transit-delivered traffic to healthy POPs begins dropping.
+          why: |
+            Outbound export routes were entered on an inbound-facing interface, effectively leaking the full CDN prefix set from HK. This is directly observable through BGP update markers
+            and indirectly through reduced transit-served access volume and increased synthetic probe timeouts.
+          flows: [user_http_transit_f, user_http_peer_f, synthetic_probe_ok_f, synthetic_probe_timeout_f]
+          rate_multipliers:
+            user_http_transit_f: 0.2
+            synthetic_probe_ok_f: 0.8
+            synthetic_probe_timeout_f: 1.2
+            route_monitor.route_leak_alert: 5.0
+            route_monitor.edge_traffic_drop_alert: 2.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: netcfg_tool.change_applied
+              count: 1
+              hosts: [netcfg-1]
+            - ref: hkg_router.bgp_announce
+              count: 1
+              hosts: [rtr-hkg-1]
+            - ref: upstream_transit.bgp_update_received
+              count: 1
+              hosts: [transit-1]
+          manifestation:
+            - hkg_router.bgp_announce
+            - upstream_transit.bgp_update_received
+            - route_monitor.route_leak_alert
+            - route_monitor.probe_timeout
+
+        - order: 2
+          at_min: 20
+          component: route_monitor
+          event: |
+            As the leaked routes propagate further, transit-delivered served traffic at non-HK POPs falls to near-zero and probe timeouts dominate.
+          why: |
+            BGP propagation causes more networks to prefer the HK-originated path, blackholing a larger fraction of transit traffic. This is observable as a sharp
+            drop in transit access logs at healthy POPs and a sustained increase in synthetic probe timeouts; leak and traffic-drop alerts fire more frequently.
+          flows: [user_http_transit_f, synthetic_probe_ok_f, synthetic_probe_timeout_f]
+          rate_multipliers:
+            user_http_transit_f: 0.02
+            synthetic_probe_ok_f: 0.2
+            synthetic_probe_timeout_f: 1.8
+            route_monitor.route_leak_alert: 8.0
+            route_monitor.edge_traffic_drop_alert: 6.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: upstream_transit.bgp_propagation_notice
+              count: 1
+              hosts: [transit-1]
+          manifestation:
+            - route_monitor.probe_timeout
+            - route_monitor.edge_traffic_drop_alert
+            - route_monitor.route_leak_alert
+
+        - order: 3
+          at_min: 27
+          component: netcfg_tool
+          event: |
+            Operators push the corrected policy and withdraw the bad HK announcements; probe successes become common again and transit-served traffic begins returning.
+          why: |
+            Withdrawing the leaked prefixes removes the HK-attracting path from the transit provider, but Internet-wide routing still needs time to reconverge.
+            This is observable as fewer probe timeouts and a reduction in leak/traffic-drop alerts while transit access volume rises from near-zero.
+          flows: [user_http_transit_f, synthetic_probe_ok_f, synthetic_probe_timeout_f]
+          rate_multipliers:
+            user_http_transit_f: 0.4
+            synthetic_probe_ok_f: 1.8
+            synthetic_probe_timeout_f: 0.2
+            route_monitor.route_leak_alert: 2.0
+            route_monitor.edge_traffic_drop_alert: 3.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: netcfg_tool.change_reverted
+              count: 1
+              hosts: [netcfg-1]
+            - ref: hkg_router.bgp_withdraw
+              count: 1
+              hosts: [rtr-hkg-1]
+            - ref: upstream_transit.bgp_update_received
+              count: 1
+              hosts: [transit-1]
+          manifestation:
+            - hkg_router.bgp_withdraw
+            - netcfg_tool.change_reverted
+            - route_monitor.probe_ok
+            - route_monitor.probe_timeout
+
+        - order: 4
+          at_min: 30
+          component: upstream_transit
+          event: |
+            Route selection across the transit path stabilizes after withdrawal propagation; probe timeouts stop and transit-delivered traffic returns to normal levels.
+          why: |
+            As BGP reconverges after the withdrawal, the leaked HK origin is no longer selected and traffic resumes reaching healthy POPs. This is observable as
+            the disappearance of probe timeouts and route-leak/traffic-drop alerts, alongside restored transit-served access volume.
+          flows: [user_http_transit_f, synthetic_probe_ok_f]
+          rate_multipliers:
+            user_http_transit_f: 1.0
+            synthetic_probe_ok_f: 2.0
+            synthetic_probe_timeout_f: 0.0
+            route_monitor.route_leak_alert: 0.0
+            route_monitor.edge_traffic_drop_alert: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - route_monitor.probe_ok
+            - edge_pop_other.access_transit
+
+      steady:
+        - component: upstream_transit
+          condition: |
+            Transit routing has reconverged after the HK withdrawal; the leaked route is no longer attracting traffic.
+          user_impact: |
+            Transit-delivered users regain normal reachability; widespread timeouts cease.
+          manifestation:
+            - route_monitor.probe_ok
+            - edge_pop_other.access_transit
+        - component: direct_peer
+          condition: |
+            Direct peering remains stable throughout and continues delivering its share of traffic to healthy POPs.
+          user_impact: |
+            Users behind direct peers see little or no impact during the incident window.
+          manifestation:
+            - direct_peer.peer_stats
+            - edge_pop_other.access_peer
+        - component: edge_pop_other
+          condition: |
+            Healthy POPs return to serving both transit and peer traffic at typical levels.
+          user_impact: |
+            End-user performance and availability return to baseline.
+          manifestation:
+            - edge_pop_other.edge_stats
+            - edge_pop_other.access_transit
+            - edge_pop_other.access_peer
+
+      feedback_loops:
+        - id: bgp_trust_propagation_loop
+          desc: |
+            The transit provider trusts customer announcements and rapidly propagates BGP updates to its upstreams; this amplifies the blast radius
+            because more networks select the leaked HK path, further reducing the fraction of traffic that reaches healthy POPs until withdrawal reconverges.
+
+      flows: [user_http_transit_f, user_http_peer_f, synthetic_probe_ok_f, synthetic_probe_timeout_f]
+      manifestation:
+        - route_monitor.route_leak_alert
+        - route_monitor.edge_traffic_drop_alert
+        - route_monitor.probe_timeout
+        - edge_pop_other.edge_stats
+        - direct_peer.peer_stats
+        - edge_pop_other.access_peer
+        - edge_pop_other.access_transit
+
+  assumptions:
+    - "Failure duration is modeled as 15 minutes (16..31), matching the post-mortem's maximum downtime and ~15-minute network-wide correction window."
+    - "Piecewise failure breakdown (minutes): 16-20 leak begins; 20-27 near-total transit blackhole; 27-30 recovery in progress after withdrawal; 30-31 stabilized recovery."
+    - "Effective request rates during failure (approx): user_http_peer_f stays ~300 rpm; user_http_transit_f ~180 rpm (0.2x) then ~18 rpm (0.02x) then ~360 rpm (0.4x) then ~900 rpm (1.0x)."
+    - "Probes remain ~60 rpm total in failure via ok/timeout split: 16-20 (ok~24 rpm, timeout~36 rpm), 20-27 (ok~6 rpm, timeout~54 rpm), 27-30 (ok~54 rpm, timeout~6 rpm), 30-31 (ok~60 rpm, timeout~0)."
+    - "One-shot counts: event1=3 markers (config applied, BGP announce, transit received), event2=1 marker (propagation notice), event3=3 markers (revert, withdraw, transit received), event4=0."
+    - "Total log estimate: normal ~20.2k + failure ~8.3k ≈ 28.5k logs. Failure signals are likely visible because probe_timeout is frequent during 20-27, route_leak_alert repeats during the leak, and access_transit volume returns sharply once corrected."
+```

@@ -1,0 +1,251 @@
+```yaml
+scenario:
+  id: honeycomb_total_outage_stamp_cache_mysql_lockup_recovery_with_freshness_skew
+  title: Total outage from MySQL lockup after cache-warming stamps stop; circuit-break, failover, cache rebuild restore service with minor freshness skew
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally ingests events via Shepherd and serves queries via Retriever, with a shared schema cache shielding a main MySQL metadata database.
+    Cache-warming schema-stamp writes from Retriever stop, the schema cache goes cold, and MySQL experiences severe contention leading to connection exhaustion and widespread 5xx.
+    On-call blocks ingest traffic, fails over MySQL, manually forces schema stamps forward to rebuild cache warmth, restarts Retriever hosts, and then restores ingest and query traffic.
+    The full outage ends when traffic is restored, but a minor UI freshness indicator remains incorrect due to the manual stamp update.
+
+  trigger_desc: |
+    A prior cluster/feature-flag change leaves Retriever stamp-writer activity effectively stopped; as cache warmth collapses and metadata reads surge, MySQL hits a rare internal lockup and connection exhaustion, starting a total outage window.
+
+  time:
+    total_minutes: 56
+    phases:
+      n: {start_min: 0, end_min: 28}
+      f: {start_min: 28, end_min: 56}
+
+  phases:
+    n:
+      desc: |
+        Ingest and query operate normally. Retriever stamp-writer activity is running, keeping the schema cache warm and stable.
+        MySQL health metrics stay within normal bounds and lock waits are rare.
+      flows: [ingest_event, query_request]
+      manifestation:
+        - schema_cache.cache_stats_warm
+        - mysql_main_db.db_health_ok
+        - retriever_engine.stamp_writer_metrics_running
+        - api_gateway.access_ingest_202
+        - api_gateway.access_query_200
+
+    f:
+      desc: |
+        The outage begins with MySQL becoming heavily contended and rejecting connections; Shepherd and Retriever cannot resolve schema/metadata and client requests return 500.
+        To break the death spiral, on-call circuit-breaks ingest at the edge and fails over to a MySQL replica, restoring database responsiveness but leaving service unavailable while Retriever hosts and caches are repaired.
+        On-call then forces schema stamps to "now" to reload the schema store and restarts Retriever hosts to resume stamp-writer activity and pass internal checks.
+        Finally, ingest circuit-breaking is removed and traffic returns, but the manual stamp update leaves a freshness indicator temporarily incorrect.
+
+      events:
+        - order: 1
+          at_min: 28
+          component: mysql_main_db
+          event: |
+            MySQL enters a lockup/connection-exhaustion state and dependent services begin failing metadata access.
+            Client-facing ingest and query requests return 500, marking the start of a total outage.
+          why: |
+            With the schema cache cold (no recent stamp updates) services fall back to MySQL more often, increasing concurrent reads and raising the likelihood of rare internal lock contention.
+            The lockup is directly observable via MySQL connection-limit errors and lock-wait warnings; the exact internal deadlock chain is inferred.
+          flows: [ingest_event_fail_500, query_request_fail_500]
+          rate_multipliers:
+            ingest_event_fail_500: 1.0
+            ingest_event_blocked_503: 0.0
+            ingest_event_recovered_202: 0.0
+            query_request_fail_500: 1.0
+            query_request_fail_500_unready: 0.0
+            query_request_recovered_200: 0.0
+            retriever_engine.stamp_writer_metrics_running: 0.0
+            retriever_engine.stamp_writer_metrics_stopped: 1.0
+            schema_cache.cache_stats_warm: 0.0
+            schema_cache.cache_stats_cold: 1.0
+            mysql_main_db.db_health_ok: 0.0
+            mysql_main_db.db_health_overloaded: 1.0
+            mysql_main_db.too_many_connections: 6.0
+            mysql_main_db.innodb_lock_wait: 6.0
+          latency_multipliers:
+            ingest_event_fail_500: {p50: 1.0, p95: 1.0}
+            query_request_fail_500: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: mysql_main_db.innodb_internal_deadlock
+              count: 1
+              hosts: [mysql-primary-1]
+          manifestation:
+            - mysql_main_db.too_many_connections
+            - mysql_main_db.innodb_internal_deadlock
+            - api_gateway.access_upstream_500
+            - schema_cache.cache_stats_cold
+
+        - order: 2
+          at_min: 33
+          component: ops_console
+          event: |
+            On-call opens the ingest circuit breaker to protect MySQL, shifting ingest failures from upstream 500s to immediate 503 responses at the edge.
+            Query traffic continues to return 500 while the database remains locked up.
+          why: |
+            Circuit-breaking reduces new ingest-driven schema lookups and connection churn, giving the team space to execute database recovery.
+            The operational action and the resulting 503s are directly observable in ops markers and gateway access logs.
+          flows: [ingest_event_blocked_503, query_request_fail_500]
+          rate_multipliers:
+            ingest_event_fail_500: 0.0
+            ingest_event_blocked_503: 1.0
+            ingest_event_recovered_202: 0.0
+            mysql_main_db.too_many_connections: 3.0
+            mysql_main_db.innodb_lock_wait: 4.0
+          latency_multipliers:
+            ingest_event_blocked_503: {p50: 1.0, p95: 1.0}
+            query_request_fail_500: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_console.enable_ingest_circuit_breaker
+              count: 1
+              hosts: [oncall-1]
+          manifestation:
+            - ops_console.enable_ingest_circuit_breaker
+            - api_gateway.access_circuit_503
+            - mysql_main_db.db_health_overloaded
+
+        - order: 3
+          at_min: 38
+          component: ops_console
+          event: |
+            On-call initiates a MySQL failover to a replica; the new primary comes up responsive and health snapshots return to near-normal.
+            Query requests still return 500, but now primarily due to Retriever hosts being unready (post-failover dependency checks/restarts), not due to MySQL lockup.
+          why: |
+            Failover replaces the locked-up instance with a fresh primary, clearing stuck internal state and restoring database responsiveness.
+            The failover is directly observable via ops markers and the shift from overloaded to ok health snapshots; the continued query unavailability is observable via Retriever-side unready failures and is attributed to host readiness rather than database contention.
+          flows: [ingest_event_blocked_503, query_request_fail_500_unready]
+          rate_multipliers:
+            query_request_fail_500: 0.0
+            query_request_fail_500_unready: 1.0
+            mysql_main_db.db_health_ok: 1.0
+            mysql_main_db.db_health_overloaded: 0.0
+            mysql_main_db.too_many_connections: 0.2
+            mysql_main_db.innodb_lock_wait: 0.4
+          latency_multipliers:
+            query_request_fail_500_unready: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_console.initiate_db_failover
+              count: 1
+              hosts: [oncall-1]
+            - ref: ops_console.db_failover_complete
+              count: 1
+              hosts: [oncall-1]
+          manifestation:
+            - ops_console.initiate_db_failover
+            - ops_console.db_failover_complete
+            - mysql_main_db.db_health_ok
+            - retriever_engine.query_fail_unready
+
+        - order: 4
+          at_min: 45
+          component: ops_console
+          event: |
+            On-call bulk-updates schema 'last written' timestamps to force schema reload and restarts Retriever hosts so stamp-writer activity resumes.
+            The schema cache reports warm behavior again, but querying remains unavailable while hosts restart and checks complete; ingest remains blocked by the circuit breaker.
+          why: |
+            Forcing stamps to "now" triggers schema reload into the shared cache, and Retriever restarts are required to resume stamp-writer workers that do not automatically restart after being stopped.
+            The manual action is directly observable via ops logs; cache warmth and stamp-writer running state are observable in cache stats and Retriever metrics.
+          flows: [query_request_fail_500_unready, ingest_event_blocked_503]
+          rate_multipliers:
+            schema_cache.cache_stats_warm: 1.0
+            schema_cache.cache_stats_cold: 0.0
+            retriever_engine.stamp_writer_metrics_running: 1.0
+            retriever_engine.stamp_writer_metrics_stopped: 0.0
+          latency_multipliers:
+            query_request_fail_500_unready: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_console.bulk_schema_stamp_update
+              count: 1
+              hosts: [oncall-1]
+            - ref: retriever_engine.host_restart
+              count: 4
+              hosts: [retriever-1, retriever-2, retriever-3, retriever-4]
+          manifestation:
+            - ops_console.bulk_schema_stamp_update
+            - retriever_engine.host_restart
+            - schema_cache.cache_stats_warm
+            - retriever_engine.stamp_writer_metrics_running
+
+        - order: 5
+          at_min: 50
+          component: ops_console
+          event: |
+            On-call closes the ingest circuit breaker and remaining Retriever restarts/checks complete, restoring both ingest and query traffic.
+            The UI freshness indicator is temporarily skewed due to the earlier bulk stamp update.
+          why: |
+            With MySQL healthy and cache warmth restored, ingest no longer risks saturating database connections and can be safely re-enabled.
+            Completing post-failover restarts resolves Retriever readiness failures; the freshness skew is a side effect of forcing timestamps forward.
+          flows: [ingest_event_recovered_202, query_request_recovered_200]
+          rate_multipliers:
+            ingest_event_blocked_503: 0.0
+            ingest_event_recovered_202: 1.0
+            ingest_event_fail_500: 0.0
+            query_request_fail_500_unready: 0.0
+            query_request_recovered_200: 1.0
+          latency_multipliers:
+            ingest_event_recovered_202: {p50: 1.0, p95: 1.0}
+            query_request_recovered_200: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_console.disable_ingest_circuit_breaker
+              count: 1
+              hosts: [oncall-1]
+            - ref: retriever_engine.host_restart
+              count: 2
+              hosts: [retriever-2, retriever-3]
+          manifestation:
+            - ops_console.disable_ingest_circuit_breaker
+            - api_gateway.access_ingest_202
+            - api_gateway.access_query_200
+            - retriever_engine.query_ok
+
+      steady:
+        - component: retriever_engine
+          condition: |
+            Core ingest and query traffic are operating again, but the freshness indicator returned with query results is temporarily inconsistent due to the earlier manual bulk stamp update.
+          user_impact: |
+            Users can access data again, but parts of the UI that report "how fresh" data is may be misleading until corrected.
+          manifestation:
+            - retriever_engine.query_ok
+            - api_gateway.access_query_200
+            - schema_cache.cache_stats_warm
+
+      feedback_loops:
+        - id: cold_cache_db_pressure_loop
+          desc: |
+            Stopped stamp updates → schema cache goes cold → cache misses drive high MySQL read concurrency →
+            lock waits and connection pressure → more request failures and longer waits.
+
+      flows:
+        - ingest_event_fail_500
+        - ingest_event_blocked_503
+        - ingest_event_recovered_202
+        - query_request_fail_500
+        - query_request_fail_500_unready
+        - query_request_recovered_200
+      manifestation:
+        - schema_cache.cache_stats_cold
+        - mysql_main_db.too_many_connections
+        - api_gateway.access_upstream_500
+        - api_gateway.access_circuit_503
+        - mysql_main_db.db_health_ok
+        - schema_cache.cache_stats_warm
+        - retriever_engine.stamp_writer_metrics_running
+        - retriever_engine.query_fail_unready
+
+  assumptions:
+    - "Repair: set all scenario latency_multipliers back to 1.0 so failure-flow latency hints remain consistent with 15s max duration-like domains (dur_ms/total_ms/waited_ms). Slowness is expressed by the failure flows' base latency_ms hints and state_vars ranges, not by multipliers."
+    - "The real outage lasted longer than the 56-minute constraint; the scenario compresses the same causal order: stamps stop/cold cache → MySQL lockup → circuit-break ingest → DB failover → manual stamp update + retriever restarts → restore ingest/query."
+    - |
+      Piecewise failure-phase rough volume (flow logs dominate; backgrounds provide anchors):
+      - min 28–33 (5m): ~480 flow-logs/min (all 500); one-shot deadlock marker count=1
+      - min 33–38 (5m): ~300 flow-logs/min (ingest 503, query 500 due to DB); one-shot circuit-breaker count=1
+      - min 38–45 (7m): ~300 flow-logs/min (ingest 503, query 500 due to Retriever unready); one-shots failover start/complete count=2
+      - min 45–50 (5m): ~300 flow-logs/min (ingest 503, query 500 due to Retriever unready); one-shots bulk stamp update count=1, retriever restarts count=4
+      - min 50–56 (6m): ~480 flow-logs/min (ingest 202, query 200); one-shots circuit-breaker close count=1, extra retriever restarts count=2
+    - "Normal-phase expected volume: ~480 flow-logs/min plus ~6–8 background-logs/min."
+    - "Total estimated logs across the full scenario: ~24k–32k, within the 20k–100k target."
+    - "Visibility rationale: edge 500/503 logs appear at request rate, per-minute cache/db/writer metrics (switched via multipliers) mark boundaries, and Retriever-side query_fail_unready distinguishes post-failover failures from pre-failover MySQL-caused failures in a single log file."
+```

@@ -1,0 +1,536 @@
+```yaml
+sys:
+  id: us_east_1_az_power_control_planes
+  desc: >
+    A cloud region provides compute, block storage, and load balancing resources across multiple Availability Zones (AZs).
+    Customers use regional control-plane APIs to create/modify resources, while DNS and load balancer endpoints serve data-plane traffic.
+    Control planes persist metadata in a multi-AZ replicated datastore to survive single-AZ faults.
+    This model focuses on a single-AZ power loss that forces control planes into read-only mode and later triggers an ELB control-plane queue backlog.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: client
+    name: Customer / SDK Clients
+    svc: null
+    hosts: [external]
+    desc: External clients calling control-plane APIs and making data-plane connections via DNS-resolved ELB endpoints.
+    to:
+      - dst: control_plane_api
+        proto: https
+        desc: EC2/EBS regional control-plane API calls.
+      - dst: elb_control_plane
+        proto: https
+        desc: ELB management/control-plane calls.
+      - dst: dns_service
+        proto: udp
+        desc: DNS queries for ELB names.
+      - dst: elb_edge
+        proto: tcp
+        desc: TCP connections to ELB endpoints returned by DNS.
+    logs:
+      client_call:
+        desc: A client operation is initiated (modeled sparingly; mostly used as optional noise).
+        lvl: DEBUG
+        msg: "client call kind={kind} target={target} req_id={req_id}"
+        vars:
+          kind: {k: ch, v: [api, dns, connect]}
+          target: {k: ch, v: [ec2, ebs, elb, dns]}
+          req_id: {k: uuid, v: null}
+    beh:
+      n: {desc: No client-side background logs modeled., emit: []}
+      f: {desc: No client-side background logs modeled., emit: []}
+
+  - id: dc_power_az1
+    name: AZ1 Datacenter Power & UPS
+    svc: null
+    hosts: [use1-az1-facility]
+    desc: Power distribution/UPS/generator systems for the impacted datacenter in a single Availability Zone (use1-az1).
+    to: []
+    logs:
+      utility_event:
+        desc: Utility power event detected for the facility.
+        lvl: CRITICAL
+        msg: "utility power event state={state} az={az}"
+        vars:
+          state: {k: ch, v: [fluctuation, loss, restore]}
+          az: {k: ch, v: [use1-az1]}
+      gen_sync_fail:
+        desc: Generator started but could not reach stable power within transfer window.
+        lvl: ERROR
+        msg: "generator sync failed voltage_v={voltage_v} freq_hz={freq_hz} az={az}"
+        vars:
+          voltage_v: {k: f, v: [0.0, 520.0]}
+          freq_hz: {k: f, v: [0.0, 70.0]}
+          az: {k: ch, v: [use1-az1]}
+      ups_metric:
+        desc: Periodic UPS status for the facility.
+        lvl: INFO
+        msg: "UPS on_battery={on_battery} charge_pct={charge_pct} az={az}"
+        vars:
+          on_battery: {k: ch, v: [true, false]}
+          charge_pct: {k: i, v: [0, 100]}
+          az: {k: ch, v: [use1-az1]}
+      rack_power_loss:
+        desc: Rack power loss as UPS depletes and servers drop.
+        lvl: CRITICAL
+        msg: "rack power lost racks_offline={racks_offline} az={az}"
+        vars:
+          racks_offline: {k: i, v: [10, 900]}
+          az: {k: ch, v: [use1-az1]}
+      power_restore:
+        desc: Facility power stabilized and racks begin to re-energize.
+        lvl: INFO
+        msg: "facility power stabilized source={source} az={az}"
+        vars:
+          source: {k: ch, v: [utility, generator]}
+          az: {k: ch, v: [use1-az1]}
+    beh:
+      n:
+        desc: Facility runs normally on utility power; UPS metrics are steady.
+        emit:
+          - id: ups_metric
+            per_min: 0.5
+            scope: global
+      f:
+        desc: During the incident the facility runs on UPS/generator with frequent status updates.
+        emit:
+          - id: ups_metric
+            per_min: 2.0
+            scope: global
+
+  - id: metadata_store
+    name: Multi-AZ Replicated Metadata Store
+    svc: metadata-store
+    hosts: [meta-az1, meta-az2, meta-az3]
+    desc: >
+      Replicated datastore holding control-plane metadata. When the AZ1 primary is lost,
+      other replicas enter a guarded read-only mode until a safe promotion occurs.
+    to:
+      - dst: control_plane_api
+        proto: grpc
+        desc: Returns commit/role results to API frontends (modeled as a logical return edge).
+    logs:
+      write_commit:
+        desc: Successful metadata write commit on the leader.
+        lvl: INFO
+        msg: "write committed op={op} req_id={req_id} leader={leader} dur_ms={dur_ms}"
+        vars:
+          op: {k: ch, v: [RunInstances, AttachVolume]}
+          req_id: {k: uuid, v: null}
+          leader: {k: ch, v: [meta-az1, meta-az2, meta-az3]}
+          dur_ms: {k: i, v: [5, 5000]}
+      write_rejected_readonly:
+        desc: Write rejected because the system is in read-only safety mode.
+        lvl: WARN
+        msg: "write rejected (read-only replica) op={op} req_id={req_id} leader={leader}"
+        vars:
+          op: {k: ch, v: [RunInstances, AttachVolume]}
+          req_id: {k: uuid, v: null}
+          leader: {k: ch, v: [meta-az1, meta-az2, meta-az3]}
+      leader_change:
+        desc: Replica role/leader changes (automatic demotion or manual promotion).
+        lvl: INFO
+        msg: "replica role change old={old_role} new={new_role} leader={leader}"
+        vars:
+          old_role: {k: ch, v: [primary, replica-rw, replica-ro, down]}
+          new_role: {k: ch, v: [primary, replica-rw, replica-ro, down]}
+          leader: {k: ch, v: [meta-az1, meta-az2, meta-az3]}
+      replication_health:
+        desc: Periodic replication/role health metric.
+        lvl: INFO
+        msg: "replication health role={role} leader={leader} lag_ms={lag_ms}"
+        vars:
+          role: {k: ch, v: [primary, replica-rw, replica-ro]}
+          leader: {k: ch, v: [meta-az1, meta-az2, meta-az3]}
+          lag_ms: {k: i, v: [0, 60000]}
+    beh:
+      n:
+        desc: Replication is healthy with low lag.
+        emit:
+          - id: replication_health
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Replication remains active but may show elevated lag during leader loss and recovery.
+        emit:
+          - id: replication_health
+            per_min: 1.0
+            scope: per_host
+
+  - id: control_plane_api
+    name: EC2/EBS Control Plane API
+    svc: compute-storage-api
+    hosts: [api-1, api-2]
+    desc: >
+      Regional API frontends for instance/volume actions. Writes depend on the metadata store leader;
+      when the primary is lost, APIs fail with read-only safety mode.
+    to:
+      - dst: metadata_store
+        proto: grpc
+        desc: Read/write metadata operations against the replicated datastore.
+    logs:
+      api_request:
+        desc: API request received.
+        lvl: INFO
+        msg: "API {api} request received req_id={req_id} account={account} region={region}"
+        vars:
+          api: {k: ch, v: [RunInstances, AttachVolume]}
+          req_id: {k: uuid, v: null}
+          account: {k: i, v: [100000000000, 999999999999]}
+          region: {k: ch, v: [us-east-1]}
+      api_response_ok:
+        desc: API request succeeded.
+        lvl: INFO
+        msg: "API {api} succeeded req_id={req_id} status=200 latency_ms={latency_ms}"
+        vars:
+          api: {k: ch, v: [RunInstances, AttachVolume]}
+          req_id: {k: uuid, v: null}
+          latency_ms: {k: i, v: [10, 120000]}
+      api_response_err:
+        desc: API request failed due to datastore safety read-only mode.
+        lvl: WARN
+        msg: "API {api} failed req_id={req_id} status=409 err=ReadOnlyMode latency_ms={latency_ms}"
+        vars:
+          api: {k: ch, v: [RunInstances, AttachVolume]}
+          req_id: {k: uuid, v: null}
+          latency_ms: {k: i, v: [10, 120000]}
+    beh:
+      n: {desc: No periodic API background logs modeled., emit: []}
+      f: {desc: No periodic API background logs modeled., emit: []}
+
+  - id: elb_control_plane
+    name: ELB Control Plane (Regional Queue)
+    svc: elb-control-plane
+    hosts: [elbcp-1, elbcp-2]
+    desc: >
+      Processes ELB management requests and time-sensitive traffic-shift tasks through a shared regional queue.
+      Queue backlog increases when task inflow spikes or processing slows.
+    to:
+      - dst: dns_service
+        proto: udp
+        desc: Updates DNS A records to remove/add ELB endpoints.
+    logs:
+      mgmt_request:
+        desc: Customer-initiated ELB management call received.
+        lvl: INFO
+        msg: "ELB mgmt request action={action} lb={lb} req_id={req_id}"
+        vars:
+          action: {k: ch, v: [RegisterTargets, DeregisterTargets, ScaleLoadBalancer]}
+          lb: {k: str, v: "lb-[a-z]{4}-[0-9]{2}"}
+          req_id: {k: uuid, v: null}
+      enqueue_task:
+        desc: Task enqueued to the regional queue.
+        lvl: DEBUG
+        msg: "enqueued task type={task} lb={lb} queue=region-main qdepth={qdepth}"
+        vars:
+          task: {k: ch, v: [traffic_shift, scale, register_targets]}
+          lb: {k: str, v: "lb-[a-z]{4}-[0-9]{2}"}
+          qdepth: {k: i, v: [0, 250000]}
+      task_processed:
+        desc: Task processed successfully by a worker (DNS updates only occur on success).
+        lvl: INFO
+        msg: "processed task type={task} lb={lb} result=ok latency_ms={latency_ms}"
+        vars:
+          task: {k: ch, v: [traffic_shift, scale, register_targets]}
+          lb: {k: str, v: "lb-[a-z]{4}-[0-9]{2}"}
+          latency_ms: {k: i, v: [10, 600000]}
+      queue_metric:
+        desc: Periodic queue depth/age metric for the regional queue.
+        lvl: INFO
+        msg: "queue region-main depth={depth} oldest_age_s={oldest_age_s} rate_in={rate_in} rate_out={rate_out}"
+        vars:
+          depth: {k: i, v: [0, 300000]}
+          oldest_age_s: {k: i, v: [0, 7200]}
+          rate_in: {k: i, v: [0, 8000]}
+          rate_out: {k: i, v: [0, 8000]}
+      bug_scale_trigger:
+        desc: Unexpected scaling evaluation emitted when the rebooted ELB state triggers a rare bug.
+        lvl: ERROR
+        msg: "unexpected scaling evaluation for lb={lb} reason={reason} desired_size={desired_size}"
+        vars:
+          lb: {k: str, v: "lb-[a-z]{4}-[0-9]{2}"}
+          reason: {k: ch, v: [recovered_state_mismatch, missing_health_snapshot]}
+          desired_size: {k: ch, v: [large, xlarge]}
+      operator_action:
+        desc: Operator applies an emergency mitigation to reduce queue pressure.
+        lvl: INFO
+        msg: "operator action={action} detail={detail}"
+        vars:
+          action: {k: ch, v: [apply_rate_limit, disable_auto_scale_eval]}
+          detail: {k: ch, v: [region-main, scale_tasks]}
+    beh:
+      n:
+        desc: Queue depth is low and stable.
+        emit:
+          - id: queue_metric
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Queue depth metrics continue; bug-trigger logs may appear during recovery-induced storms.
+        emit:
+          - id: queue_metric
+            per_min: 1.5
+            scope: per_host
+          - id: bug_scale_trigger
+            per_min: 0.2
+            scope: per_host
+
+  - id: dns_service
+    name: DNS Service for ELB Names
+    svc: dns
+    hosts: [dns-1, dns-2]
+    desc: Serves DNS queries for ELB names and applies control-plane-driven record updates to add/remove endpoints.
+    to:
+      - dst: elb_edge
+        proto: tcp
+        desc: Logical handoff from name resolution to the chosen ELB endpoint connection (modeled for path connectivity).
+    logs:
+      record_update:
+        desc: A record set updated for an ELB name (add/remove an endpoint).
+        lvl: INFO
+        msg: "updated DNS A records name={name} action={action} ip={ip} ttl_s={ttl_s}"
+        vars:
+          name: {k: str, v: "lb-[a-z]{4}-[0-9]{2}\\.elb\\.use1\\.example\\.com"}
+          action: {k: ch, v: [add, remove]}
+          ip: {k: ip, v: "54.0.0.0/8"}
+          ttl_s: {k: i, v: [30, 300]}
+      dns_query:
+        desc: DNS query handled; returns multiple A records.
+        lvl: DEBUG
+        msg: "DNS query name={name} client_type={client_type} answered_ips={answered_ips}"
+        vars:
+          name: {k: str, v: "lb-[a-z]{4}-[0-9]{2}\\.elb\\.use1\\.example\\.com"}
+          client_type: {k: ch, v: [browser, console, iot, sdk]}
+          answered_ips: {k: i, v: [1, 4]}
+    beh:
+      n: {desc: No periodic DNS background logs modeled., emit: []}
+      f: {desc: No periodic DNS background logs modeled., emit: []}
+
+  - id: elb_edge
+    name: ELB Data Plane Endpoints
+    svc: elb-edge
+    hosts: [elb-az1, elb-az2, elb-az3]
+    desc: >
+      Accepts client connections. When an AZ endpoint is down and DNS has not yet removed it,
+      single-IP clients can fail to connect.
+    to: []
+    logs:
+      connect_ok:
+        desc: Client request served successfully.
+        lvl: INFO
+        msg: "client request served lb={lb} az={az} code=200 latency_ms={latency_ms}"
+        vars:
+          lb: {k: str, v: "lb-[a-z]{4}-[0-9]{2}"}
+          az: {k: ch, v: [use1-az1, use1-az2, use1-az3]}
+          latency_ms: {k: i, v: [5, 30000]}
+      connect_fail:
+        desc: Client connection failed to an endpoint (typically the impacted AZ).
+        lvl: WARN
+        msg: "client connection failed lb={lb} az={az} reason={reason}"
+        vars:
+          lb: {k: str, v: "lb-[a-z]{4}-[0-9]{2}"}
+          az: {k: ch, v: [use1-az1, use1-az2, use1-az3]}
+          reason: {k: ch, v: [timeout, no_route, conn_refused]}
+    beh:
+      n: {desc: No periodic endpoint background logs modeled., emit: []}
+      f: {desc: No periodic endpoint background logs modeled., emit: []}
+
+  - id: ebs_recovery
+    name: EBS Volume Recovery Workers
+    svc: ebs-recovery
+    hosts: [ebsrec-1, ebsrec-2]
+    desc: >
+      Background workers that bring volumes back after server restart.
+      Volumes with in-flight writes return in impaired state with I/O paused until recovery completes.
+    to:
+      - dst: metadata_store
+        proto: grpc
+        desc: Reads volume metadata and writes recovered-state transitions.
+    logs:
+      recovery_progress:
+        desc: Periodic recovery backlog and throughput metric.
+        lvl: INFO
+        msg: "ebs recovery backlog={backlog} processing_rate_vpm={processing_rate_vpm} completed={completed}"
+        vars:
+          backlog: {k: i, v: [0, 40000]}
+          processing_rate_vpm: {k: i, v: [10, 4000]}
+          completed: {k: i, v: [0, 40000]}
+      volume_state_impaired:
+        desc: Volume opened in impaired (I/O paused) state due to possible inconsistency.
+        lvl: WARN
+        msg: "volume {vol_id} opened in impaired state io_paused=true reason={reason}"
+        vars:
+          vol_id: {k: str, v: "vol-[0-9a-f]{8,12}"}
+          reason: {k: ch, v: [in_flight_writes, journal_replay]}
+      volume_recovered:
+        desc: Volume recovery completed and I/O unpaused.
+        lvl: INFO
+        msg: "volume {vol_id} recovery complete io_paused=false"
+        vars:
+          vol_id: {k: str, v: "vol-[0-9a-f]{8,12}"}
+    beh:
+      n:
+        desc: Low steady background maintenance/recovery activity.
+        emit:
+          - id: recovery_progress
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Elevated recovery activity after the AZ power event (once storage servers/workers are back online).
+        emit:
+          - id: recovery_progress
+            per_min: 1.0
+            scope: per_host
+          - id: volume_state_impaired
+            per_min: 2.5
+            scope: per_host
+          - id: volume_recovered
+            per_min: 2.0
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [control_plane_api, elb_control_plane]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal regional control-plane operations and steady ELB DNS/endpoint usage.
+    req:
+      - id: ec2_run_instances_n
+        desc: Customer launches instances; control plane writes instance metadata.
+        rpm: 70
+        path: [client, control_plane_api, metadata_store, control_plane_api]
+        emit: [control_plane_api.api_request, metadata_store.write_commit, control_plane_api.api_response_ok]
+        latency_ms: [[1, 3], [5, 30], [20, 250]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_attach_volume_n
+        desc: Customer attaches a volume; control plane writes attachment metadata.
+        rpm: 40
+        path: [client, control_plane_api, metadata_store, control_plane_api]
+        emit: [control_plane_api.api_request, metadata_store.write_commit, control_plane_api.api_response_ok]
+        latency_ms: [[1, 3], [5, 35], [25, 350]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: elb_register_targets_n
+        desc: Customer registers targets with a load balancer; results in DNS updates.
+        rpm: 30
+        path: [client, elb_control_plane, dns_service]
+        emit: [elb_control_plane.mgmt_request, elb_control_plane.enqueue_task, elb_control_plane.task_processed, dns_service.record_update]
+        latency_ms: [[1, 2], [1, 5], [20, 200], [5, 50]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: elb_shift_traffic_n
+        desc: Routine traffic-shift tasks (small steady rate) processed by ELB control plane.
+        rpm: 50
+        path: [elb_control_plane, dns_service]
+        emit: [elb_control_plane.task_processed, dns_service.record_update]
+        latency_ms: [[15, 150], [5, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: elb_client_request_n
+        desc: Client resolves an ELB name and connects successfully to an endpoint.
+        rpm: 120
+        path: [client, dns_service, elb_edge]
+        emit: [dns_service.dns_query, elb_edge.connect_ok]
+        latency_ms: [[1, 3], [20, 250]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      AZ power loss forces metadata store into guarded read-only mode (EC2/EBS API errors).
+      Later, ELB control plane experiences a queue storm and processing latency spikes.
+    req:
+      - id: ec2_run_instances_f_readonly
+        desc: Instance launches fail because metadata store is in read-only safety mode.
+        rpm: 80
+        path: [client, control_plane_api, metadata_store, control_plane_api]
+        emit: [control_plane_api.api_request, metadata_store.write_rejected_readonly, control_plane_api.api_response_err]
+        latency_ms: [[1, 3], [2, 15], [30, 1200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ec2_run_instances_f_ok
+        desc: Instance launches succeed after safe promotion of a new metadata primary (still during broader incident).
+        rpm: 40
+        path: [client, control_plane_api, metadata_store, control_plane_api]
+        emit: [control_plane_api.api_request, metadata_store.write_commit, control_plane_api.api_response_ok]
+        latency_ms: [[1, 3], [10, 80], [40, 800]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_attach_volume_f_readonly
+        desc: Volume attach fails because metadata store is in read-only safety mode.
+        rpm: 50
+        path: [client, control_plane_api, metadata_store, control_plane_api]
+        emit: [control_plane_api.api_request, metadata_store.write_rejected_readonly, control_plane_api.api_response_err]
+        latency_ms: [[1, 3], [2, 15], [30, 1500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_attach_volume_f_ok
+        desc: Volume attach succeeds after safe promotion of a new metadata primary.
+        rpm: 25
+        path: [client, control_plane_api, metadata_store, control_plane_api]
+        emit: [control_plane_api.api_request, metadata_store.write_commit, control_plane_api.api_response_ok]
+        latency_ms: [[1, 3], [10, 100], [50, 1200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: elb_register_targets_f
+        desc: Customers re-register/modify targets in healthy AZs; requests enqueue tasks that may complete slowly due to queue backlog.
+        rpm: 60
+        path: [client, elb_control_plane, dns_service]
+        emit: [elb_control_plane.mgmt_request, elb_control_plane.enqueue_task, elb_control_plane.task_processed, dns_service.record_update]
+        latency_ms: [[1, 3], [1, 10], [200, 60000], [5, 200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: elb_shift_traffic_f
+        desc: Traffic-shift tasks execute to remove failed AZ endpoints from DNS; processing slows as the regional queue backlogs.
+        rpm: 70
+        path: [elb_control_plane, dns_service]
+        emit: [elb_control_plane.task_processed, dns_service.record_update]
+        latency_ms: [[200, 60000], [5, 200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: elb_client_request_f_ok
+        desc: Most clients connect to healthy AZ endpoints and succeed.
+        rpm: 110
+        path: [client, dns_service, elb_edge]
+        emit: [dns_service.dns_query, elb_edge.connect_ok]
+        latency_ms: [[1, 5], [30, 600]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: elb_client_request_f_fail
+        desc: A small subset of clients hit a dead AZ endpoint and fail to connect before DNS is updated.
+        rpm: 2.0
+        path: [client, dns_service, elb_edge]
+        emit: [dns_service.dns_query, elb_edge.connect_fail]
+        latency_ms: [[1, 5], [200, 5000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - >-
+    Timeline is compressed into a 60-minute scenario while preserving the causal sequence
+    (AZ power loss → metadata store read-only → EC2/EBS API failures → partial power return → ELB control-plane queue storm → manual promotion restores EC2/EBS writes).
+  - >-
+    The model focuses on EC2/EBS control-plane read-only safety behavior and ELB control-plane backlog; RDS-specific behaviors are omitted to keep components minimal.
+  - >-
+    ELB task completion logs are modeled only for successful tasks because these flows also emit DNS record updates; queue backlog is represented by high task latency and queue-depth metrics, not by failed task outcomes.
+  - >-
+    EC2/EBS API failures in this incident are modeled specifically as read-only safety rejections (status=409 err=ReadOnlyMode) to keep per-request narratives consistent with the paired metadata-store rejection log.
+  - >-
+    ELB client impact is modeled as a low-rate failure flow (single-IP/non-retrying clients) rather than inflating widespread data-plane errors.
+  - >-
+    For path connectivity, DNS-to-ELB is modeled as a logical edge representing "DNS answer leads to a chosen endpoint connection", not a literal service-to-service call.
+  - >-
+    Normal-phase expected volume is approximately 790–820 logs/min (~19.8k–20.5k logs over 25 min) from ~310 rpm of combined flows plus light metrics.
+  - >-
+    Total expected scenario volume is approximately 55k–75k logs (within 20k–100k): failure flows are heavier and background queue/replication metrics remain visible throughout.
+  - >-
+    Key diagnostic visibility anchors include dc_power_az1.utility_event/rack_power_loss (trigger),
+    metadata_store.leader_change and write_rejected_readonly (read-only safety),
+    control_plane_api.api_response_err (customer-visible API failures),
+    elb_control_plane.queue_metric and bug_scale_trigger (queue storm),
+    and ebs_recovery.recovery_progress/volume_state_impaired (slow volume recovery).
+```

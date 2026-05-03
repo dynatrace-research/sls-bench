@@ -1,0 +1,298 @@
+```yaml
+scenario:
+  id: oct21_cross_region_mysql_failover_compressed
+  title: Network partition triggers cross-region MySQL failover, stale reads, and paused background jobs
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally serves GitHub metadata from a US East API tier backed by US East MySQL primaries and read replicas,
+    with Orchestrator managing MySQL topology and workers processing webhooks and Pages builds.
+    A brief network partition causes Orchestrator to form quorum outside the primary site and promote US West primaries, shifting writes cross-country.
+    The API tier experiences slow writes and some write timeouts, while later restoration brings East primaries back but leaves many replicas far behind, producing stale reads.
+    To protect data consistency, webhook delivery and Pages builds are paused and later resumed to drain backlog, during which some webhook jobs are dropped due to TTL.
+
+  trigger_desc: |
+    Routine maintenance on optical equipment causes a brief loss of connectivity between the US East network hub and the primary US East data center,
+    triggering Orchestrator Raft leader changes and cross-region MySQL promotions.
+
+  time:
+    total_minutes: 48
+    phases:
+      n: {start_min: 0, end_min: 24}
+      f: {start_min: 24, end_min: 48}
+
+  phases:
+    n:
+      desc: |
+        User traffic is routed through the edge to the API tier in US East. Reads are served from East replicas and writes go to East primaries.
+        Orchestrator emits routine Raft ticks but performs no promotions. Queue depths for webhook and Pages jobs remain low and steady.
+      flows: [user_read_east, user_write_east, webhook_delivery, pages_build]
+      manifestation:
+        - dc_link.link_health
+        - api.pool_stats
+        - mysql_east.repl_lag_metric
+        - worker.queue_depth
+        - sre_control_plane.status_heartbeat
+
+    f:
+      desc: |
+        A short partition causes Orchestrator to promote US West primaries and the API tier begins sending write traffic cross-country.
+        Responders observe west-only topologies and lock deployments while escalating incident status. To avoid further inconsistency,
+        webhook and Pages job processing is paused while East clusters are restored and replication is re-established.
+        When East primaries return, performance improves for writes but many read replicas lag significantly, producing inconsistent/stale reads until additional replicas are added.
+        Job processing is resumed to drain backlog; some webhook jobs have exceeded TTL and are dropped, prompting a temporary TTL increase.
+
+      events:
+        - order: 1
+          at_min: 24
+          component: dc_link
+          event: |
+            A brief WAN partition occurs; Orchestrator loses effective leadership in the primary site and initiates cross-region promotions.
+            The API tier starts reading/writing against West MySQL, introducing cross-country latency and some write timeouts.
+          why: |
+            Orchestrator's Raft quorum is satisfied by West+Cloud nodes during the partition, allowing promotions to proceed as configured.
+            The cross-region topology is directly observable via Orchestrator promotion logs and elevated API request durations; the underlying physical maintenance is external context.
+          flows:
+            - user_read_west
+            - user_write_west_ok
+            - user_write_west_timeout
+          rate_multipliers:
+            user_read_east_replica_lagged: 0.0
+            user_read_east_replica_fresh: 0.0
+            user_write_east_ok: 0.0
+            orch_api_get_topology: 0.0
+            webhook_ttl_drop: 0.0
+            mysql_east.restore_progress: 0.0
+            mysql_east.repl_lag_metric: 0.0
+            sre_control_plane.alert_flood: 0.0
+          latency_multipliers:
+            user_read_west: {p50: 4.0, p95: 5.0}
+            user_write_west_ok: {p50: 4.0, p95: 5.0}
+            user_write_west_timeout: {p50: 3.0, p95: 4.0}
+          one_shots:
+            - ref: dc_link.link_down
+              count: 1
+              hosts: [linkmon-1]
+            - ref: dc_link.link_up
+              count: 1
+              hosts: [linkmon-1]
+            - ref: orchestrator.raft_leader_change
+              count: 1
+              hosts: [orch-w1]
+            - ref: orchestrator.promotion_start
+              count: 3
+              hosts: [orch-w1]
+          manifestation:
+            - dc_link.link_down
+            - orchestrator.raft_leader_change
+            - orchestrator.promotion_start
+            - api.req_end_err
+
+        - order: 2
+          at_min: 26
+          component: sre_control_plane
+          event: |
+            Monitoring begins generating a burst of alerts. Responders query Orchestrator and see west-only topologies.
+            Deployments are locked and public status is escalated to yellow then red to prevent additional change while triage continues.
+          why: |
+            Cross-region latency and timeouts propagate into alerting, and Orchestrator API visibility confirms the unexpected topology state.
+            Deploy lock and status changes are explicit operator actions and are directly observable via control-plane logs.
+          flows:
+            - orch_api_get_topology
+            - user_write_west_timeout
+          rate_multipliers:
+            sre_control_plane.alert_flood: 1.0
+            orch_api_get_topology: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: sre_control_plane.deploy_lock
+              count: 1
+              hosts: [sre-ctl-1]
+            - ref: sre_control_plane.status_change
+              count: 2
+              hosts: [sre-ctl-1]
+          manifestation:
+            - sre_control_plane.alert_flood
+            - sre_control_plane.deploy_lock
+            - orchestrator.api_get_topology
+            - sre_control_plane.status_change
+
+        - order: 3
+          at_min: 30
+          component: worker
+          event: |
+            To reduce risk while MySQL topology is inconsistent, webhook delivery and Pages builds are paused.
+            Database responders begin restoring East clusters from backups/streams, with restore progress becoming visible.
+          why: |
+            Background jobs write and read metadata that depends on consistent MySQL topology; pausing reduces further divergence and load.
+            Restore work is directly observable via MySQL restore start/progress logs, while the intent is operational decision-making.
+          flows:
+            - webhook_delivery
+            - pages_build
+          rate_multipliers:
+            webhook_delivery: 0.0
+            pages_build: 0.0
+            mysql_east.restore_progress: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: worker.jobs_paused
+              count: 2
+              hosts: [worker-1]
+            - ref: mysql_east.restore_started
+              count: 3
+              hosts: [mysql-e1]
+          manifestation:
+            - worker.jobs_paused
+            - mysql_east.restore_started
+            - mysql_east.restore_progress
+
+        - order: 4
+          at_min: 38
+          component: mysql_east
+          event: |
+            East primaries are re-established for the affected clusters and most writes return to East, improving responsiveness.
+            Replication from West into East replicas is active but heavily behind, and user reads frequently hit lagged replicas resulting in stale data.
+          why: |
+            Rebuilding/restore enables East to safely serve primaries again, but replica catch-up is slow under load.
+            The role change and lag are directly observable via MySQL logs; stale reads are observable via API WARN completions indicating replica lag.
+          flows:
+            - user_write_east_ok
+            - user_read_east_replica_lagged
+          rate_multipliers:
+            user_write_east_ok: 0.95
+            user_write_west_ok: 0.05
+            user_write_west_timeout: 0.05
+            user_read_west: 0.4
+            user_read_east_replica_lagged: 0.6
+            user_read_east_replica_fresh: 0.0
+            mysql_east.repl_lag_metric: 1.0
+            mysql_east.repl_error: 0.5
+            mysql_east.restore_progress: 0.0
+          latency_multipliers:
+            user_write_west_ok: {p50: 4.0, p95: 5.0}
+            user_write_west_timeout: {p50: 3.0, p95: 4.0}
+            user_read_west: {p50: 4.0, p95: 5.0}
+          one_shots:
+            - ref: mysql_east.role_change
+              count: 3
+              hosts: [mysql-e1]
+          manifestation:
+            - mysql_east.role_change
+            - mysql_east.repl_lag_metric
+            - api.req_end_stale
+
+        - order: 5
+          at_min: 44
+          component: worker
+          event: |
+            Additional East read replicas are provisioned to spread read load, improving catch-up conditions and reducing the share of stale reads.
+            Webhook delivery and Pages builds are resumed at elevated throughput to drain backlog; some webhook jobs are dropped due to TTL and TTL is increased temporarily.
+          why: |
+            Reducing per-replica load helps replication apply faster, shifting more reads to fresher replicas.
+            Resuming processing is an operator action; TTL drops are directly observable in worker logs, and the TTL change is an explicit configuration action.
+          flows:
+            - user_read_east_replica_fresh
+            - webhook_delivery
+            - pages_build
+            - webhook_ttl_drop
+          rate_multipliers:
+            user_read_west: 0.2
+            user_read_east_replica_lagged: 0.2
+            user_read_east_replica_fresh: 0.6
+            webhook_delivery: 5.0
+            pages_build: 5.0
+            webhook_ttl_drop: 1.0
+            mysql_east.repl_error: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: mysql_east.replica_provisioned
+              count: 3
+              hosts: [mysql-e1]
+            - ref: worker.jobs_resumed
+              count: 2
+              hosts: [worker-1]
+            - ref: worker.ttl_config_update
+              count: 1
+              hosts: [worker-1]
+          manifestation:
+            - mysql_east.replica_provisioned
+            - worker.jobs_resumed
+            - worker.job_dropped_ttl
+            - worker.ttl_config_update
+
+      steady:
+        - component: api
+          condition: |
+            Many reads are still routed to lagging East replicas, producing stale/inconsistent views even as write latency improves.
+          user_impact: |
+            Pages may load but show out-of-date or inconsistent metadata; some write operations still fail with 503 due to residual timeouts.
+          manifestation: [api.req_end_stale, api.req_end_err]
+        - component: mysql_east
+          condition: |
+            Replication catch-up is ongoing with significant lag and intermittent replication errors; restore/catch-up work is incomplete.
+          user_impact: |
+            Users may see inconsistent data depending on which replica serves their read, and recovery estimates are uncertain.
+          manifestation: [mysql_east.repl_lag_metric, mysql_east.repl_error]
+        - component: worker
+          condition: |
+            Backlog draining is active; webhook and Pages queues are large and some webhook jobs have exceeded TTL and are dropped.
+          user_impact: |
+            Webhooks and Pages builds are delayed; a subset of webhook events is not delivered due to expiration.
+          manifestation: [worker.queue_depth, worker.job_dropped_ttl, worker.job_processed]
+        - component: sre_control_plane
+          condition: |
+            Incident remains in red status while data consistency and backlog processing are not yet fully stabilized.
+          user_impact: |
+            Public status remains degraded and users experience slow or inconsistent behavior.
+          manifestation: [sre_control_plane.status_heartbeat, sre_control_plane.alert_flood]
+
+      feedback_loops:
+        - id: replica_lag_feedback
+          desc: |
+            High read load on replicas slows replication apply, increasing lag; higher lag increases the probability of stale reads,
+            which drives retries/refresh behavior and sustains elevated read pressure.
+        - id: cross_region_timeout_pressure
+          desc: |
+            Cross-region DB calls increase request duration and timeouts; retries amplify load on the API tier and MySQL,
+            producing more alerts and operational caution that prolongs degraded-mode operation.
+
+      flows:
+        - user_read_west
+        - user_read_east_replica_lagged
+        - user_read_east_replica_fresh
+        - user_write_west_ok
+        - user_write_west_timeout
+        - user_write_east_ok
+        - webhook_delivery
+        - pages_build
+        - webhook_ttl_drop
+        - orch_api_get_topology
+      manifestation:
+        - orchestrator.promotion_start
+        - sre_control_plane.alert_flood
+        - mysql_east.restore_progress
+        - mysql_east.repl_lag_metric
+        - api.req_end_stale
+        - worker.queue_depth
+
+  assumptions:
+    - |
+      Time compression: the original multi-hour restore/replication/catch-up period is represented by restore_progress and repl_lag_metric becoming active in later failure events.
+    - |
+      Failure-phase piecewise volume breakdown (rough):
+      - 24-26: cross-region traffic begins; alerts suppressed; ~1.2k-1.4k logs/min dominated by user flows.
+      - 26-30: alert flood + Orchestrator queries visible; ~1.3k logs/min plus alert/triage noise.
+      - 30-38: webhook/pages paused; restore progress active; ~1.2k-1.3k logs/min; queue depth begins growing.
+      - 38-44: writes return East; stale reads appear; repl lag telemetry active; ~1.2k-1.3k logs/min.
+      - 44-48: backlog drain spikes job flows; TTL drops appear; ~1.5k-1.7k logs/min.
+    - |
+      One-shot counts per event (expected): event1 emits 6 one-shots, event2 emits 3, event3 emits 5, event4 emits 3, event5 emits 7.
+    - |
+      Total estimated logs: ~58k-73k across 48 minutes (within target), with key diagnostics likely visible:
+      - Trigger: dc_link.link_down/link_up + orchestrator.raft_leader_change + orchestrator.promotion_start
+      - Triage: sre_control_plane.alert_flood + orchestrator.api_get_topology + deploy_lock/status_change
+      - Mitigation: worker.jobs_paused + mysql_east.restore_started/restore_progress
+      - Degraded steady: mysql_east.repl_lag_metric + api.req_end_stale + worker.queue_depth
+      - Backlog effects: worker.job_dropped_ttl + worker.ttl_config_update
+```

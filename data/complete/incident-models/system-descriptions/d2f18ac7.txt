@@ -1,0 +1,533 @@
+```yaml
+sys:
+  id: payments_api_dashboard_stack
+  desc: >
+    A Rails-based payments platform serving a public API and a web dashboard.
+    The application persists critical data in a 3-node Postgres cluster managed by Pacemaker with a virtual IP (VIP) for the current primary.
+    During the incident, a hardware disk array failure took down the primary, and an edge-case Pacemaker constraint prevented automatic promotion of the synchronous replica.
+    Operators attempted remediation actions (fencing, resource cleanup, maintenance mode) and then manually promoted a replica while reconfiguring applications.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: nginx
+    hosts: [lb1, lb2]
+    desc: Terminates HTTPS from clients and forwards requests to the Rails application fleet.
+    to:
+      - dst: api_app
+        proto: https
+        desc: Forwards API and dashboard requests to the application servers.
+    logs:
+      lb_stats:
+        desc: Periodic load balancer stats snapshot.
+        lvl: INFO
+        msg: "lb stats active_conns={active_conns} upstream_5xx={up_5xx} req_rate_rps={rps}"
+        vars:
+          active_conns: {k: i, v: [50, 900]}
+          up_5xx: {k: i, v: [0, 80]}
+          rps: {k: i, v: [5, 25]}
+    beh:
+      n:
+        desc: Low-rate operational stats.
+        emit:
+          - id: lb_stats
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Similar low-rate stats; does not directly explain the outage.
+        emit:
+          - id: lb_stats
+            per_min: 0.2
+            scope: per_host
+
+  - id: api_app
+    name: API and Dashboard App
+    svc: rails-app
+    hosts: [app1, app2, app3]
+    desc: >
+      Handles API and dashboard HTTP requests and issues SQL queries to Postgres.
+      Connects to the database via a Pacemaker-managed VIP in normal operation; during mitigation, some instances may be reconfigured to use a node IP.
+    to:
+      - dst: postgres_primary
+        proto: tcp
+        desc: Connects to Postgres via the VIP that normally targets the primary.
+      - dst: postgres_sync
+        proto: tcp
+        desc: During mitigation, may connect directly to a specific node IP.
+    logs:
+      req_done_2xx:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: "req {method} {route} completed status=200 dur_ms={dur_ms} db_ms={db_ms} request_id={request_id} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/api/payments, /api/mandates, /dashboard]}
+          request_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [20, 220]}
+            db_ms: {k: i, v: [2, 45]}
+          f:
+            dur_ms: {k: i, v: [40, 900]}
+            db_ms: {k: i, v: [4, 260]}
+
+      req_done_503:
+        desc: Request failed and returned a 503 to the client.
+        lvl: WARN
+        msg: "req {method} {route} completed status=503 dur_ms={dur_ms} err=DBUnavailable request_id={request_id} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/api/payments, /api/mandates, /dashboard]}
+          dur_ms: {k: i, v: [600, 4500]}
+          request_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      db_connect_err_vip:
+        desc: Database connection attempt to the Postgres VIP failed.
+        lvl: ERROR
+        msg: "db connect failed host=10.0.0.10:5432 err={err} timeout_ms={timeout_ms} request_id={request_id} trace_id={trace_id}"
+        vars:
+          err: {k: ch, v: [timeout, connection_refused, no_route]}
+          timeout_ms: {k: i, v: [800, 1600]}
+          request_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      db_connect_err_direct:
+        desc: Database connection attempt to a specific node IP failed.
+        lvl: ERROR
+        msg: "db connect failed host=10.0.0.22:5432 err={err} timeout_ms={timeout_ms} request_id={request_id} trace_id={trace_id}"
+        vars:
+          err: {k: ch, v: [timeout, too_many_connections]}
+          timeout_ms: {k: i, v: [600, 1600]}
+          request_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      config_db_host_override:
+        desc: Operator change to point apps at a specific database node IP.
+        lvl: WARN
+        msg: "set DB_HOST override to 10.0.0.22:5432 reason={reason} change_id={change_id}"
+        vars:
+          reason: {k: ch, v: [manual_failover]}
+          change_id: {k: hex, v: 12}
+
+      housekeeping_tick:
+        desc: Periodic application housekeeping marker.
+        lvl: DEBUG
+        msg: "housekeeping tick job={job} dur_ms={dur_ms}"
+        vars:
+          job: {k: ch, v: [cache_warm, metrics_flush]}
+          dur_ms: {k: i, v: [5, 80]}
+
+    beh:
+      n:
+        desc: Low-volume background housekeeping logs unrelated to request outcomes.
+        emit:
+          - id: housekeeping_tick
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: No additional background logs beyond request flows and operator one-shots.
+        emit: []
+
+  - id: pacemaker
+    name: Pacemaker Cluster Manager
+    svc: pacemaker
+    hosts: [db1, db2, db3]
+    desc: >
+      Manages Postgres primary promotion and VIP placement across the database nodes.
+      During the incident, constraint interactions (including a backup VIP colocation rule and non-zero resource stickiness) prevented election of a new primary.
+    to:
+      - dst: postgres_primary
+        proto: tcp
+        desc: Monitors and controls Postgres resource on the primary node.
+      - dst: postgres_sync
+        proto: tcp
+        desc: Monitors and controls Postgres resource on the synchronous replica.
+      - dst: postgres_async
+        proto: tcp
+        desc: Monitors and controls Postgres resource on the asynchronous replica.
+    logs:
+      cluster_status:
+        desc: Periodic cluster status summary.
+        lvl: INFO
+        msg: "cluster status: dc={dc} quorum={quorum} primary_res={primary_res} vip_postgres={vip_postgres} vip_backup={vip_backup} vip_backup_node={vip_node}"
+        vars:
+          dc: {k: ch, v: [db1, db2, db3]}
+          quorum: {k: ch, v: [yes]}
+          primary_res: {k: ch, v: [pg_primary]}
+          vip_postgres: {k: ch, v: [vip_postgres]}
+          vip_backup: {k: ch, v: [vip_backup]}
+        state_vars:
+          n:
+            vip_node: {k: ch, v: [db2, db3]}
+          f:
+            vip_node: {k: ch, v: [db2]}
+
+      promote_attempt:
+        desc: Pacemaker attempts to promote a replica to primary.
+        lvl: WARN
+        msg: "attempting promote resource={resource} from={from_node} to={to_node} result=pending"
+        vars:
+          resource: {k: ch, v: [pg_primary]}
+          from_node: {k: ch, v: [db1]}
+          to_node: {k: ch, v: [db2]}
+
+      promote_failed_constraints:
+        desc: Promotion fails due to constraints/placement decisions.
+        lvl: ERROR
+        msg: "promote failed resource={resource} candidate={candidate} reason=constraints colocation_rule={coloc_rule} stickiness={stickiness}"
+        vars:
+          resource: {k: ch, v: [pg_primary]}
+          candidate: {k: ch, v: [db2]}
+          coloc_rule: {k: ch, v: ["vip_backup -INF with pg_primary"]}
+          stickiness: {k: i, v: [100, 200]}
+
+      vip_not_managed:
+        desc: Cluster resources are unmanaged because maintenance mode is enabled.
+        lvl: WARN
+        msg: "maintenance-mode=true; skipping resource management for VIPs and Postgres"
+        vars: {}
+
+      crm_resource_cleanup:
+        desc: Operator action to clear Pacemaker error counts for a resource.
+        lvl: INFO
+        msg: "crm resource cleanup invoked resource={resource} by={user}"
+        vars:
+          resource: {k: ch, v: [pg_primary, vip_postgres]}
+          user: {k: ch, v: [sre]}
+
+      maintenance_mode_enabled:
+        desc: Operator enables Pacemaker maintenance-mode property.
+        lvl: WARN
+        msg: "crm property maintenance-mode=true by={user}"
+        vars:
+          user: {k: ch, v: [sre]}
+
+      maintenance_mode_disabled:
+        desc: Operator disables Pacemaker maintenance-mode property.
+        lvl: WARN
+        msg: "crm property maintenance-mode=false by={user}"
+        vars:
+          user: {k: ch, v: [sre]}
+
+      node_fenced:
+        desc: Node is powered off/fenced to remove it from the cluster.
+        lvl: WARN
+        msg: "node {node} fenced action={action} result=success"
+        vars:
+          node: {k: ch, v: [db1]}
+          action: {k: ch, v: [poweroff]}
+
+    beh:
+      n:
+        desc: Cluster emits periodic status as a single cluster-level stream.
+        emit:
+          - id: cluster_status
+            per_min: 0.35
+            scope: global
+      f:
+        desc: Repeated promotion attempts fail; later, maintenance mode produces unmanaged-resource warnings.
+        emit:
+          - id: cluster_status
+            per_min: 0.35
+            scope: global
+          - id: promote_attempt
+            per_min: 3.0
+            scope: global
+          - id: promote_failed_constraints
+            per_min: 3.0
+            scope: global
+          - id: vip_not_managed
+            per_min: 0.8
+            scope: global
+
+  - id: postgres_primary
+    name: Postgres Primary (db1)
+    svc: postgres
+    hosts: [db1]
+    desc: The primary Postgres node that serves reads and writes in normal operation.
+    to: []
+    logs:
+      checkpoint_complete:
+        desc: Periodic checkpoint completion.
+        lvl: INFO
+        msg: "checkpoint complete wrote={buffers} buffers dur_ms={dur_ms}"
+        vars:
+          buffers: {k: i, v: [200, 2000]}
+          dur_ms: {k: i, v: [30, 250]}
+
+      raid_disk_loss:
+        desc: RAID controller detects multiple disk losses.
+        lvl: CRITICAL
+        msg: "raid controller: simultaneous loss of {disk_count} disks; array degraded"
+        vars:
+          disk_count: {k: i, v: [3, 3]}
+
+      raid_io_error:
+        desc: I/O errors from the RAID-backed device.
+        lvl: CRITICAL
+        msg: "raid I/O error op={op} sector={sector} errno={errno}"
+        vars:
+          op: {k: ch, v: [read, write]}
+          sector: {k: i, v: [100000, 900000]}
+          errno: {k: ch, v: [EIO]}
+
+      fs_remount_ro:
+        desc: Filesystem remounted read-only after errors.
+        lvl: CRITICAL
+        msg: "filesystem error; remounting read-only device={dev}"
+        vars:
+          dev: {k: ch, v: [/dev/sda1]}
+
+      postgres_fatal_io:
+        desc: Postgres stops due to unrecoverable WAL/disk I/O errors.
+        lvl: CRITICAL
+        msg: "could not write to file \"pg_wal/{wal_seg}\": {err}"
+        vars:
+          wal_seg: {k: str, v: "wal_segment_name"}
+          err: {k: ch, v: ["Read-only file system", "Input/output error"]}
+
+      postgres_stopped:
+        desc: Postgres process termination marker.
+        lvl: CRITICAL
+        msg: "postmaster terminated due to unrecoverable I/O errors"
+        vars: {}
+
+    beh:
+      n:
+        desc: Normal periodic Postgres checkpoint logging.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.25
+            scope: per_host
+      f:
+        desc: During disk failure, I/O errors and read-only remount logs appear until the node is powered off.
+        emit:
+          - id: raid_io_error
+            per_min: 10.0
+            scope: per_host
+          - id: fs_remount_ro
+            per_min: 0.4
+            scope: per_host
+
+  - id: postgres_sync
+    name: Postgres Synchronous Replica (db2)
+    svc: postgres
+    hosts: [db2]
+    desc: >
+      Synchronous replica intended to be promoted on primary failure.
+      During the incident a subprocess crash/restart occurred, and Pacemaker could not promote it automatically.
+    to: []
+    logs:
+      replication_receiver:
+        desc: Periodic replication receiver status.
+        lvl: INFO
+        msg: "walreceiver status streaming={streaming} replay_lag_ms={lag_ms}"
+        vars:
+          streaming: {k: ch, v: [yes]}
+          lag_ms: {k: i, v: [0, 30]}
+
+      postmaster_child_crash:
+        desc: A Postgres subprocess crashes, triggering a restart.
+        lvl: ERROR
+        msg: "child process {pid} terminated by signal {sig}; restarting"
+        vars:
+          pid: {k: i, v: [12000, 18000]}
+          sig: {k: ch, v: [SIGSEGV, SIGABRT]}
+
+      postmaster_restart:
+        desc: Postgres restarted and comes up as standby.
+        lvl: WARN
+        msg: "database system was interrupted; starting up in standby mode"
+        vars: {}
+
+      restore_invalid_wal:
+        desc: restore_command pulls an invalid WAL file (red herring) and discards it.
+        lvl: WARN
+        msg: "restore_command failed for WAL {wal_seg}: invalid WAL record; file discarded"
+        vars:
+          wal_seg: {k: str, v: "wal_segment_name"}
+
+      recovery_conf_restored:
+        desc: Standby configuration restored by cluster management after manual edits.
+        lvl: WARN
+        msg: "standby config restored; starting as replica under cluster control"
+        vars: {}
+
+      manual_promote:
+        desc: Operator manually promotes and starts Postgres as primary.
+        lvl: WARN
+        msg: "promoted to primary by operator; timeline={tli} listening=10.0.0.22:5432"
+        vars:
+          tli: {k: i, v: [2, 3]}
+
+    beh:
+      n:
+        desc: Replica reports low replication lag.
+        emit:
+          - id: replication_receiver
+            per_min: 0.25
+            scope: per_host
+      f:
+        desc: No steady background logs modeled during the failure (key changes are one-shots).
+        emit: []
+
+  - id: postgres_async
+    name: Postgres Asynchronous Replica (db3)
+    svc: postgres
+    hosts: [db3]
+    desc: Asynchronous replica; during the outage it cannot stream because no primary is elected.
+    to: []
+    logs:
+      replication_lag:
+        desc: Periodic replication lag metric under normal operation.
+        lvl: INFO
+        msg: "replication status replay_lag_ms={lag_ms}"
+        vars:
+          lag_ms: {k: i, v: [0, 80]}
+
+      standby_conn_lost:
+        desc: Replica cannot connect to any primary for streaming replication.
+        lvl: ERROR
+        msg: "could not connect to primary for streaming replication: {err}"
+        vars:
+          err: {k: ch, v: ["connection refused", "no route to host"]}
+
+    beh:
+      n:
+        desc: Low replication lag metrics.
+        emit:
+          - id: replication_lag
+            per_min: 0.25
+            scope: per_host
+      f:
+        desc: Connection failures while no primary exists.
+        emit:
+          - id: standby_conn_lost
+            per_min: 0.7
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring and Alerting
+    svc: prometheus
+    hosts: [mon1]
+    desc: Probes API/Dashboard availability and emits alerts on sustained failures.
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Sends periodic probes to the public endpoints.
+    logs:
+      probe_ok:
+        desc: Synthetic probe succeeded.
+        lvl: INFO
+        msg: "probe ok target={target} status=200 latency_ms={lat_ms}"
+        vars:
+          target: {k: ch, v: [api, dashboard]}
+          lat_ms: {k: i, v: [20, 180]}
+
+      probe_fail:
+        desc: Synthetic probe failed.
+        lvl: ERROR
+        msg: "probe failed target={target} status={status} latency_ms={lat_ms}"
+        vars:
+          target: {k: ch, v: [api, dashboard]}
+          status: {k: ch, v: [503, 504]}
+          lat_ms: {k: i, v: [900, 3200]}
+
+      alert_api_outage:
+        desc: Alert fired due to near-total error rate.
+        lvl: CRITICAL
+        msg: "api/dashboard outage alert fired err_rate_pct={err_rate_pct} window_s={window_s}"
+        vars:
+          err_rate_pct: {k: i, v: [95, 100]}
+          window_s: {k: i, v: [60, 180]}
+
+    beh:
+      n:
+        desc: Regular probes show the service is healthy.
+        emit:
+          - id: probe_ok
+            per_min: 4.0
+            scope: global
+      f:
+        desc: During the outage window, probes fail consistently.
+        emit:
+          - id: probe_fail
+            per_min: 4.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [api_app, monitoring]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: |
+      Normal operation: API/Dashboard requests complete successfully with low DB latency.
+    req:
+      - id: web_request_ok
+        desc: Typical API or dashboard request that hits Postgres and succeeds.
+        rpm: 650.0
+        path: [api_app, postgres_primary]
+        emit: [api_app.req_done_2xx]
+        latency_ms: [[60, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: |
+      Failure operation: the cluster has no elected primary behind the Postgres VIP, so requests fail and return 503.
+      Later, operators may attempt to re-point applications to a node IP while service is still down.
+    req:
+      - id: web_request_db_down_vip
+        desc: Request fails because the Postgres VIP has no reachable primary (Pacemaker stuck without promotion).
+        rpm: 650.0
+        path: [api_app, postgres_primary]
+        emit: [api_app.db_connect_err_vip, api_app.req_done_503]
+        latency_ms: [[950, 1600], [1100, 3800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: web_request_db_direct_fail
+        desc: During manual intervention, some app instances attempt to connect to a specific node IP but still fail and return 503.
+        rpm: 250.0
+        path: [api_app, postgres_sync]
+        emit: [api_app.db_connect_err_direct, api_app.req_done_503]
+        latency_ms: [[800, 1600], [950, 3600]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Modeling choice: request flows start at api_app (not the edge load balancer) so that request-level retry semantics are not needed for this incident and terminal response logs remain once-per-request.
+  - |
+    The Pacemaker edge case is represented via repeated promote attempts failing with a colocation constraint involving a backup VIP and non-zero resource stickiness; detailed Pacemaker rule syntax is simplified.
+  - |
+    Pacemaker background logs are modeled as cluster-level (scope=global) streams so that after db1 is fenced/powered off the log generator does not continue emitting Pacemaker background lines "from" the offline node.
+  - |
+    To preserve the causal core ("backup VIP running on the synchronous replica blocks promoting it"), pacemaker.cluster_status fixes vip_backup_node=db2 in failure state; in normal it may be db2 or db3.
+  - |
+    Time is compressed to fit a 54-minute scenario while preserving the causal sequence (primary disk failure → failed Pacemaker promotion → operator attempts → manual promotion and app re-pointing efforts).
+  - |
+    The scenario ends before confirmed recovery; the incident’s headline user impact is modeled as total outage throughout the failure phase, consistent with the post-mortem summary.
+  - |
+    Normal-phase log volume estimate: ~650 req/min × 1 log/req ≈ 650 logs/min plus ~5–8 background logs/min (monitoring probes, Pacemaker status, DB metrics, app housekeeping, LB stats).
+  - |
+    Total scenario log estimate: ~50k–63k logs, dominated by request failures during the outage; key diagnostics are likely visible (Pacemaker promotion failures, app DB connect errors, monitoring alert, and operator one-shots).
+```

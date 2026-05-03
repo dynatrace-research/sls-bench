@@ -1,0 +1,241 @@
+```yaml
+scenario:
+  id: incident_2025_02_28_wikipedia_portal_redirect
+  title: www.wikipedia.org self-redirect loop ramping in via CDN cache expiry
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The Wikipedia portal (https://www.wikipedia.org/) is normally served as a cached HTTP 200 from the CDN edge, with occasional cache misses fetching from Apache origin.
+    A previously deployed Apache configuration makes the origin return a 301 redirect whose Location points back to the same URL.
+    As cached 200 entries expire, the edge increasingly caches and serves the 301, producing "Too Many Redirects" for a growing share of users while others still see cached 200s.
+    Responders start mitigation (revert attempt and targeted cache purge), restoring codfw while the primary DC (eqiad) remains impacted by the end of this scenario.
+
+  trigger_desc: |
+    CDN cache entries for the portal begin expiring in the primary DC, causing cache-miss fetches to reach the misconfigured Apache origin and seed cached 301 responses at the edge.
+
+  time:
+    total_minutes: 44
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 44}
+
+  phases:
+    n:
+      desc: |
+        Traffic to https://www.wikipedia.org/ is largely served from the CDN cache as HTTP 200 in each DC.
+        A small percentage of requests miss cache and are fetched from the Apache origin, which returns 200.
+        Aggregated edge metrics show mostly 200 responses and high cache hit ratios.
+      flows:
+        - portal_eqiad_hit_200_n
+        - portal_eqiad_miss_200_n
+        - portal_codfw_hit_200_n
+        - portal_codfw_miss_200_n
+        - portal_drmrs_hit_200_n
+        - portal_drmrs_miss_200_n
+      manifestation:
+        - cdn_edge.edge_access_200_hit_eqiad
+        - cdn_edge.edge_metric
+        - portal_apache.config_snapshot
+
+    f:
+      desc: |
+        Cache expiry causes more clients to be served cached 301 redirects originating from a bad Apache vhost configuration.
+        The impact ramps unevenly by DC and is hard to reproduce reliably due to a mix of cached 200 and cached 301 responses.
+        Responders use direct-origin tests to confirm the self-redirect at the origin and attempt mitigation (revert + cache purging), restoring codfw while eqiad remains heavily affected.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: cdn_edge
+          event: |
+            In eqiad, portal cache entries begin expiring and the edge starts serving 301 redirects seeded by cache-miss fetches to origin.
+            Other DCs do not yet show meaningful 301 volume.
+          why: |
+            The Apache origin is already capable of returning a self-referential 301 due to a bad vhost config.
+            Only when edge cache misses occur (TTL expiry) does the edge fetch and then cache/serve the 301. This is directly observable in edge access logs and in origin access logs on cache misses.
+          flows:
+            - portal_eqiad_hit_301_f
+            - portal_eqiad_miss_301_f
+          rate_multipliers:
+            portal_codfw_hit_301_f: 0.0
+            portal_codfw_miss_301_f: 0.0
+            portal_codfw_miss_200_f: 0.0
+            portal_drmrs_hit_301_f: 0.0
+            portal_drmrs_miss_301_f: 0.0
+            ops_curl_origin_f: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - cdn_edge.edge_access_301_hit_eqiad
+            - cdn_edge.edge_access_301_miss_eqiad
+            - portal_apache.apache_access_301_self_eqiad
+
+        - order: 2
+          at_min: 26
+          component: cdn_edge
+          event: |
+            Redirect-loop responses ramp up: eqiad shifts toward a much higher fraction of cached 301, and drmrs begins to surface 301s as its cached 200s expire.
+            codfw also begins to show some 301s, but not yet at eqiad levels.
+          why: |
+            As more cached 200 objects expire, additional cache misses reach the misconfigured origin and seed 301s into edge caches.
+            Once cached, 301 responses are served quickly at high volume without contacting origin, increasing the observed 301 fraction.
+          flows:
+            - portal_eqiad_hit_301_f
+            - portal_drmrs_hit_301_f
+            - portal_codfw_hit_301_f
+          rate_multipliers:
+            portal_eqiad_hit_200_f: 0.6
+            portal_eqiad_hit_301_f: 6.0
+            portal_eqiad_miss_301_f: 1.5
+            portal_drmrs_hit_200_f: 0.8
+            portal_drmrs_hit_301_f: 3.0
+            portal_drmrs_miss_301_f: 1.5
+            portal_codfw_hit_301_f: 1.0
+            portal_codfw_miss_301_f: 1.0
+            portal_codfw_miss_200_f: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - cdn_edge.edge_metric
+            - cdn_edge.edge_access_301_hit_eqiad
+            - cdn_edge.edge_access_301_hit_drmrs
+
+        - order: 3
+          at_min: 34
+          component: ops_chat
+          event: |
+            User reports and internal discussion trigger incident response; responders begin investigation and mitigation.
+            They start a portal config revert and purge codfw edge caches; after this, codfw cache misses refill with 200 responses (instead of 301), while eqiad continues to serve many cached 301s.
+          why: |
+            A direct origin check bypasses CDN caching and confirms the origin behavior is a self-redirect, distinguishing it from an application outage.
+            In codfw, applying the revert changes the origin response on new fetches to 200, and purging removes cached 301 objects, temporarily increasing cache misses that then repopulate the cache with 200.
+          flows:
+            - ops_curl_origin_f
+            - portal_codfw_miss_200_f
+          rate_multipliers:
+            ops_curl_origin_f: 1.0
+            portal_codfw_hit_301_f: 0.0
+            portal_codfw_miss_301_f: 0.0
+            portal_codfw_miss_200_f: 3.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_chat.user_report
+              count: 4
+              hosts: [ops01]
+            - ref: status_page.status_update_investigating
+              count: 1
+              hosts: [status01]
+            - ref: deploy_manager.deploy_start_portal_revert
+              count: 1
+              hosts: [deploy01]
+            - ref: cache_purger.purge_start_codfw
+              count: 1
+              hosts: [purge01]
+            - ref: cache_purger.purge_done_codfw
+              count: 1
+              hosts: [purge01]
+          manifestation:
+            - ops_shell.curl_run_eqiad
+            - portal_apache.apache_access_301_self_eqiad
+            - cdn_edge.edge_access_200_miss_codfw
+            - cache_purger.purge_done_codfw
+            - status_page.status_update_investigating
+
+        - order: 4
+          at_min: 40
+          component: deploy_manager
+          event: |
+            The revert effort becomes blocked by unrelated mediawiki-config validation errors, delaying a clean rollout of the portal fix to all DCs.
+            eqiad continues to worsen as cache expiry drives a higher 301 fraction, while codfw settles into mostly-200 behavior after the purge refill.
+          why: |
+            The block is observable in deploy-manager logs; until the revert can be applied broadly and eqiad caches are purged/expire, cached 301s persist at the edge.
+            In codfw, once caches are refilled after the purge, cache misses decrease and most responses return to cached 200.
+          flows:
+            - portal_eqiad_miss_301_f
+            - portal_codfw_miss_200_f
+          rate_multipliers:
+            portal_eqiad_hit_200_f: 0.3
+            portal_eqiad_hit_301_f: 10.0
+            portal_eqiad_miss_301_f: 2.0
+            portal_drmrs_hit_301_f: 4.0
+            portal_drmrs_miss_301_f: 2.0
+            portal_codfw_miss_200_f: 1.2
+            portal_codfw_hit_200_f: 1.1
+          latency_multipliers: {}
+          one_shots:
+            - ref: deploy_manager.deploy_blocked_mediawiki_config
+              count: 1
+              hosts: [deploy01]
+          manifestation:
+            - deploy_manager.deploy_blocked_mediawiki_config
+            - cdn_edge.edge_access_301_hit_eqiad
+            - cdn_edge.cache_miss_eqiad
+
+      steady:
+        - component: cdn_edge
+          condition: |
+            eqiad edges predominantly serve cached 301 redirects for https://www.wikipedia.org/, with drmrs also serving a noticeable fraction of cached 301.
+            codfw is largely recovered and serves mostly 200 after the revert+purge, with occasional cache misses refilling 200 objects.
+          user_impact: |
+            Many users (especially routed to eqiad) see "Too Many Redirects" or an endlessly reloading portal page; users routed to codfw are mostly successful, and some users still succeed elsewhere via remaining cached 200 paths.
+          manifestation:
+            - cdn_edge.edge_access_301_hit_eqiad
+            - cdn_edge.edge_access_301_hit_drmrs
+            - cdn_edge.edge_metric
+            - cdn_edge.edge_access_200_hit_codfw
+        - component: portal_apache
+          condition: |
+            The portal origin continues to return a self-referential 301 in eqiad for uncached requests, visible via cache-miss fetches and responder curl checks, while codfw origin returns 200 after partial mitigation.
+          user_impact: |
+            Bypass-cache tests confirm the portal origin behavior in eqiad is a redirect loop rather than a MediaWiki application outage; codfw origin fetches returning 200 explain partial recovery there.
+          manifestation:
+            - portal_apache.apache_access_301_self_eqiad
+            - portal_apache.apache_access_200_codfw
+            - portal_apache.config_snapshot
+
+      feedback_loops:
+        - id: redirect_cache_persistence
+          desc: |
+            Once a 301 is cached at the edge, it is served at high volume without contacting origin, sustaining user-visible failure until explicit purging and/or cache expiry.
+        - id: partial_visibility_due_to_cache_state
+          desc: |
+            Mixed cached 200 and cached 301 responses across edges/DCs makes reproduction inconsistent, delaying confident diagnosis and widening the window where the issue ramps.
+
+      flows:
+        - portal_eqiad_hit_200_f
+        - portal_eqiad_hit_301_f
+        - portal_eqiad_miss_301_f
+        - portal_codfw_hit_200_f
+        - portal_codfw_hit_301_f
+        - portal_codfw_miss_301_f
+        - portal_codfw_miss_200_f
+        - portal_drmrs_hit_200_f
+        - portal_drmrs_hit_301_f
+        - portal_drmrs_miss_301_f
+        - ops_curl_origin_f
+      manifestation:
+        - cdn_edge.edge_access_301_hit_eqiad
+        - cdn_edge.edge_metric
+        - portal_apache.apache_access_301_self_eqiad
+        - portal_apache.apache_access_200_codfw
+        - deploy_manager.deploy_blocked_mediawiki_config
+        - cache_purger.purge_done_codfw
+
+  assumptions:
+    - |
+      The real incident began with a prior-day deploy and then ramped over many hours as CDN caches expired; this scenario compresses that ramp and ends before final full recovery to satisfy the "ends in failure" requirement.
+    - |
+      Codfw recovery is modeled explicitly: after the revert+purge event, codfw 301 miss/hit flows are suppressed and codfw cache-miss traffic switches to portal_codfw_miss_200_f (origin returns 200), matching the intended mitigation mechanism.
+    - |
+      Failure-phase piecewise volume (rough):
+        - mins 0-20 normal: ~1418 logs/min => ~28k logs.
+        - mins 20-26 early failure (eqiad only): ~1310–1320 logs/min => ~7.8k–7.9k logs.
+        - mins 26-34 ramp expands (eqiad high; drmrs starts; codfw starts): ~1250–1300 logs/min => ~10k–10.5k logs.
+        - mins 34-40 mitigation begins (codfw purge refill increases 200 misses): ~1350–1450 logs/min => ~8k–9k logs.
+        - mins 40-44 eqiad worsens; codfw mostly stable: ~1250–1350 logs/min => ~5k–5.5k logs.
+        - one-shots: event3 ~8 logs; event4 ~1 log.
+      Total estimated logs: ~58k–75k (within 20k–100k).
+    - |
+      Key failure signals are likely visible because cached 301 edge access logs (cdn_edge.edge_access_301_hit_eqiad / drmrs) occur at high rate after the ramp begins; the codfw recovery is corroborated by cdn_edge.edge_access_200_miss_codfw + portal_apache.apache_access_200_codfw after event 3; and origin 301 confirmation appears via cache-miss chains plus responder curl checks.
+```

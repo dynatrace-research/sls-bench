@@ -1,0 +1,233 @@
+```yaml
+scenario:
+  id: eu_gateway_restart_kazoo_zk_buffer_incident
+  title: Gateways restarted while orchestrator unstable; ZooKeeper session churn and strace EPIPE during startup burst, then ZooKeeper max-buffer rejection; recovery after buffer increase
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    In normal operation, gateways route user HTTP traffic to application runtimes using a routing table refreshed from the orchestrator.
+    During a maintenance upgrade, gateways were restarted while the orchestrator was not fully started, clearing in-memory routes and preventing refresh, so websites returned 503 no_route.
+    The orchestrator showed repeated ZooKeeper session churn and slow lock acquisition; operators used strace to discover frequent EPIPE errors during the startup burst (a Kazoo-related scaling issue), and applied a hotfix to throttle client-side load.
+    After the hotfix, a separate issue surfaced: ZooKeeper consistently rejected an oversized node/packet due to jute.maxbuffer; increasing the ZooKeeper max buffer and restarting ZooKeeper restored route serving and most website traffic.
+
+  trigger_desc: |
+    Maintenance procedure restarts/upgrades the gateway cluster before verifying the orchestrator is fully started and able to serve routing snapshots.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Gateways have a populated in-memory route table and periodically refresh it from the orchestrator.
+        User traffic is routed successfully to application backends. ZooKeeper is stable aside from low-rate quorum status logs.
+        Operators run occasional direct backend probes.
+      flows: [user_web_request_ok, gateway_config_refresh_ok, ops_backend_probe]
+      manifestation:
+        - gateway.http_access
+        - gateway.gw_metrics
+        - gateway.refresh_ok
+        - orchestrator.serve_app_list_ok
+        - orchestrator.orch_metrics
+        - zookeeper.quorum_ok
+        - app_backend.app_access
+
+    f:
+      desc: |
+        After gateways restart, their in-memory routing tables are empty and they must fetch routes from the orchestrator.
+        The orchestrator is mid-startup and struggles to acquire ownership locks across a large ZooKeeper namespace; gateways repeatedly attempt refreshes and get upstream errors.
+        Under higher startup load, ZooKeeper session churn increases; operators attach strace and observe frequent EPIPE during writes in the orchestrator process (a Kazoo-related scaling behavior), and apply a hotfix that reduces the random churn.
+        After that, ZooKeeper begins consistently rejecting oversized packets/nodes due to max buffer constraints; increasing ZooKeeper jute.maxbuffer and restarting ZooKeeper allows the orchestrator to serve routing snapshots again and gateways repopulate routes.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: ops_runner
+          event: |
+            Gateways are restarted as part of maintenance while the orchestrator is still starting; route caches are cleared and route refresh attempts begin failing, leading to 503 no_route responses with an empty route table.
+          why: |
+            Gateways keep routes in memory; a restart clears that state. Because the orchestrator is not yet ready to serve snapshots (still dependent on ZooKeeper startup/locks),
+            refresh attempts fail and gateways reject requests with 503 no_route. This is directly observable in gateway logs; the orchestrator readiness dependency is operational knowledge.
+          flows: [user_web_request_503_empty, gateway_config_refresh_fail]
+          rate_multipliers:
+            user_web_request_ok_recovered: 0.0
+            user_web_request_503_partial: 0.0
+            gateway_config_refresh_ok_recovered: 0.0
+            gateway.gw_metrics: 0.0
+            orchestrator.zk_jute_buffer_error: 0.0
+            orchestrator.orch_metrics_recovered: 0.0
+            zookeeper.packet_too_large: 0.0
+          latency_multipliers:
+            gateway_config_refresh_fail: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_runner.gateway_restart
+              count: 1
+              hosts: [opsctl-1]
+          manifestation:
+            - ops_runner.gateway_restart
+            - gateway.http_503_no_route_empty
+            - gateway.gw_metrics_degraded
+            - gateway.refresh_fail
+            - orchestrator.startup_waiting_locks
+
+        - order: 2
+          at_min: 27
+          component: orchestrator
+          event: |
+            Orchestrator lock acquisition load rises and ZooKeeper session churn increases, slowing readiness; operators attach strace and observe frequent EPIPE errors during orchestrator process writes.
+          why: |
+            Startup creates many ZooKeeper operations (ephemeral ownership locks) across a very large namespace, increasing client-side concurrency.
+            The orchestrator primarily shows this as connection churn (session expired / reconnect) and prolonged startup; the specific EPIPE evidence is not normally logged, but was discovered via strace (operator-only visibility).
+          flows: [gateway_config_refresh_fail]
+          rate_multipliers:
+            orchestrator.zk_session_expired: 6.0
+            orchestrator.startup_waiting_locks: 2.0
+            orchestrator.orch_metrics_recovered: 0.0
+          latency_multipliers:
+            gateway_config_refresh_fail: {p50: 1.8, p95: 2.5}
+          one_shots:
+            - ref: ops_runner.debug_strace_attached
+              count: 1
+              hosts: [opsctl-1]
+            - ref: ops_runner.strace_epipe_seen
+              count: 1
+              hosts: [opsctl-1]
+          manifestation:
+            - ops_runner.debug_strace_attached
+            - ops_runner.strace_epipe_seen
+            - orchestrator.zk_session_expired
+            - orchestrator.startup_waiting_locks
+            - gateway.refresh_retry
+
+        - order: 3
+          at_min: 37
+          component: ops_runner
+          event: |
+            A hotfix throttles the orchestrator's ZooKeeper client startup burst, reducing random session churn; ZooKeeper then begins rejecting oversized packets/nodes due to max buffer limits, keeping route snapshots unavailable.
+          why: |
+            Throttling reduces client-side concurrency so random session churn drops. The orchestrator still needs to read/write large ZooKeeper nodes.
+            When a node exceeds jute.maxbuffer, ZooKeeper rejects the request and closes the connection, producing consistent, repeatable failures. This is directly observable in ZooKeeper and orchestrator error logs.
+          flows: [gateway_config_refresh_fail, ops_backend_probe]
+          rate_multipliers:
+            orchestrator.zk_session_expired: 0.6
+            orchestrator.zk_jute_buffer_error: 1.0
+            zookeeper.packet_too_large: 1.0
+          latency_multipliers:
+            gateway_config_refresh_fail: {p50: 0.9, p95: 1.1}
+          one_shots:
+            - ref: ops_runner.deploy_kazoo_patch
+              count: 1
+              hosts: [opsctl-1]
+          manifestation:
+            - ops_runner.deploy_kazoo_patch
+            - zookeeper.packet_too_large
+            - orchestrator.zk_jute_buffer_error
+            - gateway.refresh_fail
+
+        - order: 4
+          at_min: 45
+          component: ops_runner
+          event: |
+            ZooKeeper max buffer is increased and ZooKeeper is restarted to apply it; oversized-packet rejections stop, the orchestrator serves app lists again, and gateways repopulate routes, restoring most user traffic while a small residual 503 rate remains due to partial convergence.
+          why: |
+            Increasing jute.maxbuffer allows reads/writes involving the oversized node to succeed without the server rejecting the packet.
+            After the restart applies the configuration, the orchestrator can complete enough ZooKeeper operations to serve routing snapshots, which gateways use to rebuild their in-memory route tables. This is directly observable via the disappearance of packet-too-large errors and the return of successful refresh and access logs, along with orchestrator metrics showing a connected zk_state.
+          flows: [gateway_config_refresh_ok_recovered, user_web_request_ok_recovered, user_web_request_503_partial]
+          rate_multipliers:
+            user_web_request_503_empty: 0.0
+            user_web_request_503_partial: 0.05
+            user_web_request_ok_recovered: 0.95
+            gateway_config_refresh_fail: 0.1
+            gateway_config_refresh_ok_recovered: 1.0
+            gateway.gw_metrics: 1.0
+            gateway.gw_metrics_degraded: 0.0
+            orchestrator.orch_metrics: 0.0
+            orchestrator.orch_metrics_recovered: 1.0
+            orchestrator.zk_jute_buffer_error: 0.0
+            zookeeper.packet_too_large: 0.0
+            orchestrator.zk_session_expired: 0.2
+            orchestrator.startup_waiting_locks: 0.2
+          latency_multipliers:
+            gateway_config_refresh_ok_recovered: {p50: 0.9, p95: 0.9}
+            user_web_request_ok_recovered: {p50: 1.0, p95: 1.0}
+            user_web_request_503_partial: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_runner.zookeeper_maxbuffer_increase
+              count: 1
+              hosts: [opsctl-1]
+            - ref: ops_runner.zookeeper_restart
+              count: 1
+              hosts: [opsctl-1]
+          manifestation:
+            - ops_runner.zookeeper_maxbuffer_increase
+            - ops_runner.zookeeper_restart
+            - orchestrator.orch_metrics_recovered
+            - gateway.refresh_ok
+            - gateway.http_access
+            - gateway.http_503_no_route_partial
+
+      steady:
+        - component: gateway
+          condition: |
+            Routes are largely repopulated and most requests are routed successfully; a small residual fraction of requests still returns 503 no_route due to partial route convergence.
+          user_impact: |
+            Websites are mostly available again, with intermittent 503s for a subset of routes while gateways converge.
+          manifestation: [gateway.http_access, gateway.gw_metrics, gateway.http_503_no_route_partial]
+
+        - component: orchestrator
+          condition: |
+            Orchestrator can read required ZooKeeper state and serve routing snapshots; ZooKeeper session churn drops to a low level after restarts.
+          user_impact: |
+            Gateways can refresh routes again, allowing continued operation (with minor convergence gaps).
+          manifestation: [orchestrator.serve_app_list_ok, orchestrator.orch_metrics_recovered]
+
+        - component: zookeeper
+          condition: |
+            ZooKeeper no longer rejects requests for oversized nodes/packets after max buffer increase.
+          user_impact: |
+            Control-plane stability is restored.
+          manifestation: [zookeeper.quorum_ok]
+
+      feedback_loops:
+        - id: refresh_retry_pressure_loop
+          desc: |
+            Empty routes trigger repeated gateway refresh attempts and retries. Those retries increase orchestrator load during its fragile startup,
+            which increases ZooKeeper session churn, further delaying successful route publication.
+
+        - id: reconnect_restarts_startup_loop
+          desc: |
+            Each ZooKeeper disconnect forces the orchestrator to reconnect and continue/restart parts of its ownership/lock acquisition workflow,
+            creating more bursts of ZooKeeper operations and sustaining instability until remediation.
+
+      flows:
+        - user_web_request_503_empty
+        - gateway_config_refresh_fail
+        - ops_backend_probe
+        - gateway_config_refresh_ok_recovered
+        - user_web_request_ok_recovered
+        - user_web_request_503_partial
+      manifestation:
+        - gateway.http_503_no_route_empty
+        - gateway.refresh_fail
+        - orchestrator.zk_session_expired
+        - ops_runner.strace_epipe_seen
+        - zookeeper.packet_too_large
+        - orchestrator.zk_jute_buffer_error
+        - ops_runner.zookeeper_maxbuffer_increase
+        - orchestrator.orch_metrics_recovered
+        - gateway.refresh_ok
+        - gateway.http_access
+        - gateway.http_503_no_route_partial
+        - ops_runner.probe_ok
+
+  assumptions:
+    - "The two-phase constraint is kept by modeling remediation and near-recovery as late events within the failure phase rather than adding a third (post-incident) normal phase."
+    - "Failure-phase piecewise breakdown (minutes are scenario-relative): 20–27 (7 min) gateways restarted; route caches empty; empty-table 503s (user_web_request_503_empty) and refresh failures; healthy gateway metrics suppressed and only degraded metrics emit; ZooKeeper packet-too-large and orchestrator buffer errors explicitly suppressed. 27–37 (10 min) ZooKeeper session churn rises (orchestrator.zk_session_expired multiplier 6.0) and refresh failures slow; operators attach strace and record EPIPE via one-shots. 37–45 (8 min) hotfix reduces session churn (multiplier 0.6) but oversized-packet rejections appear (zookeeper.packet_too_large and orchestrator.zk_jute_buffer_error enabled). 45–50 (5 min) ZooKeeper max buffer increased and ZooKeeper restarted; oversized-packet errors stop; successful refresh and most user traffic return; degraded gateway metrics are suppressed to 0.0 while healthy metrics resume; a small residual of user_web_request_503_partial remains to represent partial convergence."
+    - "One-shots per event: gateway_restart=1 at min 20; debug_strace_attached=1 and strace_epipe_seen=1 at min 27; deploy_kazoo_patch=1 at min 37; zookeeper_maxbuffer_increase=1 and zookeeper_restart=1 at min 45."
+    - "Expected visibility: empty-table 503s are frequent immediately after restart; refresh failures/retries occur at ~60 rpm with retries; ZooKeeper session-expired logs become frequent only in 27–37 due to the explicit multiplier; the EPIPE detail is intentionally visible only as an operator strace one-shot (not a frequent app log); ZooKeeper packet_too_large and orchestrator zk_jute_buffer_error are suppressed early, enabled mid-incident, then suppressed again at remediation; late residual 503s are emitted via the explicit partial-503 flow/log."
+    - "Rough volume estimate: normal ~1.4k logs/min for 20 min (~28k). Failure: 20–45 averages ~0.63k–0.66k logs/min (~16k–17k), 45–50 ~1.2k–1.3k logs/min (~6k–7k). Total ~49k–53k logs."
+```

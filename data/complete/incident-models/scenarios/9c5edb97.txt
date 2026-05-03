@@ -1,0 +1,223 @@
+```yaml
+scenario:
+  id: flowspec_packet_length_router_crash
+  title: Bad Flowspec packet-length rule crashes edge routers and withdraws routes
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system provides anycast reachability for DNS and HTTP services across multiple data centers.
+    A DDoS signature with an abnormal packet-length range was translated into a Flowspec discard rule and pushed network-wide.
+    On receipt, routers consumed memory until the control plane crashed, causing BGP sessions to drop and routes to be withdrawn.
+    External users experienced DNS errors and "no route to host" symptoms, while mitigation reduced but did not fully end the outage within this scenario window.
+
+  trigger_desc: |
+    An on-call operator applies an automated attack profiler signature as a Flowspec rule to drop UDP/53 traffic
+    matching packet-length [99971,99985], unintentionally triggering a Juniper router bug.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Global probes show normal reachability and low latency to the anycast edge.
+        Edge routers report stable memory usage and established BGP sessions.
+        Flowspec manager syncs configuration without pushing changes.
+      flows: [dns_probe, http_probe]
+      manifestation:
+        - external_probe.dns_probe_ok
+        - external_probe.http_probe_ok
+        - edge_router.bgp_session_state
+        - edge_router.mem_stat
+
+    f:
+      desc: |
+        A newly pushed Flowspec rule with an extremely large packet-length range triggers control-plane memory exhaustion.
+        Routers crash and restart, dropping BGP sessions and withdrawing routes so many networks cannot reach the anycast prefixes.
+        Automated watchdogs attempt reboots but some routers remain management-unreachable, and anycast load shifts increase instability.
+        The rule is later withdrawn and hard reboots are requested, improving conditions but leaving significant residual reachability loss.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: flowspec_manager
+          event: |
+            The profiler’s packet-length signature is converted into a Flowspec discard rule and pushed to edge routers.
+            Within minutes, routers begin showing memory pressure and the first control-plane crashes, and reachability alerts fire.
+          why: |
+            The packet-length match triggers a router bug that causes excessive memory consumption when the rule is evaluated.
+            The rule push and router symptoms are directly observable in controller/router/watchdog logs; the underlying bug is external to logs.
+          flows: [dns_probe_fail, http_probe_fail]
+          rate_multipliers:
+            edge_router.mem_alarm: 4.0
+            edge_router.rpd_oom_crash: 2.0
+            edge_router.bgp_neighbor_down: 3.0
+            edge_router.route_withdrawn: 2.0
+            router_watchdog.crash_detected: 3.0
+            router_watchdog.reboot_attempt: 3.0
+            router_watchdog.mgmt_unreachable: 2.0
+          latency_multipliers:
+            dns_probe_fail: {p50: 1.2, p95: 1.1}
+            http_probe_fail: {p50: 1.2, p95: 1.1}
+          one_shots:
+            - ref: ddos_profiler.attack_signature_generated
+              count: 1
+              hosts: [prof-1]
+            - ref: flowspec_manager.rule_compiled
+              count: 1
+              hosts: [ctl-1]
+            - ref: flowspec_manager.rule_pushed
+              count: 1
+              hosts: [ctl-1]
+            - ref: edge_router.flowspec_rule_received
+              count: 3
+              hosts: [rtr-sfo1-1, rtr-ams1-1, rtr-sin1-1]
+            - ref: edge_router.flowspec_rule_installed
+              count: 3
+              hosts: [rtr-sfo1-1, rtr-ams1-1, rtr-sin1-1]
+            - ref: noc_alerting.global_reachability_alert
+              count: 1
+              hosts: [alert-1]
+          manifestation:
+            - flowspec_manager.rule_pushed
+            - edge_router.flowspec_rule_installed
+            - edge_router.mem_alarm
+            - external_probe.dns_probe_fail
+            - noc_alerting.global_reachability_alert
+
+        - order: 2
+          at_min: 25
+          component: edge_router
+          event: |
+            Router crashes cascade across sites: BGP neighbors drop frequently and route withdrawals spike.
+            Watchdogs increase reboot attempts, but management-plane unreachability becomes more common and probe timeouts lengthen.
+          why: |
+            As more routers crash, fewer anycast sites remain to absorb global traffic, amplifying load on survivors and increasing instability.
+            This amplification is partially observable via higher withdraw/reboot logs and worsening probe latency; load distribution is inferred.
+          flows: [dns_probe_fail, http_probe_fail]
+          rate_multipliers:
+            edge_router.mem_alarm: 8.0
+            edge_router.rpd_oom_crash: 6.0
+            edge_router.bgp_neighbor_down: 8.0
+            edge_router.route_withdrawn: 8.0
+            router_watchdog.crash_detected: 10.0
+            router_watchdog.reboot_attempt: 8.0
+            router_watchdog.mgmt_unreachable: 6.0
+          latency_multipliers:
+            dns_probe_fail: {p50: 1.8, p95: 1.4}
+            http_probe_fail: {p50: 1.6, p95: 1.4}
+          one_shots: []
+          manifestation:
+            - edge_router.bgp_neighbor_down
+            - edge_router.route_withdrawn
+            - router_watchdog.mgmt_unreachable
+            - external_probe.http_probe_fail
+
+        - order: 3
+          at_min: 32
+          component: flowspec_manager
+          event: |
+            Operations withdraw the Flowspec rule and request hard reboots at impacted sites.
+            Crash/withdraw rates fall compared to the peak, but many routes remain missing and probes still show widespread failures.
+          why: |
+            Removing the triggering rule stops new memory-exhaustion events on routers that can accept the withdrawal,
+            while hard reboots restore some routers that were wedged and management-unreachable. Recovery is partial and slow due to physical access needs.
+          flows: [dns_probe_fail, http_probe_fail]
+          rate_multipliers:
+            edge_router.mem_alarm: 3.0
+            edge_router.rpd_oom_crash: 1.5
+            edge_router.bgp_neighbor_down: 3.0
+            edge_router.route_withdrawn: 3.0
+            router_watchdog.crash_detected: 3.0
+            router_watchdog.reboot_attempt: 6.0
+            router_watchdog.mgmt_unreachable: 4.0
+          latency_multipliers:
+            dns_probe_fail: {p50: 1.2, p95: 1.1}
+            http_probe_fail: {p50: 1.2, p95: 1.1}
+          one_shots:
+            - ref: flowspec_manager.rule_withdrawn
+              count: 1
+              hosts: [ctl-1]
+            - ref: edge_router.flowspec_rule_removed
+              count: 2
+              hosts: [rtr-sfo1-1, rtr-ams1-1]
+            - ref: router_watchdog.hard_reboot_requested
+              count: 3
+              hosts: [wd-sfo1, wd-ams1, wd-sin1]
+          manifestation:
+            - flowspec_manager.rule_withdrawn
+            - router_watchdog.hard_reboot_requested
+            - edge_router.rpd_oom_crash
+            - external_probe.dns_probe_fail
+
+      steady:
+        - component: edge_router
+          condition: |
+            A substantial fraction of edge routers remain unstable or down, with continued BGP neighbor drops and route withdrawals
+            (reduced from peak but still persistent).
+          user_impact: |
+            Many clients cannot reach anycast prefixes at all ("no route") or experience timeouts because routes are withdrawn or flapping.
+          manifestation:
+            - edge_router.bgp_neighbor_down
+            - edge_router.route_withdrawn
+            - edge_router.mem_alarm
+
+        - component: router_watchdog
+          condition: |
+            Watchdogs repeatedly attempt recovery; some routers remain management-unreachable, requiring manual intervention.
+          user_impact: |
+            Prolonged restoration time because remote reboot is ineffective for a subset of routers/sites.
+          manifestation:
+            - router_watchdog.mgmt_unreachable
+            - router_watchdog.reboot_attempt
+            - router_watchdog.crash_detected
+
+        - component: external_probe
+          condition: |
+            Probes continue to record widespread DNS/HTTP failures dominated by 'no_route' and timeouts,
+            with occasional 'cached_servfail' as downstream resolvers cache failures.
+          user_impact: |
+            End users see DNS errors and unreachable sites even as partial recovery begins.
+          manifestation:
+            - external_probe.dns_probe_fail
+            - external_probe.http_probe_fail
+
+      feedback_loops:
+        - id: anycast_failover_overload
+          desc: |
+            As routes withdraw and anycast sites disappear, remaining sites attract more global traffic.
+            Increased load and control-plane stress further destabilize routers, leading to additional crashes and withdrawals.
+
+      flows: [dns_probe_fail, http_probe_fail]
+      manifestation:
+        - external_probe.dns_probe_fail
+        - external_probe.http_probe_fail
+        - edge_router.bgp_neighbor_down
+        - edge_router.route_withdrawn
+        - router_watchdog.mgmt_unreachable
+
+  assumptions:
+    - Scenario time is compressed to 40 minutes and ends while the incident is still ongoing (partial mitigation applied but not fully restored).
+    - Failure begins at minute 20 to keep a clear normal baseline and align with a sudden global drop after the Flowspec rule push.
+    - |-
+      Volume estimate (rough, order-of-magnitude):
+      - Normal (0-20m): dns_probe 600/min + dns retries ~30/min + http_probe 300/min + http retries ~6/min + background ~8/min
+        -> ~940 logs/min over 20m ~= 19k logs.
+      - Failure (20-40m): dns failures 650/min + dns retries ~1105/min + http failures 320/min + http retries ~384/min + background ~15-40/min
+        -> ~2450-2520 logs/min over 20m ~= 49k-50k logs.
+      - Total ~= 68k-70k logs (within 20k-100k target).
+    - |-
+      Failure-phase interval breakdown and one-shots:
+      - 20-25m (5m): initial onset; one-shots: 1 signature, 1 rule_compiled, 1 rule_pushed, 3 rule_received, 3 rule_installed, 1 global alert.
+      - 25-32m (7m): peak cascade; no one-shots.
+      - 32-40m (8m): mitigation; one-shots: 1 rule_withdrawn, 2 rule_removed, 3 hard_reboot_requested.
+    - |-
+      Visibility rationale:
+      - Root cause linkage: flowspec_manager.rule_pushed and edge_router.flowspec_rule_installed (event markers) followed by edge_router.mem_alarm and edge_router.rpd_oom_crash.
+      - Global impact: continuous external_probe.dns_probe_fail/http_probe_fail and noc_alerting.global_reachability_alert.
+      - Persistence after mitigation: sustained edge_router.bgp_neighbor_down/route_withdrawn and router_watchdog.mgmt_unreachable/reboot_attempt.
+```

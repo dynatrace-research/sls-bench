@@ -1,0 +1,558 @@
+```yaml
+sys:
+  id: direct_connect_tokyo_layer_fault
+  desc: >
+    A private connectivity service forwards customer traffic from Direct Connect edge locations into a region
+    through multiple redundant network layers. Customers use it to reach their VPCs in the Tokyo region
+    (ap-northeast-1) without traversing the public internet. This model focuses on one internal forwarding
+    layer where a subset of devices intermittently fails to forward traffic, creating packet loss and
+    intermittent connectivity, and where a protocol disable in one AZ partially mitigates impact.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: dx_edge_pop
+    name: Direct Connect Edge (POP)
+    svc: direct-connect
+    hosts: [dx-edge-a, dx-edge-b]
+    desc: >
+      Edge routers at a Direct Connect location that accept customer connections and send traffic toward the region.
+      They also maintain BGP sessions with customer routers and provide coarse forwarding telemetry.
+    to:
+      - dst: dx_transport_layer
+        proto: bgp
+        desc: Private routing/forwarding handoff into the internal Direct Connect transport layers.
+    logs:
+      edge_forward_batch:
+        desc: Summarized forwarding record for an aggregated traffic batch on a customer connection.
+        lvl: INFO
+        msg: "DX edge forwarded batch {batch_id} on {conn_id} to {dst_region} bytes={bytes}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          conn_id: {k: ch, v: [dxconn-001, dxconn-002, dxconn-003, dxconn-004]}
+          dst_region: {k: ch, v: [ap-northeast-1]}
+          bytes: {k: i, v: [20000, 800000]}
+      bgp_keepalive:
+        desc: Periodic BGP keepalive/health summary for the customer peering.
+        lvl: INFO
+        msg: "BGP keepalive peer={peer_ip} state={state} rtt_ms={rtt_ms}"
+        vars:
+          peer_ip: {k: ip, v: "169.254.0.0/16"}
+          rtt_ms: {k: i, v: [1, 80]}
+        state_vars:
+          n:
+            state: {k: ch, v: [Established]}
+          f:
+            state: {k: ch, v: [Established, HoldTimer]}
+      bgp_flap:
+        desc: Occasional BGP reset observed during severe impairment.
+        lvl: WARN
+        msg: "BGP session reset peer={peer_ip} reason={reason}"
+        vars:
+          peer_ip: {k: ip, v: "169.254.0.0/16"}
+          reason: {k: ch, v: [hold_timer_expired, cease_admin_reset]}
+    beh:
+      n:
+        desc: Regular keepalives indicate steady control-plane health.
+        emit:
+          - id: bgp_keepalive
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Keepalives continue but occasional flaps appear during impairment.
+        emit:
+          - id: bgp_keepalive
+            per_min: 1.0
+            scope: per_host
+          - id: bgp_flap
+            per_min: 0.05
+            scope: per_host
+
+  - id: dx_transport_layer
+    name: Direct Connect Transport Layer (Layer-3 Aggregation)
+    svc: direct-connect
+    hosts: [dx-l3-1, dx-l3-2, dx-l3-3, dx-l3-4]
+    desc: >
+      An internal redundant forwarding layer between the edge POP and the regional datacenter fabric.
+      During the incident, a subset of devices intermittently fails to forward traffic correctly, creating
+      packet loss and occasional blackholing/timeouts. A mitigation disables a fast-convergence protocol
+      in one AZ, causing traffic in that AZ to switch to a legacy convergence mode.
+    to:
+      - dst: tokyo_dc_fabric
+        proto: mpls
+        desc: Forwarding toward the Tokyo regional datacenter ingress fabric.
+    logs:
+      fwd_batch_result:
+        desc: Forwarding outcome for an aggregated batch as it traverses the layer (fast protocol; used for AZ1 in failure).
+        lvl: INFO
+        msg: "Layer forwarding batch {batch_id} device={device_id} az={az} proto={proto} action={action} loss_pct={loss_pct} queue_depth={qdepth}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          proto: {k: ch, v: [fast-converge-v2]}
+        state_vars:
+          n:
+            device_id: {k: ch, v: [dx-l3-1, dx-l3-2, dx-l3-3, dx-l3-4]}
+            az: {k: ch, v: [apne1-az1, apne1-az2]}
+            action: {k: ch, v: [forward]}
+            loss_pct: {k: i, v: [0, 1]}
+            qdepth: {k: i, v: [0, 50]}
+          f:
+            device_id: {k: ch, v: [dx-l3-1, dx-l3-2]}
+            az: {k: ch, v: [apne1-az1]}
+            action: {k: ch, v: [forward, congested_forward]}
+            loss_pct: {k: i, v: [0, 60]}
+            qdepth: {k: i, v: [10, 800]}
+      fwd_batch_result_fast_az2:
+        desc: Forwarding outcome in AZ2 when fast protocol is enabled (used before protocol disable).
+        lvl: INFO
+        msg: "Layer forwarding batch {batch_id} device={device_id} az={az} proto={proto} action={action} loss_pct={loss_pct} queue_depth={qdepth}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          device_id: {k: ch, v: [dx-l3-3, dx-l3-4]}
+          az: {k: ch, v: [apne1-az2]}
+          proto: {k: ch, v: [fast-converge-v2]}
+        state_vars:
+          n:
+            action: {k: ch, v: [forward]}
+            loss_pct: {k: i, v: [0, 1]}
+            qdepth: {k: i, v: [0, 50]}
+          f:
+            action: {k: ch, v: [forward, congested_forward]}
+            loss_pct: {k: i, v: [0, 60]}
+            qdepth: {k: i, v: [10, 800]}
+      fwd_batch_result_legacy_az2:
+        desc: Forwarding outcome in AZ2 after protocol disable (legacy convergence mode).
+        lvl: INFO
+        msg: "Layer forwarding batch {batch_id} device={device_id} az={az} proto={proto} action={action} loss_pct={loss_pct} queue_depth={qdepth}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          device_id: {k: ch, v: [dx-l3-3, dx-l3-4]}
+          az: {k: ch, v: [apne1-az2]}
+          proto: {k: ch, v: [legacy-converge-v1]}
+        state_vars:
+          n:
+            action: {k: ch, v: [forward]}
+            loss_pct: {k: i, v: [0, 1]}
+            qdepth: {k: i, v: [0, 50]}
+          f:
+            action: {k: ch, v: [forward]}
+            loss_pct: {k: i, v: [0, 8]}
+            qdepth: {k: i, v: [0, 200]}
+      device_fault:
+        desc: Terminal forwarding exception on an AZ1 fast-protocol device leading to effective blackholing for that batch.
+        lvl: ERROR
+        msg: "Forwarding exception device={device_id} az={az} proto={proto} code={code} pkt_sig={pkt_sig}"
+        vars:
+          proto: {k: ch, v: [fast-converge-v2]}
+          code: {k: ch, v: [fe_assert, rx_parser_err]}
+          pkt_sig: {k: hex, v: 8}
+        state_vars:
+          n:
+            device_id: {k: ch, v: [dx-l3-1, dx-l3-2, dx-l3-3, dx-l3-4]}
+            az: {k: ch, v: [apne1-az1, apne1-az2]}
+          f:
+            device_id: {k: ch, v: [dx-l3-1, dx-l3-2]}
+            az: {k: ch, v: [apne1-az1]}
+      device_fault_fast_az2:
+        desc: Terminal forwarding exception on an AZ2 fast-protocol device (used before protocol disable).
+        lvl: ERROR
+        msg: "Forwarding exception device={device_id} az={az} proto={proto} code={code} pkt_sig={pkt_sig}"
+        vars:
+          device_id: {k: ch, v: [dx-l3-3, dx-l3-4]}
+          az: {k: ch, v: [apne1-az2]}
+          proto: {k: ch, v: [fast-converge-v2]}
+          code: {k: ch, v: [fe_assert, rx_parser_err]}
+          pkt_sig: {k: hex, v: 8}
+      drop_metric:
+        desc: Periodic drop/queue metric emitted by each transport device.
+        lvl: INFO
+        msg: "Layer drop metric device={device_id} drop_ppm={drop_ppm} queue_depth={qdepth}"
+        vars:
+          device_id: {k: ch, v: [dx-l3-1, dx-l3-2, dx-l3-3, dx-l3-4]}
+        state_vars:
+          n:
+            drop_ppm: {k: i, v: [0, 50]}
+            qdepth: {k: i, v: [0, 80]}
+          f:
+            drop_ppm: {k: i, v: [500, 50000]}
+            qdepth: {k: i, v: [50, 1200]}
+      signature_detected:
+        desc: Rare but repeatable observation of an unusual packet attribute signature on affected devices.
+        lvl: WARN
+        msg: "Unexpected packet attribute set observed device={device_id} pkt_sig={pkt_sig} count={count}"
+        vars:
+          device_id: {k: ch, v: [dx-l3-1, dx-l3-2, dx-l3-3, dx-l3-4]}
+          pkt_sig: {k: hex, v: 8}
+          count: {k: i, v: [1, 50]}
+      protocol_disabled:
+        desc: Operator action to disable the fast convergence protocol in AZ2 as a mitigation test.
+        lvl: INFO
+        msg: "Protocol {proto} disabled in {az} for mitigation"
+        vars:
+          proto: {k: ch, v: [fast-converge-v2]}
+          az: {k: ch, v: [apne1-az2]}
+    beh:
+      n:
+        desc: Drop metrics stay near zero in steady state.
+        emit:
+          - id: drop_metric
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Drop metrics rise sharply and rare signature observations become visible.
+        emit:
+          - id: drop_metric
+            per_min: 5.0
+            scope: per_host
+          - id: signature_detected
+            per_min: 0.3
+            scope: per_host
+
+  - id: tokyo_dc_fabric
+    name: Tokyo Region Datacenter Ingress Fabric
+    svc: vpc-network
+    hosts: [tokyo-fabric-1, tokyo-fabric-2]
+    desc: >
+      Regional ingress fabric where customer VPC traffic enters the Tokyo datacenter network.
+      It observes delivered traffic and elevated loss during the incident.
+    to: []
+    logs:
+      ingress_batch:
+        desc: Receipt summary for a batch reaching the regional ingress.
+        lvl: INFO
+        msg: "Region ingress received batch {batch_id} from {conn_id} delivered_pct={delivered_pct} az={az}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          conn_id: {k: ch, v: [dxconn-001, dxconn-002, dxconn-003, dxconn-004]}
+          az: {k: ch, v: [apne1-az1, apne1-az2]}
+        state_vars:
+          n:
+            delivered_pct: {k: i, v: [99, 100]}
+          f:
+            delivered_pct: {k: i, v: [40, 100]}
+      fabric_drop_detected:
+        desc: Global ingress monitoring summarizing delivery quality at the fabric boundary.
+        lvl: INFO
+        msg: "Ingress monitoring delivered_pct_p95={deliv_p95}"
+        vars: {}
+        state_vars:
+          n:
+            deliv_p95: {k: i, v: [98, 100]}
+          f:
+            deliv_p95: {k: i, v: [30, 95]}
+    beh:
+      n:
+        desc: Monitoring occasionally logs minor variance.
+        emit:
+          - id: fabric_drop_detected
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Monitoring frequently reports degraded delivery during the incident.
+        emit:
+          - id: fabric_drop_detected
+            per_min: 2.0
+            scope: global
+
+  - id: dx_health_automation
+    name: Direct Connect Health Automation
+    svc: direct-connect-ops
+    hosts: [dx-auto-1]
+    desc: >
+      Automation that evaluates device health and normally removes failed devices from service.
+      During the incident it defers auto-isolation when the failure rate exceeds a safety threshold and
+      instead escalates to engineers for manual remediation.
+    to:
+      - dst: dx_transport_layer
+        proto: ssh
+        desc: Performs administrative isolation/drain and reset actions on transport devices.
+    logs:
+      health_eval:
+        desc: Periodic evaluation summary for the transport layer.
+        lvl: INFO
+        msg: "Health eval layer={layer} failed_devices={failed} total_devices={total} action={action}"
+        vars:
+          layer: {k: ch, v: [dx_layer_3]}
+          total: {k: i, v: [8, 12]}
+        state_vars:
+          n:
+            failed: {k: i, v: [0, 1]}
+            action: {k: ch, v: [auto_isolate]}
+          f:
+            failed: {k: i, v: [2, 8]}
+            action: {k: ch, v: [notify_only]}
+      auto_isolation_skipped:
+        desc: Automation defers auto-removal due to elevated failure rate, creating reliance on manual ops.
+        lvl: WARN
+        msg: "Auto-isolation deferred layer={layer} failed_devices={failed} threshold={threshold}"
+        vars:
+          layer: {k: ch, v: [dx_layer_3]}
+          failed: {k: i, v: [3, 10]}
+          threshold: {k: i, v: [3, 3]}
+      manual_isolation:
+        desc: Operator-driven isolation of a set of devices.
+        lvl: INFO
+        msg: "Operator isolated {count} devices in {layer}"
+        vars:
+          count: {k: i, v: [1, 4]}
+          layer: {k: ch, v: [dx_layer_3]}
+      device_reset_started:
+        desc: Operator-initiated reset attempt on a device.
+        lvl: INFO
+        msg: "Operator reset started device={device_id} az={az}"
+        vars:
+          device_id: {k: ch, v: [dx-l3-1, dx-l3-2, dx-l3-3, dx-l3-4]}
+          az: {k: ch, v: [apne1-az1, apne1-az2]}
+    beh:
+      n:
+        desc: Automation evaluates and auto-isolates rare single-device issues.
+        emit:
+          - id: health_eval
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Evaluations continue but deferrals are common due to elevated failure rate.
+        emit:
+          - id: health_eval
+            per_min: 1.0
+            scope: global
+          - id: auto_isolation_skipped
+            per_min: 2.0
+            scope: global
+
+  - id: noc_alerting
+    name: NOC Alerting / Incident Feed
+    svc: noc
+    hosts: [noc-1]
+    desc: >
+      Central alerting that raises alarms on packet loss for Direct Connect traffic into the Tokyo region.
+      Provides a clear timeline marker for onset and severity changes.
+    to:
+      - dst: dx_health_automation
+        proto: https
+        desc: Links alerts to runbooks and automation dashboards.
+    logs:
+      alarm_packet_loss:
+        desc: Alarm fired when packet loss into the region crosses thresholds.
+        lvl: CRITICAL
+        msg: "ALARM DirectConnect packet loss elevated region={region} loss_p95={loss_p95}% affected_conns={conns}"
+        vars:
+          region: {k: ch, v: [ap-northeast-1]}
+          conns: {k: i, v: [1, 50]}
+        state_vars:
+          n:
+            loss_p95: {k: i, v: [0, 2]}
+          f:
+            loss_p95: {k: i, v: [10, 70]}
+      incident_triage_started:
+        desc: Marker that engineers have started active triage.
+        lvl: INFO
+        msg: "Incident note: triage started for Direct Connect Tokyo"
+        vars: {}
+      incident_devices_drained:
+        desc: Marker that impacted devices were manually drained/isolated.
+        lvl: INFO
+        msg: "Incident note: manual device drain/isolation performed"
+        vars: {}
+      incident_congestion_returned:
+        desc: Marker that additional device failures caused renewed congestion/loss.
+        lvl: INFO
+        msg: "Incident note: congestion and loss increased again"
+        vars: {}
+      incident_protocol_disable_test_started:
+        desc: Marker that protocol disable test started in a single AZ.
+        lvl: INFO
+        msg: "Incident note: started disabling fast convergence protocol in one AZ"
+        vars: {}
+    beh:
+      n:
+        desc: Alarms are absent in steady state (any healthy packet-loss telemetry is modeled elsewhere).
+        emit:
+          - id: alarm_packet_loss
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Alarms fire frequently while packet loss remains elevated.
+        emit:
+          - id: alarm_packet_loss
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [dx_edge_pop]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal Direct Connect forwarding with low loss and stable latency.
+    req:
+      - id: dx_customer_batch_normal
+        desc: Aggregated customer traffic batches forwarded from edge to Tokyo VPC ingress.
+        rpm: 250.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 6], [2, 8], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_probe_batch_normal
+        desc: Synthetic probe batches used to measure delivery and latency across the same path.
+        rpm: 30.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 6], [2, 10], [1, 6]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: Forwarding is intermittently degraded with elevated loss, congestion, and occasional blackholing.
+    req:
+      - id: dx_customer_batch_delivered_degraded_az1
+        desc: Customer batches delivered via AZ1 devices with elevated loss/latency (fast protocol remains enabled).
+        rpm: 110.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 8], [12, 140], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_customer_batch_blackhole_az1
+        desc: Customer batches blackholed at AZ1 fast-protocol devices due to forwarding exceptions.
+        rpm: 30.0
+        path: [dx_edge_pop, dx_transport_layer]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.device_fault
+        latency_ms: [[2, 8], [80, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_customer_batch_delivered_degraded_az2
+        desc: Customer batches delivered via AZ2 devices while fast protocol is enabled (pre-mitigation).
+        rpm: 90.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result_fast_az2
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 8], [10, 120], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_customer_batch_blackhole_az2
+        desc: Customer batches blackholed at AZ2 fast-protocol devices due to forwarding exceptions (pre-mitigation).
+        rpm: 20.0
+        path: [dx_edge_pop, dx_transport_layer]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.device_fault_fast_az2
+        latency_ms: [[2, 8], [80, 350]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_customer_batch_delivered_legacy_az2
+        desc: Customer batches delivered via AZ2 after protocol disable, using legacy convergence with improved delivery.
+        rpm: 90.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result_legacy_az2
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 8], [4, 35], [1, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_probe_batch_degraded_az2
+        desc: Synthetic probes through AZ2 while fast protocol is enabled (pre-mitigation).
+        rpm: 20.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result_fast_az2
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 8], [8, 90], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dx_probe_batch_legacy_az2
+        desc: Synthetic probes through AZ2 after protocol disable, reflecting improved delivery/latency.
+        rpm: 20.0
+        path: [dx_edge_pop, dx_transport_layer, tokyo_dc_fabric]
+        emit:
+          - dx_edge_pop.edge_forward_batch
+          - dx_transport_layer.fwd_batch_result_legacy_az2
+          - tokyo_dc_fabric.ingress_batch
+        latency_ms: [[2, 8], [4, 30], [1, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - >
+    The real incident lasted multiple hours; the scenario compresses it into 50 minutes while preserving the onset,
+    partial mitigations, worsening due to additional device failures, and a mitigation test disabling a protocol in one AZ.
+  - >
+    Direct Connect is packet-based; to keep logs tractable, traffic is modeled as aggregated "batches" per connection,
+    where loss/latency metrics summarize many packets.
+  - >
+    To make the protocol-disable mitigation causally consistent in logs, AZ2 traffic is explicitly modeled with two
+    mutually exclusive flow families: fast protocol (fwd_batch_result_fast_az2 / device_fault_fast_az2) before the disable,
+    and legacy convergence (fwd_batch_result_legacy_az2) after the disable. Scenario events suppress the fast-AZ2 flows
+    once protocol_disabled is applied, preventing post-disable logs from claiming fast-converge-v2 in AZ2.
+  - >
+    The remaining degradation at the end of the scenario is attributed to AZ1 continuing to use the fast protocol
+    (fwd_batch_result / device_fault), while AZ2 shows improvement after the single-AZ mitigation.
+  - >
+    noc_alerting.alarm_packet_loss is a true alarm log and is suppressed in normal (per_min=0.0) to avoid contradicting
+    the alarm wording with healthy loss values.
+  - >
+    To keep dx_health_automation.auto_isolation_skipped semantically consistent, threshold is fixed at 3 and failed_devices
+    is constrained to be >= 3, matching the message claim that auto-isolation was deferred due to exceeding a safety threshold.
+  - >
+    Normal-phase expected volume: ~21k logs over 25 minutes (dominant: dx_customer_batch_normal and dx_probe_batch_normal).
+  - >
+    Total expected scenario volume: ~41k logs (normal ~21k + failure ~20k), within the 20k..100k target.
+  - >
+    Key diagnostic visibility comes from frequent noc_alerting.alarm_packet_loss (failure only), elevated
+    dx_transport_layer.drop_metric, intermittent device_fault logs (AZ1 and pre-disable AZ2), and
+    dx_health_automation.auto_isolation_skipped, plus the explicit protocol switch visible as
+    fwd_batch_result_fast_az2 disappearing and fwd_batch_result_legacy_az2 appearing after mitigation.
+```

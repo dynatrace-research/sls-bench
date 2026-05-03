@@ -1,0 +1,174 @@
+```yaml
+scenario:
+  id: atl_backbone_route_leak_overload
+  title: Atlanta backbone route leak attracted traffic and overloaded router; later observability drops
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The edge network normally serves requests locally within POPs, using a private backbone for inter-POP routing when needed.
+    A configuration change on the Atlanta backbone router inadvertently makes Atlanta-exported routes overly preferred, attracting traffic from many POPs.
+    Atlanta becomes overloaded, affected POPs stop serving traffic locally, and many requests time out or return 5xx while overall traffic drops roughly in half.
+    Operations remove Atlanta from the backbone to restore customer traffic, but a central observability pipeline later congests and drops some telemetry.
+
+  trigger_desc: |
+    A network engineer commits a backbone routing policy change on the Atlanta router intended to reduce congestion, but the change unintentionally causes a broad iBGP route export with higher local preference.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        POPs serve HTTP requests locally with stable latency and low error rates. Backbone routing logs show
+        routine summaries, and occasional link congestion warnings may appear without impacting request success.
+        The observability pipeline ingests telemetry normally.
+      flows: [http_req_affected_ok_n, http_req_unaffected_ok_n]
+      manifestation:
+        [edge_pop_affected.req_complete_ok, edge_pop_unaffected.req_complete_ok, traffic_manager.pop_sample, backbone_router_atl.bgp_advertise_summary, core_observability.ingest_metric]
+
+    f:
+      desc: |
+        At failure start, a routing policy change in Atlanta causes traffic from many POPs to prefer Atlanta via the backbone.
+        Atlanta's router exports far more attractive routes, peers churn bestpath selection, and Atlanta overload causes packet drops and request failures.
+        The edge performs internal upstream retries toward Atlanta, and client requests complete with 5xx/timeouts.
+        Mitigation removes Atlanta from the backbone, restoring normal request routing and success, but later the observability ingest pipeline becomes congested and drops telemetry.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: backbone_router_atl
+          event: |
+            A configuration commit on the Atlanta backbone router is followed by a sharp increase in exported prefixes and bestpath changes toward Atlanta, concentrating traffic in Atlanta and driving upstream timeouts/retries and client 5xx from affected POPs while overall request volume drops.
+          why: |
+            The policy mistake makes many routes more preferred via Atlanta (higher local preference), which is directly observable via the commit marker plus elevated export/bestpath-churn logs; the customer impact is observable via frequent client error completions and upstream-fetch retry markers.
+          flows: [http_req_affected_to_atl_fail_f, http_req_affected_client_err_f, http_req_unaffected_ok_f]
+          rate_multipliers:
+            http_req_affected_ok_f: 0.0
+            http_req_unaffected_ok_f: 0.5
+            http_req_affected_client_err_f: 0.25
+            http_req_affected_to_atl_fail_f: 0.25
+            backbone_router_atl.bgp_advertise_summary: 2.0
+            backbone_router_atl.cpu_overload: 1.0
+            backbone_router_atl.forwarding_drops: 1.0
+            backbone_router_peer.bgp_bestpath_change: 2.0
+            backbone_router_atl.participation_status_disabled: 0.0
+            backbone_router_peer.neighbor_state_idle: 0.0
+            core_observability.drop_warn: 0.0
+          latency_multipliers:
+            http_req_affected_to_atl_fail_f: {p50: 1.2, p95: 1.3}
+            http_req_affected_client_err_f: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: backbone_router_atl.config_commit
+              count: 1
+              hosts: [atl01]
+            - ref: traffic_manager.anomaly_alert
+              count: 1
+              hosts: [tm01]
+          manifestation:
+            [backbone_router_atl.config_commit, backbone_router_atl.cpu_overload, backbone_router_peer.bgp_bestpath_change, edge_pop_affected.retrying_upstream, edge_pop_affected.req_complete_err]
+
+        - order: 2
+          at_min: 35
+          component: backbone_router_atl
+          event: |
+            Operations disable Atlanta from the backbone; BGP neighbor-down events occur and affected POPs resume local routing with request success returning.
+          why: |
+            Removing Atlanta from backbone participation withdraws the overly preferred paths and stops the traffic concentration; this is directly observable from the router disable marker and neighbor-down logs, and indirectly from the sharp drop in client error completions and upstream retries.
+          flows: [http_req_affected_ok_f, http_req_unaffected_ok_f]
+          rate_multipliers:
+            http_req_affected_ok_f: 1.0
+            http_req_unaffected_ok_f: 1.0
+            http_req_affected_client_err_f: 0.02
+            http_req_affected_to_atl_fail_f: 0.02
+            backbone_router_atl.cpu_overload: 0.0
+            backbone_router_atl.forwarding_drops: 0.0
+            backbone_router_atl.bgp_advertise_summary: 0.0
+            backbone_router_peer.bgp_bestpath_change: 0.4
+            backbone_router_atl.participation_status_disabled: 1.0
+            backbone_router_peer.neighbor_state_idle: 1.0
+          latency_multipliers:
+            http_req_affected_ok_f: {p50: 1.0, p95: 1.0}
+            http_req_unaffected_ok_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: backbone_router_atl.router_disabled
+              count: 1
+              hosts: [atl01]
+            - ref: backbone_router_peer.bgp_neighbor_down
+              count: 3
+              hosts: [ord01, ewr01, lon01]
+            - ref: traffic_manager.recovery_notice
+              count: 1
+              hosts: [tm01]
+          manifestation:
+            [backbone_router_atl.router_disabled, backbone_router_peer.bgp_neighbor_down, edge_pop_affected.req_complete_ok, backbone_router_atl.participation_status_disabled]
+
+        - order: 3
+          at_min: 40
+          component: core_observability
+          event: |
+            The core observability ingest pipeline develops backpressure and begins dropping some telemetry while edge request handling remains healthy.
+          why: |
+            Delayed ingestion pressure in the central pipeline leads to increased queue lag and explicit dropped-event warnings; this is directly observable from ingest stats and drop warnings, while customer traffic is not directly impacted in this phase.
+          flows: [http_req_affected_ok_f, http_req_unaffected_ok_f]
+          rate_multipliers:
+            core_observability.ingest_metric: 2.0
+            core_observability.drop_warn: 1.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation: [core_observability.ingest_metric, core_observability.drop_warn]
+
+      steady:
+        - component: core_observability
+          condition: |
+            Observability ingestion remains congested with elevated queue lag and intermittent dropped telemetry events.
+          user_impact: |
+            Customers mostly see recovered service, but operators have reduced visibility (some logs/metrics are missing or delayed), slowing verification and follow-up analysis.
+          manifestation: [core_observability.drop_warn, core_observability.ingest_metric]
+
+        - component: backbone_router_atl
+          condition: |
+            Atlanta remains out of backbone participation, and peers continue to show the Atlanta iBGP neighbor in a non-established state.
+          user_impact: |
+            Backbone paths avoid Atlanta; routing remains stable but with reduced backbone connectivity through that site.
+          manifestation: [backbone_router_atl.participation_status_disabled, backbone_router_peer.neighbor_state_idle]
+
+      feedback_loops:
+        - id: retry_storm_overload_loop
+          desc: |
+            As Atlanta overload causes upstream timeouts, the edge retries internal upstream fetches toward Atlanta,
+            amplifying load during the route-leak interval until Atlanta is removed from the backbone.
+
+      flows:
+        [http_req_affected_ok_f, http_req_unaffected_ok_f, http_req_affected_client_err_f, http_req_affected_to_atl_fail_f]
+      manifestation:
+        [edge_pop_affected.req_complete_err, edge_pop_affected.retrying_upstream, backbone_router_atl.forwarding_drops, core_observability.drop_warn]
+
+  assumptions:
+    - |
+      POP identity is treated as a semantic carrier for localized impact: edge_pop_affected emits only [ewr, ord, sjc, lon, ams]
+      and edge_pop_unaffected emits only [syd], preventing affected/unaffected flows from producing contradictory POP codes.
+    - |
+      The real incident durations (27-minute outage plus later observability disruption) are compressed to fit a short,
+      analysis-friendly window while preserving the causal sequence: route leak → Atlanta overload → mitigation → telemetry drops.
+    - |
+      Failure-phase piecewise breakdown (effective, approximate):
+      - mins 25-35 (10 min): overall entry traffic ~50% of normal (unaffected at 50%; affected error/timeout flows at 25% each);
+        affected local-success suppressed; Atlanta routing/overload signals elevated.
+      - mins 35-40 (5 min): customer traffic recovers near normal; Atlanta removed from backbone so overload/export-summary logs stop;
+        post-mitigation neighbor/participation markers appear; residual Atlanta-routed errors/retries are rare.
+      - mins 40-50 (10 min): customer traffic remains healthy; observability ingest metrics are elevated and drop warnings are present.
+    - |
+      One-shots per event: event1 (2), event2 (5), event3 (0).
+    - |
+      Visibility rationale: during mins 25-35, frequent client error completions plus retry markers (affected POPs only), along with
+      router/peer routing signals and an anomaly alert, make the trigger and localized impact clear; mitigation is marked by explicit
+      shutdown/neighbor-down one-shots plus ongoing disabled/idle status; the later observability issue is visible via ingest stats and
+      explicit drop warnings (rather than relying on missing logs).
+    - |
+      Total log volume estimate: normal ~30k logs (25 min * ~1200/min) + failure ~23k-30k logs (flows dominate; moderate background) ~= ~53k-60k logs total,
+      within 20k..100k.
+```

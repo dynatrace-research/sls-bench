@@ -1,0 +1,513 @@
+```yaml
+sys:
+  id: event_api_rds_cache_refresh
+  desc: >
+    A public API serves "bounce information" used for request gating (rate limit, sampling, blacklist) and reads
+    primarily from an in-process TTL cache. On cache miss or expiry, handlers refresh entries by querying a single
+    MySQL RDS instance and repopulating the cache. A periodic disk-usage cron workload writes stats into the same RDS.
+    During the modeled incident, DB latency increases trigger concurrent cache refreshes, overwhelming RDS and driving
+    API memory growth into OOM crash loops.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_gateway
+    name: API Gateway / Edge Proxy
+    svc: edge-gateway
+    hosts: [gw-1, gw-2]
+    desc: >
+      Terminates client connections and forwards requests to the API servers.
+      In failure it retries upstream requests on timeouts/5xx, increasing pressure on the API tier.
+      Gateway request/response logs in this model are per-upstream-attempt (not once per end-to-end client request).
+    to:
+      - dst: api_server
+        proto: https
+        desc: Forwards /v1/bounce requests to the API servers.
+    logs:
+      gw_in:
+        desc: Upstream attempt begins (attempt-scoped, emitted once per attempt).
+        lvl: INFO
+        msg: "upstream start {method} {route} upstream={upstream} attempt={attempt} trace={trace_id} client_ip={client_ip}"
+        vars:
+          method: {k: ch, v: [GET]}
+          route: {k: ch, v: [/v1/bounce]}
+          upstream: {k: ch, v: [api_server]}
+          attempt: {k: i, v: [1, 3]}
+          trace_id: {k: hex, v: 32}
+          client_ip: {k: ip, v: null}
+      gw_out:
+        desc: Upstream attempt finishes with status and observed duration (attempt-scoped).
+        lvl: INFO
+        msg: "upstream done {method} {route} upstream={upstream} attempt={attempt} status={status} dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET]}
+          route: {k: ch, v: [/v1/bounce]}
+          upstream: {k: ch, v: [api_server]}
+          attempt: {k: i, v: [1, 3]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            status: {k: ch, v: ["200"]}
+            dur_ms: {k: i, v: [8, 250]}
+          f:
+            status: {k: ch, v: ["200", "502", "503", "504"]}
+            dur_ms: {k: i, v: [30, 180000]}
+      gw_retry:
+        desc: Retry marker emitted between upstream attempts for the same client request.
+        lvl: INFO
+        msg: "retry upstream={upstream} attempt={attempt} backoff_ms={backoff_ms} reason={reason} trace={trace_id}"
+        vars:
+          upstream: {k: ch, v: [api_server]}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [80, 2500]}
+          reason: {k: ch, v: [upstream_timeout, upstream_5xx]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: Gateway emits no background logs in this model.
+        emit: []
+      f:
+        desc: Gateway emits no background logs in this model.
+        emit: []
+
+  - id: api_server
+    name: API Server
+    svc: api
+    hosts: [api-1, api-2, api-3, api-4]
+    desc: >
+      Serves /v1/bounce and maintains an in-process TTL cache. On cache miss/expiry, handlers refresh by querying RDS.
+      When DB latency rises, many goroutines concurrently refresh the same keys, driving high in-flight query counts and
+      memory usage; repeated OOMs cause restarts that clear caches and further increase DB load.
+    to:
+      - dst: rds_mysql
+        proto: jdbc
+        desc: Queries MySQL for bounce information and other lookup tables.
+      - dst: api_gateway
+        proto: https
+        desc: Sends responses back through the gateway.
+    logs:
+      api_req_start:
+        desc: Request handler begins.
+        lvl: INFO
+        msg: "start {method} {route} req_id={req_id} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET]}
+          route: {k: ch, v: [/v1/bounce]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      api_cache_hit:
+        desc: Cache hit for a bounce-info key.
+        lvl: DEBUG
+        msg: "cache hit key={cache_key} ttl_s={ttl_s} trace={trace_id}"
+        vars:
+          cache_key: {k: str, v: "bounce:{team_id}"}
+          ttl_s: {k: i, v: [1, 900]}
+          trace_id: {k: hex, v: 32}
+      api_cache_miss:
+        desc: Cache miss/expiry for a bounce-info key.
+        lvl: INFO
+        msg: "cache miss key={cache_key} trace={trace_id}"
+        vars:
+          cache_key: {k: str, v: "bounce:{team_id}"}
+          trace_id: {k: hex, v: 32}
+      api_cache_refresh_start:
+        desc: Handler begins refreshing an expired/missing cache key; includes estimated concurrency.
+        lvl: WARN
+        msg: "refreshing key={cache_key} refreshers_inflight={refreshers_inflight} trace={trace_id}"
+        vars:
+          cache_key: {k: str, v: "bounce:{team_id}"}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            refreshers_inflight: {k: i, v: [1, 6]}
+          f:
+            refreshers_inflight: {k: i, v: [20, 800]}
+      api_db_query:
+        desc: Database query issued and completed (duration is DB time observed by the API).
+        lvl: INFO
+        msg: "db query name={query} dur_ms={dur_ms} rows={rows} trace={trace_id}"
+        vars:
+          query: {k: ch, v: [bounce_rate_limit, bounce_sampling, bounce_blacklist]}
+          rows: {k: i, v: [0, 200]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [3, 220]}
+          f:
+            dur_ms: {k: i, v: [80, 180000]}
+      api_resp_ok:
+        desc: Handler completes successfully.
+        lvl: INFO
+        msg: "completed status=200 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [8, 300]}
+          f:
+            dur_ms: {k: i, v: [40, 190000]}
+      api_resp_err:
+        desc: Handler completes with error (typically upstream DB slowness/timeouts).
+        lvl: ERROR
+        msg: "completed status={status} dur_ms={dur_ms} err={err} trace={trace_id}"
+        vars:
+          status: {k: ch, v: ["502", "503", "504"]}
+          err: {k: ch, v: ["context deadline exceeded", "db timeout", "upstream overloaded"]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [50, 1500]}
+          f:
+            dur_ms: {k: i, v: [2000, 140000]}
+      api_mem_stats:
+        desc: Periodic runtime stats to observe memory and goroutine growth.
+        lvl: INFO
+        msg: "runtime mem rss_mb={rss_mb} heap_mb={heap_mb} goroutines={goroutines}"
+        vars: {}
+        state_vars:
+          n:
+            rss_mb: {k: i, v: [220, 850]}
+            heap_mb: {k: i, v: [140, 650]}
+            goroutines: {k: i, v: [120, 800]}
+          f:
+            rss_mb: {k: i, v: [650, 3200]}
+            heap_mb: {k: i, v: [450, 2500]}
+            goroutines: {k: i, v: [1500, 18000]}
+      api_oom:
+        desc: Process hits a Go runtime out-of-memory fatal error and crashes.
+        lvl: CRITICAL
+        msg: "runtime out of memory; rss_mb={rss_mb} goroutines={goroutines}"
+        vars:
+          rss_mb: {k: i, v: [1400, 3400]}
+          goroutines: {k: i, v: [8000, 20000]}
+      api_startup:
+        desc: API server process starts (typically after a crash during the incident).
+        lvl: INFO
+        msg: "server started version={version} build={build} warm_cache={warm_cache}"
+        vars:
+          version: {k: ch, v: ["1.42.0"]}
+          build: {k: ch, v: ["2024-10-04.1"]}
+          warm_cache: {k: ch, v: ["true", "false"]}
+    beh:
+      n:
+        desc: Normal servers emit runtime stats and only rarely restart.
+        emit:
+          - id: api_mem_stats
+            per_min: 1.0
+            scope: per_host
+          - id: api_startup
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: During failure, servers show elevated memory/goroutines and may crash/restart repeatedly.
+        emit:
+          - id: api_mem_stats
+            per_min: 1.0
+            scope: per_host
+          - id: api_oom
+            per_min: 0.25
+            scope: per_host
+          - id: api_startup
+            per_min: 0.25
+            scope: per_host
+
+  - id: rds_mysql
+    name: MySQL on RDS
+    svc: rds-mysql
+    hosts: [rds-1]
+    desc: >
+      Single primary MySQL database backing the API and the disk-usage stats workload.
+      The incident is characterized by sustained high CPU and increased connection pressure, degrading query latency.
+    to:
+      - dst: api_server
+        proto: tcp
+        desc: Returns query results to API servers.
+      - dst: disk_usage_worker
+        proto: tcp
+        desc: Accepts writes from the disk-usage worker.
+    logs:
+      rds_metrics:
+        desc: Per-minute resource and throughput metrics.
+        lvl: INFO
+        msg: "rds metrics cpu_pct={cpu_pct} conns={conns} qps={qps}"
+        vars: {}
+        state_vars:
+          n:
+            cpu_pct: {k: i, v: [25, 60]}
+            conns: {k: i, v: [40, 200]}
+            qps: {k: i, v: [1, 10]}
+          f:
+            cpu_pct: {k: i, v: [55, 85]}
+            conns: {k: i, v: [120, 900]}
+            qps: {k: i, v: [3, 25]}
+      rds_metrics_hot:
+        desc: Per-minute metrics when RDS is effectively stalled near ~90% CPU.
+        lvl: WARN
+        msg: "rds hot cpu_pct={cpu_pct} conns={conns} qps={qps}"
+        vars:
+          cpu_pct: {k: i, v: [85, 95]}
+          conns: {k: i, v: [500, 1400]}
+          qps: {k: i, v: [4, 18]}
+    beh:
+      n:
+        desc: RDS runs with moderate baseline CPU and occasional spikes (not explicitly periodic here).
+        emit:
+          - id: rds_metrics
+            per_min: 1.0
+            scope: global
+          - id: rds_metrics_hot
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Failure baseline includes higher CPU/connection pressure; "hot" metrics are enabled by failure events.
+        emit:
+          - id: rds_metrics
+            per_min: 1.0
+            scope: global
+          - id: rds_metrics_hot
+            per_min: 1.0
+            scope: global
+
+  - id: disk_usage_worker
+    name: Disk Usage Cron Worker
+    svc: disk-usage-worker
+    hosts: [du-1]
+    desc: >
+      Periodic job that writes disk usage statistics per dataset into RDS.
+      During the incident, a write-heavy run contributes to DB load and coincides with the onset of cache refresh storms.
+    to:
+      - dst: rds_mysql
+        proto: jdbc
+        desc: Writes disk usage statistics to MySQL.
+    logs:
+      du_write_stmt:
+        desc: One DB write statement for disk-usage statistics.
+        lvl: INFO
+        msg: "disk-usage write dataset_id={dataset_id} bytes={bytes} dur_ms={dur_ms} result={result}"
+        vars:
+          dataset_id: {k: i, v: [1, 4000]}
+          bytes: {k: i, v: [1000000, 50000000]}
+          result: {k: ch, v: [ok, error]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [10, 220]}
+          f:
+            dur_ms: {k: i, v: [80, 2500]}
+    beh:
+      n:
+        desc: No background logs; modeled workload is via explicit flow.
+        emit: []
+      f:
+        desc: No background logs; modeled workload is via explicit flow.
+        emit: []
+
+  - id: autoscaler_controller
+    name: Autoscaler / On-call Control Plane
+    svc: autoscaler
+    hosts: [asgctl-1]
+    desc: >
+      Records autoscaling state and manual capacity changes. In the incident, on-call temporarily reduces capacity
+      to relieve retry pressure.
+    to: []
+    logs:
+      asg_status:
+        desc: Periodic autoscaling group status.
+        lvl: INFO
+        msg: "asg status desired={desired} in_service={in_service}"
+        vars:
+          desired: {k: i, v: [2, 10]}
+          in_service: {k: i, v: [1, 10]}
+      asg_scale_action:
+        desc: Manual change to desired capacity.
+        lvl: WARN
+        msg: "set desired capacity from {from} to {to} reason={reason}"
+        vars:
+          from: {k: i, v: [6, 10]}
+          to: {k: i, v: [2, 5]}
+          reason: {k: ch, v: [reduce_retry_pressure, shed_load]}
+    beh:
+      n:
+        desc: Periodic status in normal.
+        emit:
+          - id: asg_status
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Periodic status continues during failure.
+        emit:
+          - id: asg_status
+            per_min: 0.5
+            scope: global
+
+tracing:
+  on: true
+  origins: [api_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic is dominated by cache hits for bounce information; cache misses refresh from RDS with low latency.
+      The disk-usage worker performs a low steady rate of writes (periodicity not explicitly modeled in normal phase).
+    req:
+      - id: api_get_bounce_cache_hit
+        desc: /v1/bounce served from in-process cache.
+        rpm: 140
+        path: [api_gateway, api_server, api_gateway]
+        emit:
+          - api_gateway.gw_in
+          - api_server.api_req_start
+          - api_server.api_cache_hit
+          - api_server.api_resp_ok
+          - api_gateway.gw_out
+        latency_ms: [[1, 3], [0, 2], [0, 2], [6, 25], [1, 3]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: api_get_bounce_cache_miss
+        desc: /v1/bounce cache miss triggers refresh query to RDS and repopulation.
+        rpm: 30
+        path: [api_gateway, api_server, rds_mysql, api_server, api_gateway]
+        emit:
+          - api_gateway.gw_in
+          - api_server.api_req_start
+          - api_server.api_cache_miss
+          - api_server.api_cache_refresh_start
+          - api_server.api_db_query
+          - api_server.api_resp_ok
+          - api_gateway.gw_out
+        latency_ms: [[1, 3], [0, 2], [0, 2], [0, 3], [30, 160], [6, 35], [1, 3]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: disk_usage_write_stmt
+        desc: One disk-usage stats write statement from cron worker to RDS.
+        rpm: 2
+        path: [disk_usage_worker, rds_mysql]
+        emit: [disk_usage_worker.du_write_stmt]
+        latency_ms: [[15, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      DB latency rises and cache refresh concurrency amplifies, producing slow requests, timeouts, and gateway retries.
+      A write-heavy disk-usage run adds load to RDS. Later, API servers OOM and restart, clearing caches and shifting
+      even more traffic to RDS.
+    req:
+      - id: api_get_bounce_cache_hit_f
+        desc: Cache hits still occur but overall latency increases modestly.
+        rpm: 130
+        path: [api_gateway, api_server, api_gateway]
+        emit:
+          - api_gateway.gw_in
+          - api_server.api_req_start
+          - api_server.api_cache_hit
+          - api_server.api_resp_ok
+          - api_gateway.gw_out
+        latency_ms: [[1, 5], [0, 4], [0, 3], [40, 2500], [1, 6]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [api_gateway.gw_retry]
+          backoff_ms: [[80, 300]]
+        trace: true
+
+      - id: api_get_bounce_cache_miss_f
+        desc: Cache misses refresh from RDS with elevated latency; some may succeed after retries.
+        rpm: 70
+        path: [api_gateway, api_server, rds_mysql, api_server, api_gateway]
+        emit:
+          - api_gateway.gw_in
+          - api_server.api_req_start
+          - api_server.api_cache_miss
+          - api_server.api_cache_refresh_start
+          - api_server.api_db_query
+          - api_server.api_resp_ok
+          - api_gateway.gw_out
+        latency_ms: [[1, 5], [0, 4], [0, 4], [0, 8], [1500, 20000], [50, 2500], [1, 8]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.0
+          emit_per_retry: [api_gateway.gw_retry]
+          backoff_ms: [[120, 500], [250, 900]]
+        trace: true
+
+      - id: api_get_bounce_refresh_storm_f
+        desc: Thundering herd refresh where many goroutines concurrently refresh the same keys.
+        rpm: 40
+        path: [api_gateway, api_server, rds_mysql, api_server, api_gateway]
+        emit:
+          - api_gateway.gw_in
+          - api_server.api_req_start
+          - api_server.api_cache_miss
+          - api_server.api_cache_refresh_start
+          - api_server.api_db_query
+          - api_server.api_resp_ok
+          - api_gateway.gw_out
+        latency_ms: [[1, 6], [0, 5], [0, 5], [0, 10], [5000, 60000], [80, 6000], [1, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.1
+          emit_per_retry: [api_gateway.gw_retry]
+          backoff_ms: [[150, 650], [320, 1200]]
+        trace: true
+
+      - id: api_get_bounce_db_timeout_f
+        desc: Requests that exceed handler DB deadlines and return errors (often retried at the gateway).
+        rpm: 25
+        path: [api_gateway, api_server, rds_mysql, api_server, api_gateway]
+        emit:
+          - api_gateway.gw_in
+          - api_server.api_req_start
+          - api_server.api_cache_miss
+          - api_server.api_cache_refresh_start
+          - api_server.api_db_query
+          - api_server.api_resp_err
+          - api_gateway.gw_out
+        latency_ms: [[1, 6], [0, 5], [0, 5], [0, 12], [20000, 120000], [10, 120], [1, 12]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [api_gateway.gw_retry]
+          backoff_ms: [[200, 900], [450, 2000]]
+        trace: true
+
+      - id: disk_usage_write_stmt_f
+        desc: Disk-usage write statements contend with API queries on RDS.
+        rpm: 2
+        path: [disk_usage_worker, rds_mysql]
+        emit: [disk_usage_worker.du_write_stmt]
+        latency_ms: [[120, 2200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Names/routes are genericized; 'bounce information' stands for rate limit/sampling/blacklist lookups described in the postmortem."
+  - "The cache is modeled as in-process on API servers (no separate Redis/Memcached component); restarts implicitly clear it."
+  - "Gateway logs (gw_in/gw_out) are attempt-scoped to remain coherent with retries; end-to-end client response logging is not modeled separately."
+  - "The disk-usage cron is represented as a stream of write statements (disk_usage_write_stmt*) to capture DB write load without modeling an entire batch job lifecycle."
+  - "The incident's 'thousands of in-flight queries' is scaled down to a few hundred in-flight refreshers to keep request rates and log volume within the 20k–100k target while preserving the same causal feedback loop."
+  - "Crash-loop coherence: failure-state api_startup per_min is aligned to api_oom per_min so restarts roughly correspond to OOM crash frequency (extra non-OOM restarts are not modeled)."
+  - "Autoscaler manual action log domains are constrained so {to} is always less than {from}, ensuring the minute-38 event cannot contradict itself by emitting a scale-up."
+  - "Normal-phase traffic is modeled at ~172 RPM total across hit/miss; normal logs/min ≈ 140*5 + 30*7 + 2*1 ≈ 912 logs/min (+~6/min background metrics) => ~918 logs/min."
+  - "Failure-phase request rates are increased vs normal to represent retry amplification and cache-cold behavior; long DB latencies (up to ~180s in api_db_query) make high in-flight counts quantitatively plausible."
+  - "Scenario-sized volume target: with a 44 minute run and modeled retries, total logs are expected ~80k–90k (bounded below 100k)."
+  - "Key diagnostic visibility is ensured by (a) per-minute RDS metrics, (b) frequent cache miss/refresh logs under failure, (c) gateway retry markers, and (d) API OOM/startup background logs enabled mid-incident."
+```

@@ -1,0 +1,258 @@
+```yaml
+scenario:
+  id: us_east_az_ebs_memory_leak_and_api_throttling_2012_10_22
+  title: AZ EBS host memory leak causes stuck volumes; aggressive API throttling degrades Describe* calls
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally serves steady block I/O from storage servers and allows customers to manage resources through the EC2/EBS APIs.
+    A stale internal DNS record causes storage hosts’ low-priority collection-agent to repeatedly contact a dead collector endpoint, triggering a latent memory leak and rising memory pressure.
+    As memory becomes constrained, volume I/O latency increases and some requests time out, causing a surge in failover/recovery tasks that further stresses the AZ.
+    During recovery efforts, operators enable an overly aggressive API throttling policy that disproportionately throttles Describe* calls, degrading management/console usability; the incident ends with partial mitigation but persistent AZ degradation.
+
+  trigger_desc: |
+    An internal DNS change for the fleet collector endpoint is not fully propagated; at failure onset, some storage hosts keep resolving the old collector address and the collection-agent enters a retry loop that leaks memory.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Storage hosts report successfully to the fleet collector and maintain healthy free memory.
+        EBS I/O completes quickly with few errors, and customer APIs (Describe* and mutations) return successful responses.
+        Failover activity is minimal and cluster health metrics show near-zero stuck volumes.
+      flows: [ebs_io_ok, api_describe_ok, api_mutation_ok]
+      manifestation:
+        - ebs_storage.host_mem_sample
+        - ebs_storage.agent_report_ok
+        - ebs_failover_mgr.failover_metrics_1m
+        - api_frontend.api_resp_200
+
+    f:
+      desc: |
+        A subset of storage hosts keeps resolving a stale collector endpoint and the collection-agent begins failing reports and leaking memory.
+        Memory pressure on storage hosts increases I/O latency, then produces timeouts/stuck volumes; failover activity later surges and becomes self-amplifying.
+        Operators later reduce failover throughput to stabilize the system, which helps but does not fully restore the AZ.
+        During ongoing recovery, an aggressive API throttling policy is enabled and heavily impacts Describe* calls for some customers until it is relaxed.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: internal_dns
+          event: |
+            Stale internal DNS responses persist for the fleet collector name; storage hosts begin repeated collection-agent connection failures.
+            Early I/O degradation appears, while failover activity remains relatively low.
+          why: |
+            Storage hosts use internal DNS to find the collector endpoint. A stale record points the agent at an unreachable collector address,
+            and a latent bug causes the agent to retry in a way that steadily increases its memory footprint (partially observable via agent errors and host memory samples).
+          flows: [ebs_io_ok, ebs_io_timeout, api_describe_ok, api_mutation_ok]
+          rate_multipliers:
+            api_describe_throttled_aggressive: 0.0
+            api_describe_throttled_relaxed: 0.0
+            ebs_io_timeout: 0.8
+            ebs_failover_mgr.failover_task_enqueued: 0.3
+            ebs_failover_mgr.failover_metrics_1m: 0.0
+            ebs_failover_mgr.failover_rate_limited: 0.0
+            ebs_storage.low_free_mem: 0.6
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - ebs_storage.agent_report_err
+            - ebs_storage.host_mem_sample
+            - ebs_storage.io_timeout
+
+        - order: 2
+          at_min: 35
+          component: ebs_storage
+          event: |
+            Memory pressure becomes correlated across multiple storage hosts, increasing I/O queueing and causing a rapid rise in timed-out (stuck) I/O.
+            Failover task creation spikes and cluster failover metrics show high stuck volume counts and shrinking healthy host capacity.
+          why: |
+            As leaked memory accumulates, normal request-handling processes cannot keep up; volumes stop making forward progress and appear stuck.
+            The failover system reacts by enqueuing recovery/failover work, but the cluster has fewer healthy targets at the same time
+            (observable via failover metrics and increased io_timeout volume).
+          flows: [ebs_io_timeout, ebs_io_ok]
+          rate_multipliers:
+            ebs_io_timeout: 2.5
+            ebs_failover_mgr.failover_task_enqueued: 20.0
+            ebs_failover_mgr.failover_metrics_1m: 5.0
+            ebs_storage.low_free_mem: 4.0
+          latency_multipliers:
+            ebs_io_ok: {p50: 1.6, p95: 2.0}
+            api_describe_ok: {p50: 1.3, p95: 1.4}
+          one_shots: []
+          manifestation:
+            - ebs_failover_mgr.failover_metrics_1m
+            - ebs_failover_mgr.failover_task_enqueued
+            - ebs_storage.low_free_mem
+            - ebs_storage.io_timeout
+
+        - order: 3
+          at_min: 40
+          component: ebs_failover_mgr
+          event: |
+            Operators reduce failover throughput to remove load; failover activity drops and I/O timeouts reduce but do not disappear.
+            Rate-limiting warnings appear as the new limit is enforced.
+          why: |
+            High failover concurrency competes with normal recovery and worsens correlated stress. Reducing the failover rate prevents the control plane from
+            continuously churning volumes when too few healthy hosts exist (directly observable via the reduction marker and rate-limited warnings).
+          flows: [ebs_io_timeout, ebs_io_ok]
+          rate_multipliers:
+            ebs_failover_mgr.failover_task_enqueued: 6.0
+            ebs_io_timeout: 1.2
+            ebs_failover_mgr.failover_rate_limited: 20.0
+          latency_multipliers:
+            ebs_io_ok: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: ebs_failover_mgr.failover_rate_limit_reduced
+              count: 1
+              hosts: [failover-1]
+          manifestation:
+            - ebs_failover_mgr.failover_rate_limit_reduced
+            - ebs_failover_mgr.failover_rate_limited
+            - ebs_storage.io_timeout
+
+        - order: 4
+          at_min: 45
+          component: api_frontend
+          event: |
+            An aggressive throttling policy is enabled to protect the control plane during recovery, sharply increasing throttled Describe* responses.
+          why: |
+            During large operational events, clients and automation often increase retry traffic. The team enables a stronger throttling policy, but it is too aggressive for some customers,
+            causing many Describe* requests to be rejected (directly observable via aggressive-policy 429 responses and the policy-change marker).
+          flows: [api_describe_throttled_aggressive, api_describe_ok]
+          rate_multipliers:
+            api_describe_throttled_aggressive: 1600.0
+            api_describe_throttled_relaxed: 0.0
+            api_describe_ok: 0.7
+          latency_multipliers: {}
+          one_shots:
+            - ref: api_frontend.throttle_policy_set_aggressive
+              count: 1
+              hosts: [api-1]
+          manifestation:
+            - api_frontend.throttle_policy_set_aggressive
+            - api_frontend.api_resp_429_aggressive
+
+        - order: 5
+          at_min: 53
+          component: api_frontend
+          event: |
+            The throttling policy is relaxed; Describe* throttling drops substantially but remains present.
+          why: |
+            After observing customer impact, the team reduces the aggressiveness of throttling to restore manageability while retaining some protection
+            (observable via a relaxed-policy marker and relaxed-policy 429 responses afterward).
+          flows: [api_describe_throttled_relaxed, api_describe_ok]
+          rate_multipliers:
+            api_describe_throttled_aggressive: 0.0
+            api_describe_throttled_relaxed: 320.0
+            api_describe_ok: 0.9
+          latency_multipliers: {}
+          one_shots:
+            - ref: api_frontend.throttle_policy_set_relaxed
+              count: 1
+              hosts: [api-2]
+          manifestation:
+            - api_frontend.throttle_policy_set_relaxed
+            - api_frontend.api_resp_429_relaxed
+
+        - order: 6
+          at_min: 55
+          component: ebs_storage
+          event: |
+            The team identifies the misbehaving collection-agent and restarts it on storage hosts, freeing memory and reducing the rate of I/O timeouts.
+            Agent connection failures continue at a lower level (stale DNS is not fully eliminated in this modeled window).
+          why: |
+            Restarting the agent reclaims leaked memory and reduces pressure on request-handling processes, which lowers queueing and timeouts.
+            This is directly observable as action markers and a drop in low-memory warnings and io_timeout frequency, while lingering agent errors indicate the underlying DNS mismatch persists on some hosts.
+          flows: [ebs_io_timeout, ebs_io_ok]
+          rate_multipliers:
+            ebs_storage.agent_report_err: 0.4
+            ebs_storage.low_free_mem: 0.5
+            ebs_io_timeout: 0.6
+            ebs_failover_mgr.failover_task_enqueued: 1.5
+            ebs_failover_mgr.failover_rate_limited: 10.0
+            api_describe_ok: 0.95
+          latency_multipliers:
+            ebs_io_ok: {p50: 0.9, p95: 0.9}
+            api_describe_ok: {p50: 0.95, p95: 0.95}
+          one_shots:
+            - ref: ebs_storage.agent_restart
+              count: 3
+              hosts: [ebs-a1, ebs-a2, ebs-a3]
+          manifestation:
+            - ebs_storage.agent_restart
+            - ebs_storage.low_free_mem
+            - ebs_storage.io_timeout
+
+      steady:
+        - component: ebs_storage
+          condition: |
+            The AZ remains partially degraded: some volumes continue to exhibit slow/stuck I/O due to lingering resource pressure and ongoing recovery work.
+          user_impact: |
+            Instances using affected volumes see elevated I/O latency and intermittent I/O timeouts; workloads in other AZs are unaffected.
+          manifestation:
+            - ebs_storage.io_timeout
+            - ebs_storage.low_free_mem
+            - ebs_failover_mgr.failover_metrics_1m
+        - component: api_frontend
+          condition: |
+            Describe* APIs remain partially throttled under a relaxed policy while recovery continues.
+          user_impact: |
+            Some customers and management tooling experience intermittent 429 throttling on Describe* calls, reducing console/API usability.
+          manifestation:
+            - api_frontend.api_resp_429_relaxed
+            - api_frontend.api_agg_1m
+
+      feedback_loops:
+        - id: correlated_host_pressure_to_failover_storm
+          desc: |
+            Agent memory leak reduces effective capacity across multiple storage hosts at once, increasing stuck volumes.
+            The failover manager responds with more recovery tasks, which adds more background work and contention in the same AZ,
+            further reducing capacity and producing additional stuck volumes.
+
+      flows:
+        - ebs_io_ok
+        - ebs_io_timeout
+        - api_describe_ok
+        - api_describe_throttled_aggressive
+        - api_describe_throttled_relaxed
+        - api_mutation_ok
+      manifestation:
+        - ebs_storage.agent_report_err
+        - ebs_storage.host_mem_sample
+        - ebs_storage.io_timeout
+        - ebs_failover_mgr.failover_task_enqueued
+        - ebs_failover_mgr.failover_metrics_1m
+        - api_frontend.api_resp_429_aggressive
+        - api_frontend.api_resp_429_relaxed
+
+  assumptions:
+    - |
+      The real event lasted many hours; this scenario compresses the timeline into 60 minutes while preserving ordering:
+      latent DNS issue -> memory leak -> stuck volumes/failover storm -> failover rate reduction -> aggressive API throttling -> throttling relaxed -> agent restart mitigates but does not fully resolve.
+    - |
+      Repair note (S8): failover_metrics_1m is suppressed at failure onset (min 25) and enabled at storm time (min 35) so early failure does not
+      immediately look like peak stuck-volume conditions; the failure-state metric domains were also widened to allow non-peak values during later mitigation.
+    - |
+      Failure-phase piecewise volume estimate (approx):
+        - mins 25-35 (10m): ~690–740 logs/min (early degradation; low failover; failover metrics suppressed; no Describe* throttling) => ~6.9k–7.4k logs.
+        - mins 35-40 (5m): ~800–880 logs/min (storm: io_timeout up; failover tasks/metrics elevated) => ~4.0k–4.4k logs.
+        - mins 40-45 (5m): ~720–780 logs/min (failover reduced; rate-limited warnings appear) => ~3.6k–3.9k logs.
+        - mins 45-53 (8m): ~790–860 logs/min (aggressive Describe* throttling visible) => ~6.3k–6.9k logs.
+        - mins 53-55 (2m): ~720–780 logs/min (relaxed throttling) => ~1.4k–1.6k logs.
+        - mins 55-60 (5m): ~700–760 logs/min (agent restart reduces io_timeout/low_mem; failover drops) => ~3.5k–3.8k logs.
+      Normal phase (25m): ~840–870 logs/min => ~21k–22k logs.
+      Total expected: ~46k–52k logs (within 20k–100k).
+    - |
+      One-shot counts: failover_rate_limit_reduced x1 at min 40; throttle_policy_set_aggressive x1 at min 45; throttle_policy_set_relaxed x1 at min 53; agent_restart x3 at min 55.
+    - |
+      Key diagnostics are likely visible in a single log file because agent_report_err/host_mem_sample are per-host periodic,
+      failover_task_enqueued sustains tens-to-hundreds per minute during the storm window, failover_rate_limited occurs repeatedly after the rate-limit change,
+      io_timeout is sustained during mid-failure, and throttling changes are explicitly marked by policy-specific one-shots plus policy-specific 429 responses.
+```

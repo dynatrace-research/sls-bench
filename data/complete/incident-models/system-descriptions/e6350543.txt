@@ -1,0 +1,366 @@
+```yaml
+sys:
+  id: maps_tile_delivery_kartotherian
+  desc: >
+    A CDN edge (ATS) serves map tile requests for maps.wikimedia.org and forwards a subset of traffic to Kartotherian origins
+    through an L4 LVS service. During a capacity shift, some origins run on Kubernetes workers while the rest remain on
+    bare metal. Because LVS only balances TCP, TLS is end-to-end between ATS and the origin, so origin certificate/SNI
+    compatibility directly affects user-visible success on origin-forwarded requests.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_ats
+    name: ATS Edge Cache
+    svc: ats
+    hosts: [ats-edge1, ats-edge2]
+    desc: >
+      Terminates client connections and proxies origin-forwarded requests to Kartotherian via LVS.
+      Uses the requested Host as TLS SNI when connecting to the origin.
+    to:
+      - dst: lvs_kart
+        proto: tcp
+        desc: L4-balanced TCP connection to Kartotherian origins (TLS passes through LVS).
+      - dst: logstash
+        proto: kafka
+        desc: Ships structured webrequest logs to centralized logging.
+    logs:
+      webrequest_ok:
+        desc: Successful client-facing request log emitted at request completion for origin-forwarded requests.
+        lvl: INFO
+        msg: "webrequest host={host} method=GET uri={uri} status=200 backend={backend} bytes={bytes} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          host: {k: ch, v: [maps.wikimedia.org]}
+          uri: {k: ch, v: ["/osm-intl/<z>/<x>/<y>.png", "/osm-intl/<z>/<x>/<y>.pbf", "/styles/<style>/<z>/<x>/<y>.png"]}
+          backend: {k: ch, v: [kart-bm1, kart-bm2]}
+          bytes: {k: i, v: [800, 90000]}
+          dur_ms: {k: i, v: [8, 220]}
+          trace_id: {k: hex, v: 32}
+
+      origin_tls_handshake_fail:
+        desc: ATS log emitted when the TLS handshake to an origin fails due to certificate validation.
+        lvl: WARN
+        msg: 'origin tls handshake failed backend={backend} sni={sni} err="x509: certificate is valid for {peer_san_sample}, not {sni}" handshake_ms={handshake_ms} trace_id={trace_id}'
+        vars:
+          backend: {k: ch, v: [kart-k8s1, kart-k8s2, kart-k8s3]}
+          sni: {k: ch, v: [maps.wikimedia.org]}
+          peer_san_sample: {k: ch, v: [kartotherian.svc.cluster.local, kartotherian.discovery.local, "*.wikikube.internal"]}
+          handshake_ms: {k: i, v: [1, 35]}
+          trace_id: {k: hex, v: 32}
+
+      webrequest_502:
+        desc: Client-facing request log for a failed attempt after origin TLS handshake failure.
+        lvl: ERROR
+        msg: "webrequest host={host} method=GET uri={uri} status=502 backend={backend} origin_error=tls_handshake_failed dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          host: {k: ch, v: [maps.wikimedia.org]}
+          uri: {k: ch, v: ["/osm-intl/<z>/<x>/<y>.png", "/osm-intl/<z>/<x>/<y>.pbf", "/styles/<style>/<z>/<x>/<y>.png"]}
+          backend: {k: ch, v: [kart-k8s1, kart-k8s2, kart-k8s3]}
+          dur_ms: {k: i, v: [3, 140]}
+          trace_id: {k: hex, v: 32}
+
+      conn_summary_ok:
+        desc: Periodic summary of origin-forwarding activity at the edge during healthy operation (near-zero TLS failures).
+        lvl: INFO
+        msg: "ats origin summary origin_rpm={origin_rpm} origin_tls_fail_rpm={origin_tls_fail_rpm}"
+        vars:
+          origin_rpm: {k: i, v: [500, 1100]}
+          origin_tls_fail_rpm: {k: i, v: [0, 2]}
+
+      conn_summary_elevated:
+        desc: Periodic summary of origin-forwarding activity at the edge during the incident (visible origin TLS failures).
+        lvl: INFO
+        msg: "ats origin summary origin_rpm={origin_rpm} origin_tls_fail_rpm={origin_tls_fail_rpm}"
+        vars:
+          origin_rpm: {k: i, v: [500, 1100]}
+          origin_tls_fail_rpm: {k: i, v: [5, 80]}
+    beh:
+      n:
+        desc: Mostly steady origin-forwarding volume with low background noise.
+        emit:
+          - id: conn_summary_ok
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Summary logs continue, but which summary variant appears depends on whether bad backends are pooled.
+        emit:
+          - id: conn_summary_ok
+            per_min: 0.5
+            scope: per_host
+          - id: conn_summary_elevated
+            per_min: 0.5
+            scope: per_host
+
+  - id: lvs_kart
+    name: LVS Kartotherian Service
+    svc: lvs-kartotherian
+    hosts: [lvs-a, lvs-b]
+    desc: >
+      L4 load balancer that forwards TCP connections from ATS to either bare-metal or Kubernetes Kartotherian backends.
+      Health and pooling decisions are independent of TLS correctness because TLS is not terminated here.
+    to:
+      - dst: kart_baremetal
+        proto: tcp
+        desc: Forwards TCP connections to bare-metal Kartotherian.
+      - dst: kart_k8s
+        proto: tcp
+        desc: Forwards TCP connections to Kubernetes Kartotherian workers.
+    logs:
+      pool_k8s_backend:
+        desc: Configuration change log when Kubernetes backends are pooled for migration.
+        lvl: INFO
+        msg: "confctl pool service=kartotherian backend={backend} reason=migration"
+        vars:
+          backend: {k: ch, v: [kart-k8s1, kart-k8s2, kart-k8s3]}
+      depool_k8s_backend:
+        desc: Configuration change log when Kubernetes backends are depooled during rollback.
+        lvl: INFO
+        msg: "confctl depool service=kartotherian backend={backend} reason=rollback_tls_errors"
+        vars:
+          backend: {k: ch, v: [kart-k8s1, kart-k8s2, kart-k8s3]}
+      pool_status:
+        desc: Periodic snapshot of pool composition for the service.
+        lvl: INFO
+        msg: "lvs pool service=kartotherian baremetal_up={baremetal_up} k8s_up={k8s_up} conns={conns}"
+        vars:
+          baremetal_up: {k: i, v: [2, 2]}
+          conns: {k: i, v: [800, 9000]}
+        state_vars:
+          n:
+            k8s_up: {k: i, v: [0, 0]}
+          f:
+            k8s_up: {k: i, v: [0, 3]}
+    beh:
+      n:
+        desc: Pool is stable; only periodic status snapshots.
+        emit:
+          - id: pool_status
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Pool may be modified operationally; status snapshots continue.
+        emit:
+          - id: pool_status
+            per_min: 1.0
+            scope: per_host
+
+  - id: kart_baremetal
+    name: Kartotherian (Bare Metal)
+    svc: kartotherian
+    hosts: [kart-bm1, kart-bm2]
+    desc: >
+      Kartotherian origin instances with a TLS certificate that validates for maps.wikimedia.org.
+      Serves most requests during and after rollback.
+    to: []
+    logs:
+      metrics:
+        desc: Periodic service metrics emitted by the origin.
+        lvl: INFO
+        msg: "kartotherian metrics host={host} req_rps={req_rps} p95_ms={p95_ms} err5xx_rps={err5xx_rps}"
+        vars:
+          host: {k: ch, v: [kart-bm1, kart-bm2]}
+          req_rps: {k: f, v: [1.0, 30.0]}
+          p95_ms: {k: i, v: [20, 260]}
+          err5xx_rps: {k: f, v: [0.0, 1.0]}
+    beh:
+      n:
+        desc: Low-rate metrics emission.
+        emit:
+          - id: metrics
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Metrics emission continues; request load can increase when Kubernetes backends are removed.
+        emit:
+          - id: metrics
+            per_min: 0.5
+            scope: per_host
+
+  - id: kart_k8s
+    name: Kartotherian (Kubernetes Workers)
+    svc: kartotherian
+    hosts: [kart-k8s1, kart-k8s2, kart-k8s3]
+    desc: >
+      Kubernetes-based Kartotherian origins. During the incident they present a TLS certificate that does not validate
+      for maps.wikimedia.org (missing SAN), causing ATS-to-origin TLS verification to fail.
+    to: []
+    logs:
+      pod_ready:
+        desc: Low-rate Kubernetes readiness noise indicating pods are up (not a TLS correctness signal).
+        lvl: INFO
+        msg: "k8s pod ready pod={pod} node={node}"
+        vars:
+          pod: {k: str, v: "kartotherian-<hash>"}
+          node: {k: str, v: "worker-<id>"}
+    beh:
+      n:
+        desc: Pods are generally ready; no direct evidence of the SAN mismatch from this side.
+        emit:
+          - id: pod_ready
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Pods remain ready even while ATS rejects the certificate; readiness logs continue.
+        emit:
+          - id: pod_ready
+            per_min: 0.05
+            scope: per_host
+
+  - id: logstash
+    name: Central Logging / Webrequest Dashboard
+    svc: logstash
+    hosts: [logstash1]
+    desc: >
+      Aggregates edge webrequest logs and emits a simple periodic dashboard metric representing 5xx rate for maps.
+      Used by operators to notice low-volume issues not caught by alerting.
+    to: []
+    logs:
+      webrequest_5xx_rate_ok:
+        desc: Periodic dashboard metric showing near-zero 5xx rate.
+        lvl: INFO
+        msg: "webrequest_5xx_dashboard service=maps rate_5xx_rpm={rate_5xx_rpm} window_s=300"
+        vars:
+          rate_5xx_rpm: {k: i, v: [0, 2]}
+      webrequest_5xx_rate_elevated:
+        desc: Periodic dashboard metric showing an elevated (but still small) 5xx stream.
+        lvl: INFO
+        msg: "webrequest_5xx_dashboard service=maps rate_5xx_rpm={rate_5xx_rpm} window_s=300"
+        vars:
+          rate_5xx_rpm: {k: i, v: [5, 80]}
+    beh:
+      n:
+        desc: Dashboard metrics show near-zero 5xx rate.
+        emit:
+          - id: webrequest_5xx_rate_ok
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Both metric variants are available; incident events switch which one is emitted.
+        emit:
+          - id: webrequest_5xx_rate_ok
+            per_min: 1.0
+            scope: global
+          - id: webrequest_5xx_rate_elevated
+            per_min: 1.0
+            scope: global
+
+  - id: ops_tooling
+    name: SRE Tooling / SAL
+    svc: null
+    hosts: [sre-bastion1]
+    desc: >
+      Represents operator actions recorded to SAL and ad-hoc probes run during investigation/rollback.
+      These are discrete, human-driven markers used for timeline reconstruction.
+    to:
+      - dst: lvs_kart
+        proto: ssh
+        desc: Operators change pool membership via confctl/confctl-like tooling.
+    logs:
+      sal_pool_k8s_backends:
+        desc: SAL entry marking that Kubernetes backends were pooled.
+        lvl: INFO
+        msg: 'SAL user={user} action=pool_k8s_backends target=kartotherian_lvs note="{note}"'
+        vars:
+          user: {k: ch, v: [elukey]}
+          note: {k: str, v: "freeform"}
+      sal_check_5xx_dashboard:
+        desc: SAL entry marking that the Webrequest 5xx dashboard was consulted.
+        lvl: INFO
+        msg: 'SAL user={user} action=check_5xx_dashboard target=maps_ats note="{note}"'
+        vars:
+          user: {k: ch, v: [elukey, yiannis]}
+          note: {k: str, v: "freeform"}
+      sal_depool_k8s_backends:
+        desc: SAL entry marking that Kubernetes backends were depooled.
+        lvl: INFO
+        msg: 'SAL user={user} action=depool_k8s_backends target=kartotherian_lvs note="{note}"'
+        vars:
+          user: {k: ch, v: [elukey]}
+          note: {k: str, v: "freeform"}
+      sal_verify_tls_san_issue:
+        desc: SAL entry marking that the TLS SAN mismatch hypothesis was verified.
+        lvl: INFO
+        msg: 'SAL user={user} action=verify_tls_san_issue target=maps_ats note="{note}"'
+        vars:
+          user: {k: ch, v: [elukey]}
+          note: {k: str, v: "freeform"}
+      openssl_probe:
+        desc: Ad-hoc certificate verification probe against a Kubernetes backend.
+        lvl: INFO
+        msg: "probe openssl_s_client addr={addr} sni={sni} verify_result={verify_result} peer_cn={peer_cn} peer_sans={peer_sans}"
+        vars:
+          addr: {k: str, v: "kart-k8s<id>:443"}
+          sni: {k: ch, v: [maps.wikimedia.org]}
+          verify_result: {k: ch, v: [hostname_mismatch]}
+          peer_cn: {k: ch, v: [kartotherian.wikikube.internal, "*.wikikube.internal"]}
+          peer_sans: {k: ch, v: ["kartotherian.svc.cluster.local,kartotherian.discovery.local", "*.wikikube.internal"]}
+    beh:
+      n:
+        desc: No background emissions; actions are discrete.
+        emit: []
+      f:
+        desc: No background emissions; actions are discrete.
+        emit: []
+
+tracing:
+  on: true
+  origins: [edge_ats]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation: ATS forwards origin requests through LVS to bare-metal Kartotherian and returns 200s.
+    req:
+      - id: tile_request_ok
+        desc: Map tile origin request successfully served via bare-metal origin.
+        rpm: 800.0
+        path: [edge_ats, lvs_kart, kart_baremetal]
+        emit: [edge_ats.webrequest_ok]
+        latency_ms: [[25, 90]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: >
+      Failure operation: Kubernetes origins are pooled but present a certificate missing the maps.wikimedia.org SAN.
+      A small fraction of origin requests routed to Kubernetes fail TLS verification at ATS and return 502.
+    req:
+      - id: tile_request_ok
+        desc: Map tile origin request successfully served (typically via bare-metal while Kubernetes is unreliable or removed).
+        rpm: 788.0
+        path: [edge_ats, lvs_kart, kart_baremetal]
+        emit: [edge_ats.webrequest_ok]
+        latency_ms: [[25, 95]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: tile_request_tls_502
+        desc: Map tile origin request routed to Kubernetes origin; TLS handshake fails due to SAN/SNI mismatch and ATS returns 502.
+        rpm: 12.0
+        path: [edge_ats, lvs_kart, kart_k8s]
+        emit: [edge_ats.origin_tls_handshake_fail, edge_ats.webrequest_502]
+        latency_ms: [[6, 22], [18, 85]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - 'The real incident lasted several hours; it is time-compressed into a 50-minute scenario while preserving ordering (pool -> low-volume 5xx -> dashboard detection -> depool -> root-cause verification pending fix).'
+  - 'This model focuses on ATS origin-forwarded traffic; ATS caching/client-hit behavior is not modeled as separate flows to keep the incident mechanism minimal and consistent.'
+  - 'LVS is modeled as pure L4 TCP balancing (no TLS termination), matching the causal mechanism that TCP health can succeed while TLS verification fails at ATS.'
+  - 'Per-request logging is modeled primarily at ATS (webrequest logs), since that is what feeds the Webrequest 50X dashboard and is the key observable signal.'
+  - 'Pooling/depooling and SAL actions are represented as discrete one-shots with fixed action fields to support timeline reconstruction.'
+  - 'Dashboard and ATS origin-summary metrics are modeled as two variants (ok vs elevated) so event-time switches can be represented via background-log rate multipliers.'
+  - 'Estimated log volume over 50 minutes is ~40k ATS webrequest logs plus a few hundred background/one-shot logs, within the 20k–100k target.'
+```

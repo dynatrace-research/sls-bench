@@ -1,0 +1,284 @@
+```yaml
+scenario:
+  id: mcp_bgp_policy_term_reorder_outage
+  title: MCP PoP outage due to BGP policy term reordering withdrawing site-local prefixes
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system models Cloudflare’s MCP PoP request handling: client HTTP traffic reaches an edge proxy,
+    which serves from cache when possible and otherwise routes to internal compute clusters and customer
+    origins. The incident is triggered by an automated rollout of a spine-router BGP export policy where
+    term reordering causes site-local prefixes to be rejected and withdrawn. This breaks internal forwarding
+    (Multimog can’t balance across clusters) and impairs origin reachability, producing widespread timeouts,
+    retries, overload, and elevated 5xx/52x responses for users whose traffic lands in the affected MCP PoPs.
+
+  trigger_desc: |
+    A network configuration rollout to MCP spine routers deployed a change intended to add/standardize BGP
+    communities, but during deployment the policy terms were reordered such that the site-local advertisement
+    terms were moved below an explicit REJECT-THE-REST term. This external action (a committed configuration
+    change pushed by automation) occurred during a staged rollout and reached MCP-enabled locations, causing
+    immediate withdrawal of critical site-local prefixes and loss of internal reachability.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        MCP PoPs operate normally: edge proxies accept client requests and assign req_id/trace_id
+        (edge_proxy.req_received). Most traffic is served from cache (http_cache_hit), producing fast
+        responses (edge_proxy.resp_sent with 2xx/3xx/404). Cache misses (http_cache_miss_origin_ok) call
+        the origin fetcher, which connects to customer origins and returns successfully
+        (origin_fetcher.fetch_success), after which responses are sent to clients.
+        
+        Spine routers advertise the required internal and external prefixes; periodic BGP summaries
+        (spine_router.bgp_summary) show a healthy number of advertised prefixes. NOC monitoring runs
+        synthetic probes (edge_healthcheck_ok) that consistently succeed (noc_monitor.http_probe_ok),
+        confirming the PoP is healthy and reachable.
+      flows: [http_cache_hit, http_cache_miss_origin_ok, edge_healthcheck_ok]
+      manifestation:
+        - edge_proxy.resp_sent
+        - cache_cluster.cache_hit
+        - spine_router.bgp_summary
+        - noc_monitor.http_probe_ok
+
+    f:
+      desc: |
+        At failure start, an automated config rollout reaches MCP spine routers and commits a policy update.
+        Immediately, the spines begin withdrawing site-local prefixes required for intra-PoP mesh reachability
+        and for origin access paths. As these routes disappear, internal forwarding in the Clos mesh degrades:
+        cache peers become intermittently unreachable, Multimog cannot forward to backends reliably, and the
+        origin fetcher experiences increasing connect and first-byte timeouts.
+        
+        The edge proxy attempts retries for failing upstream work (edge_proxy.retry_scheduled), amplifying
+        load on already impaired internal paths. With Multimog unable to balance traffic across clusters, smaller
+        compute clusters see disproportionate load and begin shedding requests (compute_worker.request_rejected_overload),
+        further increasing error rates. Monitoring escalates from probe failures to sustained paging
+        (noc_monitor.alert_rule_fired). Attempts to revert the change are complicated by intermittent reachability
+        and overlapping changes, causing route flaps (spine_router.bgp_session_flap) and renewed withdrawal bursts.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: spine_router
+          event: |
+            A new BGP export-policy commit is applied on MCP spine routers, and withdrawals of site-local
+            prefixes begin immediately. Within minutes, origin fetches start timing out and internal load
+            balancer forwarding begins failing with "no route" errors.
+          why: |
+            BGP policy terms are evaluated in order; the commit reorders the site-local advertisement terms
+            below an explicit catch-all reject term. As a result, site-local routes match the reject before they
+            can be accepted/advertised, and the routers withdraw those prefixes from peers and internal routing.
+            This mechanism is partially observable: the effect is directly visible in spine_router.prefix_withdrawn
+            and degraded spine_router.bgp_summary values, while the exact term ordering requires configuration
+            diff/validation outside these runtime logs.
+          flows: [http_origin_timeout, http_internal_lb_fail]
+          rate_multipliers:
+            http_cache_hit_degraded: 1.2
+            http_origin_timeout: 1.0
+            http_internal_lb_fail: 0.6
+            http_compute_overloaded_503: 0.0
+            multimog_lb.mesh_route_missing: 0.5
+            noc_monitor.alert_rule_fired: 0.0
+          latency_multipliers:
+            http_origin_timeout: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: config_pusher.rollout_start
+              count: 1
+            - ref: spine_router.config_commit_applied
+              count: 2
+            - ref: spine_router.policy_term_order_warning
+              count: 2
+          manifestation:
+            - spine_router.prefix_withdrawn
+            - origin_fetcher.fetch_timeout
+            - multimog_lb.forward_fail_no_route
+
+        - order: 2
+          at_min: 24
+          component: multimog_lb
+          event: |
+            Internal mesh forwarding degrades further: Multimog reports missing mesh routes continuously,
+            and compute backends begin rejecting requests due to overload. Monitoring shifts from isolated probe
+            failures to sustained alert firing as 5xx/timeout rates rise.
+          why: |
+            Without the site-local prefixes, Multimog cannot reliably reach many backend destinations and its
+            cross-cluster forwarding effectively collapses; traffic that would normally spread across multiple
+            compute clusters concentrates on reachable (often smaller) clusters. Those clusters hit queue/CPU
+            limits and reject requests, which increases upstream errors and triggers retries from the edge, creating
+            more load on failing paths. This is largely observable from multimog_lb.mesh_route_missing,
+            compute_worker.request_rejected_overload, edge_proxy.retry_scheduled, and increased http_origin_timeout/
+            http_internal_lb_fail flow volume; the precise traffic distribution skew is inferred from symptoms.
+          flows: [http_origin_timeout, http_internal_lb_fail, http_compute_overloaded_503, edge_healthcheck_fail]
+          rate_multipliers:
+            http_cache_hit_degraded: 0.8
+            http_origin_timeout: 1.3
+            http_internal_lb_fail: 1.5
+            http_compute_overloaded_503: 1.0
+            edge_healthcheck_fail: 1.2
+            multimog_lb.mesh_route_missing: 2.0
+            noc_monitor.alert_rule_fired: 1.0
+          latency_multipliers:
+            http_origin_timeout: {p50: 2.0, p95: 3.0}
+            http_internal_lb_fail: {p50: 1.2, p95: 1.8}
+          one_shots:
+            - ref: noc_monitor.incident_declared
+              count: 1
+          manifestation:
+            - multimog_lb.mesh_route_missing
+            - compute_worker.request_rejected_overload
+            - noc_monitor.alert_rule_fired
+
+        - order: 3
+          at_min: 30
+          component: spine_router
+          event: |
+            Engineers make verification changes on a subset of spines; BGP sessions begin flapping and the
+            withdrawal rate briefly decreases before returning. User-facing errors continue, but with short-lived
+            partial improvements as some routes intermittently reappear.
+          why: |
+            Partial reverts and manual policy checks can temporarily restore advertisements on individual routers,
+            but inconsistent policy state across spines and peers causes session resets and oscillating route
+            propagation. This is directly observable via increases in spine_router.bgp_session_flap and changes
+            in spine_router.prefix_withdrawn rate, while the exact operator actions and configuration correctness
+            require external operational context beyond the steady-state router logs.
+          flows: [http_origin_timeout, http_internal_lb_fail, http_compute_overloaded_503]
+          rate_multipliers:
+            http_cache_hit_degraded: 1.1
+            http_origin_timeout: 1.0
+            http_internal_lb_fail: 1.1
+            http_compute_overloaded_503: 0.7
+            spine_router.prefix_withdrawn: 0.8
+            spine_router.bgp_session_flap: 3.0
+            multimog_lb.mesh_route_missing: 1.5
+            noc_monitor.alert_rule_fired: 1.0
+          latency_multipliers:
+            http_origin_timeout: {p50: 1.5, p95: 2.5}
+          one_shots:
+            - ref: config_pusher.rollout_change
+              count: 1
+          manifestation:
+            - spine_router.bgp_session_flap
+            - spine_router.prefix_withdrawn
+            - edge_proxy.retry_scheduled
+
+        - order: 4
+          at_min: 35
+          component: config_pusher
+          event: |
+            Overlapping revert attempts occur and route advertisements oscillate again: withdrawal logs spike,
+            probe failures intensify, and origin timeouts rise. The PoP remains degraded through the end of the
+            scenario with intermittent brief recoveries.
+          why: |
+            Multiple concurrent changes to the same routing policy can overwrite prior corrections, reintroducing
+            the reject-before-accept behavior and forcing repeated withdrawals. Each withdrawal wave breaks internal
+            reachability anew, which increases timeouts and edge retries, reinforcing overload and instability.
+            This is partially observable from repeated spikes in spine_router.prefix_withdrawn, higher
+            spine_router.bgp_session_flap, and sustained noc_monitor.alert_rule_fired; confirming "change collision"
+            typically requires change-management/audit data outside runtime logs.
+          flows: [http_origin_timeout, http_internal_lb_fail, http_compute_overloaded_503, edge_healthcheck_fail]
+          rate_multipliers:
+            http_cache_hit_degraded: 0.9
+            http_origin_timeout: 1.4
+            http_internal_lb_fail: 1.6
+            http_compute_overloaded_503: 1.2
+            edge_healthcheck_fail: 1.3
+            spine_router.prefix_withdrawn: 1.4
+            spine_router.bgp_session_flap: 6.0
+            multimog_lb.mesh_route_missing: 2.0
+            noc_monitor.alert_rule_fired: 1.5
+          latency_multipliers:
+            http_origin_timeout: {p50: 2.2, p95: 3.5}
+            http_internal_lb_fail: {p50: 1.5, p95: 2.5}
+          one_shots:
+            - ref: spine_router.config_commit_applied
+              count: 2
+          manifestation:
+            - spine_router.prefix_withdrawn
+            - noc_monitor.alert_rule_fired
+            - origin_fetcher.fetch_timeout
+
+      steady:
+        - component: spine_router
+          condition: |
+            Spine routers continue to withdraw site-local prefixes and experience BGP session flaps, keeping
+            internal routes incomplete and unstable. The BGP summary shows a sustained reduction in advertised
+            prefixes compared to normal.
+          user_impact: |
+            Requests that depend on internal forwarding and stable routing fail or time out; affected MCP PoPs
+            intermittently become partially functional and then regress.
+          manifestation:
+            - spine_router.prefix_withdrawn
+            - spine_router.bgp_session_flap
+            - spine_router.bgp_summary
+
+        - component: multimog_lb
+          condition: |
+            Multimog’s mesh forwarding remains impaired (missing routes), limiting cross-cluster balancing and
+            causing uneven distribution to whatever backends are reachable.
+          user_impact: |
+            Dynamic requests routed through internal services see elevated 502/503/52x errors and high latency,
+            especially during oscillation periods.
+          manifestation:
+            - multimog_lb.mesh_route_missing
+            - multimog_lb.forward_fail_no_route
+
+        - component: edge_proxy
+          condition: |
+            Edge proxies continue retrying upstream work and emitting upstream errors due to origin timeouts
+            and internal no-route failures; a smaller subset of cache hits still succeeds.
+          user_impact: |
+            End users observe intermittent site failures, slow loads, and error pages; many requests complete
+            as 5xx/52x after retries and long timeouts.
+          manifestation:
+            - edge_proxy.upstream_error
+            - edge_proxy.retry_scheduled
+            - edge_proxy.resp_sent
+
+      feedback_loops:
+        - id: retry_amplification_overload
+          desc: |
+            Missing site-local routes cause timeouts/no-route errors → edge retries increase per-user work →
+            retries add load to already impaired internal paths and concentrated backends → more overload and
+            longer timeouts → even more retries and errors.
+
+      flows:
+        - http_cache_hit_degraded
+        - http_origin_timeout
+        - http_internal_lb_fail
+        - http_compute_overloaded_503
+        - edge_healthcheck_fail
+      manifestation:
+        - spine_router.prefix_withdrawn
+        - spine_router.bgp_session_flap
+        - spine_router.bgp_summary
+        - multimog_lb.mesh_route_missing
+        - multimog_lb.forward_fail_no_route
+        - compute_worker.request_rejected_overload
+        - origin_fetcher.fetch_timeout
+        - edge_proxy.upstream_error
+        - edge_proxy.retry_scheduled
+        - noc_monitor.alert_rule_fired
+        - noc_monitor.http_probe_fail
+
+  assumptions:
+    - >
+      The real incident included full recovery; this scenario ends while the system remains degraded
+      (still in failure) to fit a two-phase structure with no recovery phase, while still reflecting
+      the documented “sporadic re-appearance” due to overlapping reverts.
+    - >
+      The modeled failure start is aligned to the post-mortem’s “rollout reached MCP spines” moment,
+      with subsequent escalation compressed into a 20-minute failure window for the 40-minute scenario.
+    - >
+      Volume estimate recap: normal phase ~1502 logs/min for 20 min (~30k). Failure phase piecewise:
+      [20,24) ~1403/min*4 (~5.6k), [24,30) ~2100/min*6 (~12.6k), [30,35) ~1690/min*5 (~8.5k),
+      [35,40) ~2305/min*5 (~11.5k), plus ~10-30 one-shots; total ~68k logs.
+    - >
+      Flow-rate choices downscale Cloudflare’s global traffic to a tractable synthetic-log volume while
+      preserving relative behavior: lower inbound rpm during failure plus higher retry-driven noise, and
+      clear diagnostic signals (withdrawals, mesh-route missing, origin timeouts, and alert firing).
+```

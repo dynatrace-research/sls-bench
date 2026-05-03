@@ -1,0 +1,387 @@
+```yaml
+sys:
+  id: git_push_gateway
+  desc: >
+    A Git gateway service receives customer git push traffic over HTTPS and runs Git commands.
+    For each push it calls a private internal API to authorize the operation using a token provided
+    via per-instance configuration. The gateway is deployed in batches on dedicated VM hosts using
+    an internal deploy orchestrator, with configuration propagation as a separate operational step.
+    In this incident, a production batch was deployed with new code while its required auth config
+    was not yet synchronized to the instances, causing 401s to be returned to customers.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_router
+    name: Edge Router
+    svc: edge-router
+    hosts: [router-01, router-02, router-03]
+    desc: >
+      Public-facing router that terminates TLS and forwards Git HTTPS requests to the Git gateway.
+      Emits request/response access logs with status codes that are used for alerting.
+    to:
+      - dst: git_gateway
+        proto: https
+        desc: Routes Git HTTPS traffic to the Git gateway pool.
+    logs:
+      http_req:
+        desc: Ingress access log for a Git HTTPS request.
+        lvl: INFO
+        msg: "ingress {method} {route} host={host} trace_id={trace_id} client_ip={client_ip}"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: [/git-receive-pack]}
+          host: {k: ch, v: [git.example.com]}
+          trace_id: {k: hex, v: 32}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+      http_resp_200:
+        desc: Egress access log for successful responses.
+        lvl: INFO
+        msg: "egress status=200 {route} trace_id={trace_id} bytes={bytes} dur_ms={dur_ms}"
+        vars:
+          route: {k: ch, v: [/git-receive-pack]}
+          trace_id: {k: hex, v: 32}
+          bytes: {k: i, v: [800, 60000]}
+          dur_ms: {k: i, v: [500, 3600000]}
+      http_resp_401:
+        desc: Egress access log for unauthorized responses.
+        lvl: WARN
+        msg: "egress status=401 {route} trace_id={trace_id} bytes={bytes} dur_ms={dur_ms}"
+        vars:
+          route: {k: ch, v: [/git-receive-pack]}
+          trace_id: {k: hex, v: 32}
+          bytes: {k: i, v: [200, 8000]}
+          dur_ms: {k: i, v: [50, 5000]}
+    beh:
+      n:
+        desc: No periodic logs are modeled for the router.
+        emit: []
+      f:
+        desc: No periodic logs are modeled for the router.
+        emit: []
+
+  - id: git_gateway
+    name: Git Gateway (kernel app)
+    svc: git-gateway
+    hosts: [git-01, git-02, git-03, git-04]
+    desc: >
+      Go-based Git server that handles a full git push as a single request which may take up to an hour.
+      For each push it calls a private authorization API using a token read from instance configuration.
+      During batched deploys, some instances can temporarily run different code/config combinations.
+    to:
+      - dst: internal_auth_api
+        proto: https
+        desc: Calls the internal authorization API to validate pushes.
+      - dst: edge_router
+        proto: https
+        desc: Returns the HTTPS response back via the edge router.
+      - dst: deploy_orchestrator
+        proto: tcp
+        desc: Receives lifecycle control (poisoning/restarts) from the deploy orchestrator.
+      - dst: config_distributor
+        proto: tcp
+        desc: Receives config synchronization updates from the config distributor.
+    logs:
+      push_received:
+        desc: Marks the start of a git push request.
+        lvl: INFO
+        msg: "push start app={app} user={user} proto=http trace_id={trace_id}"
+        vars:
+          app: {k: ch, v: [acme-web, acme-api, demo-shop, payments, docs, internal-tools]}
+          user: {k: ch, v: [alice, bob, carol, ci-bot]}
+          trace_id: {k: hex, v: 32}
+      auth_token_missing:
+        desc: Emitted when required auth material for the internal API call is absent.
+        lvl: WARN
+        msg: "cannot authenticate internal api call auth_mode=new trace_id={trace_id}"
+        vars:
+          trace_id: {k: hex, v: 32}
+      push_complete_200:
+        desc: Completion log for successful pushes.
+        lvl: INFO
+        msg: "push complete result=ok trace_id={trace_id} dur_ms={dur_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          dur_ms: {k: i, v: [500, 3600000]}
+      push_complete_401:
+        desc: Completion log for pushes rejected due to upstream authorization failure.
+        lvl: WARN
+        msg: "push failed result=unauthorized upstream_status=401 trace_id={trace_id} dur_ms={dur_ms}"
+        vars:
+          trace_id: {k: hex, v: 32}
+          dur_ms: {k: i, v: [50, 5000]}
+      proc_restart:
+        desc: Process restart marker (manual kill or deploy lifecycle).
+        lvl: INFO
+        msg: "process restart reason={reason} code_ver={code_ver} cfg_rev={cfg_rev}"
+        vars:
+          reason: {k: ch, v: [killed_for_cfg_sync, deploy_roll]}
+          code_ver: {k: ch, v: [2020-09-03.1]}
+          cfg_rev: {k: i, v: [41, 42]}
+      health_ok:
+        desc: Periodic lightweight health signal.
+        lvl: INFO
+        msg: "health ok goroutines={goroutines} open_conns={open_conns}"
+        vars:
+          goroutines: {k: i, v: [50, 450]}
+          open_conns: {k: i, v: [5, 250]}
+    beh:
+      n:
+        desc: Emits periodic health signals under normal operation.
+        emit:
+          - id: health_ok
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Health signals continue during failure.
+        emit:
+          - id: health_ok
+            per_min: 0.5
+            scope: per_host
+
+  - id: internal_auth_api
+    name: Internal Authorization API
+    svc: internal-auth-api
+    hosts: [api-01, api-02]
+    desc: >
+      Private API called by the Git gateway to authorize pushes. Rejects requests missing required
+      authentication, returning HTTP 401. Emits access logs and a per-minute authorization summary.
+    to:
+      - dst: git_gateway
+        proto: https
+        desc: Serves authorization responses back to the Git gateway.
+    logs:
+      auth_ok:
+        desc: Access log for authorized calls.
+        lvl: INFO
+        msg: "access {endpoint} status=200 auth=ok trace_id={trace_id} dur_ms={dur_ms}"
+        vars:
+          endpoint: {k: ch, v: [/v2/git/authorize]}
+          trace_id: {k: hex, v: 32}
+          dur_ms: {k: i, v: [5, 120]}
+      auth_denied:
+        desc: Access log for unauthorized calls.
+        lvl: WARN
+        msg: "access {endpoint} status=401 auth=missing trace_id={trace_id} dur_ms={dur_ms}"
+        vars:
+          endpoint: {k: ch, v: [/v2/git/authorize]}
+          trace_id: {k: hex, v: 32}
+          dur_ms: {k: i, v: [2, 80]}
+      auth_metrics:
+        desc: Per-minute summary of authorization results for this endpoint.
+        lvl: INFO
+        msg: "auth_metrics endpoint={endpoint} ok={ok} denied={denied} window_s={window_s}"
+        vars:
+          endpoint: {k: ch, v: [/v2/git/authorize]}
+          window_s: {k: i, v: [60, 60]}
+        state_vars:
+          n:
+            ok: {k: i, v: [120, 190]}
+            denied: {k: i, v: [0, 3]}
+          f:
+            ok: {k: i, v: [80, 180]}
+            denied: {k: i, v: [15, 120]}
+    beh:
+      n:
+        desc: Emits authorization summaries each minute; unauthorized calls are typically near-zero.
+        emit:
+          - id: auth_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Authorization summaries continue; denied counts can rise during the incident.
+        emit:
+          - id: auth_metrics
+            per_min: 1.0
+            scope: per_host
+
+  - id: deploy_orchestrator
+    name: Deploy Orchestrator
+    svc: deploy-orchestrator
+    hosts: [deploy-01]
+    desc: >
+      Internal system that rolls out new Git gateway code in batches by poisoning old instances and
+      restarting processes when safe. In this incident it deployed a batch of new code while config
+      synchronization was not yet applied to production instances.
+    to:
+      - dst: git_gateway
+        proto: ssh
+        desc: Controls instance lifecycle for the Git gateway pool.
+    logs:
+      batch_deploy_start:
+        desc: Marks the start of a batch deployment.
+        lvl: INFO
+        msg: "deploy start service=git-server batch={batch} code_ver={code_ver} cfg_required_rev={cfg_required_rev}"
+        vars:
+          batch: {k: ch, v: [batch-a]}
+          code_ver: {k: ch, v: [2020-09-03.1]}
+          cfg_required_rev: {k: i, v: [42, 42]}
+      instance_poisoned:
+        desc: Instance marked as poisoned (no new requests) for rolling deploy.
+        lvl: INFO
+        msg: "poisoned instance={instance} old_code_ver={old_code_ver} batch={batch}"
+        vars:
+          instance: {k: ch, v: [git-01, git-02, git-03, git-04]}
+          old_code_ver: {k: ch, v: [2020-08-20.4]}
+          batch: {k: ch, v: [batch-a]}
+      deploy_status:
+        desc: Periodic deployment status line while a deploy is active.
+        lvl: INFO
+        msg: "deploy status batch={batch} updated={updated} poisoned={poisoned} pending={pending}"
+        vars:
+          batch: {k: ch, v: [batch-a]}
+          updated: {k: i, v: [0, 4]}
+          poisoned: {k: i, v: [0, 4]}
+          pending: {k: i, v: [0, 4]}
+      deploy_pause:
+        desc: Operator pauses the deployment.
+        lvl: WARN
+        msg: "deploy paused batch={batch} reason={reason}"
+        vars:
+          batch: {k: ch, v: [batch-a]}
+          reason: {k: ch, v: [elevated_401, manual_hold]}
+    beh:
+      n:
+        desc: No deploy activity most of the time.
+        emit: []
+      f:
+        desc: During the incident a deploy is in progress/paused, emitting periodic status.
+        emit:
+          - id: deploy_status
+            per_min: 1.0
+            scope: global
+
+  - id: config_distributor
+    name: Config Distributor
+    svc: config-distributor
+    hosts: [cfg-01]
+    desc: >
+      Internal mechanism used to transmit updated config variables to all Git gateway instances.
+      In the incident, this step was not run before deploying new code.
+    to:
+      - dst: git_gateway
+        proto: tcp
+        desc: Pushes config revision updates to Git gateway instances.
+    logs:
+      config_sync_trigger:
+        desc: Operator/script triggers propagation of updated config to instances.
+        lvl: INFO
+        msg: "config sync triggered service=git-server cfg_rev={cfg_rev} targets={targets}"
+        vars:
+          cfg_rev: {k: i, v: [42, 42]}
+          targets: {k: i, v: [4, 4]}
+      config_sync_complete:
+        desc: Config propagation finishes (some instances may still require restart to take effect).
+        lvl: INFO
+        msg: "config sync complete service=git-server cfg_rev={cfg_rev} updated={updated} failed={failed}"
+        vars:
+          cfg_rev: {k: i, v: [42, 42]}
+          updated: {k: i, v: [3, 4]}
+          failed: {k: i, v: [0, 1]}
+    beh:
+      n:
+        desc: No periodic logs modeled.
+        emit: []
+      f:
+        desc: No periodic logs modeled.
+        emit: []
+
+  - id: alerting
+    name: Alerting / Monitoring
+    svc: alerting
+    hosts: [mon-01]
+    desc: >
+      Monitoring that triggers on elevated rates of HTTP 401 responses observed at the edge router.
+    to:
+      - dst: edge_router
+        proto: https
+        desc: Consumes router metrics for alert evaluation.
+    logs:
+      alert_401_rate_high:
+        desc: Alert for elevated 401 rate on git push endpoint.
+        lvl: CRITICAL
+        msg: "ALERT name=git_push_401_rate_high rate_pct={rate_pct} window_min={window_min}"
+        vars:
+          rate_pct: {k: f, v: [10.0, 60.0]}
+          window_min: {k: i, v: [5, 5]}
+    beh:
+      n:
+        desc: Alerts are modeled as discrete one-shot emissions when triggered.
+        emit: []
+      f:
+        desc: Alerts are modeled as discrete one-shot emissions when triggered.
+        emit: []
+
+tracing:
+  on: true
+  origins: [edge_router]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal git pushes are authorized by the internal API and complete successfully.
+    req:
+      - id: git_push_http_success
+        desc: Customer git push over HTTPS succeeds with upstream authorization.
+        rpm: 300.0
+        path: [edge_router, git_gateway, internal_auth_api, git_gateway, edge_router]
+        emit:
+          - edge_router.http_req
+          - git_gateway.push_received
+          - internal_auth_api.auth_ok
+          - git_gateway.push_complete_200
+          - edge_router.http_resp_200
+        latency_ms: [[1, 3], [2, 8], [5, 40], [12000, 900000], [2, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: During the incident, a subset of git pushes are rejected due to missing auth for the internal API.
+    req:
+      - id: git_push_http_ok
+        desc: Git push succeeds (request lands on an instance with working auth config).
+        rpm: 240.0
+        path: [edge_router, git_gateway, internal_auth_api, git_gateway, edge_router]
+        emit:
+          - edge_router.http_req
+          - git_gateway.push_received
+          - internal_auth_api.auth_ok
+          - git_gateway.push_complete_200
+          - edge_router.http_resp_200
+        latency_ms: [[1, 3], [2, 10], [5, 60], [15000, 1200000], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: git_push_http_401
+        desc: Git push fails because the Git gateway calls the internal API without required auth and propagates 401.
+        rpm: 60.0
+        path: [edge_router, git_gateway, internal_auth_api, git_gateway, edge_router]
+        emit:
+          - edge_router.http_req
+          - git_gateway.push_received
+          - git_gateway.auth_token_missing
+          - internal_auth_api.auth_denied
+          - git_gateway.push_complete_401
+          - edge_router.http_resp_401
+        latency_ms: [[1, 3], [2, 8], [1, 5], [2, 30], [10, 500], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - 'Names/domains are genericized; the modeled endpoint and token are a stand-in for the internal private API and new auth method.'
+  - 'Only HTTPS git pushes are modeled (SSH omitted) because the observed symptom is a spike in HTTP 401 responses and customer-facing failures.'
+  - 'The deploy is modeled as a partial batch rollout that changes traffic distribution, represented by shifting failure-flow RPM multipliers over time.'
+  - 'Normal-phase volume estimate ~300 rpm * 5 logs/req ≈ 1500 logs/min, plus ~4 background logs/min total.'
+  - 'Total scenario log estimate ~61k logs (requests dominate; low-rate background metrics and a few one-shot operational markers), within the 20k–100k target.'
+  - 'Diagnostic visibility: internal_auth_api.auth_denied and edge_router.http_resp_401 appear repeatedly during failure; deploy/config actions appear as one-shots.'
+```

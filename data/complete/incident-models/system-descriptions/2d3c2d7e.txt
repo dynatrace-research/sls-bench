@@ -1,0 +1,394 @@
+```yaml
+sys:
+  id: anycast_cdn_bgp_control_plane
+  desc: >
+    A compact model of an Anycast CDN edge network where edge sites announce service prefixes
+    via BGP to a trusted transit provider and also receive traffic via direct peering. Most user
+    HTTP traffic arrives via transit, with a smaller fraction arriving via peers. During scheduled
+    maintenance at one site, an incorrect routing policy announcement can attract global traffic
+    to an offline POP, causing widespread timeouts until routes are corrected and propagate.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: netcfg_tool
+    name: Network Config Automation
+    svc: netcfg
+    hosts: [netcfg-1]
+    desc: Pushes routing policy changes to edge routers and records change markers.
+    to:
+      - dst: hkg_router
+        proto: tcp
+        desc: Pushes configuration changes to the Hong Kong edge router.
+    logs:
+      change_applied:
+        desc: Marker that a routing policy change was applied to a router interface.
+        lvl: INFO
+        msg: "change {change_id} applied on {device} iface={iface} policy=hkg_outbound_export_full"
+        vars:
+          change_id: {k: hex, v: 12}
+          device: {k: ch, v: [rtr-hkg-1]}
+          iface: {k: ch, v: [inbound0]}
+      change_reverted:
+        desc: Marker that a corrective routing policy change was applied.
+        lvl: INFO
+        msg: "change {change_id} applied on {device} iface={iface} policy=hkg_inbound_filter_restore"
+        vars:
+          change_id: {k: hex, v: 12}
+          device: {k: ch, v: [rtr-hkg-1]}
+          iface: {k: ch, v: [inbound0]}
+    beh:
+      n:
+        desc: Only emits logs when operators push changes.
+        emit: []
+      f:
+        desc: Only emits logs when operators push changes.
+        emit: []
+
+  - id: hkg_router
+    name: Hong Kong Edge Router
+    svc: edge-router
+    hosts: [rtr-hkg-1]
+    desc: >
+      BGP-speaking edge router for the Hong Kong site. During the incident it mistakenly
+      originates CDN-wide prefixes toward a trusted upstream while the site is effectively
+      offline for inbound service.
+    to:
+      - dst: upstream_transit
+        proto: bgp
+        desc: Announces/withdraws routes to the transit provider.
+    logs:
+      bgp_announce:
+        desc: BGP announcement sent to the upstream neighbor.
+        lvl: WARN
+        msg: "BGP announced prefixes={prefix_count} to neighbor_as={neighbor_as} session={session}"
+        vars:
+          prefix_count: {k: i, v: [400, 900]}
+          neighbor_as: {k: i, v: [64500, 64500]}
+          session: {k: ch, v: [BGP-HKG-TRANSIT1]}
+      bgp_withdraw:
+        desc: BGP withdraw sent to the upstream neighbor.
+        lvl: INFO
+        msg: "BGP withdrew prefixes={prefix_count} from neighbor_as={neighbor_as} session={session}"
+        vars:
+          prefix_count: {k: i, v: [400, 900]}
+          neighbor_as: {k: i, v: [64500, 64500]}
+          session: {k: ch, v: [BGP-HKG-TRANSIT1]}
+    beh:
+      n:
+        desc: No periodic logging modeled from the router in normal operation.
+        emit: []
+      f:
+        desc: No periodic logging modeled from the router in failure; changes are one-shot markers.
+        emit: []
+
+  - id: upstream_transit
+    name: Transit Provider Network
+    svc: transit
+    hosts: [transit-1]
+    desc: Trusted upstream that accepts customer BGP announcements and propagates them.
+    to:
+      - dst: edge_pop_other
+        proto: ip
+        desc: Sends user traffic to the selected edge site under normal routing.
+      - dst: hkg_router
+        proto: ip
+        desc: Sends user traffic toward Hong Kong when BGP selects HK as best path.
+    logs:
+      bgp_update_received:
+        desc: Control-plane log for an inbound BGP update from a customer edge router.
+        lvl: INFO
+        msg: "BGP update from {peer} action={action} prefixes={prefix_count}"
+        vars:
+          peer: {k: ch, v: [rtr-hkg-1]}
+          action: {k: ch, v: [announce, withdraw]}
+          prefix_count: {k: i, v: [400, 900]}
+      bgp_propagation_notice:
+        desc: Control-plane note that a large update is being propagated onward.
+        lvl: INFO
+        msg: "propagating BGP change action={action} prefixes={prefix_count} scope={scope}"
+        vars:
+          action: {k: ch, v: [announce, withdraw]}
+          prefix_count: {k: i, v: [400, 900]}
+          scope: {k: ch, v: [regional, global]}
+    beh:
+      n:
+        desc: No periodic transit logs modeled.
+        emit: []
+      f:
+        desc: No periodic transit logs modeled; propagation is captured via one-shot markers.
+        emit: []
+
+  - id: direct_peer
+    name: Direct Peering Fabric
+    svc: peering
+    hosts: [ix-1]
+    desc: Represents direct peers that reach the edge without being affected by the transit provider's leaked route preference.
+    to:
+      - dst: edge_pop_other
+        proto: ip
+        desc: Sends user traffic to edge sites via direct peering.
+    logs:
+      peer_stats:
+        desc: Periodic snapshot of aggregate peering fabric traffic and established peer sessions.
+        lvl: INFO
+        msg: "peer_stats site=global peer_rpm={peer_rpm} established_peers={established_peers}"
+        vars:
+          peer_rpm: {k: i, v: [240, 360]}
+          established_peers: {k: i, v: [18, 30]}
+    beh:
+      n:
+        desc: Low-rate peering fabric stats; largely steady.
+        emit:
+          - id: peer_stats
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Peering remains largely unaffected; stats continue at the same low rate.
+        emit:
+          - id: peer_stats
+            per_min: 0.5
+            scope: global
+
+  - id: edge_pop_other
+    name: Non-HK Edge POPs (Singapore/Tokyo)
+    svc: edge-proxy
+    hosts: [edge-sin-1, edge-sin-2, edge-tyo-1]
+    desc: >
+      Represents the healthy edge POPs that serve traffic when routing is correct.
+      During the incident they continue serving direct-peered traffic while transit-delivered
+      traffic largely disappears due to blackholing toward HK.
+    to: []
+    logs:
+      access_transit:
+        desc: Per-request access log for requests arriving from transit paths.
+        lvl: INFO
+        msg: "served route=transit colo={colo} {method} {uri} status={status} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          colo: {k: ch, v: [SIN, TYO]}
+          method: {k: ch, v: [GET, HEAD]}
+          uri: {k: ch, v: [/static/app.js, /, /api/v1/ping]}
+          status: {k: i, v: [200, 200]}
+          dur_ms: {k: i, v: [10, 180]}
+          bytes: {k: i, v: [200, 50000]}
+      access_peer:
+        desc: Per-request access log for requests arriving from direct peers.
+        lvl: INFO
+        msg: "served route=peer colo={colo} {method} {uri} status={status} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          colo: {k: ch, v: [SIN, TYO]}
+          method: {k: ch, v: [GET, HEAD]}
+          uri: {k: ch, v: [/static/app.js, /, /api/v1/ping]}
+          status: {k: i, v: [200, 200]}
+          dur_ms: {k: i, v: [10, 160]}
+          bytes: {k: i, v: [200, 50000]}
+      edge_stats:
+        desc: Periodic metric snapshot for request volume and active connections.
+        lvl: INFO
+        msg: "edge_stats colo={colo} req_per_min={req_per_min} active_conns={active_conns}"
+        vars:
+          colo: {k: ch, v: [SIN, TYO]}
+          req_per_min: {k: i, v: [60, 520]}
+          active_conns: {k: i, v: [200, 1800]}
+      cache_eviction_pressure:
+        desc: Low-rate background warning unrelated to the incident (realistic noise).
+        lvl: WARN
+        msg: "cache eviction pressure: evicted_keys={evicted_keys} in {window_s}s"
+        vars:
+          evicted_keys: {k: i, v: [100, 900]}
+          window_s: {k: i, v: [30, 60]}
+    beh:
+      n:
+        desc: Normal operation emits periodic stats with occasional cache pressure warnings.
+        emit:
+          - id: edge_stats
+            per_min: 1.0
+            scope: per_host
+          - id: cache_eviction_pressure
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: In failure, stats continue; values may dip during blackholing and recover as routing is corrected.
+        emit:
+          - id: edge_stats
+            per_min: 1.0
+            scope: per_host
+          - id: cache_eviction_pressure
+            per_min: 0.2
+            scope: per_host
+
+  - id: route_monitor
+    name: Routing & Availability Monitor
+    svc: monitor
+    hosts: [mon-1, mon-2]
+    desc: >
+      Internal monitoring that (1) tracks aggregate BGP origin anomalies and (2) runs
+      synthetic HTTP probes via transit paths. It alerts on sudden origin concentration and on
+      elevated probe timeouts.
+    to:
+      - dst: upstream_transit
+        proto: https
+        desc: Runs synthetic probes that traverse transit routing to reach the edge.
+    logs:
+      rib_summary:
+        desc: Periodic summary of current best origin for the CDN prefixes.
+        lvl: INFO
+        msg: "rib_summary best_origin={best_origin} observed_prefixes={observed_prefixes}"
+        vars:
+          best_origin: {k: ch, v: [MIXED, HKG, OTHER]}
+          observed_prefixes: {k: i, v: [400, 900]}
+      route_leak_alert:
+        desc: Alert that a single POP is originating an unusually large portion of prefixes.
+        lvl: ERROR
+        msg: "route_leak_alert origin={origin} prefixes={prefixes} severity={severity}"
+        vars:
+          origin: {k: ch, v: [HKG]}
+          prefixes: {k: i, v: [400, 900]}
+          severity: {k: ch, v: [high]}
+      edge_traffic_drop_alert:
+        desc: Alert that served edge traffic dropped sharply (observed at non-HK POPs).
+        lvl: WARN
+        msg: "edge_traffic_drop_alert observed_drop_pct={drop_pct} window_min={window_min}"
+        vars:
+          drop_pct: {k: i, v: [50, 90]}
+          window_min: {k: i, v: [1, 5]}
+      probe_ok:
+        desc: Synthetic HTTP probe succeeded.
+        lvl: INFO
+        msg: "probe_ok target={target} status=200 rtt_ms={rtt_ms}"
+        vars:
+          target: {k: ch, v: [anycast_http]}
+          rtt_ms: {k: i, v: [25, 180]}
+      probe_timeout:
+        desc: Synthetic HTTP probe timed out (represents user-visible timeouts).
+        lvl: WARN
+        msg: "probe_timeout target={target} code={code} timeout_ms={timeout_ms}"
+        vars:
+          target: {k: ch, v: [anycast_http]}
+          code: {k: ch, v: [522, 504]}
+          timeout_ms: {k: i, v: [800, 2000]}
+    beh:
+      n:
+        desc: Periodic routing summaries; no alerts expected in normal.
+        emit:
+          - id: rib_summary
+            per_min: 1.0
+            scope: global
+      f:
+        desc: In failure, routing summaries continue and alerts can fire.
+        emit:
+          - id: rib_summary
+            per_min: 1.0
+            scope: global
+          - id: route_leak_alert
+            per_min: 0.2
+            scope: global
+          - id: edge_traffic_drop_alert
+            per_min: 0.1
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user traffic arrives via transit and direct peers; monitoring probes succeed.
+    req:
+      - id: user_http_transit_n
+        desc: User HTTP requests reaching edge POPs via a transit provider.
+        rpm: 900.0
+        path: [upstream_transit, edge_pop_other]
+        emit: [edge_pop_other.access_transit]
+        latency_ms: [[25, 90]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: user_http_peer_n
+        desc: User HTTP requests reaching edge POPs via direct peering.
+        rpm: 300.0
+        path: [direct_peer, edge_pop_other]
+        emit: [edge_pop_other.access_peer]
+        latency_ms: [[20, 70]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: synthetic_probe_n
+        desc: Synthetic availability probes to Anycast HTTP, normally successful.
+        rpm: 60.0
+        path: [route_monitor, upstream_transit, edge_pop_other]
+        emit: [route_monitor.probe_ok]
+        latency_ms: [[40, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Transit routing is disrupted by a route leak; peering remains mostly unaffected.
+    req:
+      - id: user_http_transit_f
+        desc: Transit-delivered user traffic that still reaches non-HK POPs (shrinks sharply during failure, then returns after correction).
+        rpm: 900.0
+        path: [upstream_transit, edge_pop_other]
+        emit: [edge_pop_other.access_transit]
+        latency_ms: [[30, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: user_http_peer_f
+        desc: Direct-peered user traffic continuing to reach non-HK POPs during the incident.
+        rpm: 300.0
+        path: [direct_peer, edge_pop_other]
+        emit: [edge_pop_other.access_peer]
+        latency_ms: [[20, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: synthetic_probe_ok_f
+        desc: Portion of synthetic probes that succeed (varies over the incident).
+        rpm: 30.0
+        path: [route_monitor, upstream_transit, edge_pop_other]
+        emit: [route_monitor.probe_ok]
+        latency_ms: [[50, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: synthetic_probe_timeout_f
+        desc: Portion of synthetic probes that time out due to blackholing toward offline Hong Kong.
+        rpm: 30.0
+        path: [route_monitor, upstream_transit, hkg_router]
+        emit: [route_monitor.probe_timeout]
+        latency_ms: [[900, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Names and volumes are scaled down; 'non-HK POPs' aggregates Singapore/Tokyo behavior while preserving the incident's routing mechanism."
+  - "User traffic split is modeled as 75% transit (900 rpm) and 25% direct peering (300 rpm), matching the described unaffected peer fraction."
+  - "User-visible failures are represented via synthetic probe timeouts (route_monitor.probe_timeout) rather than per-user client logs, since blackholed traffic does not reach edge servers to be logged."
+  - "Normal-phase log rate estimate is ~1265 logs/min (mostly access logs). For the modeled 31-minute scenario, total estimated logs are ~28k (within 20k..100k)."
+  - "Key diagnostic visibility comes from: hkg_router BGP announce/withdraw one-shots, repeated route_monitor.route_leak_alert during the leak, and the shift from probe_ok to probe_timeout and back; direct_peer.peer_stats stays steady as corroborating unaffected-path evidence."
+```

@@ -1,0 +1,438 @@
+```yaml
+sys:
+  id: knight_smars_rlp_router
+  desc: >
+    A broker-dealer order routing system that receives retail liquidity program (RLP) orders from brokers,
+    routes them through an internal high-speed router (SMARS), and executes child orders on the NYSE.
+    The router runs on eight servers and relies on a feature flag to enable the new RLP behavior.
+    The incident models a deployment/version inconsistency combined with a repurposed flag that accidentally
+    activates legacy "Power Peg" logic, leading to uncontrolled child order generation and massive executions.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: order_gateway
+    name: Order Gateway
+    svc: order-gateway
+    hosts: [gw1, gw2]
+    desc: >
+      Front door for broker-dealer order flow. Validates and forwards parent orders to SMARS and returns
+      completion status to upstream clients.
+    to:
+      - dst: smars_router
+        proto: grpc
+        desc: Forwards parent orders to SMARS for routing/execution.
+    logs:
+      rlp_order_recv:
+        desc: Parent order received from a broker for routing (RLP flag carried on the order).
+        lvl: INFO
+        msg: "recv parent_order={order_id} sym={sym} qty={qty} broker={broker} rlp_flag={rlp_flag} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          sym: {k: ch, v: [AAPL, MSFT, GE, F, BAC, XOM, INTC, CSCO, AMZN, JPM, WMT, T, C]}
+          qty: {k: i, v: [100, 50000]}
+          broker: {k: ch, v: [td_ameritrade, etrade, scottrade, vanguard, other]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            rlp_flag: {k: ch, v: [off]}
+          f:
+            rlp_flag: {k: ch, v: [on]}
+      respond_ok:
+        desc: Gateway completes the parent order successfully.
+        lvl: INFO
+        msg: "complete parent_order={order_id} status=FILLED fills={fills} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          fills: {k: i, v: [1, 50000]}
+          dur_ms: {k: i, v: [5, 60000]}
+          trace_id: {k: hex, v: 32}
+      respond_err:
+        desc: Gateway rejects or fails the parent order (e.g., downstream disabled).
+        lvl: WARN
+        msg: "complete parent_order={order_id} status=REJECTED reason={reason} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          reason: {k: ch, v: [downstream_disabled, timeout, overloaded]}
+          dur_ms: {k: i, v: [1, 2000]}
+          trace_id: {k: hex, v: 32}
+      conn_pool_warn:
+        desc: Low-rate infrastructure noise about downstream connectivity.
+        lvl: WARN
+        msg: "grpc pool warning dst=smars_router active_conns={active_conns} pending={pending}"
+        vars:
+          active_conns: {k: i, v: [20, 300]}
+          pending: {k: i, v: [0, 50]}
+    beh:
+      n:
+        desc: Mostly quiet; occasional connectivity noise.
+        emit:
+          - id: conn_pool_warn
+            per_min: 0.08
+            scope: global
+      f:
+        desc: Similar background noise; primary symptoms appear in flows and SMARS metrics.
+        emit:
+          - id: conn_pool_warn
+            per_min: 0.12
+            scope: global
+
+  - id: smars_router
+    name: SMARS Order Router
+    svc: smars
+    hosts: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]
+    desc: >
+      High-speed router that decomposes parent orders into child orders and sends them to NYSE.
+      In failure, a legacy build combined with a repurposed RLP flag can execute old "Power Peg"
+      logic without effective throttling, generating excessive child orders.
+    to:
+      - dst: nyse_venue
+        proto: fix
+        desc: Sends child orders and receives execution reports from NYSE.
+      - dst: order_gateway
+        proto: grpc
+        desc: Returns parent-order completion and fill summaries back to the gateway.
+    logs:
+      dispatch:
+        desc: SMARS assigns the parent order to a routing engine on a specific host/build.
+        lvl: INFO
+        msg: "dispatch parent_order={order_id} host={host} build={build} rlp_flag={rlp_flag} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            build: {k: ch, v: [rlp_v2]}
+            rlp_flag: {k: ch, v: [off]}
+          f:
+            build: {k: ch, v: [rlp_v2, legacy_v1]}
+            rlp_flag: {k: ch, v: [on]}
+      powerpeg_activated:
+        desc: Legacy Power Peg path is entered for a parent order.
+        lvl: ERROR
+        msg: "PowerPeg active parent_order={order_id} sym={sym} host={host} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          sym: {k: ch, v: [AAPL, MSFT, GE, F, BAC, XOM, INTC, CSCO, AMZN, JPM, WMT, T, C]}
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          trace_id: {k: hex, v: 32}
+      child_order_burst:
+        desc: A single parent order generates an unusually large number of child orders.
+        lvl: WARN
+        msg: "child order burst parent_order={order_id} host={host} child_orders={child_orders} throttle={throttle} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          child_orders: {k: i, v: [50, 250000]}
+          throttle: {k: ch, v: [on, off]}
+          trace_id: {k: hex, v: 32}
+      heartbeat:
+        desc: Periodic per-host liveness and build indicator.
+        lvl: INFO
+        msg: "heartbeat host={host} build={build} queue_depth={queue_depth} cpu_pct={cpu_pct}"
+        vars:
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          queue_depth: {k: i, v: [0, 5000]}
+          cpu_pct: {k: i, v: [5, 100]}
+        state_vars:
+          n:
+            build: {k: ch, v: [rlp_v2]}
+          f:
+            build: {k: ch, v: [rlp_v2, legacy_v1]}
+      child_order_stats:
+        desc: Per-minute routing stats; in failure shows extreme child order and unmatched execution counts.
+        lvl: INFO
+        msg: "stats host={host} child_orders_sent={child_orders_sent} exec_reports_rcvd={exec_reports_rcvd} unmatched_execs={unmatched_execs}"
+        vars:
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          child_orders_sent: {k: i, v: [100, 6000000]}
+          exec_reports_rcvd: {k: i, v: [100, 6000000]}
+          unmatched_execs: {k: i, v: [0, 2000000]}
+      shutdown_host:
+        desc: Per-host marker that trading/routing has been disabled.
+        lvl: INFO
+        msg: "trading disabled host={host} reason={reason}"
+        vars:
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          reason: {k: ch, v: [incident_mitigation, operator_request]}
+    beh:
+      n:
+        desc: Hosts emit heartbeats and routine routing stats at low rates.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+          - id: child_order_stats
+            per_min: 0.5
+      f:
+        desc: Same baseline emission points; rates/values can be amplified during the incident.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+          - id: child_order_stats
+            per_min: 0.5
+
+  - id: nyse_venue
+    name: NYSE Execution Venue
+    svc: nyse
+    hosts: [nyse1]
+    desc: >
+      External venue that executes child orders and returns execution reports.
+      Also emits market-wide volume anomaly alerts attributed to a member.
+    to:
+      - dst: smars_router
+        proto: fix
+        desc: Sends aggregated execution reports/alerts back to SMARS/member connections.
+    logs:
+      parent_exec_summary:
+        desc: Aggregated execution summary observed for a parent order.
+        lvl: INFO
+        msg: "exec summary parent_order={order_id} sym={sym} side={side} execs={execs} shares={shares} venues={venues} trace_id={trace_id}"
+        vars:
+          order_id: {k: uuid, v: null}
+          sym: {k: ch, v: [AAPL, MSFT, GE, F, BAC, XOM, INTC, CSCO, AMZN, JPM, WMT, T, C]}
+          side: {k: ch, v: [BUY, SELL]}
+          execs: {k: i, v: [1, 50000]}
+          shares: {k: i, v: [100, 5000000]}
+          venues: {k: i, v: [1, 20]}
+          trace_id: {k: hex, v: 32}
+      volume_alert:
+        desc: NYSE operations alerts on abnormal member-driven volume.
+        lvl: WARN
+        msg: "volume anomaly member={member} symbols_affected={symbols_affected} volume_mult={volume_mult} action={action}"
+        vars:
+          member: {k: ch, v: [KNIGHT]}
+          symbols_affected: {k: i, v: [5, 200]}
+          volume_mult: {k: f, v: [1.0, 10.0]}
+          action: {k: ch, v: [monitoring, called_member]}
+    beh:
+      n:
+        desc: Rare market-wide alerts during normal operation.
+        emit:
+          - id: volume_alert
+            per_min: 0.01
+            scope: global
+      f:
+        desc: Alerts become more common during anomalous activity.
+        emit:
+          - id: volume_alert
+            per_min: 0.05
+            scope: global
+
+  - id: bnet_alerting
+    name: BNET Alerting / Emailer
+    svc: bnet
+    hosts: [bnet1]
+    desc: >
+      Internal alerting channel that sends email messages about SMARS status. In the incident it
+      emits many low-priority emails referencing "Power Peg disabled", which are not treated as urgent.
+    to:
+      - dst: ops_console
+        proto: smtp
+        desc: Sends email notifications to IT distribution lists.
+    logs:
+      email_powerpeg_disabled:
+        desc: One email message referencing a Power Peg related condition on a SMARS host.
+        lvl: INFO
+        msg: "email queued to={to_group} subject={subject} host={host} detail={detail}"
+        vars:
+          to_group: {k: ch, v: [smars-notify]}
+          subject: {k: ch, v: ["SMARS: Power Peg disabled"]}
+          host: {k: ch, v: [smars1, smars2, smars3, smars4, smars5, smars6, smars7, smars8]}
+          detail: {k: ch, v: [flag_mismatch, feature_disabled, unknown_state]}
+    beh:
+      n:
+        desc: No routine emission modeled (emails appear as one-shot bursts when they happen).
+        emit: []
+      f:
+        desc: No routine emission modeled (emails appear as one-shot bursts when they happen).
+        emit: []
+
+  - id: pmon
+    name: PMON Position Monitor
+    svc: pmon
+    hosts: [pmon1]
+    desc: >
+      Post-execution position monitoring that aggregates gross/net exposure, including a special
+      holding account "33" for unmatched or transient positions. In this incident it shows large
+      exposures but does not automatically stop trading.
+    to:
+      - dst: ops_console
+        proto: https
+        desc: Displays exposures to operators; no automatic kill action is modeled.
+    logs:
+      position_snapshot:
+        desc: Periodic exposure snapshot for an account.
+        lvl: INFO
+        msg: "snapshot acct={acct} gross_usd={gross_usd} net_usd={net_usd} symbols={symbols}"
+        vars:
+          acct: {k: ch, v: ["33", "MM_MAIN"]}
+          gross_usd: {k: i, v: [0, 4000000000]}
+          net_usd: {k: i, v: [-4000000000, 4000000000]}
+          symbols: {k: i, v: [0, 200]}
+      limit_breach:
+        desc: Gross exposure limit breach (modeled as notify-only).
+        lvl: WARN
+        msg: "limit breach acct={acct} gross_usd={gross_usd} limit_usd={limit_usd} action={action}"
+        vars:
+          acct: {k: ch, v: ["33"]}
+          gross_usd: {k: i, v: [1000000, 4000000000]}
+          limit_usd: {k: i, v: [2000000, 2000000]}
+          action: {k: ch, v: [notify_only]}
+      operator_ack:
+        desc: Operator acknowledges viewing a breach on the console.
+        lvl: INFO
+        msg: "operator viewed breach acct={acct} ack_by={ack_by}"
+        vars:
+          acct: {k: ch, v: ["33"]}
+          ack_by: {k: ch, v: [cio, it_lead, risk_ops]}
+    beh:
+      n:
+        desc: Normal snapshots show low exposure; breaches are rare.
+        emit:
+          - id: position_snapshot
+            per_min: 1.0
+            scope: global
+          - id: limit_breach
+            per_min: 0.01
+            scope: global
+      f:
+        desc: Snapshots continue; breach notifications may become more common as exposure grows.
+        emit:
+          - id: position_snapshot
+            per_min: 1.0
+            scope: global
+          - id: limit_breach
+            per_min: 0.2
+            scope: global
+
+  - id: ops_console
+    name: Operations Console
+    svc: ops
+    hosts: [ops1]
+    desc: >
+      Human-operated console used to apply rollbacks and disable trading systems. Actions are logged
+      as discrete operational markers.
+    to:
+      - dst: smars_router
+        proto: ssh
+        desc: Used by operators to roll back binaries and stop SMARS.
+    logs:
+      rollback_started:
+        desc: Operator starts a rollback across SMARS hosts.
+        lvl: WARN
+        msg: "ops started rollback target_build={target_build} reason={reason}"
+        vars:
+          target_build: {k: ch, v: [legacy_v1]}
+          reason: {k: ch, v: [suspected_new_code_issue, incident_response]}
+      shutdown_issued:
+        desc: Operator issues an emergency shutdown of SMARS trading.
+        lvl: CRITICAL
+        msg: "ops issued SMARS shutdown reason={reason}"
+        vars:
+          reason: {k: ch, v: [runaway_orders, incident_response]}
+    beh:
+      n:
+        desc: No routine emission modeled.
+        emit: []
+      f:
+        desc: No routine emission modeled.
+        emit: []
+
+tracing:
+  on: true
+  origins: [order_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: |
+      Normal order routing: parent orders are dispatched to SMARS and executed on NYSE with bounded child order activity.
+    req:
+      - id: parent_order_normal
+        desc: Normal parent order processed and filled with a small number of executions.
+        rpm: 180.0
+        path: [order_gateway, smars_router, nyse_venue, smars_router, order_gateway]
+        emit:
+          - order_gateway.rlp_order_recv
+          - smars_router.dispatch
+          - nyse_venue.parent_exec_summary
+          - order_gateway.respond_ok
+        latency_ms: [[1, 3], [2, 8], [10, 60], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: |
+      Failure order routing: a legacy build interprets the RLP flag as Power Peg activation, generating unthrottled child orders and huge execution volumes; later an attempted rollback spreads the behavior; finally SMARS is shut down and the gateway rejects orders.
+    req:
+      - id: parent_order_ok
+        desc: Parent order handled correctly on updated hosts (RLP v2).
+        rpm: 140.0
+        path: [order_gateway, smars_router, nyse_venue, smars_router, order_gateway]
+        emit:
+          - order_gateway.rlp_order_recv
+          - smars_router.dispatch
+          - nyse_venue.parent_exec_summary
+          - order_gateway.respond_ok
+        latency_ms: [[1, 3], [2, 10], [15, 100], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: parent_order_powerpeg
+        desc: Parent order hits a legacy host and triggers Power Peg behavior with a large child-order burst.
+        rpm: 20.0
+        path: [order_gateway, smars_router, nyse_venue, smars_router, order_gateway]
+        emit:
+          - order_gateway.rlp_order_recv
+          - smars_router.dispatch
+          - smars_router.powerpeg_activated
+          - smars_router.child_order_burst
+          - nyse_venue.parent_exec_summary
+          - order_gateway.respond_ok
+        latency_ms: [[1, 3], [3, 20], [1, 5], [5, 50], [50, 7000], [1, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: parent_order_rejected
+        desc: After SMARS is shut down, the gateway rejects incoming parent orders.
+        rpm: 120.0
+        path: [order_gateway]
+        emit:
+          - order_gateway.rlp_order_recv
+          - order_gateway.respond_err
+        latency_ms: [[1, 3], [2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Timeline is compressed to fit a sub-hour scenario: the pre-open BNET email burst occurs minutes before active order flow rather than ~90 minutes earlier.
+  - |
+    SMARS runs on eight hosts; during early failure the generator should route most Power Peg-triggering orders to smars8 with build=legacy_v1, while other hosts run rlp_v2.
+  - |
+    After the modeled "rollback", the generator should emit build=legacy_v1 on all SMARS hosts, making nearly all parent orders follow the Power Peg flow variant.
+  - |
+    Execution volume is modeled via aggregated per-parent-order summaries and per-minute SMARS stats, not per-trade logs, to keep volume realistic for analysis.
+  - |
+    order_gateway.respond_ok.dur_ms is widened to cover worst-case modeled end-to-end latencies under Power Peg (including event latency multipliers), so duration fields remain coherent with degraded flows.
+  - |
+    Normal-phase rough log volume: ~180 rpm * 4 logs/req ≈ 720 logs/min plus ~15 logs/min background ≈ 735 logs/min.
+  - |
+    Total scenario log volume target: ~30k logs (within 20k..100k) driven mainly by per-request gateway/SMARS/NYSE logs plus a 97-email one-shot burst and amplified SMARS stats during failure.
+  - |
+    Key diagnostic visibility: BNET email burst (early warning), SMARS Power Peg activation + child order burst logs (triggered subset then widespread), NYSE volume anomaly alerts, and PMON account "33" limit breaches.
+```

@@ -1,0 +1,228 @@
+```yaml
+scenario:
+  id: waf_rule_regex_cpu_exhaustion_global
+  title: Global HTTP 502s from WAF regex backtracking after rapid ruleset deploy
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally serves customer HTTP/HTTPS traffic at the edge and evaluates a WAF managed ruleset in simulate mode.
+    A globally distributed KV deploy pushes a new managed rule containing a pathological PCRE regex, which exhausts CPU in the HTTP workers.
+    Front-line proxies then time out reaching the workers and return widespread 502s; synthetic monitors detect failures and paging opens a P0.
+    Operators eventually use a breakglass path to execute a global terminate disabling the WAF, restoring traffic while leaving WAF protection disabled.
+
+  trigger_desc: |
+    A new WAF managed ruleset version is deployed globally via the distributed KV store, and the newly introduced regex causes catastrophic backtracking on live traffic.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 30}
+      f: {start_min: 30, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Edge proxies and workers handle requests successfully. Per-host metrics show moderate CPU and near-zero 5xx errors.
+        External synthetic checks consistently succeed.
+      flows: [user_http_ok, synthetic_waf_check_ok]
+      manifestation:
+        - edge_frontend.access_ok
+        - http_worker.req_done
+        - edge_metrics_agent.cpu_sample_normal
+        - edge_metrics_agent.traffic_sample_normal
+        - synth_monitor.check_ok
+        - waf_engine.waf_stats
+
+    f:
+      desc: |
+        Immediately after a rapid global ruleset deploy, worker CPU saturates due to a backtracking regex and the frontend begins returning 502s.
+        Monitoring escalates from WAF check failures to a clear global outage picture with CPU exhaustion and traffic drop.
+        Mitigation requires disabling the WAF worldwide via a global terminate; after that, traffic recovers but WAF remains disabled.
+
+      events:
+        - order: 1
+          at_min: 30
+          component: quicksilver_kv
+          event: |
+            A new managed ruleset is published globally and applied on edge hosts; within minutes workers become CPU-bound and 502s become widespread.
+          why: |
+            The deployed ruleset contains a regex that can backtrack catastrophically in the Lua/PCRE WAF, consuming CPU on all worker cores.
+            CPU saturation is directly observable via periodic CPU samples; the timing link to the ruleset publish is observable via deployment markers.
+          flows: [user_http_502, user_http_ok_degraded, synthetic_waf_check_fail]
+          rate_multipliers:
+            user_http_ok_nowaf: 0.0
+            synthetic_waf_check_ok_f: 0.0
+            waf_engine.waf_status: 0.0
+            edge_metrics_agent.cpu_sample_recovered: 0.0
+            edge_metrics_agent.traffic_sample_recovered: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: quicksilver_kv.publish_ruleset
+              count: 1
+              hosts: [qs-ctl-01]
+            - ref: waf_engine.ruleset_applied
+              count: 3
+              hosts: [edge-lhr-01, edge-lhr-02, edge-lhr-03]
+          manifestation:
+            - quicksilver_kv.publish_ruleset
+            - waf_engine.ruleset_applied
+            - edge_frontend.upstream_timeout
+            - edge_frontend.access_502
+            - edge_metrics_agent.cpu_sample_high
+
+        - order: 2
+          at_min: 33
+          component: synth_monitor
+          event: |
+            External synthetic checks are consistently failing with 502s; paging fires and a P0 incident is opened while initial operator access attempts fail.
+          why: |
+            Synthetic monitors directly observe client-facing 502 responses. Paging is thresholded/aggregated, so it triggers once when failures spike.
+            During the outage, internal systems that rely on the edge path can be intermittently unreachable, producing authentication failures before breakglass is used.
+          flows: [synthetic_waf_check_fail]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: synth_monitor.page_sent
+              count: 1
+              hosts: [mon-01]
+            - ref: synth_monitor.pagerduty_incident_opened
+              count: 1
+              hosts: [mon-01]
+            - ref: control_panel.auth_failed
+              count: 2
+              hosts: [cp-01]
+          manifestation:
+            - synth_monitor.check_fail
+            - synth_monitor.page_sent
+            - synth_monitor.pagerduty_incident_opened
+            - control_panel.auth_failed
+
+        - order: 3
+          at_min: 48
+          component: edge_metrics_agent
+          event: |
+            Telemetry and on-host investigation highlight CPU exhaustion and point to WAF/regex evaluation as the dominant CPU consumer.
+          why: |
+            Periodic CPU/traffic samples show near-100% CPU and very high 5xx rates across hosts. A perf snapshot showing PCRE/Lua functions
+            dominating CPU is partially observable and supports narrowing the suspect component to WAF evaluation rather than an external attack.
+          flows: [user_http_502]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: edge_metrics_agent.traffic_drop_alert
+              count: 1
+              hosts: [edge-lhr-01]
+            - ref: edge_metrics_agent.perf_top_snapshot
+              count: 1
+              hosts: [edge-lhr-02]
+          manifestation:
+            - edge_metrics_agent.traffic_drop_alert
+            - edge_metrics_agent.perf_top_snapshot
+            - edge_metrics_agent.traffic_sample_impact
+            - waf_engine.regex_backtrack_warn
+
+        - order: 4
+          at_min: 55
+          component: control_panel
+          event: |
+            An operator uses breakglass access to execute a global terminate disabling WAF; CPU and 5xx rates rapidly drop and synthetic checks recover.
+          why: |
+            Disabling WAF removes the expensive regex evaluations from the request path, freeing worker CPU and restoring responsiveness.
+            The action is directly observable via control-plane and WAF disable markers, and the recovery is observable via metrics and synthetic checks.
+          flows: [user_http_ok_nowaf, synthetic_waf_check_ok_f]
+          rate_multipliers:
+            user_http_502: 0.01
+            user_http_ok_degraded: 0.0
+            user_http_ok_nowaf: 1.0
+            synthetic_waf_check_fail: 0.0
+            synthetic_waf_check_ok_f: 1.0
+            edge_metrics_agent.cpu_sample_high: 0.0
+            edge_metrics_agent.traffic_sample_impact: 0.0
+            edge_metrics_agent.cpu_sample_recovered: 1.0
+            edge_metrics_agent.traffic_sample_recovered: 1.0
+            waf_engine.regex_backtrack_warn: 0.0
+            waf_engine.waf_status: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: control_panel.bypass_used
+              count: 1
+              hosts: [cp-01]
+            - ref: control_panel.global_terminate
+              count: 1
+              hosts: [cp-01]
+            - ref: quicksilver_kv.publish_waf_disable
+              count: 1
+              hosts: [qs-ctl-01]
+            - ref: waf_engine.waf_disabled_marker
+              count: 3
+              hosts: [edge-lhr-01, edge-lhr-02, edge-lhr-03]
+          manifestation:
+            - control_panel.global_terminate
+            - quicksilver_kv.publish_waf_disable
+            - waf_engine.waf_disabled_marker
+            - edge_metrics_agent.cpu_sample_recovered
+            - http_worker.req_done_nowaf
+            - synth_monitor.check_ok
+
+      steady:
+        - component: waf_engine
+          condition: |
+            WAF remains globally disabled after the terminate action; edge traffic is largely restored but security filtering is degraded.
+          user_impact: |
+            End users mostly stop seeing 502s, but customers temporarily lose WAF managed-rule protection until WAF is re-enabled later.
+          manifestation:
+            - waf_engine.waf_status
+
+        - component: edge_frontend
+          condition: |
+            Residual 502s may occur at a very low rate while hosts stabilize, but the dominant error mode is gone.
+          user_impact: |
+            Most requests succeed; a small fraction may still see transient 502s.
+          manifestation:
+            - edge_frontend.access_502
+            - edge_frontend.access_ok
+
+      feedback_loops:
+        - id: saturation_timeout_pressure
+          desc: |
+            Worker CPU saturation causes timeouts and 502s, which can prompt clients and automated systems to retry or refresh.
+            Those additional attempts add load at the edge, prolonging saturation until WAF is removed from the hot path.
+
+      flows: [user_http_502, user_http_ok_degraded, user_http_ok_nowaf, synthetic_waf_check_fail, synthetic_waf_check_ok_f]
+      manifestation:
+        - edge_frontend.upstream_timeout
+        - edge_frontend.access_502
+        - edge_metrics_agent.cpu_sample_high
+        - edge_metrics_agent.traffic_sample_impact
+        - waf_engine.regex_backtrack_warn
+        - control_panel.global_terminate
+        - waf_engine.waf_status
+        - http_worker.req_done_nowaf
+
+  assumptions:
+    - |
+      Timeline is compressed into a 60-minute window with failure starting at minute 30; key beats preserved:
+      rapid deploy, early synthetic paging, later identification via CPU/perf signals, and global terminate mitigation.
+    - |
+      Failure-phase piecewise rates (approx):
+      - Minutes 30-55 (25 min): ~220 rpm 502 flow (≈440 logs/min), ~30 rpm degraded-ok flow (≈90 logs/min),
+        synthetic fail (≈6 logs/min), metrics impact samplers (≈6 logs/min), sampled slow-regex warnings (≈6 logs/min)
+        => ~545-550 logs/min.
+      - Minutes 55-60 (5 min): residual 502 reduced to ~2.2 rpm (≈4-5 logs/min), post-terminate ok-nowaf flow ~180 rpm (≈540 logs/min),
+        synthetic ok (≈6 logs/min), metrics recovered samplers (≈6 logs/min), WAF status (≈3 logs/min)
+        => ~558-560 logs/min and implied 5xx% consistent with recovered err_5xx_pct ≤ 3%.
+    - |
+      One-shots per event: deploy markers (4), paging/incident-open/auth-fail markers (4), telemetry markers (2), terminate markers (6).
+    - |
+      Normal-phase estimate: ~900 logs/min from user traffic + ~12 logs/min metrics/synth => ~27k logs over 30 minutes.
+    - |
+      Total estimated logs: ~43k-48k; decisive failure signals (502 access + upstream timeouts, CPU/5xx metric samples,
+      slow-regex warnings, and global terminate markers) are high-probability within a single generated log file.
+    - |
+      Paging realism: synth_monitor.page_sent is modeled as a single thresholded/aggregated one-shot when synthetic failures become persistent,
+      rather than being emitted once per failed check.
+    - |
+      Recovery consistency: after global terminate, successful request completions are modeled via http_worker.req_done_nowaf (low total_ms/waf_ms),
+      and degraded-but-successful pre-mitigation requests use edge_frontend.access_ok_slow so access-log duration domains remain coherent.
+```

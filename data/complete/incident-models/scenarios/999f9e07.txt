@@ -1,0 +1,335 @@
+```yaml
+scenario:
+  id: incident_20190204_useast1_coordination_proxy_outage
+  title: us-east-1 coordination outage causes proxy disruption and extended Kibana degradation
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The region normally routes customer traffic through a proxy fleet that depends on ZooKeeper-backed service discovery, while the console API reads deployment state from ZooKeeper and Kibana reaches Elasticsearch through an internal TLS sidecar.
+    During routine maintenance, the ZooKeeper ensemble entered a leader election and the leader became overwhelmed by connection load, losing quorum and breaking both routing and control-plane reads.
+    Recovery efforts were delayed by host unresponsiveness triggered during container namespace debugging, and later a reconnection storm overloaded proxies and the observer layer.
+    After Elasticsearch routing largely recovered, Kibana remained degraded on a subset of hosts due to sidecar forwarding/resource exhaustion and leaked sockets driving conntrack pressure.
+
+  trigger_desc: |
+    A routine patching/replacement procedure on the coordination ZooKeeper ensemble coincided with elevated client reconnect load, triggering leader election and leader shutdown under pressure.
+
+  time:
+    total_minutes: 55
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 55}
+
+  phases:
+    n:
+      desc: |
+        Customer traffic to Elasticsearch and Kibana is routed by proxies using observer-cached routes.
+        The console API frequently reads deployment state from ZooKeeper.
+        Kibana instances make internal calls to Elasticsearch through a TLS sidecar, with bounded socket usage and low conntrack utilization.
+      flows: [es_search_ok, kibana_ui_ok, console_list_deployments_ok, kibana_es_call_ok]
+      manifestation:
+        - lb_edge.lb_metrics
+        - zk_ensemble.zk_health
+        - zk_observer.observer_health
+        - proxy_router.proxy_cpu
+        - proxy_router.proxy_es_access_ok
+        - control_plane_api.api_health
+        - kibana_instance.kibana_health
+        - kibana_instance.open_sockets_metric
+        - tls_proxy.conntrack_metric
+
+    f:
+      desc: |
+        The coordination layer loses quorum, causing route discovery failures for proxies and read timeouts for the console API.
+        Attempts to troubleshoot trigger host-level unresponsiveness on ZooKeeper members, prolonging instability.
+        When traffic is reintroduced, a large reconnection surge overloads proxies and destabilizes observers until configuration and scaling actions reduce pressure.
+        Even after most Elasticsearch traffic succeeds again, Kibana stays degraded on some hosts due to internal sidecar strain and connection/socket leaks that can exhaust conntrack resources.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: zk_ensemble
+          event: |
+            A leader election occurs and the leader shuts down under incoming connection pressure; the ensemble cannot maintain quorum.
+            Proxy routing begins failing broadly and the load balancer observes a sharp increase in 5xx and latency.
+          why: |
+            Coordination instability removes or delays route state needed by proxies and blocks console reads. This is directly observable via ZooKeeper quorum/connection logs,
+            proxy access attempt errors with route lookup retries, and ALB 5xx metrics.
+          flows:
+            - es_search_503_route_unavailable
+            - console_list_deployments_timeout
+            - kibana_ui_proxy_fail
+            - kibana_es_call_fail_proxy
+          rate_multipliers:
+            es_search_200_after_recovery: 0.0
+            console_list_deployments_ok_after_restore: 0.0
+            kibana_ui_503_kibana_unhealthy: 0.0
+            kibana_es_call_fail_conntrack: 0.0
+            zk_ensemble.zk_client_conn_fail: 1.4
+            zk_ensemble.zk_quorum_lost: 1.6
+            proxy_router.zk_session_reset: 1.5
+            zk_observer.observer_sync_timeout: 1.3
+            kibana_instance.open_sockets_pressure: 0.0
+            tls_proxy.conntrack_pressure: 0.0
+            lb_edge.lb_metrics_recovered: 0.0
+          latency_multipliers:
+            es_search_503_route_unavailable: {p50: 1.2, p95: 1.6}
+            console_list_deployments_timeout: {p50: 1.1, p95: 1.3}
+          one_shots:
+            - ref: zk_ensemble.zk_leader_election
+              count: 1
+              hosts: [zk-1]
+            - ref: zk_ensemble.zk_leader_shutdown
+              count: 1
+              hosts: [zk-1]
+          manifestation:
+            - zk_ensemble.zk_quorum_lost
+            - zk_ensemble.zk_client_conn_fail
+            - proxy_router.proxy_es_access_err
+            - proxy_router.route_lookup_retry
+            - lb_edge.lb_metrics
+
+        - order: 2
+          at_min: 33
+          component: zk_ensemble
+          event: |
+            During troubleshooting, two ZooKeeper hosts become unresponsive (kernel softlocks) and require reboots, keeping quorum unstable.
+          why: |
+            Entering a container network namespace on the affected hosts can trigger a runc/kernel issue, causing long CPU softlocks and temporarily removing ensemble members.
+            This is directly observable in kernel softlock and reboot markers; the underlying trigger is only partially observable from application logs alone.
+          flows:
+            - es_search_503_route_unavailable
+            - console_list_deployments_timeout
+            - kibana_es_call_fail_proxy
+          rate_multipliers:
+            zk_ensemble.zk_client_conn_fail: 1.8
+            zk_ensemble.zk_quorum_lost: 2.2
+            proxy_router.zk_session_reset: 1.7
+            zk_observer.observer_sync_timeout: 1.6
+          latency_multipliers:
+            es_search_503_route_unavailable: {p50: 1.3, p95: 2.2}
+          one_shots:
+            - ref: zk_ensemble.kernel_softlock
+              count: 2
+              hosts: [zk-1, zk-2]
+            - ref: zk_ensemble.host_reboot
+              count: 2
+              hosts: [zk-1, zk-2]
+          manifestation:
+            - zk_ensemble.kernel_softlock
+            - zk_ensemble.host_reboot
+            - zk_ensemble.zk_quorum_lost
+            - proxy_router.zk_session_reset
+
+        - order: 3
+          at_min: 40
+          component: proxy_router
+          event: |
+            Client load is intentionally reduced (traffic shedding) and services are restarted to lower reconnect pressure; quorum is observed stable enough to re-form.
+          why: |
+            Reducing client connections allows the ensemble and observers to settle, decreasing connection failures and session resets. This is directly observable via reduced ZooKeeper
+            client connection failure logs and fewer proxy session reset warnings, plus an operational traffic-shedding marker.
+          flows:
+            - es_search_503_route_unavailable
+            - console_list_deployments_timeout
+            - kibana_ui_proxy_fail
+            - kibana_es_call_fail_proxy
+          rate_multipliers:
+            es_search_503_route_unavailable: 0.7
+            console_list_deployments_timeout: 0.5
+            kibana_ui_proxy_fail: 0.7
+            kibana_es_call_fail_proxy: 0.7
+            zk_ensemble.zk_client_conn_fail: 0.3
+            zk_ensemble.zk_quorum_lost: 0.1
+            proxy_router.zk_session_reset: 0.4
+            zk_observer.observer_sync_timeout: 0.6
+          latency_multipliers:
+            es_search_503_route_unavailable: {p50: 1.0, p95: 1.3}
+          one_shots:
+            - ref: proxy_router.traffic_shed_enabled
+              count: 1
+              hosts: [proxy-1]
+            - ref: zk_ensemble.zk_quorum_established
+              count: 1
+              hosts: [zk-3]
+          manifestation:
+            - proxy_router.traffic_shed_enabled
+            - zk_ensemble.zk_quorum_established
+            - zk_ensemble.zk_client_conn_fail
+            - proxy_router.proxy_es_access_err
+
+        - order: 4
+          at_min: 44
+          component: lb_edge
+          event: |
+            Traffic is reintroduced and the console becomes usable again; a large external reconnection surge increases proxy CPU and destabilizes the observer layer, keeping data-plane error rates elevated.
+          why: |
+            Re-established clients reconnect in bursts, spiking active connections and stressing observer sync, which then cascades back into routing instability.
+            This is directly observable via proxy CPU metrics, observer sync timeouts, and elevated ALB 5xx/latency.
+          flows:
+            - es_search_503_route_unavailable
+            - kibana_ui_proxy_fail
+            - console_list_deployments_ok_after_restore
+          rate_multipliers:
+            es_search_503_route_unavailable: 1.3
+            kibana_ui_proxy_fail: 1.3
+            console_list_deployments_ok_after_restore: 1.0
+            console_list_deployments_timeout: 0.05
+            zk_observer.observer_sync_timeout: 2.5
+            proxy_router.proxy_cpu: 1.7
+          latency_multipliers:
+            es_search_503_route_unavailable: {p50: 1.2, p95: 2.0}
+            console_list_deployments_ok_after_restore: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: proxy_router.traffic_shed_disabled
+              count: 1
+              hosts: [proxy-1]
+          manifestation:
+            - lb_edge.lb_metrics
+            - proxy_router.proxy_cpu
+            - zk_observer.observer_sync_timeout
+            - proxy_router.proxy_es_access_err
+            - control_plane_api.console_access_ok
+
+        - order: 5
+          at_min: 49
+          component: zk_observer
+          event: |
+            The observer layer is stabilized by increasing initLimit and the proxy fleet is scaled out; successful Elasticsearch traffic surges (reconnections) while external 5xx/latency drop back near baseline.
+          why: |
+            A higher initLimit reduces observer flapping during sync, and more proxy capacity absorbs the reconnection surge. This is directly observable via the config change marker,
+            autoscale marker, fewer observer sync timeouts, many more successful proxy access logs, and near-baseline ALB metric values with only a small residual 5xx rate.
+          flows:
+            - es_search_200_after_recovery
+            - es_search_503_route_unavailable
+            - kibana_ui_proxy_fail
+            - kibana_es_call_fail_proxy
+            - console_list_deployments_ok_after_restore
+          rate_multipliers:
+            es_search_503_route_unavailable: 0.05
+            es_search_200_after_recovery: 3.0
+            kibana_ui_proxy_fail: 0.05
+            kibana_es_call_fail_proxy: 0.1
+            console_list_deployments_timeout: 0.0
+            console_list_deployments_ok_after_restore: 1.0
+            zk_observer.observer_sync_timeout: 0.2
+            proxy_router.proxy_cpu: 0.8
+            lb_edge.lb_metrics: 0.0
+            lb_edge.lb_metrics_recovered: 1.0
+          latency_multipliers:
+            es_search_200_after_recovery: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: zk_observer.initlimit_changed
+              count: 1
+              hosts: [zkobs-1]
+            - ref: proxy_router.autoscale_add
+              count: 1
+              hosts: [proxy-1]
+          manifestation:
+            - zk_observer.initlimit_changed
+            - proxy_router.autoscale_add
+            - proxy_router.proxy_es_access_ok
+            - lb_edge.lb_metrics_recovered
+
+        - order: 6
+          at_min: 52
+          component: kibana_instance
+          event: |
+            With proxies mostly stable, a subset of Kibana hosts develops severe socket/conntrack pressure and the TLS sidecar cannot reliably forward requests, producing persistent 503/504 responses from Kibana.
+          why: |
+            Repeated failed internal calls can leave sockets open and push nf_conntrack toward exhaustion; this increases sidecar overhead and forwarding failures, which then cause more failed calls.
+            This is directly observable via high-pressure socket/conntrack metrics and conntrack-related forwarding/call errors; the underlying leak behavior is inferred from the symptom pattern.
+          flows:
+            - kibana_es_call_fail_conntrack
+            - kibana_ui_503_kibana_unhealthy
+            - es_search_200_after_recovery
+          rate_multipliers:
+            kibana_es_call_fail_proxy: 0.0
+            kibana_ui_proxy_fail: 0.0
+            kibana_es_call_fail_conntrack: 1.0
+            kibana_ui_503_kibana_unhealthy: 1.0
+            kibana_instance.open_sockets_pressure: 2.5
+            tls_proxy.conntrack_pressure: 2.5
+            kibana_instance.kibana_health: 1.5
+          latency_multipliers:
+            kibana_es_call_fail_conntrack: {p50: 1.2, p95: 1.5}
+            kibana_ui_503_kibana_unhealthy: {p50: 1.1, p95: 1.4}
+          one_shots: []
+          manifestation:
+            - kibana_instance.open_sockets_pressure
+            - tls_proxy.conntrack_pressure
+            - tls_proxy.forward_err_conntrack
+            - kibana_instance.es_call_err_conntrack
+            - kibana_instance.kibana_ui_err
+
+      steady:
+        - component: proxy_router
+          condition: |
+            Proxy routing for Elasticsearch is mostly restored after observer stabilization and scaling, while overall request volume remains elevated due to reconnections.
+          user_impact: |
+            Most customers can access Elasticsearch again, but a small fraction of requests still intermittently fail or show elevated latency.
+          manifestation:
+            - proxy_router.proxy_es_access_ok
+            - proxy_router.proxy_es_access_err
+            - lb_edge.lb_metrics_recovered
+
+        - component: kibana_instance
+          condition: |
+            Kibana remains degraded on a subset of hosts because internal ES connectivity is unstable and connection/socket leakage drives high open sockets and conntrack utilization.
+          user_impact: |
+            Users see Kibana pages intermittently return 503/504 or load very slowly even though Elasticsearch is mostly reachable via direct API.
+          manifestation:
+            - kibana_instance.kibana_ui_err
+            - kibana_instance.open_sockets_pressure
+            - tls_proxy.conntrack_pressure
+
+      feedback_loops:
+        - id: zk_reconnect_storm
+          desc: |
+            ZooKeeper quorum loss triggers client reconnects; reconnects raise connection load and outstanding work, delaying quorum recovery and increasing session churn.
+        - id: kibana_conntrack_spiral
+          desc: |
+            Kibana failed internal calls leak sockets; conntrack pressure increases sidecar overhead and failure rate, causing more retries and further socket growth.
+
+      flows:
+        - es_search_503_route_unavailable
+        - es_search_200_after_recovery
+        - console_list_deployments_timeout
+        - console_list_deployments_ok_after_restore
+        - kibana_ui_proxy_fail
+        - kibana_ui_503_kibana_unhealthy
+        - kibana_es_call_fail_proxy
+        - kibana_es_call_fail_conntrack
+      manifestation:
+        - zk_ensemble.zk_quorum_lost
+        - zk_observer.observer_sync_timeout
+        - proxy_router.proxy_es_access_err
+        - proxy_router.route_lookup_retry
+        - kibana_instance.open_sockets_pressure
+        - tls_proxy.conntrack_pressure
+        - lb_edge.lb_metrics
+        - lb_edge.lb_metrics_recovered
+
+  assumptions:
+    - |
+      Timeline is compressed into 55 minutes while preserving the incident’s beats: coordination failure at failure start, troubleshooting-induced host unresponsiveness,
+      controlled load reduction, reconnect storm on reintroduction (console back), proxy/observer stabilization with scaling and ALB recovery, then late-stage Kibana conntrack/socket pressure.
+    - |
+      Failure-phase piecewise volume estimate (rough, including background):
+      minutes 25-33 ~1.20k logs/min + 2 one-shots;
+      33-40 ~1.20k logs/min + 4 one-shots;
+      40-44 ~0.83k logs/min + 2 one-shots;
+      44-49 ~1.34k logs/min + 1 one-shot;
+      49-52 ~0.87k logs/min + 2 one-shots (success traffic surge with low residual 5xx);
+      52-55 ~1.25k logs/min.
+      Total failure logs ~34k. ALB metrics stay at ~1 log/min throughout failure by swapping lb_edge.lb_metrics (degraded) to lb_edge.lb_metrics_recovered at event 5.
+    - |
+      Normal-phase estimate: ~17.5k logs over 25 minutes (dominated by proxy access logs and Kibana internal call logs), plus ~0.3k background metrics.
+    - |
+      Total scenario estimate: ~52k logs (within 20k–100k). Visibility is ensured by global lb_edge metrics (degraded early, recovered after event 5),
+      high-rate proxy Elasticsearch access attempt errors with retries early in failure, steady ZooKeeper/observer background warnings during instability,
+      and late-only high-pressure socket/conntrack metrics (kibana_instance.open_sockets_pressure, tls_proxy.conntrack_pressure) enabled at event 6.
+    - |
+      Quantitative consistency note (S8 fix): after event 5, residual external 5xx-producing flows are reduced while successful Elasticsearch traffic is increased to represent reconnection surge;
+      this keeps ALB recovered http_5xx_rate (<=3%) consistent with modeled external success/error volumes.
+```

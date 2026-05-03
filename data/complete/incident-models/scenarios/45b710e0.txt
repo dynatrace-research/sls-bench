@@ -1,0 +1,152 @@
+```yaml
+scenario:
+  id: arpanet_1980_routing_update_cycle
+  title: Routing update sequence-number cycle causes network-wide IMP resource starvation
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    IMP nodes normally flood routing updates and TIP users can open remote sessions through stable neighbor lines.
+    A hardware fault leads to malformed/corrupted routing update sequence numbers for updates originating at IMP50,
+    creating a cycle (8/40/44) that is repeatedly accepted/forwarded and overwhelms IMP CPU and buffers.
+    As line protocol messages are starved, many neighbor lines are declared down and TIP users see widespread "net trouble" errors.
+
+  trigger_desc: |
+    A flaky neighbor link and memory/table corruption during routing update retransmission causes routing updates
+    that claim origin=IMP50 to circulate with the mutually "later" sequence numbers 8, 40, and 44.
+
+  time:
+    total_minutes: 30
+    phases:
+      n: {start_min: 0, end_min: 15}
+      f: {start_min: 15, end_min: 30}
+
+  phases:
+    n:
+      desc: |
+        TIP users routinely open sessions via their local IMP. IMPs flood routing updates at a bounded rate,
+        CPU is mostly available, buffers are healthy, and neighbor lines are generally stable.
+      flows: [tip_connect_success, routing_update_processed_n]
+      manifestation: [imp_node.cpu_stat, imp_node.buf_stat, imp_node.ru_rx_normal, tip_access.conn_ok]
+
+    f:
+      desc: |
+        A repeating set of routing updates claiming origin IMP50 (seq 8/40/44) begins circulating broadly.
+        IMP routing processing consumes CPU and buffers, causing update backlogs and buffer starvation.
+        As starvation persists, line up/down protocol processing fails (hello timeouts), lines flap down, and most TIP sessions fail.
+
+      events:
+        - order: 1
+          at_min: 15
+          component: imp_node
+          event: |
+            Cycling routing updates from origin IMP50 (seq 8/40/44) begin arriving at high rate, creating widespread routing backlog.
+          why: |
+            A malformed sequence-number set forms a "later-than" cycle, so updates are repeatedly accepted/forwarded rather than aging out.
+            The underlying bit-drop/table corruption mechanism is not directly observable; the repeating origin+seq pattern is observable.
+          flows: [routing_update_backlog, routing_update_processed_f, routing_update_drop, tip_connect_fail_net_trouble]
+          rate_multipliers:
+            routing_update_backlog: 2.0
+            routing_update_processed_f: 1.5
+            routing_update_drop: 2.0
+            imp_node.cpu_warn: 2.0
+            imp_node.buffer_low: 1.2
+            imp_node.line_state: 0.5
+            imp_node.session_reset: 0.5
+            ncc.patch_ack: 0.0
+          latency_multipliers:
+            tip_connect_fail_net_trouble: {p50: 1.2, p95: 1.4}
+          one_shots: []
+          manifestation: [imp_node.ru_rx_cycle, imp_node.ru_enqueue, imp_node.cpu_warn, tip_access.net_trouble]
+
+        - order: 2
+          at_min: 20
+          component: ncc
+          event: |
+            Operators attempt mitigation by restarting several IMPs for diagnostics; outage persists network-wide.
+          why: |
+            Restart clears local dynamic state, but as soon as restarted IMPs exchange routing state with neighbors,
+            the circulating updates reintroduce the backlog and resource pressure.
+          flows: [tip_connect_fail_net_trouble, routing_update_backlog]
+          rate_multipliers:
+            imp_node.line_state: 4.0
+            imp_node.session_reset: 3.0
+            imp_node.buffer_low: 3.0
+          latency_multipliers:
+            routing_update_backlog: {p50: 1.3, p95: 2.0}
+          one_shots:
+            - ref: ncc.restart_cmd
+              count: 3
+              hosts: [ncc01]
+            - ref: imp_node.restart_complete
+              count: 3
+              hosts: [imp12, imp17, imp33]
+          manifestation: [ncc.restart_cmd, imp_node.restart_complete, imp_node.line_state, imp_node.buffer_low]
+
+        - order: 3
+          at_min: 27
+          component: ncc
+          event: |
+            NCC begins broadcasting a patch to ignore routing updates originating at IMP50; only a subset of IMPs apply it quickly.
+          why: |
+            Suppressing the cycling origin reduces update processing load on patched IMPs, but patch distribution depends on the impaired network,
+            so unpatched IMPs continue to flood/queue the same cycling updates.
+          flows: [routing_update_backlog, routing_update_processed_f, tip_connect_fail_net_trouble]
+          rate_multipliers:
+            routing_update_backlog: 1.0
+            routing_update_processed_f: 0.8
+            routing_update_drop: 0.8
+            imp_node.cpu_warn: 1.2
+            imp_node.buffer_low: 2.0
+            imp_node.line_state: 2.5
+            imp_node.session_reset: 2.0
+            ncc.patch_ack: 1.0
+          latency_multipliers:
+            tip_connect_fail_net_trouble: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: ncc.patch_broadcast_start
+              count: 1
+              hosts: [ncc01]
+            - ref: imp_node.patch_applied
+              count: 2
+              hosts: [imp12, imp17]
+          manifestation: [ncc.patch_broadcast_start, ncc.patch_ack, imp_node.patch_applied, imp_node.cpu_warn]
+
+      steady:
+        - component: imp_node
+          condition: |
+            Many IMPs remain dominated by routing-update churn and backlog from origin IMP50's cycling sequence set,
+            with buffer starvation and neighbor lines frequently declared down (hello timeouts).
+          user_impact: |
+            Most TIP connection attempts fail with "net trouble" (no physical path), and existing sessions reset during line flaps.
+            Small pockets of success may occur, but the network is largely unusable.
+          manifestation: [imp_node.ru_rx_cycle, imp_node.ru_enqueue, imp_node.buffer_low, imp_node.line_state, tip_access.net_trouble]
+
+        - component: ncc
+          condition: |
+            Patch rollout is in progress but incomplete due to reliance on the impaired network for control traffic.
+          user_impact: |
+            Operational recovery actions are slowed; some IMPs acknowledge the patch while others remain unreachable.
+          manifestation: [ncc.patch_ack]
+
+      feedback_loops:
+        - id: routing_storm_resource_starvation
+          desc: |
+            More cycling updates -> higher routing CPU and buffer use -> HELLO/I-HEARD-YOU starvation -> lines declared down ->
+            partitions/timeouts increase retransmits and acceptance windows -> even more cycling update traffic.
+
+      flows: [tip_connect_fail_net_trouble, tip_connect_success_rare, routing_update_backlog, routing_update_processed_f, routing_update_drop]
+      manifestation: [imp_node.ru_rx_cycle, imp_node.cpu_warn, imp_node.buffer_low, imp_node.line_state, tip_access.net_trouble, ncc.patch_ack]
+
+  assumptions:
+    - Timeline is modeled as a 30-minute slice during the outage and early mitigation; the real-world full recovery is omitted so the scenario ends in failure as required.
+    - |
+      Failure-phase piecewise breakdown (approx):
+      - min 15-20 (5 min): routing storm begins; routing_update_backlog effective rpm ~1200 (2.0x), processed ~225 (1.5x), drop ~100 (2.0x) => ~3.5k flow logs/min.
+      - min 20-27 (7 min): line flaps and buffer starvation become prominent via increased imp_node.line_state/session_reset/buffer_low multipliers; flow rates unchanged from prior controls.
+      - min 27-30 (3 min): partial patch reduces routing flow multipliers (backlog to 1.0x, processed to 0.8x) but does not eliminate failure; NCC patch_ack background becomes visible.
+    - "One-shot counts per event: event2 has 6 one-shots (3 restart_cmd + 3 restart_complete); event3 has 3 one-shots (patch_broadcast_start + 2 patch_applied)."
+    - |
+      Visibility rationale: repeated imp_node.ru_rx_cycle and imp_node.ru_enqueue provide a strong signature of the cycling sequence set; imp_node.cpu_warn, imp_node.buffer_low, and imp_node.line_state show resource starvation and downstream line failure; tip_access.net_trouble captures user impact; ncc.patch_broadcast_start (event marker) and ncc.patch_ack (ongoing) mark mitigation attempts despite impaired control-plane reachability.
+    - "Total expected log volume is ~60k (normal ~12k-13k, failure ~45k-50k), within the 20k-100k target."
+```

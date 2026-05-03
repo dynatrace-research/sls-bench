@@ -1,0 +1,216 @@
+```yaml
+scenario:
+  id: us_region_service_discovery_thundering_herd_2020_09_24
+  title: Service discovery quorum loss from uncached NXDOMAIN DNS storm
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system serves an interactive web UI/API and ingests telemetry, with most components depending on internal
+    service discovery and dynamic configuration via node-local DNS resolvers. A routine recycle of a latency-tracker
+    cluster removes its discovery record, producing uncached NXDOMAIN answers that trigger rapid repeated DNS lookups.
+    The resulting thundering herd destabilizes the service-discovery cluster, leading to intermittent dependency/config
+    resolution failures and high 5xx rates from the web tier, while telemetry ingestion continues to accept data.
+
+  trigger_desc: |
+    The latency-tracker cluster is recycled (scaled down and back up), temporarily removing its service-discovery entry.
+    Because NXDOMAIN answers are not cached by the node-local resolvers, clients repeatedly query for the missing record,
+    rapidly increasing DNS traffic to the service-discovery cluster.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Web requests usually succeed with only rare transient 503s. Telemetry payloads are accepted at intake.
+        The intake-side latency tracking lookup is typically served from the node-local DNS cache (positive caching),
+        resulting in low upstream DNS load on service discovery. Service discovery emits stable raft health snapshots.
+      flows: [ui_widget_ok, ui_widget_backend_503, ui_widget_lookup_failed, payload_ingest, latency_tracker_dns_ok]
+      manifestation:
+        - web_frontend.access_ok
+        - backend_api.req_ok
+        - intake_cluster.payload_accepted
+        - dns_resolver.cache_hit
+        - service_discovery.raft_state
+
+    f:
+      desc: |
+        After the latency-tracker record disappears, resolvers repeatedly forward NXDOMAIN responses upstream because they
+        do not cache NXDOMAIN. The spike in DNS load pushes the service-discovery cluster into instability: quorum is
+        intermittently lost and DNS answers degrade into SERVFAIL and timeouts. Backend services struggle to refresh
+        runtime configuration, and the web tier sees high rates of lookup failures and downstream 503s. Data ingestion
+        remains successful, but latency tracking is often skipped.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: latency_tracker
+          event: |
+            Latency-tracker cluster recycling starts; its discovery entry is missing long enough for clients to receive
+            NXDOMAIN and repeatedly re-query, sharply increasing forwarded DNS lookups.
+          why: |
+            NXDOMAIN responses are intentionally not cached by the node-local resolver, so a missing record causes rapid
+            repeat queries (directly observable via cache_miss_nxdomain and upstream NXDOMAIN answers). The resulting load
+            begins stressing the consensus-based discovery cluster, which is partially observable via quorum_lost.
+          flows: [latency_tracker_dns_nxdomain, payload_ingest, ui_widget_ok, ui_widget_backend_503, ui_widget_lookup_failed]
+          rate_multipliers:
+            latency_tracker_dns_nxdomain: 1.5
+            latency_tracker_dns_servfail: 0.0
+            latency_tracker_dns_timeout: 0.0
+            service_discovery.quorum_lost: 2.0
+            backend_api.config_refresh_failed: 1.0
+          latency_multipliers:
+            ui_widget_lookup_failed: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: latency_tracker.cluster_recycle
+              count: 1
+              hosts: [lt-1]
+          manifestation:
+            - dns_resolver.cache_miss_nxdomain
+            - service_discovery.dns_nxdomain
+            - service_discovery.quorum_lost
+
+        - order: 2
+          at_min: 30
+          component: service_discovery
+          event: |
+            After caches expire across more nodes, the DNS thundering herd expands and service discovery becomes more
+            unstable, producing SERVFAIL and timeouts alongside continued NXDOMAIN traffic.
+          why: |
+            Once client-side caches and resolver caches refresh, more nodes simultaneously query the same missing record,
+            amplifying the load. Under high inflight work, the discovery cluster struggles to maintain quorum and timely
+            responses, observable as increased quorum_lost frequency and a mix of dns_servfail and resolver timeouts.
+          flows: [latency_tracker_dns_nxdomain, latency_tracker_dns_servfail, latency_tracker_dns_timeout, ui_widget_ok, ui_widget_backend_503, ui_widget_lookup_failed]
+          rate_multipliers:
+            latency_tracker_dns_nxdomain: 2.2
+            latency_tracker_dns_servfail: 6.0
+            latency_tracker_dns_timeout: 5.0
+            ui_widget_ok: 0.85
+            ui_widget_backend_503: 1.2
+            ui_widget_lookup_failed: 1.25
+            service_discovery.quorum_lost: 3.0
+            backend_api.config_refresh_failed: 1.6
+          latency_multipliers:
+            ui_widget_backend_503: {p50: 1.3, p95: 1.6}
+            ui_widget_lookup_failed: {p50: 1.4, p95: 1.8}
+          one_shots: []
+          manifestation:
+            - service_discovery.dns_servfail
+            - dns_resolver.upstream_timeout
+            - dns_resolver.upstream_timeout_backend_api
+            - backend_api.config_refresh_failed
+            - web_frontend.access_err
+
+        - order: 3
+          at_min: 42
+          component: service_discovery
+          event: |
+            Service discovery operators switch to controlled client admission (rate limiting) and backend teams enable a
+            local config fallback, reducing overall query pressure but leaving partial service degradation.
+          why: |
+            Cutting down the number of admitted clients lowers inflight load and reduces the frequency of quorum loss,
+            but dependency/config data is still incomplete for some services and caches must repopulate. The backend’s
+            local fallback reduces config refresh failures without fully restoring all lookups.
+          flows: [latency_tracker_dns_nxdomain, latency_tracker_dns_servfail, latency_tracker_dns_timeout, ui_widget_ok, ui_widget_backend_503, ui_widget_lookup_failed]
+          rate_multipliers:
+            latency_tracker_dns_nxdomain: 0.7
+            latency_tracker_dns_servfail: 0.8
+            latency_tracker_dns_timeout: 0.6
+            ui_widget_ok: 1.35
+            ui_widget_backend_503: 0.8
+            ui_widget_lookup_failed: 0.8
+            service_discovery.quorum_lost: 0.8
+            backend_api.config_refresh_failed: 0.7
+          latency_multipliers:
+            ui_widget_ok: {p50: 0.9, p95: 0.9}
+          one_shots:
+            - ref: service_discovery.client_admission
+              count: 1
+              hosts: [sd-2]
+            - ref: backend_api.fallback_config_enabled
+              count: 1
+              hosts: [api-1]
+          manifestation:
+            - service_discovery.client_admission
+            - service_discovery.raft_state
+            - web_frontend.access_ok
+            - web_frontend.access_err
+
+      steady:
+        - component: service_discovery
+          condition: |
+            Cluster remains partially unstable: occasional quorum loss persists and DNS answers intermittently degrade
+            (NXDOMAIN for missing latency-tracker record plus periods of SERVFAIL/slow responses under residual load).
+          user_impact: |
+            Any service relying on discovery/config can intermittently fail to resolve dependencies or refresh runtime
+            configuration, contributing to user-facing errors and slow responses.
+          manifestation: [service_discovery.quorum_lost, service_discovery.raft_state, service_discovery.dns_servfail]
+        - component: web_frontend
+          condition: |
+            Web/API remains intermittently available with elevated 5xx due to lookup failures and backend 503s, though
+            some requests succeed after load control measures.
+          user_impact: |
+            Dashboards and UI widgets often fail to load or refresh, and API calls intermittently return 5xx.
+          manifestation: [web_frontend.dep_lookup_failed, web_frontend.access_err, web_frontend.access_ok]
+        - component: backend_api
+          condition: |
+            Runtime config refresh remains error-prone but is partially mitigated by local fallback; request failures
+            still occur when dependencies cannot be resolved.
+          user_impact: |
+            Even when the UI is reachable, some widget queries fail with 503 and higher latency.
+          manifestation: [backend_api.config_refresh_failed, backend_api.req_err]
+        - component: intake_cluster
+          condition: |
+            Telemetry ingestion stays operational; latency tracking is frequently skipped due to DNS instability.
+          user_impact: |
+            Customers’ incoming telemetry continues to be ingested, but internal latency-tracking-derived signals may be
+            missing or delayed.
+          manifestation: [intake_cluster.payload_accepted, intake_cluster.tracking_skipped]
+
+      feedback_loops:
+        - id: nxdomain_uncached_thundering_herd
+          desc: |
+            Missing latency-tracker record yields NXDOMAIN that is not cached by resolvers; clients rapidly repeat DNS
+            queries, increasing discovery load. Increased load causes slower responses/SERVFAIL/timeouts, which further
+            increases client retry/refresh pressure and prolongs instability.
+
+      flows:
+        - ui_widget_ok
+        - ui_widget_backend_503
+        - ui_widget_lookup_failed
+        - payload_ingest
+        - latency_tracker_dns_nxdomain
+        - latency_tracker_dns_servfail
+        - latency_tracker_dns_timeout
+      manifestation:
+        - dns_resolver.cache_miss_nxdomain
+        - dns_resolver.upstream_timeout
+        - dns_resolver.upstream_timeout_backend_api
+        - service_discovery.quorum_lost
+        - backend_api.config_refresh_failed
+        - web_frontend.access_err
+
+  assumptions:
+    - |
+      The real ~10-hour outage is time-compressed into 50 minutes while preserving progression: initial NXDOMAIN spike,
+      herd expansion after cache expiry, then partial mitigation via controlled client admission and local fallback.
+    - |
+      Normal phase (0-20m) rough volume: ~1,000 logs/min (~20k total), driven by web (~540/min), ingest (~220/min), and
+      cached latency-tracker DNS lookups (~240/min), plus minimal background health logs.
+    - |
+      Failure phase piecewise volume estimate:
+      - 20-30m (10m): ~1,700–2,100 logs/min (NXDOMAIN storm active; SERVFAIL/timeout suppressed) => ~17k–21k logs.
+      - 30-42m (12m): ~2,600–3,000 logs/min (SERVFAIL/timeouts appear; web errors worsen; config refresh failures increase)
+        => ~31k–36k logs.
+      - 42-50m (8m): ~1,100–1,400 logs/min (rate limiting + fallback reduce DNS pressure and config errors) => ~9k–11k logs.
+      Total scenario expected: ~70k–90k logs, within the 20k..100k target.
+    - |
+      Visibility rationale: the root cause is diagnosable from the co-occurrence of high-rate
+      dns_resolver.cache_miss_nxdomain + service_discovery.dns_nxdomain, followed by increased
+      service_discovery.quorum_lost and the appearance of dns_servfail + resolver timeouts (both latency-tracker
+      lookups and backend-api lookups), correlating with web_frontend access_err and backend_api config_refresh_failed.
+```

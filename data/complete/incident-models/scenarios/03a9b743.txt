@@ -1,0 +1,200 @@
+```yaml
+scenario:
+  id: dynamodb_us_east_membership_retry_storm
+  title: Metadata membership timeout causes storage node self-disqualification and retry storm
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    DynamoDB storage nodes periodically renew their partition membership from an internal metadata service.
+    A brief network disruption synchronized membership renewals, and some membership responses were slow due to
+    significantly larger membership payloads (driven by rapid GSI adoption) and insufficient metadata-service capacity.
+    Storage nodes timed out, disqualified themselves from serving traffic, and retried membership fetches, sustaining
+    overload and driving elevated customer API error rates.
+
+  trigger_desc: |
+    A brief network disruption affects a subset of storage nodes, causing many nodes to simultaneously request
+    membership renewals from the metadata service.
+
+  time:
+    total_minutes: 30
+    phases:
+      n: {start_min: 0, end_min: 15}
+      f: {start_min: 15, end_min: 30}
+
+  phases:
+    n:
+      desc: |
+        Customer read/write requests are served by eligible storage nodes at low latency.
+        Storage nodes renew membership periodically; metadata service queue depth is low and membership build times
+        remain well within the storage deadline.
+      flows: [customer_rw, membership_renewal]
+      manifestation:
+        - api_frontend.resp_ok
+        - metadata_service.queue_metrics
+        - metadata_service.membership_resp
+        - storage_node.membership_applied
+
+    f:
+      desc: |
+        A synchronized membership-renewal surge hits the metadata service. Membership payload sizes are larger than
+        historical norms, so concurrent requests push build times beyond the storage-node deadline. As timeouts occur,
+        storage nodes self-disqualify and customer requests fail when routed to ineligible nodes. Retries keep pressure
+        high on the metadata service, including failed administrative scaling attempts, until operators pause membership
+        fetches to reduce the retry storm and regain control of the metadata service.
+
+      events:
+        - order: 1
+          at_min: 15
+          component: storage_node
+          event: |
+            A brief network disruption causes multiple storage nodes to refresh membership at the same time, increasing
+            concurrent membership fetches and pushing metadata service load upward.
+          why: |
+            The disruption is directly visible via storage-node network markers; the membership surge is visible as a jump
+            in membership fetch attempts and metadata-service load metrics. Larger membership payloads (from GSI-driven
+            partition growth) make some builds close to the storage deadline, increasing timeout likelihood.
+          flows: [membership_renewal_timeout_f, membership_renewal_success_f, customer_rw_err_f]
+          rate_multipliers:
+            membership_renewal_timeout_f: 1.4
+            metadata_service.queue_metrics: 1.3
+          latency_multipliers:
+            membership_renewal_timeout_f: {p50: 1.2, p95: 1.4}
+          one_shots:
+            - ref: storage_node.net_disruption
+              count: 2
+              hosts: [stor-01, stor-02]
+          manifestation:
+            - storage_node.net_disruption
+            - metadata_service.queue_metrics
+            - metadata_service.slow_build
+            - storage_node.membership_timeout
+
+        - order: 2
+          at_min: 21
+          component: metadata_service
+          event: |
+            Membership timeouts and retries amplify, creating sustained overload; more storage nodes become disqualified,
+            and customer API errors rise toward a majority of requests.
+          why: |
+            Retries from disqualified nodes keep inflight work and queue depth high (visible in queue_metrics), and more
+            slow_membership_build logs appear due to large payload sizes and reduced effective capacity. Admin scaling
+            attempts fail because overload prevents administrative requests from completing.
+          flows: [membership_renewal_timeout_f, customer_rw_err_f, admin_scale_attempt_fail_f]
+          rate_multipliers:
+            membership_renewal_timeout_f: 2.0
+            membership_renewal_success_f: 1.2
+            customer_rw_err_f: 1.2
+            customer_rw_ok_f: 0.8
+            admin_scale_attempt_fail_f: 2.0
+            metadata_service.queue_metrics: 2.0
+          latency_multipliers:
+            membership_renewal_timeout_f: {p50: 1.5, p95: 2.0}
+            membership_renewal_success_f: {p50: 1.3, p95: 1.8}
+          one_shots: []
+          manifestation:
+            - metadata_service.queue_metrics
+            - metadata_service.slow_build
+            - storage_node.membership_retry
+            - api_frontend.resp_err
+            - metadata_service.admin_api_err
+
+        - order: 3
+          at_min: 26
+          component: ops_control
+          event: |
+            Operators pause storage-node membership fetches to stop the retry storm, then successfully add metadata-service
+            capacity once administrative requests can complete. Metadata load eases, but many storage nodes remain out of
+            the request path so customer errors stay elevated.
+          why: |
+            Pausing membership fetches removes the primary source of retries (directly observable via the operator action log
+            and a sharp reduction in membership renewal attempts). With load relieved, the metadata service can accept
+            administrative scaling (observable as an admin_api status=200 marker). Requalification is not immediate because
+            membership fetches are paused and nodes remain disqualified.
+          flows: [customer_rw_err_f, customer_rw_ok_f]
+          rate_multipliers:
+            membership_renewal_timeout_f: 0.0
+            membership_renewal_success_f: 0.0
+            admin_scale_attempt_fail_f: 0.0
+            customer_rw_err_f: 0.6
+            customer_rw_ok_f: 1.0
+            metadata_service.queue_metrics: 0.5
+          latency_multipliers:
+            membership_renewal_timeout_f: {p50: 0.9, p95: 1.1}
+            membership_renewal_success_f: {p50: 0.9, p95: 1.1}
+          one_shots:
+            - ref: ops_control.pause_membership_requests
+              count: 1
+              hosts: [ops-01]
+            - ref: metadata_service.admin_api_ok
+              count: 1
+              hosts: [meta-01]
+            - ref: ops_control.scale_capacity_applied
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - ops_control.pause_membership_requests
+            - metadata_service.admin_api_ok
+            - metadata_service.queue_metrics
+            - api_frontend.resp_err
+
+      steady:
+        - component: storage_node
+          condition: |
+            Membership fetches remain paused, leaving a significant subset of storage nodes disqualified/eligible=false and
+            unable to rejoin the customer request path by the end of the scenario.
+          user_impact: |
+            Customer API requests intermittently fail (e.g., 503/504) when routed to disqualified nodes; overall capacity is
+            reduced, so some successful operations may be slower than normal.
+          manifestation:
+            - storage_node.heartbeat
+            - storage_node.serve_reject
+            - api_frontend.resp_err
+
+        - component: metadata_service
+          condition: |
+            Retry pressure is relieved after the pause, and the service can process administrative scaling; load indicators
+            are reduced compared to the peak but the system remains in an incident posture while storage nodes are out.
+          user_impact: |
+            Control-plane actions can proceed, but customer-facing availability remains degraded due to storage nodes still
+            being disqualified and not renewing membership.
+          manifestation:
+            - metadata_service.queue_metrics
+            - metadata_kvstore.latency_metrics
+
+      feedback_loops:
+        - id: membership_retry_storm
+          desc: |
+            Membership fetch timeouts cause storage nodes to retry; retries increase metadata service concurrency and queue depth,
+            which further increases build time and produces more timeouts. Disqualification reduces serving capacity, increasing
+            customer errors without directly reducing membership retry pressure until traffic is explicitly paused.
+
+      flows:
+        - customer_rw_ok_f
+        - customer_rw_err_f
+        - membership_renewal_success_f
+        - membership_renewal_timeout_f
+        - admin_scale_attempt_fail_f
+      manifestation:
+        - metadata_service.queue_metrics
+        - metadata_service.slow_build
+        - storage_node.membership_timeout
+        - storage_node.membership_retry
+        - api_frontend.resp_err
+        - ops_control.pause_membership_requests
+
+  assumptions:
+    - >
+      Timeline is compressed: minutes 15..30 represent the early incident progression (network disruption → retry storm → pause+scale),
+      without modeling full restoration; the scenario ends while still in a degraded failure state as required.
+    - >
+      Failure-phase piecewise volume (rough): 15..21 (6 min) elevated membership timeouts (~1.4x) ≈ 2.7k logs/min;
+      21..26 (5 min) peak retry storm (~2.0x) ≈ 3.3k logs/min; 26..30 (4 min) post-pause with membership renewals stopped
+      (0.0x) ≈ 0.85k logs/min, with three one-shot operator/admin markers at minute 26.
+    - >
+      Normal-phase volume (15 min) ≈ 1.4k logs/min (~21k logs total). Total scenario volume ≈ 55k–60k logs, within 20k..100k.
+    - >
+      Key diagnostic visibility: slow_membership_build (bytes/elapsed_ms/partitions), membership_fetch_timeout + retries,
+      and metadata queue_metrics are high-rate during the early/mid failure, while the pause is unambiguous via ops_control.pause_membership_requests
+      plus a sudden disappearance of membership renewal flows.
+```

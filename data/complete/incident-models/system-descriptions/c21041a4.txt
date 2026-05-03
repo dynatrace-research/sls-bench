@@ -1,0 +1,559 @@
+```yaml
+sys:
+  id: gitlab_consul_tls_expiry_maintenance
+  desc: >
+    A GitLab.com-like web application serves HTTP API/UI traffic backed by PostgreSQL.
+    Pgbouncer pools database connections and uses Consul for lock/service discovery, while Patroni uses Consul for HA coordination.
+    Consul client/server communication uses mutual TLS; an expired certificate can break new handshakes while existing long-lived sessions keep working.
+    The incident models a certificate-expiry-driven fragility that becomes visible on reconnects and during a coordinated restart mitigation.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: gitlab_frontend
+    name: GitLab Frontend (web/api)
+    svc: gitlab-frontend
+    hosts: [web-01, web-02, web-03, web-04]
+    desc: >
+      Handles user HTTP requests and talks to PostgreSQL via pgbouncer.
+      Errors here reflect user-visible impact (e.g., 500s when DB connectivity/lookup fails), though in this incident customer errors stay at the noise floor.
+    to:
+      - dst: pgbouncer_pool
+        proto: tcp
+        desc: Connects to pgbouncer for pooled PostgreSQL access.
+    logs:
+      http_access_ok:
+        desc: Successful HTTP request access log (request completion).
+        lvl: INFO
+        msg: "req {method} {route} status=200 dur_ms={dur_ms} req_id={req_id} actor={actor}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/users/sign_in", "/api/v4/projects", "/api/v4/jobs/request"]}
+          dur_ms: {k: i, v: [20, 800]}
+          req_id: {k: hex, v: 16}
+          actor: {k: ch, v: [anon, auth_user, ci_runner]}
+      http_access_500:
+        desc: Failed HTTP request where the app cannot complete a DB-backed action (request completion).
+        lvl: ERROR
+        msg: "req {method} {route} status=500 dur_ms={dur_ms} req_id={req_id} err={err}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/users/sign_in", "/api/v4/projects", "/api/v4/jobs/request"]}
+          dur_ms: {k: i, v: [200, 4000]}
+          req_id: {k: hex, v: 16}
+          err: {k: ch, v: [db_connect_failed, db_timeout, service_discovery_error]}
+      worker_stats:
+        desc: Periodic worker/pool stats emitted by the frontend.
+        lvl: INFO
+        msg: "workers busy={busy} queued={queued} db_pool_wait_ms_p95={db_wait_p95}"
+        vars:
+          busy: {k: i, v: [10, 80]}
+          queued: {k: i, v: [0, 50]}
+          db_wait_p95: {k: i, v: [0, 250]}
+    beh:
+      n:
+        desc: Frontend is healthy; periodic stats and high-volume access logs via request flows.
+        emit:
+          - id: worker_stats
+            per_min: 0.5
+      f:
+        desc: Similar baseline behavior; customer-visible errors remain at the noise floor in this incident.
+        emit:
+          - id: worker_stats
+            per_min: 0.5
+
+  - id: pgbouncer_pool
+    name: Pgbouncer Pool
+    svc: pgbouncer
+    hosts: [pgb-01, pgb-02, pgb-03]
+    desc: >
+      Pools PostgreSQL connections for the frontend.
+      Uses Consul for lock/service discovery and exposes a health-check process that can give up after repeated failures (requiring manual restart).
+    to:
+      - dst: postgres_db
+        proto: tcp
+        desc: Connects to PostgreSQL primary/replicas.
+      - dst: consul_cluster
+        proto: https
+        desc: Queries Consul for service discovery and lock status over mTLS.
+      - dst: gitlab_frontend
+        proto: tcp
+        desc: Returns query results/errors to the frontend over the client connection.
+    logs:
+      txn_ok:
+        desc: Successful transaction summary for a client request.
+        lvl: INFO
+        msg: "txn ok db={db} backend={backend} dur_ms={dur_ms} client={client}"
+        vars:
+          db: {k: ch, v: [gitlabhq_production]}
+          backend: {k: ch, v: [db-01, db-02, db-03]}
+          dur_ms: {k: i, v: [5, 200]}
+          client: {k: ch, v: [web, api, sidekiq]}
+      txn_fail:
+        desc: Failed transaction summary due to backend/lookup issues.
+        lvl: WARN
+        msg: "txn fail db={db} err={err} dur_ms={dur_ms} client={client}"
+        vars:
+          db: {k: ch, v: [gitlabhq_production]}
+          err: {k: ch, v: [backend_conn_refused, backend_timeout, no_primary, consul_lookup_failed]}
+          dur_ms: {k: i, v: [50, 5000]}
+          client: {k: ch, v: [web, api, sidekiq]}
+      pool_stats:
+        desc: Periodic pool statistics.
+        lvl: INFO
+        msg: "stats conns_active={conns} conns_waiting={waiting} max_client_conn={max}"
+        vars:
+          conns: {k: i, v: [50, 500]}
+          waiting: {k: i, v: [0, 80]}
+          max: {k: i, v: [500, 500]}
+      consul_lock_ok:
+        desc: Health-check successfully verified Consul lock/service availability.
+        lvl: INFO
+        msg: "healthcheck ok lock={lock} consul={consul} dur_ms={dur_ms}"
+        vars:
+          lock: {k: ch, v: ["pgbouncer/primary"]}
+          consul: {k: ch, v: ["consul.service"]}
+          dur_ms: {k: i, v: [5, 120]}
+      consul_lock_fail:
+        desc: Health-check failed to verify Consul lock/service availability.
+        lvl: WARN
+        msg: "healthcheck fail lock={lock} err={err} next_retry_ms={next_ms}"
+        vars:
+          lock: {k: ch, v: ["pgbouncer/primary"]}
+          err: {k: ch, v: [connection_refused, no_leader, tls_handshake_failed]}
+          next_ms: {k: i, v: [200, 3000]}
+      healthcheck_giveup:
+        desc: Health-check process gives up after repeated failures (requires manual restart).
+        lvl: ERROR
+        msg: "healthcheck disabled after {failures} failures; last_err={err}"
+        vars:
+          failures: {k: i, v: [3, 8]}
+          err: {k: ch, v: [no_leader, connection_refused, tls_handshake_failed]}
+      manual_healthcheck_restart:
+        desc: Operator manually restarts the health-check process.
+        lvl: INFO
+        msg: "healthcheck process restarted; mode={mode}"
+        vars:
+          mode: {k: ch, v: [manual]}
+    beh:
+      n:
+        desc: Pgbouncer is stable; health-checks and pool stats emit periodically.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+          - id: consul_lock_ok
+            per_min: 2.0
+      f:
+        desc: >
+          During the incident, pool stats continue, but the Consul health-check may become unreliable and can stop emitting success results
+          when the health-check process gives up (until manually restarted). Failures are primarily modeled via explicit failure probe flows.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+          - id: consul_lock_ok
+            per_min: 2.0
+
+  - id: postgres_db
+    name: PostgreSQL Database
+    svc: postgres
+    hosts: [db-01, db-02, db-03]
+    desc: >
+      Core data store. The model uses periodic stats and occasional connection-limit warnings as the main observability.
+    to:
+      - dst: pgbouncer_pool
+        proto: tcp
+        desc: Responds to pgbouncer database sessions (query results, errors).
+    logs:
+      pg_stat:
+        desc: Periodic database stats snapshot.
+        lvl: INFO
+        msg: "pgstat conns={conns} xact_commits={commits} repl_lag_s={lag_s}"
+        vars:
+          conns: {k: i, v: [200, 950]}
+          commits: {k: i, v: [5000, 28000]}
+          lag_s: {k: f, v: [0.0, 2.0]}
+      too_many_connections_warn:
+        desc: Warning when connection usage hits or exceeds configured limit.
+        lvl: WARN
+        msg: "connection limit reached conns={conns} max={max}"
+        vars:
+          conns: {k: i, v: [900, 1300]}
+          max: {k: i, v: [1000, 1000]}
+    beh:
+      n:
+        desc: Database operates normally with stable replica lag.
+        emit:
+          - id: pg_stat
+            per_min: 1.0
+          - id: too_many_connections_warn
+            per_min: 0.05
+      f:
+        desc: DB remains mostly healthy; transient surges in connection pressure may occur when pooling/health checks misbehave.
+        emit:
+          - id: pg_stat
+            per_min: 1.0
+          - id: too_many_connections_warn
+            per_min: 0.2
+
+  - id: patroni_ha
+    name: Patroni HA Controller
+    svc: patroni
+    hosts: [db-01, db-02, db-03]
+    desc: >
+      Patroni manages PostgreSQL HA and uses Consul for coordination/locks.
+      Operators can pause/resume to freeze failover during maintenance; Consul session errors appear when connectivity is disrupted.
+    to:
+      - dst: consul_cluster
+        proto: https
+        desc: Uses Consul for leader election and distributed locks over mTLS.
+    logs:
+      patroni_loop_ok:
+        desc: Periodic Patroni loop indicating role and Consul reachability.
+        lvl: INFO
+        msg: "patroni loop role={role} leader={leader} consul={consul_state}"
+        vars:
+          role: {k: ch, v: [leader, replica]}
+          leader: {k: ch, v: [db-01, db-02, db-03]}
+          consul_state: {k: ch, v: [reachable]}
+      patroni_consul_error:
+        desc: Patroni cannot establish or maintain its Consul session.
+        lvl: ERROR
+        msg: "consul session error err={err} waited_ms={waited_ms}"
+        vars:
+          err: {k: ch, v: [x509_expired, connection_refused, no_leader, timeout]}
+          waited_ms: {k: i, v: [50, 5000]}
+      patroni_paused:
+        desc: Operator pauses Patroni failover logic for a maintenance window.
+        lvl: WARN
+        msg: "patroni pause requested by {who}"
+        vars:
+          who: {k: ch, v: [infra_maint]}
+      patroni_resumed:
+        desc: Operator resumes Patroni after maintenance.
+        lvl: INFO
+        msg: "patroni resume requested by {who}"
+        vars:
+          who: {k: ch, v: [infra_maint]}
+      patroni_sync_complete:
+        desc: Patroni reports Consul session re-established and state synced.
+        lvl: INFO
+        msg: "consul session re-established; synced={synced}"
+        vars:
+          synced: {k: ch, v: [true]}
+    beh:
+      n:
+        desc: Patroni loop is stable and Consul is reachable.
+        emit:
+          - id: patroni_loop_ok
+            per_min: 6.0
+            scope: global
+      f:
+        desc: Patroni loop remains; Consul session errors are modeled via explicit failure flows (not baseline background).
+        emit:
+          - id: patroni_loop_ok
+            per_min: 6.0
+            scope: global
+
+  - id: consul_cluster
+    name: Consul Cluster (servers)
+    svc: consul
+    hosts: [consul-01, consul-02, consul-03, consul-04, consul-05]
+    desc: >
+      Provides service discovery, KV, and cluster locking. Servers communicate over mutual TLS.
+      With an expired certificate, new handshakes can fail even though existing sessions continue.
+      During coordinated restarts, the raft cluster can briefly lose leadership and return transient errors.
+    to: []
+    logs:
+      tls_handshake_error:
+        desc: TLS handshake failed due to certificate validation.
+        lvl: WARN
+        msg: "TLS handshake error from {peer} err=\"{err}\""
+        vars:
+          peer: {k: ch, v: [db-01, db-02, db-03, pgb-01, pgb-02, pgb-03, web-01, web-02]}
+          err: {k: ch, v: ["x509: certificate has expired or is not yet valid"]}
+      http_api_error_500:
+        desc: Consul HTTP API returned 500 due to transient unavailability during restart.
+        lvl: ERROR
+        msg: "HTTP {method} {endpoint} returned 500 detail={detail}"
+        vars:
+          method: {k: ch, v: [GET, PUT]}
+          endpoint: {k: ch, v: ["/v1/agent/health/service/name/pgbouncer", "/v1/kv/patroni/leader"]}
+          detail: {k: ch, v: ["connection refused", "transport shutdown"]}
+      raft_no_leader:
+        desc: Raft is up but leadership is not yet established.
+        lvl: WARN
+        msg: "raft: no leader found term={term}"
+        vars:
+          term: {k: i, v: [100, 130]}
+      raft_peers:
+        desc: Snapshot of raft peer/leader health used during monitoring.
+        lvl: INFO
+        msg: "raft peers leader={leader} voters={voters} healthy={healthy}"
+        vars:
+          leader: {k: ch, v: [consul-01, consul-02, consul-03, consul-04, consul-05, none]}
+          voters: {k: i, v: [3, 5]}
+          healthy: {k: i, v: [0, 5]}
+      raft_leader_elected:
+        desc: A leader election completed.
+        lvl: INFO
+        msg: "raft: elected leader {leader} term={term}"
+        vars:
+          leader: {k: ch, v: [consul-01, consul-02, consul-03, consul-04, consul-05]}
+          term: {k: i, v: [100, 130]}
+      agent_restart:
+        desc: Consul agent restarted as part of a coordinated maintenance action.
+        lvl: INFO
+        msg: "consul agent restarted reason={reason} verify_date={verify_date}"
+        vars:
+          reason: {k: ch, v: [scheduled_maintenance]}
+          verify_date: {k: ch, v: [false]}
+      runtime_tls_config:
+        desc: Runtime TLS configuration snapshot (shows date verification disabled post-mitigation).
+        lvl: WARN
+        msg: "tls config verify_date={verify_date} verify_incoming={verify_incoming} verify_outgoing={verify_outgoing}"
+        vars:
+          verify_date: {k: ch, v: [false]}
+          verify_incoming: {k: ch, v: [true]}
+          verify_outgoing: {k: ch, v: [true]}
+    beh:
+      n:
+        desc: Healthy cluster; no frequent TLS or raft errors.
+        emit:
+          - id: tls_handshake_error
+            per_min: 0.0
+            scope: global
+          - id: raft_peers
+            per_min: 0.2
+            scope: global
+          - id: http_api_error_500
+            per_min: 0.0
+            scope: global
+          - id: raft_no_leader
+            per_min: 0.0
+            scope: global
+          - id: runtime_tls_config
+            per_min: 0.0
+            scope: global
+      f:
+        desc: At failure onset, only TLS handshake failures are expected; restart/monitoring turbulence is modeled via explicit failure flows.
+        emit:
+          - id: tls_handshake_error
+            per_min: 8.0
+            scope: global
+
+  - id: ops_audit
+    name: Ops Audit / ChatOps
+    svc: ops-audit
+    hosts: [ops-01]
+    desc: >
+      Central audit log for operator actions during maintenance (pause/resume, config staging, scheduled restart).
+      This provides visibility into human actions that are otherwise not logged uniformly on all hosts.
+    to: []
+    logs:
+      maintenance_start:
+        desc: Marks the start of a maintenance activity.
+        lvl: INFO
+        msg: "maintenance start change_id={change_id} window_utc={window}"
+        vars:
+          change_id: {k: hex, v: 8}
+          window: {k: ch, v: ["02:10-02:40"]}
+      config_staged:
+        desc: Configuration staged across the fleet (no runtime impact until restart).
+        lvl: INFO
+        msg: "staged consul config verify_date=false on {nodes} nodes; chef_client={chef_state}"
+        vars:
+          nodes: {k: i, v: [240, 260]}
+          chef_state: {k: ch, v: [stopped]}
+      at_scheduled:
+        desc: at(1) job scheduled across nodes for a synchronized restart.
+        lvl: INFO
+        msg: "scheduled at job cmd=\"{cmd}\" when_utc={when_utc} nodes={nodes}"
+        vars:
+          cmd: {k: ch, v: ["sudo systemctl restart consul.service"]}
+          when_utc: {k: ch, v: ["02:20"]}
+          nodes: {k: i, v: [240, 260]}
+      patroni_pause_recorded:
+        desc: Records that Patroni was paused for the window.
+        lvl: WARN
+        msg: "recorded patroni pause for change_id={change_id}"
+        vars:
+          change_id: {k: hex, v: 8}
+      patroni_resume_recorded:
+        desc: Records that Patroni was resumed after verification.
+        lvl: INFO
+        msg: "recorded patroni resume for change_id={change_id}"
+        vars:
+          change_id: {k: hex, v: 8}
+      pgbouncer_node_drained:
+        desc: Records a pgbouncer node removed/drained from the load balancer pool.
+        lvl: INFO
+        msg: "drained pgbouncer node {node} from load balancer pool"
+        vars:
+          node: {k: ch, v: [pgb-03]}
+    beh:
+      n:
+        desc: No routine emissions; operator actions are one-shots.
+        emit: []
+      f:
+        desc: No routine emissions; operator actions are one-shots.
+        emit: []
+
+tracing:
+  on: true
+  origins: [gitlab_frontend]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user traffic is served successfully via frontend -> pgbouncer -> database; frontend access logs are emitted at request completion.
+    req:
+      - id: user_http_ok_n
+        desc: Typical successful user HTTP request with a pooled DB transaction.
+        rpm: 800.0
+        path: [gitlab_frontend, pgbouncer_pool, postgres_db, pgbouncer_pool, gitlab_frontend]
+        emit: [pgbouncer_pool.txn_ok, gitlab_frontend.http_access_ok]
+        latency_ms: [[15, 90], [120, 450]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_http_500_n
+        desc: Rare baseline (noise-floor) HTTP 500s unrelated to the Consul incident.
+        rpm: 0.2
+        path: [gitlab_frontend, pgbouncer_pool, postgres_db, pgbouncer_pool, gitlab_frontend]
+        emit: [pgbouncer_pool.txn_fail, gitlab_frontend.http_access_500]
+        latency_ms: [[200, 1400], [800, 3000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: During the incident, most requests still succeed and customer-visible error rate remains at the noise floor; internal Consul/HA dynamics are visible via targeted probe/healthcheck flows during the restart window.
+    req:
+      - id: user_http_ok_f
+        desc: Successful user requests continue using pooled DB connections.
+        rpm: 800.0
+        path: [gitlab_frontend, pgbouncer_pool, postgres_db, pgbouncer_pool, gitlab_frontend]
+        emit: [pgbouncer_pool.txn_ok, gitlab_frontend.http_access_ok]
+        latency_ms: [[20, 140], [140, 650]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: user_http_500_f
+        desc: Rare baseline (noise-floor) HTTP 500s; modeled as essentially unchanged by the mitigation window.
+        rpm: 0.2
+        path: [gitlab_frontend, pgbouncer_pool, postgres_db, pgbouncer_pool, gitlab_frontend]
+        emit: [pgbouncer_pool.txn_fail, gitlab_frontend.http_access_500]
+        latency_ms: [[200, 1400], [800, 3000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: consul_raft_peers_probe_f
+        desc: Operator/monitoring probes observe raft peer status during the maintenance window.
+        rpm: 6.0
+        path: [consul_cluster]
+        emit: [consul_cluster.raft_peers]
+        latency_ms: [[10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: consul_http_500_probe_f
+        desc: Probes to Consul HTTP endpoints observe transient 500 responses during restart turbulence.
+        rpm: 30.0
+        path: [consul_cluster]
+        emit: [consul_cluster.http_api_error_500]
+        latency_ms: [[5, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: consul_raft_no_leader_probe_f
+        desc: Probes observe periods where raft has no elected leader.
+        rpm: 12.0
+        path: [consul_cluster]
+        emit: [consul_cluster.raft_no_leader]
+        latency_ms: [[5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: consul_runtime_tls_config_poll_f
+        desc: After restart, Consul emits periodic TLS config snapshots showing verify_date=false.
+        rpm: 1.0
+        path: [consul_cluster]
+        emit: [consul_cluster.runtime_tls_config]
+        latency_ms: [[5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: pgbouncer_consul_lock_fail_probe_f
+        desc: Pgbouncer health-check attempts against Consul fail during restart and reconnection churn.
+        rpm: 3.0
+        path: [pgbouncer_pool, consul_cluster]
+        emit: [pgbouncer_pool.consul_lock_fail]
+        latency_ms: [[30, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: patroni_consul_session_error_probe_f
+        desc: Patroni attempts to maintain its Consul session and logs errors while reconnecting after the restart.
+        rpm: 2.0
+        path: [patroni_ha, consul_cluster]
+        emit: [patroni_ha.patroni_consul_error]
+        latency_ms: [[50, 800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Repair note: pgbouncer_pool.consul_lock_ok remains a failure-state background signal but is now explicitly suppressible via scenario event multipliers to model the "healthcheck disabled/give up" window, making the later manual restart action causal.
+  - |
+    Names/hosts are genericized; the modeled core is Consul mTLS expiry impacting reconnects, and a fleet-synchronized restart mitigation.
+  - |
+    Consul certificate renewal is impossible in this incident due to an external precondition (lost CA key); this is not directly logged.
+  - |
+    Flow paths include a coarse return path (postgres_db -> pgbouncer_pool -> gitlab_frontend) so that request-completion access logs are traversable.
+  - |
+    Customer-visible 500s are modeled as a constant noise floor (~0.2 rpm) in both normal and failure to match the post-mortem claim that customer 500 graphs did not measurably change.
+  - |
+    Normal traffic volume modeled at ~800 rpm with 2 logs/request (~1600 logs/min) plus low-rate background stats.
+  - |
+    Estimated total logs over a 40-minute scenario: ~67k (request logs ~64k + background/probes/ops ~3k), within the 20k..100k target.
+  - |
+    Key diagnostic visibility is ensured via: Consul tls_handshake_error (failure onset), probe flows for raft_no_leader/http_api_error_500 (restart window),
+    Patroni session error probe (DB HA coordination impact), pgbouncer lock-fail probe + giveup/restart one-shots (secondary symptom), and ongoing runtime_tls_config polling (verify_date=false steady end-state).
+```

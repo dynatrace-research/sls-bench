@@ -1,0 +1,342 @@
+```yaml
+scenario:
+  id: travis_ci_db_truncate_20180313
+  title: Production PostgreSQL tables truncated; empty-data window creates new users; restore leads to token/user mismatch
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally authenticates users, renders dashboards, and runs CI builds by persisting metadata in PostgreSQL
+    and dispatching jobs via Redis to workers. The incident is triggered when a TRUNCATE statement against the production
+    PostgreSQL database executes, emptying application tables while sequences continue. For a short period the API and web app
+    continue running against the effectively empty dataset, creating new user records and showing blank profiles; later applications
+    are taken offline for restore. After restore, some JWTs correspond to post-truncate user IDs that no longer match restored data,
+    causing users to be forced to log out (and potentially perceive wrong-account symptoms) while build backlogs and missing cron triggers persist.
+
+  trigger_desc: |
+    A developer accidentally runs an automated test suite in a shell session with DATABASE_URL still pointing at the
+    production PostgreSQL primary (with write access). The test tooling (e.g., database-cleaning helper) issues a TRUNCATE
+    of application tables. The statement is blocked for several minutes by locks, then completes and truncates (empties) the production
+    dataset before responders fully take user-facing applications offline.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        The platform serves browser traffic through edge_router to web_app and api_service. Users sign in, the API issues
+        JWTs, and the web_app renders dashboards by fetching profile and repository data from postgres_primary. GitHub webhooks
+        are received by the API, metadata is written to postgres_primary, and jobs are enqueued into job_queue for worker_pool
+        to execute. Separately, build_scheduler periodically scans for cron-enabled repositories and enqueues scheduled builds.
+        github_syncer runs regular sync cycles against github_api and upserts users/org memberships into postgres_primary.
+        Operationally, background heartbeats and queue depth logs provide a stable baseline.
+      flows:
+        - user_sign_in_success
+        - load_dashboard_success
+        - webhook_build_trigger_success
+        - cron_trigger_enqueue
+        - worker_job_success
+        - github_user_sync
+      manifestation:
+        - edge_router.request_received
+        - api_service.profile_ok
+        - job_queue.queue_depth
+        - worker_pool.worker_heartbeat
+
+    f:
+      desc: |
+        Failure begins when postgres_primary executes a TRUNCATE that empties application tables. For the first part of the failure phase,
+        the API and web app continue operating against a mostly-empty dataset: dashboard loads run queries successfully but receive empty
+        results, and the application responds by showing blank profiles. Login and GitHub sync code paths interpret missing user rows as new
+        users and create fresh user records using sequences that continue from their pre-TRUNCATE values.
+        Some write paths that depend on other rows being present (e.g., creating build records referencing repos/users) fail due to constraint
+        violations or application-level “missing record” behavior.
+        Incident response then intentionally takes applications offline to stop further mutations while postgres_primary is restored from a snapshot.
+        During the offline window, edge_router returns 503s for most requests, and restore progress becomes visible via postgres_primary.restore_progress.
+        Once the restore completes and services return, clients that obtained tokens during the empty-data window present JWTs whose subjects no longer
+        correspond to the restored user mapping, causing api_service.jwt_user_mismatch and web_app.forced_logout. Build processing resumes but remains
+        degraded due to backlog, and scheduled builds are missed because build_scheduler is not restarted promptly, producing persistent missed-schedule
+        warnings and “scheduler not running” signals.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: postgres_primary
+          event: |
+            postgres_primary completes a TRUNCATE of application tables. Immediately afterward, dashboard/profile reads begin returning empty
+            results, logins and GitHub sync cycles create new user records, cron scans find no candidates to enqueue, and some build-related writes
+            start failing due to missing referenced data.
+          why: |
+            TRUNCATE removes rows from tables but does not remove the relations, so SQL SELECTs can still succeed while returning zero rows; this is
+            directly observable as postgres_primary.sql_exec with low/zero rows together with application-level “not found” handling in
+            load_dashboard_blank_profile (api_service.profile_not_found and web_app.render_blank_profile). When user records are missing, login inserts
+            a new user row (api_service.user_created_after_truncate), and periodic GitHub sync upserts can also recreate users (github_syncer.upsert_missing_user
+            within github_user_sync_recreate_users); these are directly observable via those flow logs. Cron scheduling does not necessarily error at this stage:
+            it can complete a scan but find zero candidates because the repo/schedule tables are empty, observable as build_scheduler.cron_scan_complete with
+            candidates/enqueued near zero. Some write paths that reference other tables (repos/builds) can violate foreign keys or uniqueness assumptions,
+            observable as postgres_primary.sql_error (SQLSTATE 23503/23505) paired with api_service.enqueue_failed_db in webhook_build_trigger_db_error.
+            The fact that IDs continue from existing sequences (rather than resetting) is typically not proven by logs alone and often requires database
+            inspection or PostgreSQL knowledge; seq_last_value provides circumstantial signal.
+          flows:
+            - user_sign_in_new_record
+            - load_dashboard_blank_profile
+            - webhook_build_trigger_db_error
+            - cron_tick_zero_candidates
+            - worker_job_db_error
+            - github_user_sync_recreate_users
+          rate_multipliers:
+            api_offline_503: 0.0
+            api_request_with_stale_token: 0.0
+            webhook_build_trigger_success_degraded: 0.0
+            worker_job_slow_success: 0.0
+            github_user_sync_ok: 0.0
+            postgres_primary.restore_progress: 0.0
+            build_scheduler.scheduler_not_running: 0.0
+          one_shots:
+            - ref: postgres_primary.ddl_truncate_all_tables
+              count: 1
+              hosts: [pg-1]
+          manifestation:
+            - postgres_primary.ddl_truncate_all_tables
+            - api_service.profile_not_found
+            - web_app.render_blank_profile
+            - api_service.user_created_after_truncate
+            - github_syncer.upsert_missing_user
+
+        - order: 2
+          at_min: 35
+          component: api_service
+          event: |
+            Incident response takes api_service and web_app offline to prevent further mutations while recovery proceeds. Incoming
+            requests start receiving 503 responses from edge_router, and application-side request logs largely stop.
+          why: |
+            When upstream app processes are stopped/drained, edge_router cannot proxy to web_app/api_service and returns 503, which is
+            directly observable via flow api_offline_503 and edge_router.upstream_unavailable. The cessation of application-side logs
+            is represented by suppressing app background emissions and by suppressing request flows that require the apps to be running.
+            This mechanism is directly observable from the sharp shift in emitted logs/flows (edge 503s dominate; app logs drop).
+          flows:
+            - api_offline_503
+          rate_multipliers:
+            api_offline_503: 2.5
+            user_sign_in_new_record: 0.0
+            load_dashboard_blank_profile: 0.0
+            webhook_build_trigger_db_error: 0.0
+            cron_tick_zero_candidates: 0.0
+            worker_job_db_error: 0.0
+            github_user_sync_recreate_users: 0.0
+            github_user_sync_ok: 0.0
+            api_service.healthcheck: 0.0
+            api_service.pool_stats: 0.0
+            api_service.scheduled_job_missed: 0.0
+            web_app.heartbeat: 0.0
+            build_scheduler.sched_heartbeat: 0.0
+          one_shots:
+            - ref: api_service.shutdown_initiated
+              count: 3
+              hosts: [api-1, api-2, api-3]
+            - ref: web_app.shutdown_initiated
+              count: 2
+              hosts: [web-1, web-2]
+          manifestation:
+            - edge_router.upstream_unavailable
+            - api_service.shutdown_initiated
+            - web_app.shutdown_initiated
+
+        - order: 3
+          at_min: 38
+          component: postgres_primary
+          event: |
+            A replacement postgres_primary is provisioned from a snapshot and restore/provisioning progress logs begin to appear,
+            while user-facing applications remain offline and edge_router continues returning 503s.
+          why: |
+            During snapshot provisioning/restore, the database layer emits periodic progress/status messages while storage is copied
+            and replay is performed. This is directly observable via postgres_primary.restore_progress (background) once activated.
+            Because applications remain offline, edge_router continues producing 503s (api_offline_503). The restore process itself
+            is partially observable from inside system logs (progress lines), but detailed restore mechanics may require provider-side
+            telemetry.
+          flows:
+            - api_offline_503
+          rate_multipliers:
+            postgres_primary.restore_progress: 1.0
+            job_queue.queue_depth: 2.0
+            job_queue.redis_latency_warn: 2.0
+          one_shots:
+            - ref: postgres_primary.restore_started
+              count: 1
+              hosts: [pg-1]
+          manifestation:
+            - postgres_primary.restore_progress
+            - edge_router.upstream_unavailable
+            - job_queue.queue_depth
+
+        - order: 4
+          at_min: 45
+          component: api_service
+          event: |
+            postgres_primary restore completes and api_service/web_app return online. Shortly after, requests authenticated with tokens
+            issued during the empty-data window begin failing authentication checks and force logouts, while builds/webhooks resume
+            and workers start draining backlog slowly.
+          why: |
+            After restore, the database again contains the pre-truncate user mapping, but some clients hold JWTs whose subject user_id
+            refers to a post-truncate row that no longer exists (or no longer corresponds to the same person). API auth resolves the JWT
+            subject against the restored DB and detects mismatch/not-found, producing api_service.jwt_user_mismatch and web_app.forced_logout,
+            directly observable via flow api_request_with_stale_token. Build processing resumes (webhook_build_trigger_success_degraded and
+            worker_job_slow_success) but with longer tails and higher backlog signals (job_queue.queue_depth, worker_pool.db_reconnect_attempt),
+            directly observable from those flows and background logs. The scheduler is still not restarted at this point; the absence of
+            cron-trigger flows is only indirectly observable until monitoring/alerts re-surface.
+          flows:
+            - api_request_with_stale_token
+            - webhook_build_trigger_success_degraded
+            - worker_job_slow_success
+            - worker_job_db_error
+            - github_user_sync_ok
+          rate_multipliers:
+            api_offline_503: 0.6
+            api_request_with_stale_token: 1.0
+            webhook_build_trigger_success_degraded: 1.0
+            worker_job_slow_success: 2.0
+            worker_job_db_error: 0.3
+            github_user_sync_ok: 1.0
+            github_user_sync_recreate_users: 0.2
+            postgres_primary.restore_progress: 0.0
+            api_service.healthcheck: 1.0
+            api_service.pool_stats: 1.0
+            api_service.scheduled_job_missed: 1.0
+            web_app.heartbeat: 1.0
+            build_scheduler.sched_heartbeat: 0.0
+            build_scheduler.scheduler_not_running: 0.0
+          latency_multipliers:
+            worker_job_slow_success: {p50: 1.2, p95: 1.5}
+            api_request_with_stale_token: {p50: 1.1, p95: 1.4}
+          one_shots:
+            - ref: postgres_primary.restore_completed
+              count: 1
+              hosts: [pg-1]
+            - ref: api_service.startup_complete
+              count: 3
+              hosts: [api-1, api-2, api-3]
+            - ref: web_app.startup_complete
+              count: 2
+              hosts: [web-1, web-2]
+          manifestation:
+            - api_service.jwt_user_mismatch
+            - web_app.forced_logout
+            - job_queue.queue_depth
+            - worker_pool.db_reconnect_attempt
+
+        - order: 5
+          at_min: 48
+          component: build_scheduler
+          event: |
+            The platform remains degraded: build_scheduler is not running after restore, scheduled (cron) builds are not triggered,
+            and warning logs about missed schedules begin repeating while backlog remains elevated.
+          why: |
+            If the scheduler process is not restarted, no cron ticks run to enqueue scheduled builds; instead, the system emits persistent
+            “scheduler not running” and “scheduled job missed” warnings from watchdog/health signals. This is directly observable via
+            build_scheduler.scheduler_not_running and api_service.scheduled_job_missed increasing while cron-trigger flow activity does not return.
+            The exact operational omission (missed restart step and alerting gaps) may require runbook/deployment context beyond logs.
+          flows: []
+          rate_multipliers:
+            api_offline_503: 0.2
+            build_scheduler.scheduler_not_running: 3.0
+            api_service.scheduled_job_missed: 5.0
+          one_shots:
+            - ref: build_scheduler.scheduler_not_started_after_restore
+              count: 1
+              hosts: [sched-1]
+          manifestation:
+            - build_scheduler.scheduler_not_running
+            - api_service.scheduled_job_missed
+            - job_queue.queue_depth
+
+      steady:
+        - component: api_service
+          condition: |
+            API is back online but a population of clients present JWTs issued during the empty-data window. Those tokens reference user IDs
+            that do not match the restored database mapping, producing repeated authentication mismatches and forced session resets.
+          user_impact: |
+            Users may be forced to log out and re-authenticate; some requests fail with 401/denies and users may briefly perceive wrong-account symptoms.
+          manifestation:
+            - api_service.jwt_user_mismatch
+            - web_app.forced_logout
+
+        - component: build_scheduler
+          condition: |
+            Scheduler process is not running after restore, so scheduled (cron) builds are not being triggered, and watchdog/health logic reports the outage.
+          user_impact: |
+            Cron-triggered builds do not run on time; customers relying on scheduled pipelines see missing or delayed builds.
+          manifestation:
+            - build_scheduler.scheduler_not_running
+            - api_service.scheduled_job_missed
+
+        - component: job_queue
+          condition: |
+            Build backlog remains high due to accumulated jobs during downtime and reduced effective throughput during recovery. Queue depth and
+            Redis latency warnings stay elevated as workers drain the queue.
+          user_impact: |
+            Builds are delayed (longer wait time before start), and status updates may lag.
+          manifestation:
+            - job_queue.queue_depth
+            - job_queue.redis_latency_warn
+            - worker_pool.db_reconnect_attempt
+
+      feedback_loops:
+        - id: backlog_amplification
+          desc: |
+            Downtime causes webhook/cron build events to accumulate externally and internally; once services return, the system experiences a burst
+            of enqueues. Elevated queue depth increases worker concurrency and DB contention, which increases tail latency and reconnect attempts,
+            slowing draining and keeping queue depth high.
+
+        - id: auth_mismatch_persistence
+          desc: |
+            Users retry and refresh when they see unexpected UI state; each retry replays the stale token and triggers more mismatch logs and forced
+            logouts. Until tokens are revoked or users re-authenticate, the mismatch traffic persists even after DB restore.
+
+      flows:
+        - user_sign_in_new_record
+        - load_dashboard_blank_profile
+        - webhook_build_trigger_db_error
+        - cron_tick_zero_candidates
+        - worker_job_db_error
+        - api_offline_503
+        - api_request_with_stale_token
+        - webhook_build_trigger_success_degraded
+        - worker_job_slow_success
+        - github_user_sync_recreate_users
+        - github_user_sync_ok
+
+      manifestation:
+        - postgres_primary.ddl_truncate_all_tables
+        - api_service.profile_not_found
+        - web_app.render_blank_profile
+        - api_service.user_created_after_truncate
+        - github_syncer.upsert_missing_user
+        - postgres_primary.restore_progress
+        - edge_router.upstream_unavailable
+        - api_service.jwt_user_mismatch
+        - build_scheduler.scheduler_not_running
+        - api_service.scheduled_job_missed
+        - job_queue.queue_depth
+        - worker_pool.db_reconnect_attempt
+
+  assumptions:
+    - "Incident details (exact service names, host counts, and request rates) were inferred and scaled to produce realistic diagnostic logs while staying within a 50-minute two-phase simulation."
+    - "The real incident included hours of downtime and a longer post-recovery backlog; the scenario compresses these into minutes while keeping the same causal sequence and observable signals."
+    - "During the empty-data window, cron and GitHub sync are modeled primarily as successful operations operating over empty tables (zero candidates / missing-user upserts), reserving explicit DB-error flows for webhook build writes where constraint violations are expected."
+    - "Traffic during the failure phase is modeled with explicit flow suppression/activation: early failure uses load_dashboard_blank_profile and user_sign_in_new_record; the offline interval suppresses app flows and shifts traffic to api_offline_503; post-restore activates api_request_with_stale_token and backlog-processing flows."
+    - "Normal-phase log volume estimate: ~1490.3 logs/min for 25 min => ~37,258 lines."
+    - >
+      Failure-phase volume estimate (piecewise, including suppression and 14 one-shots):
+      25-35: ~14,698 lines;
+      35-38: ~1,568 lines;
+      38-45: ~3,715 lines;
+      45-48: ~3,440 lines;
+      48-50: ~2,141 lines;
+      plus 14 one-shots => ~25,576 lines.
+    - "Estimated total over 50 minutes: ~62,834 log lines. Failure remains noisy after restore due to persistent token mismatch traffic and backlog-driven worker/queue warnings."
+    - "The scenario ends in failure (degraded) rather than full recovery; token revocation and complete backlog clearance described in the post-mortem occur after the simulated window."
+```

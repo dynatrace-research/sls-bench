@@ -1,0 +1,510 @@
+```yaml
+sys:
+  id: azure_compute_cluster_control
+  desc: >
+    A simplified model of an Azure-like compute cluster control plane that provisions and manages VMs.
+    A Fabric Controller (FC) orchestrates host operations via the Host Agent (HA), while a Guest Agent (GA)
+    inside each VM initializes and establishes a secure channel used to receive secrets like certificates.
+    Customers interact through a Service Management API for deploy/scale operations, and a dependent identity
+    service (ACS-like) runs on VMs and serves token requests.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: fabric_controller
+    name: Fabric Controller
+    svc: fabric-controller
+    hosts: [fc-01, fc-02]
+    desc: >
+      Cluster orchestrator that schedules VM lifecycle operations, performs service healing, and tracks host health.
+      When too many hosts enter Human Investigate (HI), FC disables autonomic healing/servicing to contain blast radius.
+    to:
+      - dst: host_agent
+        proto: grpc
+        desc: Sends VM lifecycle commands and receives host health/fault reports.
+      - dst: service_mgmt_api
+        proto: https
+        desc: Exposes async status/acceptance semantics for management-plane requests (modeled as returning responses).
+    logs:
+      fc_cluster_health:
+        desc: Periodic snapshot of cluster health and servicing/autonomic controls.
+        lvl: INFO
+        msg: "cluster={cluster} fc_ver={fc_ver} hi_nodes={hi_nodes} auto_heal={auto_heal} servicing_updates={servicing}"
+        vars:
+          cluster: {k: ch, v: [cluster-a]}
+          fc_ver: {k: ch, v: ["5.12", "5.13"]}
+          auto_heal: {k: ch, v: ["true", "false"]}
+          servicing: {k: ch, v: [running, stopped]}
+        state_vars:
+          n:
+            hi_nodes: {k: i, v: [0, 10]}
+          f:
+            hi_nodes: {k: i, v: [10, 450]}
+      fc_vm_op:
+        desc: FC issues a VM operation to HA (deploy/scale/service-heal).
+        lvl: INFO
+        msg: "vm_op op={op} deployment={deployment} target_vm={vm_id} ud={ud}"
+        vars:
+          op: {k: ch, v: [deploy, scale_out, service_heal]}
+          deployment: {k: ch, v: [dep-app, dep-identity, dep-bus]}
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          ud: {k: i, v: [0, 4]}
+      fc_hi_threshold_hit:
+        desc: FC detects HI threshold exceeded and transitions the cluster into a constrained mode.
+        lvl: ERROR
+        msg: "HI threshold exceeded: hi_nodes={hi_nodes} threshold={threshold}; entering cluster HI mode"
+        vars:
+          hi_nodes: {k: i, v: [100, 450]}
+          threshold: {k: i, v: [80, 150]}
+      fc_autonomic_change_hi:
+        desc: Marker for autonomic controls being constrained due to HI threshold.
+        lvl: WARN
+        msg: "autonomic_ops auto_heal=false service_heal=disabled reason=hi_threshold"
+        vars: {}
+      fc_manual_repair:
+        desc: Marker for manual recovery work on corrupted/HI hosts.
+        lvl: INFO
+        msg: "manual_repair initiated scope={scope} ticket={ticket}"
+        vars:
+          scope: {k: ch, v: [cluster-a]}
+          ticket: {k: str, v: "INC-<digits>"}
+    beh:
+      n:
+        desc: FC emits low-rate cluster snapshots during steady operations.
+        emit:
+          - id: fc_cluster_health
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During incidents FC snapshots are more frequent as operators watch HI counts and controls.
+        emit:
+          - id: fc_cluster_health
+            per_min: 2.0
+            scope: per_host
+
+  - id: host_agent
+    name: Host Agent
+    svc: host-agent
+    hosts: [host-101, host-102, host-103, host-104, host-105, host-106, host-107]
+    desc: >
+      Runs on each physical host and manages VM boot/reimage, GA handshake timeouts, and VM networking configuration
+      via an HA networking plugin. Reports suspected host faults upward after repeated failed clean boots.
+    to:
+      - dst: guest_agent
+        proto: tcp
+        desc: Waits for GA initialization/handshake from within the VM.
+    logs:
+      ha_host_status:
+        desc: Periodic host-level status including versions and coarse health classification.
+        lvl: INFO
+        msg: "ha_status ha_ver={ha_ver} plugin={plugin} vms={vm_count} state={state}"
+        vars:
+          ha_ver: {k: ch, v: ["1.4", "1.5"]}
+          plugin: {k: ch, v: ["np-1.4", "np-1.5"]}
+          vm_count: {k: i, v: [0, 60]}
+          state: {k: ch, v: [ok, hi, updating, corrupted]}
+      ha_vm_start:
+        desc: HA starts a VM (new deployment/scale-out/heal) and begins waiting for GA.
+        lvl: INFO
+        msg: "vm_start vm={vm_id} image={image} ud={ud}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          image: {k: ch, v: [wa-2012.02, wa-2012.03]}
+          ud: {k: i, v: [0, 4]}
+      ha_ga_timeout:
+        desc: HA times out waiting for GA connection and triggers restart/reimage.
+        lvl: WARN
+        msg: "ga_connect_timeout vm={vm_id} waited_s={waited_s} attempt={attempt} action={action}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          waited_s: {k: i, v: [300, 1200]}
+          attempt: {k: ch, v: ["1", "2", "3"]}
+          action: {k: ch, v: [restart, reimage]}
+      ha_vm_reimage:
+        desc: HA performs OS reimage/restart of a VM after a failed initialization.
+        lvl: INFO
+        msg: "vm_reimage vm={vm_id} reason={reason}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          reason: {k: ch, v: [ga_timeout, operator_repair]}
+      ha_boot_retry:
+        desc: Retry marker for repeated clean boot attempts after GA failure/timeout.
+        lvl: INFO
+        msg: "retrying_vm_boot vm={vm_id} next_attempt={attempt} backoff_s={backoff_s}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          attempt: {k: i, v: [2, 3]}
+          backoff_s: {k: i, v: [30, 120]}
+      ha_network_plugin_incompatible:
+        desc: HA detects the networking plugin is incompatible and VM networking is not configured.
+        lvl: ERROR
+        msg: "network_plugin_error combo={combo} vm={vm_id} impact={impact}"
+        vars:
+          combo: {k: ch, v: ["ha-1.4+np-1.5"]}
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          impact: {k: ch, v: [no_vnet, no_connectivity]}
+      ha_blast_update_start_rollback:
+        desc: Operational marker for the initial blast rollback package.
+        lvl: WARN
+        msg: "blast_update start package=rollback_ha_pkg_v1 target_ha=1.4 target_ga=2.2-fixed"
+        vars: {}
+      ha_blast_update_start_corrected:
+        desc: Operational marker for the corrected blast update package.
+        lvl: WARN
+        msg: "blast_update start package=corrected_ha_pkg_v2 target_ha=1.4 target_ga=2.2-fixed"
+        vars: {}
+      ha_blast_update_complete_corrected:
+        desc: Operational marker for corrected blast update completion (not all hosts fully clean afterward).
+        lvl: INFO
+        msg: "blast_update complete package=corrected_ha_pkg_v2 result=partial"
+        vars: {}
+    beh:
+      n:
+        desc: HA emits periodic health snapshots; VM lifecycle logs are emitted via flows.
+        emit:
+          - id: ha_host_status
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: In failure, HA emits more frequent status; plugin incompatibility errors may appear during bad rollbacks.
+        emit:
+          - id: ha_host_status
+            per_min: 1.0
+            scope: per_host
+          - id: ha_network_plugin_incompatible
+            per_min: 0.3
+            scope: per_host
+
+  - id: guest_agent
+    name: Guest Agent
+    svc: guest-agent
+    hosts: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]
+    desc: >
+      Agent inside each VM that initializes first-boot state, generates a transfer certificate, and connects to HA.
+      On leap day, a date arithmetic bug can cause transfer certificate creation to fail and GA to terminate early.
+    to:
+      - dst: host_agent
+        proto: tcp
+        desc: Connects back to the HA during initialization to establish the secret-transfer channel.
+    logs:
+      ga_init_start:
+        desc: GA begins initialization and determines the current UTC day for certificate validity.
+        lvl: INFO
+        msg: "ga_init vm={vm_id} utc_date={utc_date}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+        state_vars:
+          n:
+            utc_date: {k: ch, v: ["2012-02-28"]}
+          f:
+            utc_date: {k: ch, v: ["2012-02-29"]}
+      ga_transfer_cert_error:
+        desc: GA fails to create the transfer certificate and exits.
+        lvl: ERROR
+        msg: "transfer_cert_create_failed vm={vm_id} valid_from={valid_from} valid_to={valid_to} err={err}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          valid_from: {k: ch, v: ["2012-02-29T00:00:00Z"]}
+          valid_to: {k: ch, v: ["2013-02-29T00:00:00Z"]}
+          err: {k: ch, v: [invalid_date]}
+      ga_connect_success:
+        desc: GA successfully connects to HA after creating a transfer certificate.
+        lvl: INFO
+        msg: "connected_to_host_agent vm={vm_id} transfer_cert_thumbprint={thumb}"
+        vars:
+          vm_id: {k: ch, v: [vm-a1, vm-a2, vm-a3, vm-a4, vm-a5]}
+          thumb: {k: hex, v: 40}
+    beh:
+      n:
+        desc: GA does not emit periodic logs in this model; it logs on initialization via flows.
+        emit: []
+      f:
+        desc: GA does not emit periodic logs in this model; it logs on initialization via flows.
+        emit: []
+
+  - id: service_mgmt_api
+    name: Service Management API
+    svc: service-management
+    hosts: [sm-01, sm-02]
+    desc: >
+      Customer-facing management plane for deploy/update/scale operations. During the incident,
+      operators can disable service management to reduce further destabilizing actions.
+    to:
+      - dst: fabric_controller
+        proto: https
+        desc: Submits deploy/scale requests to the control plane.
+    logs:
+      sm_request:
+        desc: Incoming management request.
+        lvl: INFO
+        msg: "req {method} {route} caller={caller} rid={rid}"
+        vars:
+          method: {k: ch, v: [POST, PUT]}
+          route: {k: ch, v: ["/deployments", "/scale"]}
+          caller: {k: ch, v: [customer, portal]}
+          rid: {k: uuid, v: null}
+      sm_response_success:
+        desc: Successful async acceptance of a management request.
+        lvl: INFO
+        msg: "resp rid={rid} status=202 fc_cluster={cluster} took_ms={took_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          cluster: {k: ch, v: [cluster-a]}
+          took_ms: {k: i, v: [200, 4000]}
+      sm_response_disabled:
+        desc: Service management is disabled and requests are rejected.
+        lvl: WARN
+        msg: "resp rid={rid} status=503 code=ServiceManagementDisabled took_ms={took_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          took_ms: {k: i, v: [10, 200]}
+      sm_disable_action_global:
+        desc: Operational marker indicating service management was disabled globally.
+        lvl: WARN
+        msg: "service_management disabled=true scope=global reason=protect_running_services"
+        vars: {}
+      sm_metric:
+        desc: Periodic management traffic snapshot including request and rejection rates.
+        lvl: INFO
+        msg: "metric req_rate_rpm={req_rpm} rejected_rpm={rej_rpm}"
+        vars:
+          req_rpm: {k: i, v: [0, 400]}
+          rej_rpm: {k: i, v: [0, 400]}
+    beh:
+      n:
+        desc: Periodic metrics for request volume and rejection rate.
+        emit:
+          - id: sm_metric
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: During incidents, metrics are emitted more frequently as disablement is toggled/observed.
+        emit:
+          - id: sm_metric
+            per_min: 1.0
+            scope: per_host
+
+  - id: acs_service
+    name: Access Control Service (dependent)
+    svc: acs
+    hosts: [acs-01, acs-02, acs-03]
+    desc: >
+      A representative dependent service running on compute VMs. If VMs lose networking or are reboot-looping,
+      token requests can time out or return 503.
+    to: []
+    logs:
+      acs_req:
+        desc: Incoming token request.
+        lvl: INFO
+        msg: "token_request client={client_ip} scope={scope} rid={rid}"
+        vars:
+          client_ip: {k: ip, v: "10.0.0.0/8"}
+          scope: {k: ch, v: [openid, sb, sql]}
+          rid: {k: uuid, v: null}
+      acs_resp_200:
+        desc: Successful token response.
+        lvl: INFO
+        msg: "token_response rid={rid} status=200 took_ms={took_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          took_ms: {k: i, v: [20, 400]}
+      acs_upstream_unreachable:
+        desc: Internal signal that backend nodes are unreachable (e.g., VM has no network).
+        lvl: ERROR
+        msg: "backend_unreachable rid={rid} reason={reason} waited_ms={waited_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          reason: {k: ch, v: [vm_no_network, backend_timeout]}
+          waited_ms: {k: i, v: [500, 5000]}
+      acs_resp_503:
+        desc: Failed token response due to backend unavailability.
+        lvl: WARN
+        msg: "token_response rid={rid} status=503 error={error} took_ms={took_ms}"
+        vars:
+          rid: {k: uuid, v: null}
+          error: {k: ch, v: [ServiceUnavailable, GatewayTimeout]}
+          took_ms: {k: i, v: [500, 8000]}
+      acs_metric:
+        desc: Periodic service snapshot for node availability and error rate.
+        lvl: INFO
+        msg: "metric active_nodes={nodes} error_rate_pct={err_pct}"
+        vars:
+          nodes: {k: i, v: [0, 10]}
+          err_pct: {k: f, v: [0.0, 60.0]}
+    beh:
+      n:
+        desc: Low-rate health metrics under normal operation.
+        emit:
+          - id: acs_metric
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: Metrics remain available but show higher error rates when clusters lose VM networking.
+        emit:
+          - id: acs_metric
+            per_min: 0.6
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [service_mgmt_api, acs_service]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation includes steady token issuance traffic and moderate customer deploy/scale activity.
+    req:
+      - id: service_mgmt_deploy
+        desc: Customer management request is accepted (202) and queued as an FC VM operation.
+        rpm: 40.0
+        path: [service_mgmt_api, fabric_controller, service_mgmt_api]
+        emit:
+          - service_mgmt_api.sm_request
+          - fabric_controller.fc_vm_op
+          - service_mgmt_api.sm_response_success
+        latency_ms:
+          - [5, 20]
+          - [20, 120]
+          - [50, 400]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: vm_bootstrap_success_n
+        desc: A VM boot completes successfully with GA initialization and HA handshake.
+        rpm: 60.0
+        path: [host_agent, guest_agent, host_agent]
+        emit:
+          - host_agent.ha_vm_start
+          - guest_agent.ga_init_start
+          - guest_agent.ga_connect_success
+        latency_ms:
+          - [200, 1200]
+          - [50, 300]
+          - [100, 800]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: acs_token_success_n
+        desc: Token issuance succeeds.
+        rpm: 250.0
+        path: [acs_service]
+        emit: [acs_service.acs_req, acs_service.acs_resp_200]
+        latency_ms: [[10, 50], [20, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      Failure includes GA boot failures leading to HA timeout/reimage loops, management-plane disablement,
+      and later a networking plugin incompatibility causing dependent-service 503s.
+    req:
+      - id: vm_bootstrap_leapday_fail
+        desc: HA attempts to start/heal a VM; GA fails transfer certificate creation, HA times out and reimages, and HA retries.
+        rpm: 120.0
+        path: [host_agent, guest_agent, host_agent]
+        emit:
+          - host_agent.ha_vm_start
+          - guest_agent.ga_init_start
+          - guest_agent.ga_transfer_cert_error
+          - host_agent.ha_ga_timeout
+          - host_agent.ha_vm_reimage
+        latency_ms:
+          - [200, 1200]
+          - [50, 250]
+          - [5, 30]
+          - [450000, 600000]
+          - [10000, 30000]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.5
+          emit_per_retry: [host_agent.ha_boot_retry]
+          backoff_ms: [[60000, 120000], [60000, 180000]]
+        trace: false
+      - id: vm_bootstrap_fixed_success_f
+        desc: VM boot succeeds after a GA hotfix is deployed, even though the cluster is otherwise degraded.
+        rpm: 80.0
+        path: [host_agent, guest_agent, host_agent]
+        emit:
+          - host_agent.ha_vm_start
+          - guest_agent.ga_init_start
+          - guest_agent.ga_connect_success
+        latency_ms:
+          - [200, 1500]
+          - [50, 400]
+          - [150, 1200]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: service_mgmt_request_disabled
+        desc: Management requests are rejected while service management is disabled.
+        rpm: 80.0
+        path: [service_mgmt_api]
+        emit: [service_mgmt_api.sm_request, service_mgmt_api.sm_response_disabled]
+        latency_ms: [[2, 20], [10, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: acs_token_success_f
+        desc: Token issuance that still succeeds in unaffected/healthy nodes.
+        rpm: 250.0
+        path: [acs_service]
+        emit: [acs_service.acs_req, acs_service.acs_resp_200]
+        latency_ms: [[10, 50], [20, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: acs_token_timeout_f
+        desc: Token issuance fails because backends are unreachable (e.g., VMs lose networking).
+        rpm: 20.0
+        path: [acs_service]
+        emit: [acs_service.acs_req, acs_service.acs_upstream_unreachable, acs_service.acs_resp_503]
+        latency_ms: [[10, 50], [500, 5000], [500, 8000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    The real incident lasted many hours; this model compresses it into <60 minutes while preserving the two key beats:
+    (1) leap-day GA transfer certificate failure causing HA timeout/reimage loops and HI escalation, and
+    (2) a rushed blast remediation on a subset of clusters that introduces an incompatible HA networking plugin and causes
+        widespread VM network loss and dependent-service 503s.
+  - |
+    The GA hotfix is represented by switching from vm_bootstrap_leapday_fail to vm_bootstrap_fixed_success_f after the blast
+    update event; ga_transfer_cert_error stops once the hotfix flow becomes active.
+  - |
+    HA's real GA timeout was 25 minutes; the model keeps the "dominant wait then retry" behavior but compresses the effective
+    waited_s/latency so multiple retries are observable within the scenario duration.
+  - |
+    Normal-phase estimate: ~800 logs/min (ACS token traffic dominates) over 25 minutes (~20k logs).
+    Total estimate: ~61k logs across the scenario (normal ~20k, failure ~41k), within the 20k..100k target.
+  - |
+    Visibility anchors intended to be frequent/clear: guest_agent.ga_transfer_cert_error and host_agent.ha_ga_timeout (early failure),
+    fabric_controller.fc_hi_threshold_hit and service_mgmt_api.sm_response_disabled (mid failure), and
+    host_agent.ha_network_plugin_incompatible + acs_service.acs_resp_503 (secondary outage).
+  - |
+    Repair note: ha_ga_timeout.attempt is explicitly modeled as one of ["1","2","3"] so per-attempt timeout logs remain coherent with
+    vm_bootstrap_leapday_fail.retry.max_attempts=3.
+```

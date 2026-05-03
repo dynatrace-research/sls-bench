@@ -1,0 +1,307 @@
+```yaml
+scenario:
+  id: incident_2025_03_31_sessionstore_unavailability
+  title: SessionStore outage from Cassandra disk exhaustion and quorum loss (recovered via wipe)
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    MediaWiki uses SessionStore for session reads/writes, and SessionStore relies on a Cassandra cluster with QUORUM consistency across two datacenters.
+    Storage growth exhausts Cassandra disks, multiple nodes shut down, and the cluster drops below quorum.
+    SessionStore begins returning HTTP 500s; sessions are lost and edit saves fail, triggering alerts and on-call investigation.
+    Service is restored by wiping/truncating the session data and restarting Cassandra; availability returns quickly but all sessions are lost (disruptive recovery).
+
+  trigger_desc: |
+    Cassandra data disks reach exhaustion after sustained session-write storage growth; enough Cassandra nodes crash that QUORUM cannot be met, causing SessionStore read/write failures and HTTP 500s.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        MediaWiki serves page views and edit saves at steady rates.
+        SessionStore reads and writes sessions successfully and Cassandra shows healthy free space and low compaction backlog.
+        No alerts are active.
+      flows: [mw_page_view_ok, mw_edit_save_ok, ss_cassandra_read_sample_ok, ss_cassandra_write_sample_ok]
+      manifestation:
+        - mediawiki_app.heartbeat
+        - sessionstore_api.http_get_200
+        - sessionstore_api.pool_health
+        - cassandra_cluster.disk_usage
+
+    f:
+      desc: |
+        Cassandra nodes begin shutting down after running out of free disk, reducing the live-node count below QUORUM.
+        SessionStore cannot complete QUORUM reads/writes and returns HTTP 500 to MediaWiki.
+        MediaWiki experiences session loss and widespread edit failures. Responders identify Cassandra quorum loss and disk exhaustion as the cause,
+        then perform a disruptive mitigation (wipe/truncate sessions + restart) that restores availability but clears all sessions.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: cassandra_cluster
+          event: |
+            Multiple Cassandra nodes hit disk exhaustion and shut down; SessionStore loses QUORUM and begins returning HTTP 500s for session reads/writes.
+          why: |
+            Cassandra is log-structured; sustained overwrite-heavy writes can grow on-disk data faster than compaction reclaims space.
+            When disks fill, commitlog writes fail and nodes shut down, dropping the cluster below QUORUM. Shutdown/DOWN is directly observable;
+            the workload change is external.
+          flows:
+            - mw_page_view_sessionstore_5xx
+            - mw_edit_save_500
+            - ss_cassandra_read_sample_fail
+            - ss_cassandra_write_sample_fail
+          rate_multipliers:
+            mw_page_view_ok_post_wipe: 0.0
+            mw_edit_save_ok_post_wipe: 0.0
+            ss_cassandra_read_sample_ok_post_wipe: 0.0
+            ss_cassandra_write_sample_ok_post_wipe: 0.0
+            sessionstore_api.pool_health_ok: 0.0
+            cassandra_cluster.disk_usage_recovered: 0.0
+            monitoring_alerts.alert_active_sessionstore_5xx: 0.0
+            monitoring_alerts.alert_active_edit_failures: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: cassandra_cluster.commitlog_no_space
+              count: 3
+              hosts: [cass-a2, cass-b1, cass-b2]
+            - ref: cassandra_cluster.node_marked_down
+              count: 3
+              hosts: [cass-a2, cass-b1, cass-b2]
+          manifestation:
+            - cassandra_cluster.commitlog_no_space
+            - sessionstore_api.http_put_500
+            - sessionstore_api.pool_health
+
+        - order: 2
+          at_min: 23
+          component: monitoring_alerts
+          event: |
+            Monitoring detects sustained SessionStore HTTP 5xx and elevated edit failures; paging and critical alerting begin.
+          why: |
+            SessionStoreErrorRateHigh is driven by sustained HTTP 500 responses from SessionStore.
+            MediaWikiEditFailures is driven by session-dependent edit saves failing. Both are directly observable through alerting logs.
+          flows: [mw_edit_save_500, mw_page_view_sessionstore_5xx]
+          rate_multipliers:
+            monitoring_alerts.alert_active_sessionstore_5xx: 1.0
+            monitoring_alerts.alert_active_edit_failures: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring_alerts.alert_fired_edit_failures
+              count: 1
+              hosts: [mon1]
+            - ref: monitoring_alerts.alert_fired_sessionstore_5xx
+              count: 1
+              hosts: [mon1]
+            - ref: monitoring_alerts.page_sent
+              count: 1
+              hosts: [mon1]
+          manifestation:
+            - monitoring_alerts.page_sent
+            - monitoring_alerts.alert_fired_sessionstore_5xx
+            - monitoring_alerts.alert_fired_edit_failures
+
+        - order: 3
+          at_min: 29
+          component: oncall_ops
+          event: |
+            On-call acknowledges the page and begins investigation; SessionStore pool health logging is increased for faster feedback on quorum status.
+          why: |
+            Human response to paging leads to acknowledgment and additional diagnostic logging.
+            The pool health signal is directly observable and corroborates loss of QUORUM across datacenters.
+          flows:
+            - mw_page_view_sessionstore_5xx
+            - mw_edit_save_500
+            - ss_cassandra_read_sample_fail
+            - ss_cassandra_write_sample_fail
+          rate_multipliers:
+            sessionstore_api.pool_health: 2.5
+          latency_multipliers: {}
+          one_shots:
+            - ref: oncall_ops.ack_page
+              count: 1
+              hosts: [ops1]
+            - ref: oncall_ops.investigation_note
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - oncall_ops.ack_page
+            - sessionstore_api.pool_health
+            - monitoring_alerts.alert_active_sessionstore_5xx
+
+        - order: 4
+          at_min: 42
+          component: cassandra_cluster
+          event: |
+            Investigation confirms Cassandra unavailability (too many nodes down for QUORUM) and ties it to disk exhaustion/compaction pressure; one more node shuts down.
+          why: |
+            SessionStore pool_health (low live_hosts) indicates a cluster below QUORUM.
+            Cassandra disk metrics show near-zero free space and elevated compaction backlog; shutdown/DOWN is directly observable.
+          flows:
+            - ss_cassandra_read_sample_fail
+            - ss_cassandra_write_sample_fail
+            - mw_edit_save_500
+          rate_multipliers:
+            cassandra_cluster.compaction_backlog: 2.0
+            sessionstore_api.pool_health: 3.0
+          latency_multipliers:
+            ss_cassandra_read_sample_fail: {p50: 1.3, p95: 1.6}
+            ss_cassandra_write_sample_fail: {p50: 1.3, p95: 1.6}
+            mw_edit_save_500: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: cassandra_cluster.commitlog_no_space
+              count: 1
+              hosts: [cass-b3]
+            - ref: cassandra_cluster.node_marked_down
+              count: 1
+              hosts: [cass-b3]
+            - ref: oncall_ops.investigation_note
+              count: 2
+              hosts: [ops1]
+          manifestation:
+            - cassandra_cluster.disk_usage
+            - cassandra_cluster.compaction_backlog
+            - sessionstore_api.pool_health
+            - oncall_ops.investigation_note
+
+        - order: 5
+          at_min: 52
+          component: oncall_ops
+          event: |
+            Responders decide to wipe/truncate SessionStore Cassandra data in both datacenters to free disk and restore quorum.
+          why: |
+            With disks exhausted and QUORUM unattainable, truncation/wipe is a disruptive but effective way to free space and bring nodes back.
+            The decision is directly observable as an operator marker; the resulting state change is confirmed by recovered metrics and reduced 5xx.
+          flows: [mw_page_view_sessionstore_5xx, mw_edit_save_500]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: oncall_ops.decision_log
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - oncall_ops.decision_log
+            - monitoring_alerts.alert_active_sessionstore_5xx
+
+        - order: 6
+          at_min: 56
+          component: cassandra_cluster
+          event: |
+            Storage is wiped/truncated and Cassandra is restarted; quorum is restored and SessionStore returns mostly-200 again, while alerts resolve.
+          why: |
+            Truncation frees disk space and allows Cassandra to start and participate in quorum again. This is directly observable via truncate/restart markers,
+            recovered disk metrics, and SessionStore switching from sustained 5xx to mostly 200s. Session loss persists because all session rows were removed.
+          flows:
+            - mw_page_view_ok_post_wipe
+            - mw_edit_save_ok_post_wipe
+            - ss_cassandra_read_sample_ok_post_wipe
+            - ss_cassandra_write_sample_ok_post_wipe
+          rate_multipliers:
+            mw_page_view_ok_post_wipe: 1.0
+            mw_page_view_sessionstore_5xx: 0.02
+            mw_edit_save_ok_post_wipe: 1.0
+            mw_edit_save_500: 0.02
+            ss_cassandra_read_sample_ok_post_wipe: 1.0
+            ss_cassandra_read_sample_fail: 0.05
+            ss_cassandra_write_sample_ok_post_wipe: 1.0
+            ss_cassandra_write_sample_fail: 0.05
+            sessionstore_api.pool_health_ok: 1.0
+            sessionstore_api.pool_health: 0.0
+            cassandra_cluster.disk_usage_recovered: 1.0
+            cassandra_cluster.disk_usage: 0.0
+            cassandra_cluster.compaction_backlog: 0.1
+            monitoring_alerts.alert_active_sessionstore_5xx: 0.0
+            monitoring_alerts.alert_active_edit_failures: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: cassandra_cluster.truncate_sessions
+              count: 2
+              hosts: [cass-a1, cass-b1]
+            - ref: cassandra_cluster.cassandra_restart
+              count: 2
+              hosts: [cass-a1, cass-b1]
+            - ref: monitoring_alerts.alert_resolved_sessionstore_5xx
+              count: 1
+              hosts: [mon1]
+            - ref: monitoring_alerts.alert_resolved_edit_failures
+              count: 1
+              hosts: [mon1]
+          manifestation:
+            - cassandra_cluster.truncate_sessions
+            - cassandra_cluster.cassandra_restart
+            - sessionstore_api.http_put_200
+            - monitoring_alerts.alert_resolved_sessionstore_5xx
+
+      steady:
+        - component: sessionstore_api
+          condition: |
+            After wipe/restart, SessionStore is available again and serves mostly HTTP 200; a small residual 5xx rate may persist briefly during stabilization.
+          user_impact: |
+            Users are forced to re-establish sessions because all session data was wiped; edit throughput returns, but some users see session loss/logouts.
+          manifestation:
+            - sessionstore_api.http_get_200
+            - sessionstore_api.http_put_200
+            - sessionstore_api.pool_health_ok
+
+        - component: cassandra_cluster
+          condition: |
+            Cassandra nodes have disk space again after truncation and are restarted; compaction backlog reduces from peak levels.
+          user_impact: |
+            Session storage is functional again, but previously stored sessions are permanently gone due to the wipe.
+          manifestation:
+            - cassandra_cluster.disk_usage_recovered
+            - cassandra_cluster.compaction_backlog
+
+      feedback_loops:
+        - id: retry_pressure_on_remaining_nodes
+          desc: |
+            As nodes go down, the remaining nodes face higher relative pressure and longer tail latencies.
+            SessionStore retry behavior (visible in sampled internal telemetry) can increase load and prolong unavailability until disk is freed.
+
+      flows:
+        - mw_page_view_sessionstore_5xx
+        - mw_edit_save_500
+        - ss_cassandra_read_sample_fail
+        - ss_cassandra_write_sample_fail
+        - mw_page_view_ok_post_wipe
+        - mw_edit_save_ok_post_wipe
+        - ss_cassandra_read_sample_ok_post_wipe
+        - ss_cassandra_write_sample_ok_post_wipe
+      manifestation:
+        - sessionstore_api.http_get_500
+        - sessionstore_api.http_put_500
+        - sessionstore_api.pool_health
+        - sessionstore_api.cassandra_op_fail
+        - cassandra_cluster.disk_usage
+        - cassandra_cluster.commitlog_no_space
+        - monitoring_alerts.alert_active_sessionstore_5xx
+        - cassandra_cluster.truncate_sessions
+        - sessionstore_api.http_put_200
+
+  assumptions:
+    - |
+      This scenario models the full incident arc including recovery, while keeping exactly two phases by treating the post-wipe period as "failure" due to disruptive session loss.
+      Scenario minute mapping: f.start_min=18 corresponds to ~02:58 UTC; recovery action occurs at min 56 (~03:36 UTC) with steady edit rates returning by the end.
+    - |
+      Failure-phase piecewise breakdown (scenario minutes):
+      - 18-23 (5m): outage begins; alerts suppressed; Cassandra shutdown/DOWN one-shots occur.
+      - 23-56 (33m): alerts active; investigation increases pool health logging; compaction backlog elevated; edits mostly failing.
+      - 56-60 (4m): wipe/truncate + restart; service restored; alerts resolve; sessions wiped (residual user disruption).
+    - |
+      One-shot counts per event: e1=6 (3 shutdown + 3 DOWN), e2=3 (2 alert_fired + 1 page_sent), e3=2 (ack + note),
+      e4=4 (1 shutdown + 1 DOWN + 2 investigation notes), e5=1 (decision), e6=6 (2 truncate + 2 restart + 2 alert_resolved).
+    - |
+      Rough volume estimate (typical generation; sampled internal Cassandra telemetry reduces total volume):
+      - Normal (18m): ~10k flow logs + ~150 background logs.
+      - Failure outage (38m of 42m): ~23k flow logs (incl. sampled retries) + ~400 background logs + one-shots.
+      - Post-wipe (4m): ~2k flow logs + ~40 background logs + one-shots (degraded pool_health/disk_usage suppressed; OK/recovered variants enabled).
+      Total ~35k logs, within 20k–100k.
+    - |
+      Visibility rationale: outage onset is evident from sustained SessionStore HTTP 500s plus degraded sessionstore_api.pool_health and Cassandra shutdown/DOWN one-shots,
+      corroborated by Cassandra disk_usage near 0–5% and increased compaction_backlog. Recovery is evident from truncate/restart one-shots, disk_usage_recovered,
+      SessionStore switching to mostly-200, and alert_resolved markers; contradictory degraded disk_usage/pool_health emissions are suppressed after the wipe.
+```

@@ -1,0 +1,231 @@
+```yaml
+scenario:
+  id: api_dashboard_outage_pacemaker_no_promotion_20171010_compressed
+  title: API and Dashboard outage due to primary disk failure and Pacemaker promotion deadlock
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform serves an API and dashboard backed by a Pacemaker-managed Postgres cluster with a VIP for the primary.
+    A disk array failure on the primary causes Postgres to become unusable, and Pacemaker repeatedly fails to promote the synchronous replica due to a constraint edge case under concurrent process instability.
+    With no elected primary behind the VIP, application DB connections fail and essentially all user requests return 503 for the whole modeled outage window.
+    Operators fence the failed node, attempt cleanup and maintenance-mode based promotion attempts, and finally begin manual promotion and application reconfiguration, but recovery is not yet confirmed by the end of the scenario.
+
+  trigger_desc: |
+    A hardware disk array failure on the primary Postgres node causes I/O errors and Postgres termination while, at nearly the same time, the synchronous replica experiences a Postgres subprocess crash/restart.
+    Under an existing Pacemaker configuration (backup VIP colocation constraint plus non-zero resource stickiness), this combination prevents Pacemaker from choosing a promotion target.
+
+  time:
+    total_minutes: 54
+    phases:
+      n: {start_min: 0, end_min: 27}
+      f: {start_min: 27, end_min: 54}
+
+  phases:
+    n:
+      desc: |
+        Requests to the API and dashboard complete normally with low latency.
+        Applications connect through the Postgres VIP to the primary, and Pacemaker reports stable cluster status.
+        Monitoring probes succeed.
+      flows: [web_request_ok]
+      manifestation: [api_app.req_done_2xx, pacemaker.cluster_status, monitoring.probe_ok]
+
+    f:
+      desc: |
+        The primary experiences a storage failure and becomes unusable.
+        Pacemaker detects the primary is unhealthy and repeatedly tries to promote the synchronous replica, but promotion fails due to placement/constraint decisions.
+        With no primary elected and the Postgres VIP not pointing at any working node, API/Dashboard traffic fails and returns 503 throughout the outage window.
+        Operator actions (fencing, crm resource cleanup, toggling maintenance mode, and manual promotion attempts) are visible in Pacemaker and Postgres logs, but do not restore end-to-end availability within this modeled window.
+
+      events:
+        - order: 1
+          at_min: 27
+          component: postgres_primary
+          event: |
+            The primary node begins logging RAID I/O failures and remounts its filesystem read-only; Postgres stops.
+            Monitoring detects a near-total outage, while Pacemaker starts repeated promotion attempts that fail to select a new primary.
+          why: |
+            The hardware disk array failure is directly observable via storage/filesystem logs on db1.
+            Pacemaker's inability to promote is observable via repeated promote failures referencing constraints; the deeper configuration edge case is not yet obvious from symptoms alone.
+          flows: [web_request_db_down_vip]
+          rate_multipliers:
+            web_request_db_direct_fail: 0.0
+            pacemaker.vip_not_managed: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: postgres_primary.raid_disk_loss
+              count: 1
+              hosts: [db1]
+            - ref: postgres_primary.postgres_fatal_io
+              count: 1
+              hosts: [db1]
+            - ref: postgres_primary.postgres_stopped
+              count: 1
+              hosts: [db1]
+            - ref: postgres_sync.postmaster_child_crash
+              count: 1
+              hosts: [db2]
+            - ref: postgres_sync.postmaster_restart
+              count: 1
+              hosts: [db2]
+            - ref: postgres_sync.restore_invalid_wal
+              count: 1
+              hosts: [db2]
+            - ref: monitoring.alert_api_outage
+              count: 1
+              hosts: [mon1]
+          manifestation:
+            - monitoring.alert_api_outage
+            - api_app.db_connect_err_vip
+            - api_app.req_done_503
+            - pacemaker.promote_failed_constraints
+            - postgres_primary.raid_io_error
+
+        - order: 2
+          at_min: 30
+          component: pacemaker
+          event: |
+            Engineers power off/fence the broken primary node so it is no longer online in a degraded state.
+            Pacemaker continues attempting promotion, but the cluster still fails to elect a primary.
+          why: |
+            Fencing is directly observable in Pacemaker logs and reduces storage noise from the dead node, but it does not resolve the underlying constraint-driven promotion deadlock.
+          flows: [web_request_db_down_vip]
+          rate_multipliers:
+            postgres_primary.raid_io_error: 0.0
+            postgres_primary.fs_remount_ro: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: pacemaker.node_fenced
+              count: 1
+              hosts: [db2]
+          manifestation:
+            - pacemaker.node_fenced
+            - pacemaker.promote_failed_constraints
+            - api_app.req_done_503
+
+        - order: 3
+          at_min: 31
+          component: pacemaker
+          event: |
+            Operators run a Pacemaker resource cleanup to clear error counts and force state re-evaluation.
+            Promotion attempts continue and still fail.
+          why: |
+            Cleanup is directly observable, but in this failure mode it does not change the constraint evaluation that prevents a promotion decision.
+          flows: [web_request_db_down_vip]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: pacemaker.crm_resource_cleanup
+              count: 1
+              hosts: [db2]
+          manifestation:
+            - pacemaker.crm_resource_cleanup
+            - pacemaker.promote_attempt
+            - pacemaker.promote_failed_constraints
+
+        - order: 4
+          at_min: 44
+          component: pacemaker
+          event: |
+            After extended attempts, operators temporarily enable then disable maintenance mode while trying to promote the synchronous replica by editing standby configuration.
+            The replica comes back as a standby under cluster control and the system remains without an elected primary.
+          why: |
+            Maintenance mode toggles and standby reconfiguration are directly observable (operator commands and standby startup messages).
+            The repeated return to standby reflects continued cluster control and unresolved promotion selection.
+          flows: [web_request_db_down_vip]
+          rate_multipliers:
+            pacemaker.promote_attempt: 1.5
+          latency_multipliers: {}
+          one_shots:
+            - ref: pacemaker.maintenance_mode_enabled
+              count: 1
+              hosts: [db2]
+            - ref: pacemaker.maintenance_mode_disabled
+              count: 1
+              hosts: [db2]
+            - ref: postgres_sync.recovery_conf_restored
+              count: 2
+              hosts: [db2]
+          manifestation:
+            - pacemaker.maintenance_mode_enabled
+            - postgres_sync.recovery_conf_restored
+            - pacemaker.promote_failed_constraints
+            - api_app.db_connect_err_vip
+
+        - order: 5
+          at_min: 49
+          component: postgres_sync
+          event: |
+            Operators enable maintenance mode and manually start the synchronous replica as a primary candidate, then begin rolling out an application DB host override to bypass the VIP.
+            Under maintenance mode, Pacemaker stops automated promotion/placement actions and emits unmanaged-resource warnings; end-to-end API/Dashboard availability is not yet restored within this window and requests continue to fail.
+          why: |
+            The manual promotion and maintenance mode are directly observable in Postgres/Pacemaker logs.
+            Application override changes are directly observable on app nodes; in this compressed window the override is not yet sufficient to restore external availability, so probes and user requests continue to show failures.
+          flows: [web_request_db_down_vip, web_request_db_direct_fail]
+          rate_multipliers:
+            web_request_db_down_vip: 0.6
+            web_request_db_direct_fail: 1.0
+            pacemaker.promote_attempt: 0.0
+            pacemaker.promote_failed_constraints: 0.0
+            pacemaker.vip_not_managed: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: pacemaker.maintenance_mode_enabled
+              count: 1
+              hosts: [db2]
+            - ref: postgres_sync.manual_promote
+              count: 1
+              hosts: [db2]
+            - ref: api_app.config_db_host_override
+              count: 3
+              hosts: [app1, app2, app3]
+          manifestation:
+            - postgres_sync.manual_promote
+            - api_app.config_db_host_override
+            - pacemaker.vip_not_managed
+            - api_app.req_done_503
+
+      steady:
+        - component: api_app
+          condition: |
+            Pacemaker did not complete an automatic promotion after the primary failure, leaving the Postgres VIP without a usable primary target.
+            In the late phase, maintenance mode disables automated resource management; operators have initiated a manual promotion and started rolling out a DB host override, but external availability remains down in this modeled window.
+          user_impact: |
+            Essentially all API and dashboard requests fail with 503 errors, and monitoring probes continue to fail.
+          manifestation: [api_app.db_connect_err_vip, api_app.req_done_503, monitoring.probe_fail, pacemaker.vip_not_managed, pacemaker.cluster_status]
+
+      feedback_loops:
+        - id: failover_deadlock_blocks_recovery
+          desc: |
+            Pacemaker repeatedly attempts promotion but cannot choose a placement due to constraint evaluation, leaving the VIP without a valid primary target.
+            This sustains the outage until operators bypass automation with maintenance mode and manual promotion, after which application-side configuration rollout becomes the pacing item.
+
+      flows: [web_request_db_down_vip, web_request_db_direct_fail]
+      manifestation:
+        - api_app.db_connect_err_vip
+        - api_app.req_done_503
+        - monitoring.probe_fail
+        - pacemaker.vip_not_managed
+        - pacemaker.cluster_status
+
+  assumptions:
+    - |
+      The 1h50m real outage is compressed to a 54-minute scenario; the ordering of key actions matches the post-mortem (detection → power off/fence primary → crm cleanup → maintenance-mode attempts → manual promotion + start of app re-pointing).
+    - |
+      To align with the post-mortem summary that requests during the outage failed, the failure phase is modeled as a total outage: all modeled user-request flows in failure end in 503, and monitoring emits only probe_fail in failure.
+    - |
+      Pacemaker periodic and promotion-attempt logs are modeled as cluster-level (global-scope) emissions, avoiding unrealistic continued background emissions from the fenced/offline db1 node.
+    - |
+      Failure-phase split (27 minutes total):
+      - minutes 27–49: all traffic uses the VIP and fails (web_request_db_direct_fail suppressed); Pacemaker promote_failed_constraints is visible.
+      - minutes 49–54: some traffic shifts to attempted direct-IP DB connections; Pacemaker promotion logs are suppressed under maintenance mode while vip_not_managed warnings appear; VIP-based failures remain.
+    - |
+      Approximate volume breakdown (per-attempt emissions; no modeled in-app retries):
+      - Normal (0–27): web_request_ok 650 rpm × 27 min ≈ 17.6k request logs + ~120–220 background logs.
+      - Failure (27–49): web_request_db_down_vip 650 rpm × 2 logs/req ≈ 1.3k logs/min, ≈ 28.6k logs + Pacemaker/monitoring background.
+      - Failure (49–54): VIP failures reduced (0.6×) plus direct-fail attempts active ≈ ~6.4k request logs over 5 min; pacemaker.vip_not_managed continues; monitoring probe_fail adds ~20 logs.
+      - One-shots: ~14 logs total marking alerting, fencing, cleanup, maintenance-mode toggles, and manual promotion/override actions.
+      Total estimated logs: ~50k–63k, within the 20k–100k target.
+    - |
+      Visibility rationale: high-rate app DB connection errors and 503 completions make user impact obvious; repeated Pacemaker promote failures make the pre-maintenance-mode deadlock diagnosable; after maintenance mode, vip_not_managed plus operator one-shots and continuing request/probe failures make the late phase legible without incorrectly implying continued promotion failures.
+```

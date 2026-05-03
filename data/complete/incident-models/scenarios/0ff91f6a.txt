@@ -1,0 +1,265 @@
+```yaml
+scenario:
+  id: feb22_cache_churn_scatter_query_cascade
+  title: Cache churn triggers scatter-query overload during client boot
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Clients must boot before the product is usable; boot depends on cached GDM membership data and falls back to a Vitess keyspace on cache misses.
+    During a Consul agent maintenance restart wave on cache nodes, mcrib rapidly updated the mcrouter ring and flushed nodes, dropping cache hit rate.
+    The resulting boot-time cache misses triggered high-volume scatter queries across many shards, overloading Vitess and causing boot 503s and retries.
+    Operators paused the rollout and throttled boot traffic; later they deployed a query patch to fetch only missing keys and read from replicas, improving some boots but leaving the system still degraded by the end of the scenario.
+
+  trigger_desc: |
+    A sequential Consul-agent restart rollout on memcached nodes causes repeated deregistration/re-registration in the service catalog.
+    Mcrib reacts quickly, promoting spares and flushing rejoining nodes, increasing cache churn and lowering cache hit rate right as boot traffic is high.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Boot requests are mostly served from the cache tier (high hit rate), so only a small number of boots fall back to Vitess.
+        The channel-membership-by-user keyspace remains healthy with near-zero timeouts, and routine send-message traffic succeeds quickly.
+      flows: [client_boot_cache_hit, client_boot_cache_miss_scatter_ok, send_message_ok]
+      manifestation:
+        - mcrouter_cache.mcrouter_stats
+        - vitess_vtgate.keyspace_load
+        - webapp_api.boot_complete_200
+
+    f:
+      desc: |
+        Cache membership churn and flushing reduces cache hit rate, so the webapp repeatedly misses on GDM membership keys during client boot.
+        Those misses trigger scatter queries across many shards in the channel-membership-by-user keyspace; timeouts become frequent, producing 503 boot failures.
+        Client retries add load. Operators then throttle boots to preserve service for already-booted clients, and later deploy a query change that reduces fan-out
+        and allows replica reads, partially improving boot success without fully restoring the system.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: consul
+          event: |
+            Sequential Consul agent restarts on memcached nodes begin, causing deregistration/re-registration and rapid mcrib ring updates; cache hit rate drops and boot scatter-query timeouts become common.
+          why: |
+            Consul restarts remove cache nodes from the catalog; mcrib quickly repairs the ring by promoting spares and flushing rejoining nodes.
+            The resulting cold cache increases boot-time cache misses, which invoke Vitess scatter queries across many shards and overwhelm the keyspace.
+            The maintenance step itself is directly observable in Consul logs; the cache-hit drop and Vitess timeouts are directly observable in mcrouter and vtgate logs.
+          flows:
+            - client_boot_cache_miss_scatter_timeout
+            - send_message_degraded_ok
+          rate_multipliers:
+            client_boot_throttled_429: 0.0
+            client_boot_cache_miss_targeted_replica_ok: 0.0
+            mcrib_control.ring_push: 1.5
+            mcrib_control.node_flush: 1.5
+          latency_multipliers:
+            client_boot_cache_miss_scatter_timeout: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: consul.rollout_step
+              count: 1
+              hosts: [consul-ops-1]
+          manifestation:
+            - consul.agent_restart
+            - mcrib_control.ring_push
+            - mcrouter_cache.mcrouter_stats
+            - vitess_vtgate.scatter_query_timeout
+
+        - order: 2
+          at_min: 24
+          component: consul
+          event: |
+            Operators pause the Consul agent restart rollout, reducing new cache membership churn, but the system remains in a metastable overload state with low cache hit rate and frequent boot timeouts.
+          why: |
+            Pausing restarts stops additional node churn, but the cache is already cold and Vitess is already overloaded; timeouts prevent refilling cache entries quickly.
+            The pause is directly observable; continued overload is observed via vtgate timeouts and keyspace load snapshots.
+          flows:
+            - client_boot_cache_miss_scatter_timeout
+            - send_message_degraded_ok
+          rate_multipliers:
+            consul.agent_restart: 0.0
+            consul.service_deregister: 0.0
+            consul.service_register: 0.0
+            mcrib_control.ring_push: 0.8
+            mcrib_control.node_flush: 0.6
+          latency_multipliers:
+            client_boot_cache_miss_scatter_timeout: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: consul.rollout_paused
+              count: 1
+              hosts: [consul-ops-1]
+          manifestation:
+            - consul.rollout_paused
+            - vitess_vtgate.keyspace_load
+            - vitess_vtgate.scatter_query_timeout
+
+        - order: 3
+          at_min: 27
+          component: webapp_api
+          event: |
+            A restrictive boot throttle is enabled; fewer boot requests reach Vitess and more are rejected with 429, improving headroom for other traffic.
+          why: |
+            By limiting boot throughput, the webapp reduces the volume of cache-miss scatter queries, lowering keyspace pressure and allowing some cache refills.
+            The throttle change is directly observable via an operator action log and increased 429 boot responses.
+          flows:
+            - client_boot_throttled_429
+            - client_boot_cache_miss_scatter_timeout
+            - send_message_degraded_ok
+          rate_multipliers:
+            client_boot_cache_miss_scatter_timeout: 0.35
+            client_boot_throttled_429: 2.5
+          latency_multipliers:
+            send_message_degraded_ok: {p50: 0.95, p95: 0.9}
+          one_shots:
+            - ref: webapp_api.boot_throttle_updated
+              count: 1
+              hosts: [app-a]
+          manifestation:
+            - webapp_api.boot_throttled_429
+            - edge_gateway.boot_access_429
+            - vitess_vtgate.scatter_query_timeout
+
+        - order: 4
+          at_min: 31
+          component: webapp_api
+          event: |
+            The boot throttle is loosened too much; boot traffic surges back into the datastore and scatter-query timeouts rise again.
+          why: |
+            The cache is still not warm enough to absorb the increased boot demand. The additional cache-miss fan-out queries push the keyspace back beyond sustainable limits.
+            This is observed via increased 503 boot completions and vtgate scatter-query timeout logs.
+          flows:
+            - client_boot_cache_miss_scatter_timeout
+            - client_boot_throttled_429
+          rate_multipliers:
+            client_boot_cache_miss_scatter_timeout: 0.9
+            client_boot_throttled_429: 1.3
+          latency_multipliers:
+            client_boot_cache_miss_scatter_timeout: {p50: 1.3, p95: 1.6}
+          one_shots:
+            - ref: webapp_api.boot_throttle_updated
+              count: 1
+              hosts: [app-b]
+          manifestation:
+            - webapp_api.boot_complete_503
+            - edge_gateway.boot_access_503
+            - vitess_vtgate.scatter_query_timeout
+
+        - order: 5
+          at_min: 33
+          component: webapp_api
+          event: |
+            The boot throttle is tightened again; 429s increase and boot-driven datastore timeouts reduce compared to the previous spike.
+          why: |
+            Reducing boot concurrency lowers scatter-query pressure, trading off new-session availability for improved stability for already-booted users.
+            This is observed via a throttle update marker and a shift from 503s toward 429s.
+          flows:
+            - client_boot_cache_miss_scatter_timeout
+            - client_boot_throttled_429
+          rate_multipliers:
+            client_boot_cache_miss_scatter_timeout: 0.4
+            client_boot_throttled_429: 2.2
+          latency_multipliers:
+            client_boot_cache_miss_scatter_timeout: {p50: 1.15, p95: 1.25}
+          one_shots:
+            - ref: webapp_api.boot_throttle_updated
+              count: 1
+              hosts: [app-a]
+          manifestation:
+            - webapp_api.boot_throttle_updated
+            - edge_gateway.boot_access_429
+            - vitess_vtgate.keyspace_load
+
+        - order: 6
+          at_min: 36
+          component: webapp_api
+          event: |
+            A query patch is deployed to fetch only missing GDM membership keys and allow replica reads; targeted queries start succeeding while scatter timeouts become less dominant, though boot throttling remains.
+          why: |
+            By reducing fan-out and moving reads off primaries where acceptable, the patched query decreases keyspace pressure and makes cache refill feasible for some boots.
+            The deploy is directly observable via a deploy marker, and the change in query shape is visible in vtgate logs (scatter=false, tablet=replica).
+          flows:
+            - client_boot_cache_miss_targeted_replica_ok
+            - client_boot_cache_miss_scatter_timeout
+            - client_boot_throttled_429
+          rate_multipliers:
+            client_boot_cache_miss_targeted_replica_ok: 1.4
+            client_boot_cache_miss_scatter_timeout: 0.15
+            client_boot_throttled_429: 2.0
+          latency_multipliers:
+            client_boot_cache_miss_targeted_replica_ok: {p50: 1.0, p95: 1.1}
+          one_shots:
+            - ref: webapp_api.deploy_query_patch
+              count: 1
+              hosts: [app-b]
+          manifestation:
+            - webapp_api.deploy_query_patch
+            - vitess_vtgate.targeted_query_ok
+            - mcrouter_cache.mcrouter_stats
+
+      steady:
+        - component: webapp_api
+          condition: |
+            Boot traffic is still constrained by throttling; many new sessions are rate limited, while some boots succeed via targeted replica reads.
+          user_impact: |
+            Users who restart clients or reconnect may see an error page or repeated "connecting" behavior due to 429/503 during boot; already-booted users can often send messages with modest latency.
+          manifestation:
+            - webapp_api.boot_throttled_429
+            - webapp_api.boot_complete_503
+            - edge_gateway.boot_access_429
+
+        - component: vitess_vtgate
+          condition: |
+            The channel-membership-by-user keyspace remains above normal load with non-trivial timeouts, but reduced scatter volume prevents total collapse.
+          user_impact: |
+            Boot operations that still require fan-out reads are unreliable; dependent reads intermittently time out.
+          manifestation:
+            - vitess_vtgate.keyspace_load
+            - vitess_vtgate.scatter_query_timeout
+            - vitess_vtgate.targeted_query_ok
+
+      feedback_loops:
+        - id: cache_miss_scatter_timeout_loop
+          desc: |
+            Cache churn lowers hit rate -> boot cache misses rise -> scatter queries fan out to all shards -> Vitess overload/timeouts -> cache cannot be refilled -> hit rate stays low.
+        - id: client_retry_amplification
+          desc: |
+            Boot failures/timeouts cause clients to retry with backoff -> additional request volume lands during overload -> recovery requires external load reduction (throttling) or query/capacity changes.
+
+      flows:
+        - client_boot_cache_miss_scatter_timeout
+        - client_boot_throttled_429
+        - client_boot_cache_miss_targeted_replica_ok
+        - send_message_degraded_ok
+      manifestation:
+        - mcrouter_cache.mcrouter_stats
+        - mcrib_control.ring_push
+        - vitess_vtgate.keyspace_load
+        - vitess_vtgate.scatter_query_timeout
+        - webapp_api.boot_throttled_429
+
+  assumptions:
+    - >
+      Timeline is compressed to 40 minutes and ends while still degraded (throttling still active), even though the real incident later fully recovered.
+      This keeps the scenario ending in failure while preserving the key mitigations (pause rollout, throttle, query patch).
+    - >
+      Failure-phase piecewise volume (approx logs/min including modeled retries; background varies ~4–10 logs/min including low-rate memcached_stats):
+      0–20m normal: ~1,890 logs/min.
+      20–24m: ~2,190 logs/min (scatter timeouts prominent; consul churn + elevated mcrib activity).
+      24–27m: ~2,185 logs/min (rollout paused; overload persists).
+      27–31m: ~2,020 logs/min (throttle on; shift toward 429s, fewer scatter attempts).
+      31–33m: ~2,300 logs/min (throttle loosened; 503/scatter activity spikes).
+      33–36m: ~2,015 logs/min (throttle tightened).
+      36–40m: ~2,025 logs/min (targeted replica reads appear; scatter reduced; throttle remains).
+    - >
+      One-shots: event1 (1x consul.rollout_step), event2 (1x consul.rollout_paused),
+      events3-5 (3x webapp_api.boot_throttle_updated), event6 (1x webapp_api.deploy_query_patch).
+    - >
+      Visibility rationale: cache hit-rate degradation is visible via mcrouter_cache.mcrouter_stats; datastore overload via vitess_vtgate.keyspace_load and scatter_query_timeout;
+      operational actions via one-shot throttle/deploy markers; user-facing impact via edge boot 429/503 access logs.
+    - >
+      Total log estimate: ~80k logs across 40 minutes (sampled traffic + retries + periodic metrics), within the 20k–100k target.
+```

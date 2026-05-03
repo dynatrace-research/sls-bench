@@ -1,0 +1,455 @@
+```yaml
+sys:
+  id: tiered_cdn_cache
+  desc: >
+    A CDN edge system serves cached HTTP assets from data centers close to end users.
+    On a local cache miss, Tiered Cache forwards an internal request from a lower-tier edge POP
+    to an upper-tier POP closer to the customer origin, reducing origin fetches.
+    Upper tiers may resolve origin hostnames via an internal DNS service before fetching from origin.
+    This incident models a buggy upper-tier release that clears routing control headers, causing DNS-related 530 errors.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_cache
+    name: Edge POP (lower tier)
+    svc: edge-cache
+    hosts: [lhr1, fra1, syd1]
+    desc: >
+      Terminates client HTTP requests, serves from local cache when possible, and uses Tiered Cache
+      to forward cache misses to an upper-tier POP for eligible customer configurations.
+    to:
+      - dst: upper_tier_cache
+        proto: https
+        desc: Internal tiered-cache request to an upper-tier POP when local cache misses occur.
+    logs:
+      access_hit_local:
+        desc: Client request served from local cache.
+        lvl: INFO
+        msg: "edge served {req_id} host={host} uri={uri} cache=HIT tiered=false status=200 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          host: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          uri: {k: str, v: "/assets/{file}.{ext}"}
+          dur_ms: {k: i, v: [2, 80]}
+          trace_id: {k: hex, v: 32}
+      access_tiered_upper_ok:
+        desc: Client request served via upper-tier cache (no origin fetch).
+        lvl: INFO
+        msg: "edge served {req_id} host={host} uri={uri} cache=MISS tiered=true upstream=upper_tier status=200 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          host: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          uri: {k: str, v: "/assets/{file}.{ext}"}
+          dur_ms: {k: i, v: [8, 260]}
+          trace_id: {k: hex, v: 32}
+      access_tiered_origin_ok:
+        desc: Client request served via origin fetch after upper-tier miss.
+        lvl: INFO
+        msg: "edge served {req_id} host={host} uri={uri} cache=MISS tiered=true upstream=origin status=200 dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          host: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          uri: {k: str, v: "/assets/{file}.{ext}"}
+          dur_ms: {k: i, v: [35, 950]}
+          trace_id: {k: hex, v: 32}
+      access_tiered_530:
+        desc: Client request failed with a 530 due to upstream DNS context loss.
+        lvl: WARN
+        msg: "edge failed {req_id} host={host} uri={uri} cache=MISS tiered=true upstream=dns status=530 err=dns_no_host dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          host: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          uri: {k: str, v: "/assets/{file}.{ext}"}
+          dur_ms: {k: i, v: [5, 140]}
+          trace_id: {k: hex, v: 32}
+      routing_change:
+        desc: Operator routing change to drain/remove a POP from tiered routing during investigation.
+        lvl: INFO
+        msg: "routing change: removed_pop={pop} reason={reason}"
+        vars:
+          pop: {k: ch, v: [lhr1, fra1, syd1]}
+          reason: {k: ch, v: [investigation, mitigation]}
+      edge_cache_stats:
+        desc: Periodic cache performance stats for the edge POP.
+        lvl: INFO
+        msg: "cache_stats pop={pop} hit_rate={hit_rate} tiered_req_rpm={tiered_rpm} evictions={evictions}"
+        vars:
+          pop: {k: ch, v: [lhr1, fra1, syd1]}
+          hit_rate: {k: f, v: [0.70, 0.98]}
+          tiered_rpm: {k: i, v: [50, 400]}
+          evictions: {k: i, v: [0, 500]}
+    beh:
+      n:
+        desc: Stable cache behavior with mostly local hits and some tiered misses.
+        emit:
+          - id: edge_cache_stats
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: Similar cache stats, but some tiered requests fail upstream; local hits remain healthy.
+        emit:
+          - id: edge_cache_stats
+            per_min: 2.0
+            scope: per_host
+
+  - id: upper_tier_cache
+    name: Upper-tier cache POP
+    svc: upper-tier-cache
+    hosts: [atl1, iad1]
+    desc: >
+      Receives internal tiered-cache requests from lower-tier POPs. Serves content from a larger cache
+      or fetches from origin (via internal DNS) when needed. A buggy release adds tracing instrumentation
+      and clears internal control headers, breaking routing context for some requests.
+    to:
+      - dst: internal_dns
+        proto: udp
+        desc: Resolves origin hostnames for requests that need an origin fetch.
+      - dst: origin_connector
+        proto: https
+        desc: Fetches content from customer origins after DNS resolution.
+      - dst: edge_cache
+        proto: https
+        desc: Returns the tiered-cache response (or error) back to the lower-tier edge POP.
+    logs:
+      upper_recv_present:
+        desc: Upper tier received a tiered request with required control context.
+        lvl: INFO
+        msg: "upper recv tiered {req_id} host={host} control_ctx=present trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          host: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          trace_id: {k: hex, v: 32}
+      upper_recv_missing:
+        desc: Upper tier received a tiered request missing required host context (headers cleared).
+        lvl: WARN
+        msg: "upper recv tiered {req_id} host=- control_ctx=missing trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      upper_served_cache:
+        desc: Upper tier served content directly from its cache.
+        lvl: INFO
+        msg: "upper served from cache key={cache_key} age_s={age_s} req_id={req_id}"
+        vars:
+          cache_key: {k: str, v: "cache:{host}:{uri}"}
+          age_s: {k: i, v: [0, 3600]}
+          req_id: {k: uuid, v: null}
+      upper_cache_miss:
+        desc: Upper tier cache miss that will require origin resolution/fetch.
+        lvl: INFO
+        msg: "upper cache miss key={cache_key} req_id={req_id}"
+        vars:
+          cache_key: {k: str, v: "cache:{host}:{uri}"}
+          req_id: {k: uuid, v: null}
+      upper_no_host_error:
+        desc: Upper tier aborts after an origin-DNS attempt fails due to missing hostname context.
+        lvl: ERROR
+        msg: "upper origin resolve failed req_id={req_id} cause=empty_qname_from_missing_control_host trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      release_started:
+        desc: Canary deploy start of the upper-tier cache component.
+        lvl: INFO
+        msg: "deploy started component=upper_tier_cache version={version} change=opentracing_wrap clear_control_headers=true rollout=canary"
+        vars:
+          version: {k: ch, v: [2022.10.25.1]}
+      rollback_completed:
+        desc: Rollback completion on a specific upper-tier POP.
+        lvl: INFO
+        msg: "rollback completed component=upper_tier_cache version={version} target=stable"
+        vars:
+          version: {k: ch, v: [2022.10.24.9]}
+      accelerated_rollback_started:
+        desc: Accelerated rollback initiated across upper tiers.
+        lvl: WARN
+        msg: "accelerated rollback initiated component=upper_tier_cache scope=upper_tiers"
+        vars: {}
+      upper_cache_stats:
+        desc: Periodic upper-tier cache stats including whether tracing wrapper is active.
+        lvl: INFO
+        msg: "upper_cache_stats pop={pop} hit_rate={hit_rate} miss_rate={miss_rate} trace_wrap={trace_wrap}"
+        vars:
+          pop: {k: ch, v: [atl1, iad1]}
+          hit_rate: {k: f, v: [0.50, 0.95]}
+          miss_rate: {k: f, v: [0.05, 0.50]}
+        state_vars:
+          n:
+            trace_wrap: {k: ch, v: [false]}
+          f:
+            trace_wrap: {k: ch, v: [true, false]}
+    beh:
+      n:
+        desc: Upper tiers serve tiered requests normally; tracing wrapper is not active.
+        emit:
+          - id: upper_cache_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Upper tiers may run the buggy tracing wrapper; missing-host errors occur only on affected traffic.
+        emit:
+          - id: upper_cache_stats
+            per_min: 1.0
+            scope: per_host
+
+  - id: internal_dns
+    name: Internal DNS resolver
+    svc: internal-dns
+    hosts: [dns1, dns2]
+    desc: >
+      Resolves customer origin hostnames for upper-tier cache fetches. In this incident,
+      some lookups are invoked with empty qnames because upstream control headers were cleared.
+    to:
+      - dst: upper_tier_cache
+        proto: udp
+        desc: Returns DNS answers (or errors) back to the upper-tier cache POP.
+    logs:
+      dns_resolve_ok:
+        desc: Successful internal DNS resolution for an origin hostname.
+        lvl: INFO
+        msg: "dns ok qname={qname} ip={ip} ttl_s={ttl_s} req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          qname: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          ip: {k: ip, v: "10.0.0.0/8"}
+          ttl_s: {k: i, v: [30, 300]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [1, 25]}
+      dns_err_empty_qname:
+        desc: DNS request rejected because the qname is empty (missing hostname context).
+        lvl: ERROR
+        msg: "dns error req_id={req_id} rcode=SERVFAIL detail=empty_qname"
+        vars:
+          req_id: {k: uuid, v: null}
+      dns_release_started:
+        desc: Concurrent internal DNS deploy (not causal here, but adds investigation noise).
+        lvl: INFO
+        msg: "deploy started component=internal_dns version={version}"
+        vars:
+          version: {k: ch, v: [2022.10.25.5]}
+      dns_health:
+        desc: Periodic DNS health snapshot for the incident-scoped tiered/origin-resolution query path (servfail_pct is percent).
+        lvl: INFO
+        msg: "dns_health node={node} qps={qps} servfail_pct={servfail_pct}"
+        vars:
+          node: {k: ch, v: [dns1, dns2]}
+          qps: {k: i, v: [0, 10]}
+        state_vars:
+          n:
+            servfail_pct: {k: f, v: [0.0, 0.1]}
+          f:
+            servfail_pct: {k: f, v: [0.0, 80.0]}
+    beh:
+      n:
+        desc: Normal DNS resolution with very low SERVFAIL rates.
+        emit:
+          - id: dns_health
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Some SERVFAILs appear due to empty-qname lookups from buggy tiered-cache traffic.
+        emit:
+          - id: dns_health
+            per_min: 1.0
+            scope: per_host
+
+  - id: origin_connector
+    name: Origin fetch connector
+    svc: origin-connector
+    hosts: [fetch1]
+    desc: >
+      Fetches content from customer origins on behalf of upper-tier cache after DNS resolution.
+      Requests failing due to missing hostname never reach this component.
+    to:
+      - dst: upper_tier_cache
+        proto: https
+        desc: Returns origin responses back to the upper-tier cache for caching/forwarding.
+    logs:
+      origin_fetch_ok:
+        desc: Successful origin fetch for a cache fill.
+        lvl: INFO
+        msg: "origin fetch ok host={host} bytes={bytes} req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          host: {k: ch, v: [example.com, shop.example.com, images.example.com]}
+          bytes: {k: i, v: [500, 5000000]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 900]}
+      origin_pool_stats:
+        desc: Periodic origin connector pool stats.
+        lvl: INFO
+        msg: "origin_pool_stats conns_active={conns} timeouts={timeouts}"
+        vars:
+          conns: {k: i, v: [50, 500]}
+          timeouts: {k: i, v: [0, 20]}
+    beh:
+      n:
+        desc: Normal origin fetch pool behavior.
+        emit:
+          - id: origin_pool_stats
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Origin pool remains mostly normal; tiered failures are upstream of origin fetching.
+        emit:
+          - id: origin_pool_stats
+            per_min: 0.5
+            scope: per_host
+
+  - id: observability
+    name: Observability / alerting
+    svc: obs-alert
+    hosts: [mon1]
+    desc: >
+      Aggregates logs/metrics into SLIs and triggers alerts. Alerts fire when 530 rates increase
+      and when customer-reported 5xx spikes are detected.
+    to: []
+    logs:
+      sli_530_sample:
+        desc: 60-second sample of 530 percentage across edge traffic.
+        lvl: INFO
+        msg: "sli_http_530 pct={pct_530} window_s=60 source=edge"
+        vars: {}
+        state_vars:
+          n:
+            pct_530: {k: f, v: [0.0, 0.2]}
+          f:
+            pct_530: {k: f, v: [0.2, 6.0]}
+      alert_fired:
+        desc: Alert fired due to SLI breach or customer reports.
+        lvl: WARN
+        msg: "alert fired alert={alert} value={value} threshold={threshold}"
+        vars:
+          alert: {k: ch, v: [customer_reported_5xx, http_530_spike]}
+          value: {k: f, v: [0.2, 6.0]}
+          threshold: {k: f, v: [0.2, 2.0]}
+      incident_declared:
+        desc: Incident declared after triage.
+        lvl: ERROR
+        msg: "incident declared id={inc_id} severity={sev}"
+        vars:
+          inc_id: {k: str, v: "INC-{digits}"}
+          sev: {k: ch, v: [SEV-2, SEV-1]}
+    beh:
+      n:
+        desc: Periodic SLI sampling; alerts are not firing.
+        emit:
+          - id: sli_530_sample
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Periodic SLI sampling continues; alert events are modeled as discrete one-shots in the scenario.
+        emit:
+          - id: sli_530_sample
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_cache]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Most requests are served from the edge local cache. A smaller fraction uses Tiered Cache to reach
+      an upper-tier POP, which may serve from cache or fetch from origin after internal DNS resolution.
+    req:
+      - id: client_asset_local_cache_hit
+        desc: Asset served directly from the edge POP cache.
+        rpm: 900.0
+        path: [edge_cache]
+        emit: [edge_cache.access_hit_local]
+        latency_ms: [[3, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: client_asset_tiered_upper_cache_hit
+        desc: Edge cache miss served by upper-tier cache hit.
+        rpm: 150.0
+        path: [edge_cache, upper_tier_cache, edge_cache]
+        emit: [upper_tier_cache.upper_recv_present, upper_tier_cache.upper_served_cache, edge_cache.access_tiered_upper_ok]
+        latency_ms: [[2, 20], [1, 10], [8, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: client_asset_tiered_upper_miss_origin_ok
+        desc: Edge cache miss served after upper-tier miss and origin fetch.
+        rpm: 50.0
+        path: [edge_cache, upper_tier_cache, internal_dns, upper_tier_cache, origin_connector, upper_tier_cache, edge_cache]
+        emit: [upper_tier_cache.upper_recv_present, upper_tier_cache.upper_cache_miss, internal_dns.dns_resolve_ok, origin_connector.origin_fetch_ok, edge_cache.access_tiered_origin_ok]
+        latency_ms: [[2, 25], [1, 15], [2, 25], [40, 850], [35, 950]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: >
+      Local cache hits remain healthy, but a buggy upper-tier release intermittently clears routing control headers
+      for tiered-cache requests, leading to empty-qname DNS lookups and 530 responses for a subset of tiered traffic.
+    req:
+      - id: client_asset_local_cache_hit
+        desc: Asset served directly from the edge POP cache.
+        rpm: 900.0
+        path: [edge_cache]
+        emit: [edge_cache.access_hit_local]
+        latency_ms: [[3, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: client_asset_tiered_upper_cache_hit
+        desc: Edge cache miss served by upper-tier cache hit (when control context is intact).
+        rpm: 145.0
+        path: [edge_cache, upper_tier_cache, edge_cache]
+        emit: [upper_tier_cache.upper_recv_present, upper_tier_cache.upper_served_cache, edge_cache.access_tiered_upper_ok]
+        latency_ms: [[2, 25], [1, 12], [8, 240]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: client_asset_tiered_upper_miss_origin_ok
+        desc: Edge cache miss served after upper-tier miss and origin fetch (when control context is intact).
+        rpm: 45.0
+        path: [edge_cache, upper_tier_cache, internal_dns, upper_tier_cache, origin_connector, upper_tier_cache, edge_cache]
+        emit: [upper_tier_cache.upper_recv_present, upper_tier_cache.upper_cache_miss, internal_dns.dns_resolve_ok, origin_connector.origin_fetch_ok, edge_cache.access_tiered_origin_ok]
+        latency_ms: [[2, 25], [1, 15], [2, 25], [45, 900], [35, 950]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: client_asset_tiered_dns_error_530
+        desc: Bug-triggered failure where host context is missing, DNS fails, and edge returns 530.
+        rpm: 10.0
+        path: [edge_cache, upper_tier_cache, internal_dns, upper_tier_cache, edge_cache]
+        emit: [upper_tier_cache.upper_recv_missing, internal_dns.dns_err_empty_qname, upper_tier_cache.upper_no_host_error, edge_cache.access_tiered_530]
+        latency_ms: [[2, 20], [1, 10], [1, 8], [5, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "Repair (S7): internal_dns.dns_health.servfail_pct domain widened in failure to [0.0,80.0] (percent) so periodic snapshots can be consistent with the modeled empty-qname SERVFAIL volume during peak rollout."
+  - "The real incident lasted ~6 hours; the scenario compresses it into a 50-minute window while preserving rollout → spread → peak → partial rollback beats."
+  - "Only the Tiered Cache path is modeled (local-cache hits remain healthy); Cloudflare Images/Bandwidth Alliance are represented implicitly as 'tiered=true' traffic."
+  - "The core causal mechanism is modeled as missing host control context at the upper tier, producing empty-qname internal DNS errors and client-facing 530s."
+  - "Normal-phase estimate: ~1100 rpm total, ~1.6k request-logs/min plus ~12 background logs/min across hosts."
+  - "Total scenario log estimate: ~80k logs (normal ~32k + failure ~48k + background/one-shots ~0.4k), within the 20k–100k target."
+  - "Diagnostic visibility anchors: upper_tier_cache.upper_recv_missing + upper_no_host_error, internal_dns.dns_err_empty_qname, edge_cache.access_tiered_530, and deploy/rollback one-shots."
+```

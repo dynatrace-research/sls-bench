@@ -1,0 +1,192 @@
+```yaml
+scenario:
+  id: duo1_capacity_queue_backup_20180829
+  title: DUO1 authentication latency and timeouts due to DB-wait queue backlog
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    DUO1 serves customer authentication checks via an edge proxy and an auth API backed by a shared database.
+    An influx of inbound requests caused the auth API to queue threads while waiting for database connections,
+    increasing authentication latency and producing intermittent timeouts. Operators attempted request limiting,
+    but it did not immediately relieve the database because queued work had already accumulated. Flushing queued
+    work and enabling a max queue limit reduced timeouts but left the deployment in a mitigated degraded state
+    with some proactive rejections.
+
+  trigger_desc: |
+    A sudden increase in authentication traffic on the DUO1 deployment drives the auth API's DB connection pool
+    into saturation, causing requests to queue while waiting for a DB connection.
+
+  time:
+    total_minutes: 58
+    phases:
+      n: {start_min: 0, end_min: 26}
+      f: {start_min: 26, end_min: 58}
+
+  phases:
+    n:
+      desc: |
+        Authentication checks flow normally through the edge proxy to the auth API. The auth API acquires DB
+        connections promptly, queue depth is near zero, and end-to-end request latency remains low.
+      flows: [auth_check_normal]
+      manifestation:
+        - edge_proxy.access_ok
+        - auth_api.queue_depth_metric
+        - auth_db.db_conn_stats
+
+    f:
+      desc: |
+        The auth API becomes constrained by database connection availability and begins queueing requests
+        internally while waiting for a DB connection. This increases request durations and produces intermittent
+        client-visible 504 timeouts. Request limiting reduces new arrivals but does not immediately clear the
+        backlog because queued work continues to pressure the database until queues are flushed and capped.
+
+      events:
+        - order: 1
+          at_min: 26
+          component: edge_proxy
+          event: |
+            Inbound authentication traffic spikes, saturating DB connection availability in the auth API and
+            creating a growing in-process wait queue; slow successes and the first timeouts appear.
+          why: |
+            The auth API queues requests while waiting for DB connections; when the pool is saturated, queued
+            work accumulates and pushes end-to-end latency beyond client/proxy timeouts. This is directly
+            observable via auth API queue/DB-pool metrics, DB connection utilization, and edge 504s.
+          flows: [auth_check_ok_queued, auth_check_timeout]
+          rate_multipliers:
+            auth_check_ok_fast: 0.0
+            auth_check_rejected_queue_full: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - auth_api.db_acquire_wait_warn
+            - edge_proxy.access_504
+            - auth_api.queue_depth_metric
+
+        - order: 2
+          at_min: 34
+          component: edge_proxy
+          event: |
+            Operators enable request limiting to reduce inbound load; overall request rate drops, but timeouts
+            and long waits continue because queued backlog remains.
+          why: |
+            Limiting new arrivals does not drain already-queued requests waiting on DB connections; the DB stays
+            heavily utilized while it works through the backlog, so elevated latency and some timeouts persist.
+          flows: [auth_check_ok_queued, auth_check_timeout]
+          rate_multipliers:
+            auth_check_ok_queued: 0.8
+            auth_check_timeout: 0.8
+            auth_check_ok_fast: 0.0
+            auth_check_rejected_queue_full: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: edge_proxy.rate_limit_enabled
+              count: 1
+              hosts: [edge-1]
+          manifestation:
+            - edge_proxy.rate_limit_enabled
+            - auth_api.db_pool_metric
+            - edge_proxy.access_504
+
+        - order: 3
+          at_min: 46
+          component: auth_api
+          event: |
+            Engineers flush queued DB-wait work on each auth API host and enable a maximum queue size that
+            rejects overflow; timeouts fall and more requests complete quickly, but some are now rejected.
+          why: |
+            Flushing removes accumulated queued work that was keeping the DB saturated, and the queue cap
+            prevents re-accumulation by rejecting requests that would otherwise wait too long. This is directly
+            observable via flush/config markers, reduced 504 volume, and appearance of 429 rejections.
+          flows: [auth_check_ok_queued, auth_check_ok_fast, auth_check_timeout, auth_check_rejected_queue_full]
+          rate_multipliers:
+            auth_check_ok_queued: 0.4
+            auth_check_ok_fast: 0.8
+            auth_check_timeout: 0.2
+            auth_check_rejected_queue_full: 0.3
+          latency_multipliers:
+            auth_check_ok_queued: {p50: 0.8, p95: 0.7}
+            auth_check_timeout: {p50: 0.7, p95: 0.7}
+          one_shots:
+            - ref: auth_api.queue_flushed
+              count: 4
+              hosts: [auth-1, auth-2, auth-3, auth-4]
+            - ref: auth_api.queue_limit_enabled
+              count: 4
+              hosts: [auth-1, auth-2, auth-3, auth-4]
+          manifestation:
+            - auth_api.queue_flushed
+            - auth_api.queue_limit_enabled
+            - edge_proxy.access_429
+            - edge_proxy.access_504
+
+      steady:
+        - component: auth_api
+          condition: |
+            The DB-wait queue is capped; overflow is rejected instead of queued. Most authentications succeed,
+            but queue pressure remains present and latency is still higher than normal during bursts.
+          user_impact: |
+            Fewer 504 timeouts than earlier in the incident, but intermittent 429 rejections and elevated p95
+            authentication latency remain for some customers.
+          manifestation:
+            - auth_api.queue_depth_metric
+            - auth_api.auth_rejected_queue_full
+            - auth_api.db_pool_metric
+        - component: auth_db
+          condition: |
+            Database utilization stays high with occasional slow queries while the system operates near capacity.
+          user_impact: |
+            Contributes to elevated authentication latency and risk of renewed queue growth during bursts.
+          manifestation:
+            - auth_db.db_conn_stats
+            - auth_db.slow_query_sample
+        - component: edge_proxy
+          condition: |
+            Edge continues to serve a mix of successful responses with elevated latency and smaller residual
+            timeout volume.
+          user_impact: |
+            Customers see generally improved success rates versus the peak, but not fully restored performance.
+          manifestation:
+            - edge_proxy.access_ok
+            - edge_proxy.access_504
+            - edge_proxy.access_429
+
+      feedback_loops:
+        - id: queued_work_sustains_db_saturation
+          desc: |
+            When many auth API threads queue waiting for DB connections, they later arrive at the DB in a burst
+            as connections free up, keeping DB utilization high. Timeouts at the edge can induce client retries
+            (modeled implicitly as continued high inbound demand), further increasing pressure and prolonging
+            the backlog until the queue is flushed/capped.
+
+      flows:
+        - auth_check_ok_queued
+        - auth_check_ok_fast
+        - auth_check_timeout
+        - auth_check_rejected_queue_full
+      manifestation:
+        - auth_api.queue_depth_metric
+        - auth_api.db_acquire_wait_warn
+        - edge_proxy.access_504
+        - auth_db.db_conn_stats
+
+  assumptions:
+    - |
+      The real incident lasted ~62 minutes; this scenario compresses to 58 minutes while preserving the same progression beats
+      (traffic spike → ineffective limiting due to queued backlog → queue flush + queue cap).
+    - |
+      Failure-phase traffic is modeled as a single authentication endpoint family; downstream push/SMS/phone impacts are treated
+      as correlated symptoms of the same capacity constraint rather than separate flows.
+    - |
+      Piecewise failure breakdown (flow logs only, approximate):
+      - mins 26–34 (8m): ~1960 logs/min (560 rpm queued successes *3 + 140 rpm timeouts *2) ≈ 15.7k
+      - mins 34–46 (12m): ~1568 logs/min (rate limiting enabled at 0.8x) ≈ 18.8k
+      - mins 46–58 (12m): ~1120 logs/min (post-flush mix: more fast successes, fewer timeouts, some rejections) ≈ 13.4k
+    - |
+      Background metrics add ~10–15 logs/min across the whole scenario (~700–900 logs total), and one-shots add 9 logs
+      (1 edge limit enable + 4 flush + 4 queue-cap enable).
+    - |
+      Total estimated logs: ~77k. Key diagnostic signals are made likely by (a) high per-request 504/429 access logs,
+      (b) frequent per-request DB-wait warnings in queued-success flows, and (c) per-minute auth API queue/DB-pool metrics
+      on each host.
+```

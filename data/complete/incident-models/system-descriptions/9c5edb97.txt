@@ -1,0 +1,466 @@
+```yaml
+sys:
+  id: anycast_edge_routing_platform
+  desc: >
+    A globally anycast edge network provides DNS and HTTP proxying for customer zones across multiple data centers.
+    Edge routers advertise reachability via BGP and are centrally managed with Flowspec rules to mitigate attacks.
+    An automated watchdog reboots crashed routers, while external probes and internal alerting track global reachability.
+    This incident models a bad Flowspec packet-length rule that triggers router memory exhaustion, crashes, and route withdrawals.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ddos_profiler
+    name: DDoS Attack Profiler
+    svc: ddos-profiler
+    hosts: [prof-1]
+    desc: Generates attack signatures (including packet-length ranges) used by operators and automation to build mitigations.
+    to:
+      - dst: flowspec_manager
+        proto: https
+        desc: Posts generated signatures to the rule orchestration service.
+    logs:
+      profiler_heartbeat:
+        desc: Periodic heartbeat indicating the profiler is running.
+        lvl: INFO
+        msg: "profiler heartbeat version={ver}"
+        vars:
+          ver: {k: ch, v: ["1.8.2"]}
+      attack_signature_generated:
+        desc: A new signature describing an observed attack, including an unusual packet-length range.
+        lvl: INFO
+        msg: "attack signature {sig_id} for zone={zone} dst={dst_prefix} proto=udp port=53 packet_length=[{len_min},{len_max}]"
+        vars:
+          sig_id: {k: hex, v: 8}
+          zone: {k: ch, v: ["customer.example", "zone-a.example"]}
+          dst_prefix: {k: ch, v: ["173.245.48.10/32"]}
+          len_min: {k: i, v: [99971, 99971]}
+          len_max: {k: i, v: [99985, 99985]}
+    beh:
+      n:
+        desc: Profiler runs quietly with occasional heartbeats.
+        emit:
+          - id: profiler_heartbeat
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Profiler continues running during the network incident.
+        emit:
+          - id: profiler_heartbeat
+            per_min: 0.1
+            scope: global
+
+  - id: flowspec_manager
+    name: Flowspec Rule Manager
+    svc: flowspec-manager
+    hosts: [ctl-1]
+    desc: Compiles and distributes Flowspec rules to edge routers via BGP sessions.
+    to:
+      - dst: edge_router
+        proto: bgp
+        desc: Sends Flowspec NLRI updates to routers in multiple data centers.
+      - dst: noc_alerting
+        proto: https
+        desc: Emits operational audit events and can trigger alerts.
+    logs:
+      sync_ok:
+        desc: Periodic control-plane sync/health log.
+        lvl: DEBUG
+        msg: "flowspec config sync ok gen={gen}"
+        vars:
+          gen: {k: i, v: [1200, 1600]}
+      rule_compiled:
+        desc: A Flowspec rule was compiled from an operator-provided signature.
+        lvl: INFO
+        msg: "compiled flowspec rule {rule_id} action=discard dst={dst_prefix} port=53 packet_length=[{len_min},{len_max}]"
+        vars:
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+          dst_prefix: {k: ch, v: ["173.245.48.10/32"]}
+          len_min: {k: i, v: [99971, 99971]}
+          len_max: {k: i, v: [99985, 99985]}
+      rule_pushed:
+        desc: The compiled rule was pushed to edge routers.
+        lvl: WARN
+        msg: "pushed flowspec rule {rule_id} to {router_count} routers"
+        vars:
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+          router_count: {k: i, v: [3, 3]}
+      rule_withdrawn:
+        desc: The rule was withdrawn from routers to mitigate an incident.
+        lvl: INFO
+        msg: "withdrew flowspec rule {rule_id} from {router_count} routers"
+        vars:
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+          router_count: {k: i, v: [3, 3]}
+    beh:
+      n:
+        desc: Manager performs periodic sync checks.
+        emit:
+          - id: sync_ok
+            per_min: 0.3
+            scope: global
+      f:
+        desc: Manager remains up; periodic sync continues during the incident.
+        emit:
+          - id: sync_ok
+            per_min: 0.3
+            scope: global
+
+  - id: edge_router
+    name: Juniper Edge Router
+    svc: junos-router
+    hosts: [rtr-sfo1-1, rtr-ams1-1, rtr-sin1-1]
+    desc: >
+      Edge routers advertise anycast reachability via BGP and enforce Flowspec rules.
+      In this incident, receiving a specific packet-length Flowspec rule triggers excessive memory use and control-plane crashes,
+      leading to BGP session loss and route withdrawals.
+    to:
+      - dst: router_watchdog
+        proto: tcp
+        desc: Exposes a management interface used by the watchdog for liveness checks and reboots.
+    logs:
+      bgp_session_state:
+        desc: Periodic summary of BGP session establishment.
+        lvl: INFO
+        msg: "bgp: sessions established peers={peer_count}"
+        vars:
+          peer_count: {k: i, v: [1, 4]}
+      mem_stat:
+        desc: Periodic memory utilization metric in normal operation.
+        lvl: INFO
+        msg: "chassisd: memory used_mb={used_mb} total_mb={total_mb}"
+        vars:
+          total_mb: {k: i, v: [2048, 2048]}
+        state_vars:
+          n:
+            used_mb: {k: i, v: [700, 1200]}
+          f:
+            used_mb: {k: i, v: [900, 1600]}
+      flowspec_rule_received:
+        desc: Router control plane receives a Flowspec update from the controller.
+        lvl: INFO
+        msg: "rpd: received flowspec {rule_id} from controller={ctl_ip}"
+        vars:
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+          ctl_ip: {k: ip, v: null}
+      flowspec_rule_installed:
+        desc: Router attempts to install the Flowspec rule into its policy/forwarding pipeline.
+        lvl: INFO
+        msg: "rpd: installed flowspec {rule_id} dst={dst_prefix} port=53 len=[{len_min},{len_max}]"
+        vars:
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+          dst_prefix: {k: ch, v: ["173.245.48.10/32"]}
+          len_min: {k: i, v: [99971, 99971]}
+          len_max: {k: i, v: [99985, 99985]}
+      flowspec_rule_removed:
+        desc: Router removes the Flowspec rule after a withdrawal.
+        lvl: INFO
+        msg: "rpd: removed flowspec {rule_id}"
+        vars:
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+      mem_alarm:
+        desc: High-memory warning as the router control plane approaches exhaustion.
+        lvl: WARN
+        msg: "chassisd: memory high used_mb={used_mb} total_mb={total_mb}"
+        vars:
+          used_mb: {k: i, v: [1600, 2048]}
+          total_mb: {k: i, v: [2048, 2048]}
+      rpd_oom_crash:
+        desc: Control plane process terminates due to out-of-memory while processing Flowspec.
+        lvl: ERROR
+        msg: "rpd[{pid}]: fatal: out of memory while evaluating flowspec {rule_id} used_mb={used_mb}"
+        vars:
+          pid: {k: i, v: [1000, 5000]}
+          rule_id: {k: ch, v: ["173_dns_drop_len99971_99985"]}
+          used_mb: {k: i, v: [1900, 2048]}
+      bgp_neighbor_down:
+        desc: BGP neighbor transitions down as the control plane restarts or becomes unstable.
+        lvl: WARN
+        msg: "bgp: neighbor {peer_ip} (AS{peer_asn}) down: {reason}"
+        vars:
+          peer_ip: {k: ip, v: null}
+          peer_asn: {k: i, v: [64500, 64502]}
+          reason: {k: ch, v: ["Hold Timer Expired", "Cease", "No route to peer"]}
+      route_withdrawn:
+        desc: Router withdraws advertised routes/prefixes during restart/unavailability.
+        lvl: WARN
+        msg: "rpd: withdrawing {prefix_count} prefixes due to restart"
+        vars:
+          prefix_count: {k: i, v: [500, 3000]}
+    beh:
+      n:
+        desc: Routers are stable; BGP is up and memory usage is steady.
+        emit:
+          - id: mem_stat
+            per_min: 1.0
+          - id: bgp_session_state
+            per_min: 0.5
+      f:
+        desc: During failure, routers exhibit memory alarms, crashes, and BGP instability with route withdrawals.
+        emit:
+          - id: mem_alarm
+            per_min: 0.2
+          - id: rpd_oom_crash
+            per_min: 0.05
+          - id: bgp_neighbor_down
+            per_min: 0.3
+          - id: route_withdrawn
+            per_min: 0.2
+
+  - id: router_watchdog
+    name: Router Watchdog
+    svc: router-watchdog
+    hosts: [wd-sfo1, wd-ams1, wd-sin1]
+    desc: Monitors router liveness and attempts automated reboots; flags management-plane unreachability.
+    to:
+      - dst: noc_alerting
+        proto: https
+        desc: Reports crash/reboot status to alerting.
+      - dst: edge_router
+        proto: tcp
+        desc: Polls router management plane and triggers reboots.
+    logs:
+      agent_heartbeat:
+        desc: Periodic watchdog heartbeat indicating it is alive.
+        lvl: INFO
+        msg: "watchdog heartbeat ok router={router_host}"
+        vars:
+          router_host: {k: ch, v: ["rtr-sfo1-1", "rtr-ams1-1", "rtr-sin1-1"]}
+      crash_detected:
+        desc: Watchdog detected a router crash or loss of liveness.
+        lvl: WARN
+        msg: "watchdog detected router crash router={router_host} reason={reason}"
+        vars:
+          router_host: {k: ch, v: ["rtr-sfo1-1", "rtr-ams1-1", "rtr-sin1-1"]}
+          reason: {k: ch, v: ["rpd exited", "kernel panic", "no heartbeat"]}
+      reboot_attempt:
+        desc: Automated reboot action was attempted.
+        lvl: INFO
+        msg: "watchdog reboot attempt router={router_host} method={method} attempt={attempt}"
+        vars:
+          router_host: {k: ch, v: ["rtr-sfo1-1", "rtr-ams1-1", "rtr-sin1-1"]}
+          method: {k: ch, v: ["soft-reboot", "power-cycle"]}
+          attempt: {k: i, v: [1, 5]}
+      mgmt_unreachable:
+        desc: Management plane became unreachable, preventing remote recovery.
+        lvl: ERROR
+        msg: "watchdog mgmt unreachable router={router_host} mgmt_ip={mgmt_ip}"
+        vars:
+          router_host: {k: ch, v: ["rtr-sfo1-1", "rtr-ams1-1", "rtr-sin1-1"]}
+          mgmt_ip: {k: ip, v: null}
+      hard_reboot_requested:
+        desc: Operations requested a manual/physical reboot at a site.
+        lvl: WARN
+        msg: "ops requested hard reboot at site={site} router={router_host} ticket={ticket_id}"
+        vars:
+          site: {k: ch, v: ["sfo1", "ams1", "sin1"]}
+          router_host: {k: ch, v: ["rtr-sfo1-1", "rtr-ams1-1", "rtr-sin1-1"]}
+          ticket_id: {k: hex, v: 10}
+    beh:
+      n:
+        desc: Watchdogs heartbeat and rarely take action.
+        emit:
+          - id: agent_heartbeat
+            per_min: 0.5
+      f:
+        desc: During failure, watchdogs detect crashes, attempt reboots, and sometimes lose management access.
+        emit:
+          - id: agent_heartbeat
+            per_min: 0.4
+          - id: crash_detected
+            per_min: 0.1
+          - id: reboot_attempt
+            per_min: 0.12
+          - id: mgmt_unreachable
+            per_min: 0.05
+
+  - id: external_probe
+    name: External Reachability Probes
+    svc: probe-fleet
+    hosts: [probe-iad, probe-fra, probe-sin]
+    desc: Runs frequent DNS and HTTP probes from multiple vantage points and records end-to-end reachability and errors.
+    to:
+      - dst: edge_router
+        proto: udp
+        desc: Sends DNS queries and expects responses via the edge anycast network.
+      - dst: edge_router
+        proto: https
+        desc: Sends HTTPS requests via the edge proxy network.
+      - dst: noc_alerting
+        proto: https
+        desc: Reports probe results to internal alerting.
+    logs:
+      agent_heartbeat:
+        desc: Periodic probe agent heartbeat.
+        lvl: INFO
+        msg: "probe agent heartbeat ok pop={pop}"
+        vars:
+          pop: {k: ch, v: ["iad", "fra", "sin"]}
+      dns_probe_ok:
+        desc: DNS probe succeeded.
+        lvl: INFO
+        msg: "dns probe ok qname={qname} rcode=NOERROR rtt_ms={rtt_ms}"
+        vars:
+          qname: {k: ch, v: ["cloud.example", "customer.example"]}
+          rtt_ms: {k: i, v: [8, 80]}
+      dns_probe_fail:
+        desc: DNS probe failed due to routing or timeout conditions.
+        lvl: ERROR
+        msg: "dns probe failed qname={qname} err={err} waited_ms={waited_ms}"
+        vars:
+          qname: {k: ch, v: ["cloud.example", "customer.example"]}
+          err: {k: ch, v: ["no_route", "timeout", "cached_servfail"]}
+          waited_ms: {k: i, v: [200, 5000]}
+      http_probe_ok:
+        desc: HTTP probe succeeded.
+        lvl: INFO
+        msg: "http probe ok url={url} status=200 ttfb_ms={ttfb_ms}"
+        vars:
+          url: {k: ch, v: ["https://www.example", "https://status.example"]}
+          ttfb_ms: {k: i, v: [20, 250]}
+      http_probe_fail:
+        desc: HTTP probe failed due to routing loss or timeout.
+        lvl: ERROR
+        msg: "http probe failed url={url} err={err} waited_ms={waited_ms}"
+        vars:
+          url: {k: ch, v: ["https://www.example", "https://status.example"]}
+          err: {k: ch, v: ["no_route", "timeout"]}
+          waited_ms: {k: i, v: [200, 7000]}
+      retrying:
+        desc: Probe is retrying after a failure or no response.
+        lvl: WARN
+        msg: "retrying probe kind={kind} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          kind: {k: ch, v: ["dns", "http"]}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [100, 2000]}
+    beh:
+      n:
+        desc: Probes run continuously and report health.
+        emit:
+          - id: agent_heartbeat
+            per_min: 0.2
+      f:
+        desc: Probes continue during failure, still emitting heartbeats.
+        emit:
+          - id: agent_heartbeat
+            per_min: 0.2
+
+  - id: noc_alerting
+    name: NOC Alerting
+    svc: alerting
+    hosts: [alert-1]
+    desc: Aggregates internal and external signals into alerts used by ops/network teams.
+    to:
+      - dst: flowspec_manager
+        proto: https
+        desc: Receives change/audit events about network rule pushes.
+      - dst: router_watchdog
+        proto: https
+        desc: Receives watchdog crash/recovery signals.
+      - dst: external_probe
+        proto: https
+        desc: Receives probe results and computes global reachability.
+    logs:
+      collector_heartbeat:
+        desc: Alerting pipeline heartbeat and ingest lag.
+        lvl: DEBUG
+        msg: "alerting collector heartbeat ok lag_s={lag_s}"
+        vars:
+          lag_s: {k: i, v: [0, 5]}
+      global_reachability_alert:
+        desc: Alert that a large fraction of probe sites cannot reach the network.
+        lvl: CRITICAL
+        msg: "alert: global reachability down sites_affected={sites} symptom={symptom}"
+        vars:
+          sites: {k: i, v: [10, 23]}
+          symptom: {k: ch, v: ["no_route_to_host", "dns_failures"]}
+      alert_cleared:
+        desc: Informational alert when reachability improves.
+        lvl: INFO
+        msg: "alert: reachability improving sites_reporting_ok={sites_ok}"
+        vars:
+          sites_ok: {k: i, v: [1, 23]}
+    beh:
+      n:
+        desc: Alerting runs with periodic heartbeats.
+        emit:
+          - id: collector_heartbeat
+            per_min: 0.3
+            scope: global
+      f:
+        desc: Alerting continues during failure with similar heartbeat volume.
+        emit:
+          - id: collector_heartbeat
+            per_min: 0.3
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Probes show normal global reachability and low latency.
+    req:
+      - id: dns_probe
+        desc: High-frequency DNS probe traffic from multiple vantage points (aggregated).
+        rpm: 600.0
+        path: [external_probe, edge_router]
+        emit: [external_probe.dns_probe_ok]
+        latency_ms: [[20, 80]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.05
+          emit_per_retry: [external_probe.retrying]
+          backoff_ms: [[100, 300], [200, 600]]
+        trace: false
+      - id: http_probe
+        desc: High-frequency HTTPS probe traffic from multiple vantage points (aggregated).
+        rpm: 300.0
+        path: [external_probe, edge_router]
+        emit: [external_probe.http_probe_ok]
+        latency_ms: [[40, 200]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.02
+          emit_per_retry: [external_probe.retrying]
+          backoff_ms: [[150, 400]]
+        trace: false
+  f:
+    desc: Probes primarily fail due to widespread route withdrawal and partial router recovery attempts.
+    req:
+      - id: dns_probe_fail
+        desc: DNS probes fail with 'no route' or timeouts; retries become common.
+        rpm: 650.0
+        path: [external_probe, edge_router]
+        emit: [external_probe.dns_probe_fail]
+        latency_ms: [[800, 4500]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.7
+          emit_per_retry: [external_probe.retrying]
+          backoff_ms: [[200, 800], [400, 1400]]
+        trace: false
+      - id: http_probe_fail
+        desc: HTTPS probes fail due to reachability loss; retries become more common.
+        rpm: 320.0
+        path: [external_probe, edge_router]
+        emit: [external_probe.http_probe_fail]
+        latency_ms: [[900, 6000]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [external_probe.retrying]
+          backoff_ms: [[300, 1200], [600, 2000]]
+        trace: false
+
+assumptions:
+  - The 23-datacenter reality is modeled with three representative edge routers/sites to keep logs and causal analysis tractable.
+  - Customer-impact is primarily modeled via aggregated external probes (high rpm) rather than per-request edge access logs, reflecting observability during "no route" failures.
+  - The Flowspec rule is bound to a specific packet-length range [99971,99985] and DNS port 53, matching the post-mortem’s causal core.
+  - Router crashes are modeled as repeated background crash/withdrawal logs to reflect crash/reboot loops and anycast load shifting.
+  - Normal-phase expected volume is ~900–950 logs/min from probe flows plus low-rate device/collector heartbeats.
+  - Total scenario volume target is ~65k–75k logs (dominated by probe failures and retries during the failure phase), within the 20k–100k requirement.
+```

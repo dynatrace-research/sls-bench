@@ -1,0 +1,555 @@
+```yaml
+sys:
+  id: gitlab_com_db_data_loss_incident
+  desc: >
+    A hosted Git service where the web application serves user requests and stores metadata
+    (issues, merge requests, users, comments, snippets) in a PostgreSQL primary with a streaming replica.
+    Normal operations are dominated by HTTP reads and writes that translate into SQL queries/transactions.
+    The incident centers on a write spike, replication lag and fragile replica re-seeding, followed by
+    accidental deletion of the primary data directory and restore from an older snapshot.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: rails_web
+    name: GitLab Rails Web
+    svc: gitlab-rails
+    hosts: [web01, web02]
+    desc: >
+      Frontend application handling HTTP requests. It talks to the primary database for reads/writes
+      and emits structured access/error logs with request and DB timing.
+    to:
+      - dst: pg_primary_db1
+        proto: tcp
+        desc: Primary PostgreSQL connection for reads/writes.
+    logs:
+      http_access:
+        desc: Successful or redirect HTTP response log with DB timing.
+        lvl: INFO
+        msg: "request {method} {route} status={status} duration_ms={duration_ms} db_ms={db_ms} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/users/sign_in", "/api/v4/snippets", "/api/v4/projects"]}
+          status: {k: ch, v: ["200", "201", "302"]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [20, 500]}
+            db_ms: {k: i, v: [5, 180]}
+          f:
+            duration_ms: {k: i, v: [40, 4000]}
+            db_ms: {k: i, v: [10, 2500]}
+      http_500:
+        desc: HTTP 500 response log for application/database write failures.
+        lvl: ERROR
+        msg: "request {method} {route} status=500 duration_ms={duration_ms} error={error} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: ["/api/v4/snippets", "/users/sign_in"]}
+          error: {k: ch, v: [ActiveRecord::LockWaitTimeout, PG::LockNotAvailable, PG::QueryCanceled]}
+          duration_ms: {k: i, v: [200, 6000]}
+          trace_id: {k: hex, v: 32}
+      http_503:
+        desc: HTTP 503 response log when DB is unavailable.
+        lvl: ERROR
+        msg: "request {method} {route} status=503 duration_ms={duration_ms} error=DBUnavailable trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/", "/users/sign_in", "/api/v4/snippets", "/api/v4/projects"]}
+          duration_ms: {k: i, v: [10, 800]}
+          trace_id: {k: hex, v: 32}
+      http_403_blocked:
+        desc: Request blocked by an abuse/IP block rule before reaching the database.
+        lvl: WARN
+        msg: "request {method} {route} status=403 ip={ip} rule_id={rule_id} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: ["/api/v4/snippets", "/users/sign_in"]}
+          ip: {k: ip, v: "0.0.0.0/0"}
+          rule_id: {k: ch, v: [abuse_snippet_spam, abuse_signin_flood]}
+          trace_id: {k: hex, v: 32}
+      db_pool_saturated:
+        desc: DB connection pool saturation warning emitted by the app.
+        lvl: WARN
+        msg: "db pool saturated active={active} waiting={waiting} timeout_ms={timeout_ms}"
+        vars:
+          active: {k: i, v: [50, 400]}
+          waiting: {k: i, v: [0, 300]}
+          timeout_ms: {k: i, v: [100, 5000]}
+      app_heartbeat:
+        desc: Periodic app health/worker heartbeat.
+        lvl: INFO
+        msg: "heartbeat rss_mb={rss_mb} threads_busy={threads_busy}"
+        vars:
+          rss_mb: {k: i, v: [600, 2400]}
+          threads_busy: {k: i, v: [5, 64]}
+    beh:
+      n:
+        desc: Mostly quiet background logs; periodic heartbeat.
+        emit:
+          - id: app_heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Heartbeats continue; pool saturation warnings become more common under load.
+        emit:
+          - id: app_heartbeat
+            per_min: 0.5
+            scope: per_host
+          - id: db_pool_saturated
+            per_min: 1.0
+            scope: per_host
+
+  - id: pg_primary_db1
+    name: PostgreSQL Primary (db1)
+    svc: postgresql
+    hosts: [db1]
+    desc: >
+      Primary database for GitLab.com metadata. Handles reads/writes and emits SQL and operational logs.
+      During the incident it experiences lock contention, replication sender issues, restart failures,
+      and finally a missing/emptied data directory.
+    to:
+      - dst: pg_replica_db2
+        proto: tcp
+        desc: WAL streaming destination (replica connects to primary).
+      - dst: rails_web
+        proto: tcp
+        desc: Server-side responses to application connections (logical return hop for request flows).
+    logs:
+      sql_query_ok:
+        desc: SQL query completion log for reads.
+        lvl: INFO
+        msg: "sql ok user={db_user} app=rails query_ms={query_ms} rows={rows} trace_id={trace_id}"
+        vars:
+          db_user: {k: ch, v: [gitlab]}
+          rows: {k: i, v: [0, 200]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            query_ms: {k: i, v: [2, 80]}
+          f:
+            query_ms: {k: i, v: [5, 800]}
+      sql_tx_commit:
+        desc: Transaction commit log for writes.
+        lvl: INFO
+        msg: "tx commit user={db_user} app=rails query_ms={query_ms} lock_wait_ms={lock_wait_ms} rows={rows} trace_id={trace_id}"
+        vars:
+          db_user: {k: ch, v: [gitlab]}
+          rows: {k: i, v: [1, 50]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            query_ms: {k: i, v: [5, 120]}
+            lock_wait_ms: {k: i, v: [0, 30]}
+          f:
+            query_ms: {k: i, v: [20, 1500]}
+            lock_wait_ms: {k: i, v: [0, 4000]}
+      sql_lock_timeout:
+        desc: Write canceled due to lock contention/timeout.
+        lvl: ERROR
+        msg: "canceling statement due to lock timeout pid={pid} relation={relation} waited_ms={waited_ms} trace_id={trace_id}"
+        vars:
+          pid: {k: i, v: [1000, 65000]}
+          relation: {k: ch, v: [snippets, users, sessions, projects]}
+          waited_ms: {k: i, v: [200, 5000]}
+          trace_id: {k: hex, v: 32}
+      wal_sender_limit:
+        desc: Primary rejects/limits WAL sender connections (replica connection attempt fails).
+        lvl: ERROR
+        msg: "WAL sender connection rejected max_wal_senders={max_wal_senders} current_senders={current_senders} client={client}"
+        vars:
+          max_wal_senders: {k: i, v: [4, 32]}
+          current_senders: {k: i, v: [0, 32]}
+          client: {k: ch, v: [db2]}
+      checkpoint_complete:
+        desc: Periodic checkpoint completion log.
+        lvl: INFO
+        msg: "checkpoint complete buffers={buffers} write_ms={write_ms}"
+        vars:
+          buffers: {k: i, v: [5000, 80000]}
+          write_ms: {k: i, v: [50, 3000]}
+      postgres_startup_failed_semaphores:
+        desc: Startup failure after restart due to semaphore/resource limits.
+        lvl: CRITICAL
+        msg: "startup failed: semaphore allocation error max_connections={max_connections} max_wal_senders={max_wal_senders}"
+        vars:
+          max_connections: {k: i, v: [2000, 8000]}
+          max_wal_senders: {k: i, v: [4, 32]}
+      postgres_started:
+        desc: PostgreSQL successfully started.
+        lvl: INFO
+        msg: "postmaster started port=5432 max_connections={max_connections} max_wal_senders={max_wal_senders}"
+        vars:
+          max_connections: {k: i, v: [2000, 8000]}
+          max_wal_senders: {k: i, v: [4, 32]}
+      data_dir_missing:
+        desc: Postgres cannot operate because the data directory is missing/empty.
+        lvl: CRITICAL
+        msg: "data directory {data_dir} is missing or empty"
+        vars:
+          data_dir: {k: ch, v: ["/var/opt/gitlab/postgresql/data"]}
+    beh:
+      n:
+        desc: Background maintenance logs (e.g., checkpoints) at a low rate.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Checkpoints continue; WAL sender limit errors may appear during replica re-seeding attempts.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+            scope: per_host
+          - id: wal_sender_limit
+            per_min: 0.5
+            scope: per_host
+
+  - id: pg_replica_db2
+    name: PostgreSQL Replica (db2)
+    svc: postgresql
+    hosts: [db2]
+    desc: >
+      Streaming replica intended for redundancy and failover. During the incident it falls behind and
+      operators attempt to re-seed it with pg_basebackup; it can appear to hang waiting for WAL start.
+    to:
+      - dst: pg_primary_db1
+        proto: tcp
+        desc: Replica connects to primary to stream WAL and to run base backup.
+    logs:
+      basebackup_start:
+        desc: pg_basebackup invoked to re-seed the replica.
+        lvl: INFO
+        msg: "pg_basebackup started primary={primary} target_dir={target_dir}"
+        vars:
+          primary: {k: ch, v: [db1]}
+          target_dir: {k: ch, v: ["/var/opt/gitlab/postgresql/data"]}
+      basebackup_waiting:
+        desc: pg_basebackup appears stuck waiting for the master to start streaming WAL.
+        lvl: WARN
+        msg: "pg_basebackup waiting for WAL start seconds_waiting={seconds_waiting} primary={primary}"
+        vars:
+          seconds_waiting: {k: i, v: [10, 600]}
+          primary: {k: ch, v: [db1]}
+      primary_conn_failed:
+        desc: Replica cannot connect to primary while primary is unavailable.
+        lvl: ERROR
+        msg: "could not connect to primary {primary} reason={reason}"
+        vars:
+          primary: {k: ch, v: [db1]}
+          reason: {k: ch, v: [connection_refused, timeout, no_route]}
+      standby_heartbeat:
+        desc: Periodic replica status/heartbeat log.
+        lvl: INFO
+        msg: "standby heartbeat receiver_status={status}"
+        vars:
+          status: {k: ch, v: [streaming, catching_up, disconnected]}
+    beh:
+      n:
+        desc: Replica emits a low-rate heartbeat in normal conditions.
+        emit:
+          - id: standby_heartbeat
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: During failure, pg_basebackup waiting messages may repeat; connection failures can appear if primary is down.
+        emit:
+          - id: standby_heartbeat
+            per_min: 0.2
+            scope: per_host
+          - id: basebackup_waiting
+            per_min: 1.0
+            scope: per_host
+          - id: primary_conn_failed
+            per_min: 0.8
+            scope: per_host
+
+  - id: repl_monitor
+    name: Replication Monitor / Pager
+    svc: monitoring
+    hosts: [mon01]
+    desc: >
+      Monitoring that periodically checks replication health and pages when lag is excessive.
+      Provides a clear time-series signal as lag moves from normal to stalled.
+    to:
+      - dst: pg_primary_db1
+        proto: tcp
+        desc: Queries primary/replica stats to compute replication lag.
+      - dst: pg_replica_db2
+        proto: tcp
+        desc: Queries replica stats to compute replication lag.
+    logs:
+      repl_lag_ok:
+        desc: Replication lag is within normal range.
+        lvl: INFO
+        msg: "replication lag primary=db1 replica=db2 lag_bytes={lag_bytes} lag_seconds={lag_seconds}"
+        vars:
+          lag_bytes: {k: i, v: [0, 50000000]}
+          lag_seconds: {k: i, v: [0, 60]}
+      repl_lag_critical:
+        desc: Replication lag is excessive or stalled; on-call is paged.
+        lvl: ERROR
+        msg: "replication stalled primary=db1 replica=db2 lag_bytes={lag_bytes} lag_seconds={lag_seconds} action=page_oncall"
+        vars:
+          lag_bytes: {k: i, v: [500000000, 6000000000]}
+          lag_seconds: {k: i, v: [600, 21600]}
+    beh:
+      n:
+        desc: Emits a global replication lag metric each minute.
+        emit:
+          - id: repl_lag_ok
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Continues emitting lag metrics; critical alerts can be enabled when lag becomes extreme.
+        emit:
+          - id: repl_lag_ok
+            per_min: 1.0
+            scope: global
+          - id: repl_lag_critical
+            per_min: 1.0
+            scope: global
+
+  - id: backup_worker
+    name: Backup Worker
+    svc: backup
+    hosts: [backup01]
+    desc: >
+      Runs logical backup jobs and uploads artifacts to object storage. In this incident,
+      backups are present but ineffective (tiny/empty) and object storage may be empty.
+    to:
+      - dst: pg_primary_db1
+        proto: tcp
+        desc: Connects to Postgres to run logical dumps.
+    logs:
+      backup_job_summary:
+        desc: Summary log for a completed logical backup attempt.
+        lvl: INFO
+        msg: "backup finished db={db} pg_bin={pg_bin} size_bytes={size_bytes} s3_put={s3_put} exit_code={exit_code}"
+        vars:
+          db: {k: ch, v: [gitlabhq_production]}
+          pg_bin: {k: ch, v: ["9.2"]}
+          size_bytes: {k: i, v: [0, 8192]}
+          s3_put: {k: ch, v: [skipped, failed]}
+          exit_code: {k: i, v: [0, 1]}
+      s3_bucket_list:
+        desc: Listing result for the backup bucket used during troubleshooting.
+        lvl: WARN
+        msg: "s3 list bucket={bucket} objects={objects}"
+        vars:
+          bucket: {k: ch, v: [gitlab-prod-db-backups]}
+          objects: {k: i, v: [0, 5]}
+    beh:
+      n:
+        desc: Low-frequency backup job summary logs (representing scheduled backups).
+        emit:
+          - id: backup_job_summary
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Backup job summaries continue but are not useful for recovery.
+        emit:
+          - id: backup_job_summary
+            per_min: 0.1
+            scope: global
+
+  - id: ops_console
+    name: Operations Console / Audit
+    svc: ops
+    hosts: [ops01]
+    desc: >
+      Operator command/audit logs capturing key operational actions: config changes, destructive commands,
+      and restore operations. Used as discrete incident markers.
+    to:
+      - dst: pg_primary_db1
+        proto: ssh
+        desc: Operators execute commands and edits on the primary host.
+      - dst: pg_replica_db2
+        proto: ssh
+        desc: Operators execute commands and edits on the replica host.
+    logs:
+      wipe_replica_datadir:
+        desc: Replica data directory wiped to attempt clean re-seeding.
+        lvl: WARN
+        msg: "run cmd=rm_rf_datadir host=db2 path={path} user={user} rc={rc}"
+        vars:
+          path: {k: ch, v: ["/var/opt/gitlab/postgresql/data"]}
+          user: {k: ch, v: [team_member_1]}
+          rc: {k: i, v: [0, 1]}
+      set_max_wal_senders:
+        desc: Change to max_wal_senders on the primary.
+        lvl: INFO
+        msg: "config change host=db1 param=max_wal_senders old={old} new={new} user={user}"
+        vars:
+          old: {k: i, v: [4, 16]}
+          new: {k: i, v: [32, 32]}
+          user: {k: ch, v: [team_member_1]}
+      set_max_connections:
+        desc: Change to max_connections on the primary.
+        lvl: INFO
+        msg: "config change host=db1 param=max_connections old={old} new={new} user={user}"
+        vars:
+          old: {k: i, v: [8000, 8000]}
+          new: {k: i, v: [2000, 2000]}
+          user: {k: ch, v: [team_member_1]}
+      restart_postgres:
+        desc: PostgreSQL restart requested on the primary.
+        lvl: INFO
+        msg: "service restart host=db1 service=postgresql user={user}"
+        vars:
+          user: {k: ch, v: [team_member_1]}
+      rmrf_on_primary_datadir:
+        desc: Accidental destructive removal on the primary data directory.
+        lvl: CRITICAL
+        msg: "rm -rf issued host=db1 path={path} user={user} terminated_after_s={terminated_after_s} bytes_remaining_gb={bytes_remaining_gb}"
+        vars:
+          path: {k: ch, v: ["/var/opt/gitlab/postgresql/data"]}
+          user: {k: ch, v: [team_member_1]}
+          terminated_after_s: {k: i, v: [1, 10]}
+          bytes_remaining_gb: {k: f, v: [2.0, 10.0]}
+      lvm_snapshot_found:
+        desc: Discovery of an older snapshot used for restore.
+        lvl: INFO
+        msg: "snapshot selected name={name} age_min={age_min} size_gb={size_gb} source={source}"
+        vars:
+          name: {k: ch, v: [staging-db-snap]}
+          age_min: {k: i, v: [330, 390]}
+          size_gb: {k: i, v: [250, 350]}
+          source: {k: ch, v: [db1_staging]}
+      restore_from_snapshot:
+        desc: Restore of the primary from a snapshot/copy.
+        lvl: WARN
+        msg: "restore started dest=db1 source={source} snapshot={snapshot} age_min={age_min}"
+        vars:
+          source: {k: ch, v: [db1_staging]}
+          snapshot: {k: ch, v: [staging-db-snap]}
+          age_min: {k: i, v: [330, 390]}
+      start_basebackup:
+        desc: Base backup initiated on the replica.
+        lvl: INFO
+        msg: "run cmd=pg_basebackup host=db2 primary=db1 user={user}"
+        vars:
+          user: {k: ch, v: [team_member_1]}
+    beh:
+      n:
+        desc: No background emission; ops actions are modeled as one-shots during incidents.
+        emit: []
+      f:
+        desc: No background emission; ops actions are modeled as one-shots during incidents.
+        emit: []
+
+tracing:
+  on: true
+  origins: [rails_web]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal request traffic dominated by reads and metadata writes.
+    req:
+      - id: read_web_n
+        desc: Typical web read requests that hit Postgres for selects, then return a completed HTTP response.
+        rpm: 260.0
+        path: [rails_web, pg_primary_db1, rails_web]
+        emit: [pg_primary_db1.sql_query_ok, rails_web.http_access]
+        latency_ms: [[10, 70], [60, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: write_snippet_n
+        desc: Normal write requests (e.g., snippet creation/sign-in session writes) committed in Postgres, then returned to the client.
+        rpm: 120.0
+        path: [rails_web, pg_primary_db1, rails_web]
+        emit: [pg_primary_db1.sql_tx_commit, rails_web.http_access]
+        latency_ms: [[20, 150], [120, 500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: Failure traffic includes elevated write pressure, lock timeouts, blocked abuse traffic, and periods of DB unavailability.
+    req:
+      - id: read_web_f
+        desc: Read traffic during the incident (often slower due to DB pressure).
+        rpm: 240.0
+        path: [rails_web, pg_primary_db1, rails_web]
+        emit: [pg_primary_db1.sql_query_ok, rails_web.http_access]
+        latency_ms: [[20, 250], [90, 800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: write_snippet_ok_f
+        desc: Successful writes during the incident (slower, higher lock waits).
+        rpm: 140.0
+        path: [rails_web, pg_primary_db1, rails_web]
+        emit: [pg_primary_db1.sql_tx_commit, rails_web.http_access]
+        latency_ms: [[60, 1200], [200, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: write_snippet_lock_timeout_f
+        desc: Failed writes due to lock timeouts/lock contention; Postgres cancels the statement, then Rails returns 500.
+        rpm: 60.0
+        path: [rails_web, pg_primary_db1, rails_web]
+        emit: [pg_primary_db1.sql_lock_timeout, rails_web.http_500]
+        latency_ms: [[800, 5000], [800, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: abuse_blocked_request_f
+        desc: Abusive POST traffic blocked by IP/rules before reaching Postgres.
+        rpm: 40.0
+        path: [rails_web]
+        emit: [rails_web.http_403_blocked]
+        latency_ms: [[5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: web_request_db_unavailable_f
+        desc: Requests failing fast with 503 when Postgres is down/unavailable.
+        rpm: 400.0
+        path: [rails_web]
+        emit: [rails_web.http_503]
+        latency_ms: [[20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Names (db1/db2, team_member_1) and exact infrastructure are simplified; the modeled system keeps the causal core:
+    write spike → replication lag → risky ops → accidental data deletion → restore from older snapshot.
+  - |
+    Flow emission order models causality: database query/tx outcomes are logged before the Rails request completion log
+    (which contains final status/duration), and paths include a logical DB→Rails return hop; the pg_primary_db1→rails_web
+    edge exists to make that traversal valid.
+  - |
+    Backup behavior is modeled as periodic low-rate logs showing tiny/ineffective artifacts and no successful object-storage upload,
+    matching “bucket empty / backups unusable” without modeling full storage infrastructure.
+  - |
+    Normal-phase log volume estimate: ~760 logs/min (mostly request + SQL logs) at the configured RPMs.
+  - |
+    Whole-scenario log volume (with the scenario timing/multipliers) is expected in the ~40k-60k range, within the 20k-100k target,
+    ensuring key failure signals (lock timeouts, replication stalled alerts, ops one-shots, 503 burst) are visible.
+```

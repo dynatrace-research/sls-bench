@@ -1,0 +1,188 @@
+```yaml
+scenario:
+  id: us_east_1_mass_reboot_20140527
+  title: Accidental mass reboot causes boot storm and delayed control-plane recovery
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The data center normally serves customer API traffic and orchestrates a compute fleet that PXE-boots via an internal DHCP/TFTP service.
+    An operator mistakenly targeted all servers with a reboot command, causing simultaneous reboots of API systems and customer compute nodes.
+    The resulting boot storm overloaded boot infrastructure, and a subset of legacy nodes intermittently failed DHCP lease acquisition, requiring manual reboots.
+    Control-plane stateful components failed to automatically re-form quorum after a full reboot, leaving the API mostly unavailable during the modeled window.
+
+  trigger_desc: |
+    Operator uses remote tooling to reboot a small batch of new capacity but mistypes the target selector, expanding it to all servers in us-east-1 and dispatching a mass reboot.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Customers make steady API requests and receive normal 200 responses.
+        The quorum store emits routine health metrics and the boot service handles only occasional PXE boots.
+        Compute node agents emit heartbeats at a stable rate.
+      flows: [api_requests_ok, pxe_boot_normal]
+      manifestation: [sdc_api.http_200_access, control_store.store_metrics, boot_service.tftp_metrics, node_agent.heartbeat]
+
+    f:
+      desc: |
+        Immediately after the mass reboot, API hosts and stateful control-plane components restart together and cannot promptly re-establish safe quorum.
+        Compute nodes simultaneously attempt PXE boot, creating contention on DHCP/TFTP infrastructure and triggering throttling and retries.
+        After throttles are adjusted, many nodes return, but a subset of legacy NIC nodes shows intermittent DHCP lease failures that require additional operator-driven reboots.
+        Manual control-plane recovery begins late in the window, allowing a small fraction of API requests to succeed, while most requests still fail.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: ops_tool
+          event: |
+            A reboot command expands to the entire availability zone and is dispatched, causing a simultaneous reboot of API systems and compute nodes.
+          why: |
+            The remote tooling expands a broad selector without sufficient confirmation and issues immediate reboots to all matched servers.
+            This is directly observable via ops_tool logs; the resulting API failures, quorum loss, and PXE boot storm are observable via service logs.
+          flows: [api_requests_503, pxe_boot_success, pxe_boot_throttled]
+          rate_multipliers:
+            api_requests_partial_200: 0.0
+            legacy_nic_dhcp_fail: 0.0
+            control_store.quorum_lost: 6.0
+            control_store.election: 3.0
+            sdc_api.startup_wait: 2.0
+          latency_multipliers:
+            pxe_boot_success: {p50: 1.3, p95: 1.6}
+            pxe_boot_throttled: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: ops_tool.cmd_invoke
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.target_expanded
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.reboot_dispatched
+              count: 1
+              hosts: [ops1]
+          manifestation: [ops_tool.reboot_dispatched, sdc_api.http_503_access, control_store.quorum_lost, boot_service.throttle_drop]
+
+        - order: 2
+          at_min: 30
+          component: boot_service
+          event: |
+            Operators adjust boot-service throttles to increase DHCP/TFTP throughput; throttling decreases and successful PXE boots accelerate.
+          why: |
+            With a simultaneous reboot, the boot infrastructure becomes the bottleneck; relaxing throttles increases concurrency at the cost of higher load.
+            This is directly observable via a throttle_update marker and changes in PXE success vs throttling signals.
+          flows: [pxe_boot_success, pxe_boot_throttled]
+          rate_multipliers:
+            pxe_boot_throttled: 0.3
+            pxe_boot_success: 1.5
+          latency_multipliers:
+            pxe_boot_success: {p50: 0.8, p95: 0.7}
+            pxe_boot_throttled: {p50: 0.9, p95: 0.8}
+          one_shots:
+            - ref: boot_service.throttle_update
+              count: 1
+              hosts: [boot1]
+          manifestation: [boot_service.throttle_update, boot_service.tftp_metrics, node_agent.boot_complete]
+
+        - order: 3
+          at_min: 38
+          component: node_agent
+          event: |
+            A small subset of rebooted nodes is observed failing to obtain DHCP leases on boot (legacy NIC behavior), prompting targeted reboots of lagging nodes and increasing additional PXE attempts.
+          why: |
+            Some legacy hardware intermittently fails DHCP at boot, which is observable as DHCP no-offer at the boot service and dhcp_lease_failed logs on affected nodes.
+            Operators mitigate by rebooting those nodes to retry boot, adding additional PXE sessions on top of the still-elevated boot demand.
+          flows: [legacy_nic_dhcp_fail, pxe_boot_success]
+          rate_multipliers:
+            legacy_nic_dhcp_fail: 1.0
+            pxe_boot_success: 1.8
+          latency_multipliers:
+            pxe_boot_success: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_tool.cmd_invoke_targeted
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.target_expanded_targeted
+              count: 1
+              hosts: [ops1]
+            - ref: ops_tool.reboot_dispatched_targeted
+              count: 1
+              hosts: [ops1]
+          manifestation: [boot_service.dhcp_no_offer, node_agent.dhcp_lease_failed, ops_tool.reboot_dispatched_targeted]
+
+        - order: 4
+          at_min: 44
+          component: control_store
+          event: |
+            Manual recovery actions are applied to the control-plane quorum store; API hosts restart and a small fraction of API requests begin to succeed.
+          why: |
+            After a full reboot, the quorum store blocks automatic recovery without sufficient history to safely elect a leader.
+            Manual actions (reseed/force leader) reduce election churn and the frequency of quorum-loss conditions, enabling limited API functionality; this is observable via manual_recover and a new trickle of 200 access logs.
+          flows: [api_requests_partial_200, api_requests_503]
+          rate_multipliers:
+            api_requests_partial_200: 1.0
+            api_requests_503: 0.8
+            control_store.election: 0.5
+            control_store.quorum_lost: 0.4
+            control_store.recovery_blocked: 0.6
+            sdc_api.startup_wait: 0.7
+          latency_multipliers:
+            api_requests_partial_200: {p50: 1.8, p95: 2.2}
+          one_shots:
+            - ref: control_store.manual_recover
+              count: 1
+              hosts: [cs1]
+            - ref: sdc_api.restart
+              count: 1
+              hosts: [api1]
+          manifestation: [control_store.manual_recover, sdc_api.http_200_access, control_store.recovery_blocked]
+
+      steady:
+        - component: boot_service
+          condition: |
+            Boot throughput is improved after throttle changes, but retries still occur under elevated demand and some nodes continue to cycle due to targeted reboots.
+          user_impact: |
+            Most instances return, but a minority remain offline longer while their hosts retry PXE/DHCP or await operator attention.
+          manifestation: [boot_service.tftp_metrics, node_agent.pxe_retry, node_agent.boot_complete]
+        - component: sdc_api
+          condition: |
+            Control-plane quorum is only partially restored; the API serves a small fraction of requests while many still fail with 503 during ongoing recovery.
+          user_impact: |
+            Customer automation and API-driven operations are largely blocked; some requests succeed intermittently but the API is not reliably available.
+          manifestation: [sdc_api.http_503_access, sdc_api.http_200_access, control_store.recovery_blocked, sdc_api.startup_wait]
+
+      feedback_loops:
+        - id: boot_storm_contention
+          desc: |
+            Simultaneous reboots create a PXE request surge that increases boot-service contention; slower boots keep more nodes in retrying state,
+            sustaining elevated demand until throughput is increased or the fleet finishes booting.
+        - id: quorum_safe_mode_delay
+          desc: |
+            The quorum store prefers safety (no split-brain) and blocks leader formation without sufficient history after a full reboot,
+            prolonging API unavailability until manual recovery actions are applied.
+
+      flows: [api_requests_503, api_requests_partial_200, pxe_boot_success, pxe_boot_throttled, legacy_nic_dhcp_fail]
+      manifestation: [ops_tool.reboot_dispatched, boot_service.throttle_drop, boot_service.tftp_metrics, node_agent.pxe_retry, boot_service.dhcp_no_offer, control_store.quorum_lost, sdc_api.http_503_access]
+
+  assumptions:
+    - "Compute-node identity is consistently modeled as cn001..cn030 across node_agent.hosts and all node={node} log fields so per-host emissions are correlatable."
+    - "The modeled timeline is truncated to a 50-minute window ending before full restoration; it intentionally ends in a still-failing/degraded state per scenario requirements."
+    - "Fleet sizing is simplified: 30 compute nodes are explicitly modeled; PXE flow rates represent aggregate per-node PXE boot sessions/attempts rather than packet-level TFTP transfers."
+    - |-
+      Failure-phase intervals and rough effective volumes:
+      - Minutes 25-30 (5m): high quorum churn and elevated PXE throttling (pxe_boot_throttled at 1.0; legacy_nic_dhcp_fail suppressed).
+      - Minutes 30-38 (8m): throttles adjusted (pxe_boot_throttled *0.3; pxe_boot_success *1.5).
+      - Minutes 38-44 (6m): legacy DHCP issue becomes visible (legacy_nic_dhcp_fail enabled) and targeted reboots add extra PXE load (pxe_boot_success *1.8).
+      - Minutes 44-50 (6m): manual quorum recovery starts; quorum-loss frequency drops (control_store.quorum_lost *0.4), enabling api_requests_partial_200 while api_requests_503 remains dominant.
+    - "One-shot counts: event1=3 (mass reboot), event2=1 (throttle update), event3=3 (targeted reboots), event4=2 (manual recover + API restart)."
+    - |-
+      Total log volume estimate:
+      - Normal (25m): api_requests_ok ~900 rpm * 25 ~= 22.5k logs plus background (~0.5k) ~= ~23k.
+      - Failure (25m): api_requests_503 ~650 rpm * 25 ~= 16.3k; plus partial_200 (~0.4k late), control-plane/boot/node background (~0.6k), PXE flows+retries (~0.2k), and one-shots (~9) ~= ~17k–19k.
+      - Total ~= ~40k–45k logs, within the 20k–100k target.
+    - "Visibility rationale: ops_tool mass vs targeted one-shots disambiguate the trigger from later mitigation; boot_service.throttle_drop and node_agent.pxe_retry show early boot contention; boot_service.dhcp_no_offer + node_agent.dhcp_lease_failed appear only after event 3 to model delayed diagnosis; and control_store.recovery_blocked plus reduced (but non-zero) control_store.quorum_lost alongside sdc_api.startup_wait make the extended API outage and partial recovery diagnosable."
+```

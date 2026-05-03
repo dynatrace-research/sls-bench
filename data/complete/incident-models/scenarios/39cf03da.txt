@@ -1,0 +1,130 @@
+```yaml
+scenario:
+  id: jun20_telia_packet_loss_522
+  title: Telia transit packet loss causes origin timeouts (522) until manual drain
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The CDN edge normally serves most requests from cache and fetches the rest from customer origins through multiple transit providers.
+    During the incident, network monitoring detected severe packet loss on the Telia transit backbone, and origin connection attempts over that path timed out.
+    This manifested as a spike in HTTP 522 errors returned by the edge (origin unreachable) and elevated end-user latency.
+    Engineers manually drained/disabled Telia ports to reroute traffic to other providers, which removed Telia loss signals but left residual 522s and congestion symptoms.
+
+  trigger_desc: |
+    Network path monitoring detects massive packet loss on Telia transit paths used for origin-bound traffic; no automatic mitigation is applied for the affected large PoPs, so traffic continues to use Telia until an operator drains the provider.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Requests are served mostly from cache with a steady fraction of cache misses fetching from origins.
+        Path probes show low packet loss across providers, and the global 522 summary remains near zero.
+      flows: [http_cache_hit, http_cache_miss_ok]
+      manifestation: [edge_proxy.access_hit_200, net_monitor.probe_ok, net_monitor.probe_ok_telia, analytics.http_522_summary_normal]
+
+    f:
+      desc: |
+        Severe packet loss on Telia causes sustained origin connection timeouts for cache-miss traffic routed via Telia.
+        522 responses spike and are observable both per-request and in aggregated metrics. After manual mitigation drains Telia,
+        Telia probe/counter signals stop and remaining providers carry the traffic, causing queueing and some residual origin timeouts.
+      events:
+        - order: 1
+          at_min: 25
+          component: net_monitor
+          event: |
+            High loss on Telia is detected by active probes, and edge cache-miss origin connections routed via Telia begin timing out, spiking 522 errors.
+          why: |
+            Packet drops on the Telia backbone force TCP retransmissions and delay/lose SYN/SYN-ACK and subsequent packets, which can exceed edge origin-connect timeouts.
+            The packet loss itself is directly observable in probe logs; the underlying transit provider fault is external to the system.
+          flows: [http_cache_miss_522_telia, http_cache_miss_ok_telia, http_cache_hit_f]
+          rate_multipliers:
+            http_cache_miss_522_alt: 0.0
+            edge_proxy.egress_queue_high: 0.0
+            analytics.http_522_summary_reduced: 0.0
+            net_monitor.probe_ok: 0.5
+          latency_multipliers:
+            http_cache_miss_ok_telia: {p50: 1.0, p95: 1.0}
+            http_cache_miss_522_telia: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: net_monitor.packet_loss_alarm
+              count: 1
+              hosts: [netmon-1]
+          manifestation: [net_monitor.packet_loss_alarm, net_monitor.probe_high_loss_telia, edge_proxy.access_522_telia, analytics.http_522_summary_high, egress_router.iface_counters_telia]
+
+        - order: 2
+          at_min: 35
+          component: traffic_engineering
+          event: |
+            On-call initiates a manual drain/disable of Telia egress and updates routing policy to prefer alternate providers, shifting origin traffic away from Telia.
+            Telia loss signals stop, 522 rates drop substantially, and edge egress queueing becomes noticeable under shifted load.
+          why: |
+            Disabling Telia ports removes the lossy path from selection, so probes and origin traffic no longer traverse the failing backbone.
+            Remaining providers absorb additional traffic; while loss improves, increased utilization can add queueing delay and leave some residual timeouts.
+            The mitigation is directly observable via runbook and router action logs, and by the disappearance of Telia-specific probe/counter logs.
+          flows: [http_cache_miss_ok_alt, http_cache_miss_522_alt, http_cache_hit_f]
+          rate_multipliers:
+            http_cache_miss_ok_telia: 0.0
+            http_cache_miss_522_telia: 0.0
+            http_cache_miss_ok_alt: 4.0
+            http_cache_miss_522_alt: 2.0
+            http_cache_hit_f: 0.9
+            net_monitor.probe_high_loss_telia: 0.0
+            analytics.http_522_summary_high: 0.0
+            analytics.http_522_summary_reduced: 1.0
+            edge_proxy.egress_queue_high: 1.0
+            egress_router.iface_counters_telia: 0.0
+          latency_multipliers:
+            http_cache_miss_ok_alt: {p50: 1.2, p95: 1.4}
+            http_cache_miss_522_alt: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: traffic_engineering.mitigation_command
+              count: 1
+              hosts: [noc-1]
+            - ref: egress_router.admin_down_telia
+              count: 2
+              hosts: [rtr-ams-1, rtr-ams-2]
+            - ref: egress_router.policy_update
+              count: 1
+              hosts: [rtr-ams-1]
+          manifestation: [egress_router.admin_down_telia, egress_router.policy_update, net_monitor.probe_ok, analytics.http_522_summary_reduced, edge_proxy.egress_queue_high, egress_router.iface_counters]
+
+      steady:
+        - component: edge_proxy
+          condition: |
+            Telia-routed origin failures are eliminated, but some residual cache-miss requests still fail with 522 via alternate providers under shifted load.
+          user_impact: |
+            End users see fewer 522 errors than at incident start, but a noticeable fraction of origin-dependent requests still fail or are slow.
+          manifestation: [edge_proxy.access_522_alt, edge_proxy.origin_connect_timeout_alt]
+
+        - component: egress_router
+          condition: |
+            Traffic remains shifted off Telia, with higher utilization on remaining providers; Telia-specific counters remain absent after the drain.
+          user_impact: |
+            Increased latency for some origin fetches and intermittent failures during peak utilization periods.
+          manifestation: [egress_router.iface_counters, edge_proxy.egress_queue_high]
+
+      feedback_loops:
+        - id: loss_to_timeout_to_load
+          desc: |
+            Packet loss increases TCP retransmissions and extends connection lifetimes, which reduces effective capacity and increases queueing.
+            Longer-lived connections and slower fetch completion further increase pressure on remaining egress capacity after reroute, sustaining elevated latency
+            and a smaller tail of origin timeouts.
+
+      flows: [http_cache_hit_f, http_cache_miss_ok_telia, http_cache_miss_ok_alt, http_cache_miss_522_telia, http_cache_miss_522_alt]
+      manifestation: [net_monitor.probe_high_loss_telia, analytics.http_522_summary_high, egress_router.admin_down_telia, analytics.http_522_summary_reduced, edge_proxy.access_522_telia, edge_proxy.access_522_alt, egress_router.iface_counters_telia]
+
+  assumptions:
+    - "Timeline mapping uses compression for modeling: minute 25 corresponds to ~12:10 UTC detection and minute 35 corresponds to the manual Telia drain action (~12:30 UTC)."
+    - "Provider-field contradiction avoidance: after mitigation, probe_ok and iface_counters cannot emit provider=telia by construction; Telia-specific background logs (probe_high_loss_telia, iface_counters_telia) are driven to 0.0 from minute 35 onward."
+    - "Failure-phase piecewise volume rough estimate: minutes 25–35 about 720 flow logs/min plus ~26–28 background logs/min; minutes 35–50 about 567 flow logs/min plus ~22–24 background logs/min."
+    - "One-shots expected: at minute 25 count 1 (packet loss alarm) and at minute 35 count 4 (runbook, admin down on two routers, and policy update)."
+    - "Normal-phase estimate: about 650 flow logs/min plus ~18–20 background logs/min for 25 minutes (~16.7k logs)."
+    - "Total log estimate across 50 minutes is ~33k logs (within 20k–100k)."
+    - "Visibility rationale: Telia high-loss probes appear frequently pre-mitigation and then stop; Telia router counters show elevated drops pre-mitigation and are suppressed after the drain; the mitigation boundary is anchored by router/admin one-shots and the switch from 522_summary_high to 522_summary_reduced."
+```

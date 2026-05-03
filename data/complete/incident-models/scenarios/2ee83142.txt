@@ -1,0 +1,190 @@
+```yaml
+scenario:
+  id: simpledb_lock_handshake_cascade_use1a
+  title: Lock-service handshake overload causes cluster self-removal and API outage; recovery with domain-op throttling
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    SimpleDB serves reads/writes from storage replicas and domain-management operations from metadata nodes, with all nodes handshaking periodically to a lock service.
+    A facility power event removes multiple storage nodes in one datacenter, triggering a surge of lock-service deregistrations and elevated handshake latency.
+    Healthy nodes time out their handshakes, retry internally, and then remove themselves from the cluster, causing widespread HTTP 500s with only a brief fraction of successful reads.
+    Operators mitigate by increasing handshake timeouts and restarting metadata nodes to authorize storage rejoin; reads/writes recover, but CreateDomain/DeleteDomain remains throttled with elevated 503s.
+
+  trigger_desc: |
+    Power is lost to a set of servers hosting multiple storage nodes in one datacenter (use1a), causing simultaneous node unavailability and rapid deregistration activity.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        The API frontend routes read/write requests via metadata nodes to storage replicas and returns 200 responses.
+        Metadata and storage nodes periodically handshake with the lock service with low latency; lock-service stats show modest inflight and low p95.
+      flows: [api_read_ok, api_write_ok, api_domain_ok]
+      manifestation: [lock_service.stats, metadata_node.handshake_ok, storage_node.handshake_ok, api_frontend.read_200]
+
+    f:
+      desc: |
+        A surge in lock-service workload increases handshake latency, producing handshake timeouts across metadata and storage nodes.
+        After repeated timeouts, nodes remove themselves from the cluster, amplifying unavailability and driving API 500s.
+        Manual mitigation restores reads/writes by increasing handshake timeout settings and restarting metadata nodes so they can authorize storage rejoin, but domain-management APIs remain impaired due to throttling.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: facility_monitor
+          event: |
+            A facility power event in use1a coincides with a spike in lock-service deregistration work and rising handshake queueing; API write and domain-management calls begin failing, while a reduced fraction of reads still succeed.
+          why: |
+            Simultaneous loss of several storage nodes causes rapid deregistration from replication groups, increasing load on the lock service.
+            Elevated handshake latency makes healthy nodes more likely to hit the pre-mitigation (low) handshake deadline, visible as lock-service queue warnings and pre-mitigation handshake timeouts.
+          flows: [api_read_ok, api_read_500, api_write_500, api_domain_500]
+          rate_multipliers:
+            api_read_ok: 0.2
+            api_read_500: 0.8
+            api_write_ok: 0.0
+            api_write_500: 1.0
+            api_domain_ok_slow: 0.0
+            api_domain_500: 1.0
+            api_domain_throttled_503: 0.0
+            lock_service.queue_warn: 2.0
+            lock_service.deregister_batch: 3.0
+            metadata_node.handshake_timeout_pre: 1.5
+            metadata_node.handshake_timeout_post: 0.0
+            storage_node.handshake_timeout_pre: 1.5
+            storage_node.handshake_timeout_post: 0.0
+            control_plane_ops.throttle_status: 0.0
+          latency_multipliers:
+            api_read_500: {p50: 1.2, p95: 1.5}
+            api_write_500: {p50: 1.2, p95: 1.6}
+            api_domain_500: {p50: 1.2, p95: 1.6}
+          one_shots:
+            - ref: facility_monitor.power_loss
+              count: 1
+              hosts: [fac-1]
+          manifestation: [facility_monitor.power_loss, lock_service.deregister_batch, lock_service.queue_warn, metadata_node.handshake_timeout_pre, api_frontend.write_500]
+
+        - order: 2
+          at_min: 25
+          component: metadata_node
+          event: |
+            Repeated pre-mitigation handshake timeouts trigger multiple metadata and storage nodes to remove themselves from the cluster, eliminating the remaining successful read fraction and producing near-total API 500s.
+          why: |
+            With lock-service handshakes timing out repeatedly, nodes interpret loss of responsibility and self-remove to avoid serving potentially incorrect data.
+            This shrinks available cluster membership, further reducing ability to route/authorize requests and sustaining lock-service churn (partially observable via leave-cluster markers and increased queue warnings).
+          flows: [api_read_500, api_write_500, api_domain_500]
+          rate_multipliers:
+            api_read_ok: 0.0
+            api_read_500: 1.0
+            lock_service.queue_warn: 3.0
+            metadata_node.handshake_timeout_pre: 2.5
+            metadata_node.handshake_timeout_post: 0.0
+            storage_node.handshake_timeout_pre: 2.5
+            storage_node.handshake_timeout_post: 0.0
+          latency_multipliers:
+            api_read_500: {p50: 1.4, p95: 2.0}
+            api_write_500: {p50: 1.4, p95: 2.0}
+            api_domain_500: {p50: 1.3, p95: 1.9}
+          one_shots:
+            - ref: metadata_node.leave_cluster
+              count: 2
+              hosts: [meta-2, meta-3]
+            - ref: storage_node.leave_cluster
+              count: 4
+              hosts: [stor-2, stor-3, stor-4, stor-5]
+          manifestation: [metadata_node.leave_cluster, storage_node.leave_cluster, lock_service.queue_warn, api_frontend.read_500]
+
+        - order: 3
+          at_min: 35
+          component: control_plane_ops
+          event: |
+            Operators increase handshake timeout settings and restart a subset of metadata nodes; metadata nodes begin authorizing storage nodes to rejoin.
+            Reads and writes recover to mostly normal behavior, while CreateDomain/DeleteDomain is throttled, leaving elevated 503s and a small fraction of slow successes.
+          why: |
+            A larger handshake timeout reduces spurious loss-of-responsibility decisions during lock-service latency spikes, so the observed remaining handshake timeouts (if any) reflect the new larger deadline.
+            Restarting metadata nodes helps re-establish a quorum capable of authorizing storage nodes to rejoin safely, restoring data-serving capacity.
+            Throttling domain-management operations protects recovering metadata nodes from overload (directly observable via ops markers and 503 responses).
+          flows: [api_read_ok, api_write_ok, api_domain_throttled_503, api_domain_ok_slow]
+          rate_multipliers:
+            api_read_ok: 1.0
+            api_read_500: 0.0
+            api_write_ok: 1.0
+            api_write_500: 0.0
+            api_domain_500: 0.0
+            api_domain_throttled_503: 0.8
+            api_domain_ok_slow: 0.2
+            lock_service.queue_warn: 0.2
+            lock_service.deregister_batch: 0.2
+            metadata_node.handshake_timeout_pre: 0.0
+            metadata_node.handshake_timeout_post: 0.1
+            storage_node.handshake_timeout_pre: 0.0
+            storage_node.handshake_timeout_post: 0.1
+            control_plane_ops.throttle_status: 1.0
+          latency_multipliers:
+            api_domain_ok_slow: {p50: 4.0, p95: 6.0}
+          one_shots:
+            - ref: control_plane_ops.config_change
+              count: 1
+              hosts: [ops-1]
+            - ref: metadata_node.process_start
+              count: 2
+              hosts: [meta-2, meta-3]
+            - ref: metadata_node.authorize_storage
+              count: 6
+              hosts: [meta-1, meta-2]
+            - ref: storage_node.rejoin_success
+              count: 4
+              hosts: [stor-2, stor-3, stor-4, stor-5]
+            - ref: control_plane_ops.throttle_enabled
+              count: 1
+              hosts: [ops-1]
+          manifestation: [control_plane_ops.config_change, metadata_node.process_start, storage_node.rejoin_success, api_frontend.read_200, api_frontend.domain_503_throttled]
+
+      steady:
+        - component: api_frontend
+          condition: |
+            CreateDomain/DeleteDomain remain throttled to protect metadata nodes while the cluster stabilizes; most other APIs operate normally.
+          user_impact: |
+            Customers attempting CreateDomain/DeleteDomain see elevated 503 throttling responses and occasional slow successes; reads/writes generally succeed.
+          manifestation: [api_frontend.domain_503_throttled, control_plane_ops.throttle_status, api_frontend.domain_200]
+
+      feedback_loops:
+        - id: lock_overload_self_removal
+          desc: |
+            Lock-service overload increases handshake latency, causing handshake timeouts.
+            Timeouts trigger nodes to self-remove, which increases routing/auth pressure and deregistration churn, further loading the lock service.
+
+      flows: [api_read_ok, api_read_500, api_write_ok, api_write_500, api_domain_500, api_domain_throttled_503, api_domain_ok_slow]
+      manifestation: [lock_service.queue_warn, lock_service.deregister_batch, metadata_node.handshake_timeout_pre, storage_node.handshake_timeout_pre, api_frontend.read_500, api_frontend.domain_503_throttled]
+
+  assumptions:
+    - |
+      The original post-mortem outage window (hours) is compressed into 30 minutes of failure while preserving ordering:
+      trigger, cascade self-removal, then partial recovery with domain-op throttling.
+    - |
+      Failure-phase piecewise breakdown (approximate):
+      minutes 20-25 (5 min) has reads split about 20% ok and 80% 500, while writes and domain ops are mostly 500;
+      minutes 25-35 (10 min) is near-total outage with 500s for reads, writes, and domain ops;
+      minutes 35-50 (15 min) has reads and writes mostly 200 while domain ops are throttled with about 80% 503 and 20% slow 200.
+    - |
+      Handshake timeout mitigation is modeled by switching from handshake_timeout_pre (deadline 150-400ms) to handshake_timeout_post (deadline 800-1200ms) at minute 35;
+      earlier events explicitly suppress the post-mitigation timeout log so deadlines cannot contradict the config_change marker.
+    - |
+      API retry behavior is not modeled; each API request produces a single terminal response log (200/500/503), while repeated handshake timeouts and attempt counters represent the internal retry loops described in the post-mortem.
+    - |
+      Throttling numerics are aligned with modeled domain-ops traffic (6 rpm): limit_rps values are sub-0.1 rps and throttle_status.rejected_last_min
+      is constrained to single-digit/low-double-digit counts, making ~80% throttling plausible without impossible metrics.
+    - |
+      Visibility rationale: each major beat has high-likelihood signals within minutes: power event one-shot, lock_service queue_warn plus deregister_batch during overload,
+      leave_cluster one-shots during cascade, and config_change plus throttle_enabled one-shots at mitigation; pre/post handshake timeout logs remain consistent with the config.
+    - |
+      Estimated total logs (rough):
+      normal phase 20 minutes is about 26.8k flow logs plus about 0.5k background logs;
+      failure phase 30 minutes is about 30-31k flow logs plus about 1-2k background logs plus about 21 one-shot logs;
+      total is about ~58k–62k logs, within the 20k–100k target.
+```

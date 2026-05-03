@@ -1,0 +1,277 @@
+```yaml
+scenario:
+  id: shard4_xid_wraparound_degradation
+  title: Shard4 XID wraparound protection causes email send degradation; truncation enables vacuum completion and recovery
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Mandrill executes send jobs by writing per-message/job state into a sharded Postgres K/V store and then delivering via workers.
+    A hot shard (shard4) hits the Postgres transaction ID (XID) wraparound protection threshold and enters safety shutdown/maintenance,
+    rejecting writes. Shard4-mapped jobs begin failing with retries and disk spooling, reducing effective delivery to about 80% while disk pressure
+    and log-aggregation backlog grow. Responders run a manual VACUUM and then truncate the largest tables to unblock progress; VACUUM completes,
+    shard4 becomes writable again, and backlog drain begins, though residual queues/disk pressure remain at the end of the modeled window.
+
+  trigger_desc: |
+    Shard4's XID age reaches the wraparound protection limit due to autovacuum lag on a hot shard, causing Postgres to shut down/refuse writes.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Send traffic is steady. Most jobs map to non-shard4 shards and complete normally; a smaller portion maps to shard4 and also completes.
+        Background metrics show healthy queue depths, modest disk utilization, and routine Postgres checkpoints and XID age telemetry.
+      flows: [send_email_other, send_email_shard4_ok]
+      manifestation:
+        - mandrill_api.healthcheck
+        - mandrill_api.disk_usage_metric
+        - mail_worker.queue_depth
+        - postgres_shard4.xid_metric
+        - log_aggregator.ingest_summary
+
+    f:
+      desc: |
+        Shard4 enters wraparound protection and rejects writes, so shard4-mapped send jobs fail, retry, and are spooled locally rather than delivered.
+        Non-shard4 sends continue to succeed, keeping overall throughput near ~80% of normal while backlogs grow. Responders open an incident amid noisy
+        centralized error reporting, then start shard4 maintenance in standalone mode with a manual VACUUM. When VACUUM proves too slow, responders
+        truncate the largest tables to reduce workload; this accelerates progress, VACUUM completes, and shard4 returns to read-write so sending from
+        backlog resumes and backlogs begin draining.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: postgres_shard4
+          event: |
+            Shard4 triggers wraparound protection and shuts down/refuses commands; shard4-mapped send jobs immediately start failing, retrying, and spooling to disk.
+          why: |
+            Postgres protects against XID wraparound by entering a safety mode where it rejects writes (and may shut down) until manual maintenance can
+            advance/freeze old XIDs. This is directly observable via shard4 CRITICAL shutdown and a high rate of connection rejections; the underlying
+            autovacuum lag on a hot shard is inferred.
+          flows: [send_email_shard4_fail, spool_job_shard4, send_email_other]
+          rate_multipliers:
+            send_email_shard4_ok: 0.0
+            postgres_shard4.vacuum_progress: 0.0
+            postgres_shard4.xid_metric_post: 0.0
+            mandrill_api.disk_low: 0.0
+            mail_worker.spool_backlog_warn: 0.0
+            mail_worker.backlog_drain: 0.0
+            log_aggregator.alert_eval: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: postgres_shard4.wraparound_shutdown
+              count: 1
+              hosts: [pg-shard4-1]
+          manifestation:
+            - postgres_shard4.wraparound_shutdown
+            - postgres_shard4.conn_reject
+            - mandrill_api.kv_write_err_shard4
+            - mandrill_api.retry_write
+            - mandrill_api.job_spooled
+
+        - order: 2
+          at_min: 32
+          component: log_aggregator
+          event: |
+            Continued shard4 failures amplify retries/spooling and central alert evaluation becomes visibly delayed; responders open an incident to investigate shard4 load/failures.
+          why: |
+            When shard4 is rejecting writes, the application keeps retrying and spooling work, amplifying error volume. Central aggregation shows backlog
+            and delayed evaluations (directly observable), while the initial key error signature can be harder to spot amid unrelated noise.
+          flows: [send_email_shard4_fail, spool_job_shard4, send_email_other]
+          rate_multipliers:
+            send_email_shard4_fail: 1.2
+            spool_job_shard4: 1.2
+            mandrill_api.disk_low: 1.0
+            mail_worker.spool_backlog_warn: 1.0
+            log_aggregator.alert_eval: 1.6
+          latency_multipliers:
+            send_email_other: {p50: 1.05, p95: 1.25}
+          one_shots:
+            - ref: log_aggregator.incident_opened
+              count: 1
+              hosts: [log-1]
+          manifestation:
+            - log_aggregator.alert_eval
+            - log_aggregator.incident_opened
+            - mandrill_api.disk_low
+            - mail_worker.spool_backlog_warn
+
+        - order: 3
+          at_min: 40
+          component: postgres_shard4
+          event: |
+            Responders start shard4 maintenance: standalone mode and a manual VACUUM; vacuum progress logs begin appearing.
+          why: |
+            Clearing/freeze-advancing old XIDs requires running maintenance while the database is in a controlled mode. This is directly observable via
+            standalone/vacuum start markers and ongoing vacuum progress snapshots.
+          flows: [send_email_shard4_fail, spool_job_shard4, send_email_other]
+          rate_multipliers:
+            postgres_shard4.vacuum_progress: 1.0
+          latency_multipliers:
+            send_email_shard4_fail: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: postgres_shard4.standalone_mode
+              count: 1
+              hosts: [pg-shard4-1]
+            - ref: postgres_shard4.vacuum_setting
+              count: 1
+              hosts: [pg-shard4-1]
+            - ref: postgres_shard4.vacuum_started
+              count: 1
+              hosts: [pg-shard4-1]
+          manifestation:
+            - postgres_shard4.standalone_mode
+            - postgres_shard4.vacuum_started
+            - postgres_shard4.vacuum_progress
+            - postgres_shard4.conn_reject
+
+        - order: 4
+          at_min: 46
+          component: postgres_shard4
+          event: |
+            Responders truncate the largest tables (search and url) to reduce vacuum workload; vacuum progress accelerates and connection rejections begin to ease, but shard4 is still not writable yet.
+          why: |
+            Removing large, non-critical tables reduces the amount of data the maintenance needs to scan/freeze, accelerating VACUUM. The truncations are directly
+            observable; early improvement is observed as faster VACUUM progress and fewer rejected connections, but full restoration requires VACUUM completion.
+          flows: [send_email_shard4_fail, spool_job_shard4, send_email_other]
+          rate_multipliers:
+            postgres_shard4.conn_reject: 0.7
+            postgres_shard4.vacuum_progress: 1.8
+            log_aggregator.alert_eval: 1.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: postgres_shard4.truncate_search
+              count: 1
+              hosts: [pg-shard4-1]
+            - ref: postgres_shard4.truncate_url
+              count: 1
+              hosts: [pg-shard4-1]
+          manifestation:
+            - postgres_shard4.truncate_search
+            - postgres_shard4.truncate_url
+            - postgres_shard4.vacuum_progress
+            - postgres_shard4.conn_reject
+
+        - order: 5
+          at_min: 48
+          component: postgres_shard4
+          event: |
+            VACUUM completes after truncation and shard4 returns to read-write; shard4-mapped sends succeed again and backlogs start draining, with only residual spooling/rejections.
+          why: |
+            Once XID freezing/cleanup completes, Postgres can safely accept normal connections again. Completion is directly observable via a VACUUM completion marker,
+            followed by successful shard4 writes and decreasing backlog symptoms; residual cleanup work/backlog drain is expected after long degradation.
+          flows: [send_email_shard4_ok, send_email_shard4_fail, spool_job_shard4, send_email_other]
+          rate_multipliers:
+            send_email_shard4_ok: 1.0
+            send_email_shard4_fail: 0.05
+            spool_job_shard4: 0.05
+            postgres_shard4.conn_reject: 0.05
+            postgres_shard4.vacuum_progress: 0.0
+            postgres_shard4.xid_metric: 0.0
+            postgres_shard4.xid_metric_post: 1.0
+            mandrill_api.disk_low: 0.2
+            mail_worker.spool_backlog_warn: 0.2
+            mail_worker.backlog_drain: 1.0
+            log_aggregator.alert_eval: 0.4
+          latency_multipliers:
+            send_email_shard4_ok: {p50: 1.2, p95: 1.6}
+          one_shots:
+            - ref: postgres_shard4.vacuum_completed
+              count: 1
+              hosts: [pg-shard4-1]
+          manifestation:
+            - postgres_shard4.vacuum_completed
+            - postgres_shard4.xid_metric_post
+            - mandrill_api.kv_write_ok_shard4
+            - mail_worker.backlog_drain
+            - mail_worker.smtp_sent
+
+        - order: 6
+          at_min: 49
+          component: log_aggregator
+          event: |
+            Responders add new alerting for XID wraparound; alert-evaluation delays continue to subside as the log backlog drops.
+          why: |
+            After the failure mode is understood, adding a dedicated alert rule makes future wraparound risk more detectable. This is directly observable via an
+            alert-rule creation marker; reduced evaluation delay is observed as fewer alert-delay warnings.
+          flows: [send_email_shard4_ok, send_email_other]
+          rate_multipliers:
+            log_aggregator.alert_eval: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: log_aggregator.alert_rule_added
+              count: 1
+              hosts: [log-1]
+          manifestation:
+            - log_aggregator.alert_rule_added
+            - log_aggregator.alert_eval
+            - log_aggregator.ingest_summary
+
+      steady:
+        - component: postgres_shard4
+          condition: |
+            Shard4 is accepting writes again after maintenance; occasional rejected connections may still appear during stabilization.
+          user_impact: |
+            Most shard4-mapped mail begins sending again, but residual delays may persist while backlogs drain.
+          manifestation:
+            - postgres_shard4.xid_metric_post
+            - mandrill_api.kv_write_ok_shard4
+            - postgres_shard4.conn_reject
+        - component: mail_worker
+          condition: |
+            Backlogs are elevated but actively draining; periodic drain metrics appear and spool backlog warnings become infrequent.
+          user_impact: |
+            Queued mail clears over time; some accounts may see lag until queues normalize.
+          manifestation:
+            - mail_worker.queue_depth
+            - mail_worker.backlog_drain
+            - mail_worker.spool_backlog_warn
+        - component: mandrill_api
+          condition: |
+            Disk usage remains high from accumulated spool files but low-space warnings are reduced as spooling largely stops.
+          user_impact: |
+            Operational risk is reduced, but hosts may require cleanup/monitoring until disk usage returns to baseline.
+          manifestation:
+            - mandrill_api.disk_usage_metric
+            - mandrill_api.disk_low
+
+      feedback_loops:
+        - id: retry_spool_amplification
+          desc: |
+            Shard4 write failures trigger repeated retry attempts and spooling, amplifying load and log volume and consuming disk space,
+            which increases operational risk and complicates triage in centralized logging until maintenance restores shard4.
+
+      flows: [send_email_other, send_email_shard4_fail, spool_job_shard4, send_email_shard4_ok]
+      manifestation:
+        - postgres_shard4.wraparound_shutdown
+        - postgres_shard4.conn_reject
+        - mandrill_api.kv_write_err_shard4
+        - mandrill_api.retry_write
+        - mandrill_api.job_spooled
+        - mandrill_api.disk_low
+        - mail_worker.spool_backlog_warn
+        - postgres_shard4.vacuum_progress
+        - postgres_shard4.truncate_search
+        - postgres_shard4.truncate_url
+        - postgres_shard4.vacuum_completed
+        - postgres_shard4.xid_metric_post
+        - mail_worker.backlog_drain
+        - log_aggregator.alert_eval
+        - log_aggregator.alert_rule_added
+
+  assumptions:
+    - |
+      The real multi-day timeline is compressed to 50 minutes but preserves the key beats and the decisive outcome: truncation unblocks VACUUM, which completes and restores shard4 writability, followed by backlog draining.
+    - |
+      Dump/restore and moving queue metadata to other shards are omitted; recovery is modeled via VACUUM + truncation, matching the causal core described.
+    - |
+      Approximate log-volume breakdown (rough order of magnitude): Normal 25 min ≈ 31k–32k logs. Failure 25 min split into 25-32 ≈ 11k, 32-40 ≈ 12k–13k, 40-46 ≈ 9k–10k, 46-48 ≈ 3k, 48-49 ≈ 1.3k, 49-50 ≈ 1.3k; plus ~11 one-shot operational markers; total ≈ 70k–80k logs (within 20k..100k).
+    - |
+      Failure-phase piecewise controls: from 25-48, postgres_shard4.xid_metric_post is suppressed (0.0) while xid_metric remains active; at 48 xid_metric is suppressed (0.0) and xid_metric_post enabled (1.0) to match the post-VACUUM narrative without leaving incident-high XID telemetry in the recovered steady view.
+    - |
+      Visibility rationale: shard4 CRITICAL shutdown and VACUUM completion are guaranteed via one-shots; ongoing shard4 rejection and API shard4 write-failure/retry logs occur at high rates early; spooling is guaranteed by a dedicated spooling flow; VACUUM progress and two distinct truncation markers are explicit; recovery is evidenced by successful shard4 write logs, backlog draining metrics, and normalized post-maint XID snapshots; wraparound alerting addition is evidenced by an explicit one-shot marker.
+```

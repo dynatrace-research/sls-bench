@@ -1,0 +1,598 @@
+```yaml
+sys:
+  id: cdn_backbone_route_leak_incident
+  desc: >
+    A global edge network serves HTTP traffic from many POPs and uses a private backbone for inter-POP
+    connectivity and internal service routing. Backbone routers exchange iBGP routes with policies that
+    control which routes are preferred and exported. An internal traffic manager aggregates POP CPU and
+    traffic signals for operations. A core observability pipeline ingests logs/metrics from the edge for
+    monitoring and troubleshooting.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_pop_affected
+    name: Edge POP Proxy Cluster (Affected POPs)
+    svc: edge-proxy
+    hosts: [edge-a01, edge-a02, edge-a03]
+    desc: >
+      Receives end-user HTTP requests at a representative set of POPs that become impacted by the backbone
+      route leak. During the incident, routing prefers Atlanta via the backbone, causing upstream timeouts
+      and client 5xx responses; after mitigation, these POPs resume local routing.
+
+    to:
+      - dst: backbone_router_peer
+        proto: ip
+        desc: POP routing can send traffic onto the private backbone via local backbone peers.
+      - dst: core_observability
+        proto: tcp
+        desc: Ships logs/metrics to the central observability pipeline.
+
+    logs:
+      req_start:
+        desc: Start of request processing at the edge proxy.
+        lvl: INFO
+        msg: "req start req_id={req_id} pop={pop} method={method} host={host} uri={uri} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          method: {k: ch, v: [GET, POST]}
+          host: {k: str, v: "customer-domain"}
+          uri: {k: str, v: "path"}
+          trace_id: {k: hex, v: 32}
+
+      route_selected_local:
+        desc: Routing decision selects local handling.
+        lvl: INFO
+        msg: "route selected req_id={req_id} pop={pop} selected=local trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          trace_id: {k: hex, v: 32}
+
+      route_selected_bbone_atl:
+        desc: Routing decision selects backbone path toward Atlanta.
+        lvl: INFO
+        msg: "route selected req_id={req_id} pop={pop} selected=bbone_atl trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          trace_id: {k: hex, v: 32}
+
+      upstream_fetch_start:
+        desc: Start of an internal upstream fetch attempt routed toward Atlanta.
+        lvl: INFO
+        msg: "upstream fetch start req_id={req_id} pop={pop} dst=atl attempt={attempt} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          attempt: {k: i, v: [1, 3]}
+          trace_id: {k: hex, v: 32}
+
+      upstream_fetch_fail:
+        desc: An internal upstream fetch attempt fails (timeout/connect/reset) before succeeding.
+        lvl: WARN
+        msg: "upstream fetch failed req_id={req_id} pop={pop} dst=atl attempt={attempt} err={err} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          attempt: {k: i, v: [1, 3]}
+          err: {k: ch, v: [timeout, connect_error, reset]}
+          dur_ms: {k: i, v: [50, 3500]}
+          trace_id: {k: hex, v: 32}
+
+      retrying_upstream:
+        desc: Edge retries after an upstream failure/timeout (backbone-to-Atlanta path).
+        lvl: WARN
+        msg: "retrying req_id={req_id} pop={pop} route=bbone_atl attempt={attempt} reason={reason} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: [timeout, connect_error]}
+          trace_id: {k: hex, v: 32}
+
+      req_complete_ok:
+        desc: Successful request completion returned to the client.
+        lvl: INFO
+        msg: "req complete req_id={req_id} pop={pop} status=200 dur_ms={dur_ms} bytes={bytes} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          dur_ms: {k: i, v: [5, 500]}
+          bytes: {k: i, v: [200, 250000]}
+          trace_id: {k: hex, v: 32}
+
+      req_complete_err:
+        desc: Request completion with an error returned to the client (after internal retries/timeouts).
+        lvl: ERROR
+        msg: "req complete req_id={req_id} pop={pop} status={status} dur_ms={dur_ms} err={err} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          status: {k: ch, v: [502, 503, 504]}
+          dur_ms: {k: i, v: [200, 7000]}
+          err: {k: ch, v: [upstream_timeout, connect_reset, no_route]}
+          trace_id: {k: hex, v: 32}
+
+      worker_health:
+        desc: Periodic edge health sample for CPU and connection pressure.
+        lvl: INFO
+        msg: "worker health pop={pop} cpu_pct={cpu_pct} conn={conn} drop_pct={drop_pct}"
+        vars:
+          pop: {k: ch, v: [ewr, ord, sjc, lon, ams]}
+          cpu_pct: {k: i, v: [0, 100]}
+          conn: {k: i, v: [500, 60000]}
+          drop_pct: {k: f, v: [0.0, 8.0]}
+
+    beh:
+      n:
+        desc: Mostly quiet; periodic health samples.
+        emit:
+          - id: worker_health
+            per_min: 0.25
+            scope: per_host
+      f:
+        desc: Health samples continue; request-level errors and upstream attempt failures dominate during the route leak window.
+        emit:
+          - id: worker_health
+            per_min: 0.25
+            scope: per_host
+
+  - id: edge_pop_unaffected
+    name: Edge POP Proxy Cluster (Unaffected POPs)
+    svc: edge-proxy
+    hosts: [edge-u01, edge-u02, edge-u03]
+    desc: >
+      Receives end-user HTTP requests at a representative POP that is not impacted by the backbone
+      route leak. Requests continue to route locally and succeed throughout the incident, though
+      aggregate traffic may dip while other regions are impaired.
+
+    to:
+      - dst: backbone_router_peer
+        proto: ip
+        desc: POP routing can send traffic onto the private backbone via local backbone peers (not used by the modeled normal flow).
+      - dst: core_observability
+        proto: tcp
+        desc: Ships logs/metrics to the central observability pipeline.
+
+    logs:
+      req_start:
+        desc: Start of request processing at the edge proxy.
+        lvl: INFO
+        msg: "req start req_id={req_id} pop={pop} method={method} host={host} uri={uri} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [syd]}
+          method: {k: ch, v: [GET, POST]}
+          host: {k: str, v: "customer-domain"}
+          uri: {k: str, v: "path"}
+          trace_id: {k: hex, v: 32}
+
+      route_selected_local:
+        desc: Routing decision selects local handling.
+        lvl: INFO
+        msg: "route selected req_id={req_id} pop={pop} selected=local trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [syd]}
+          trace_id: {k: hex, v: 32}
+
+      req_complete_ok:
+        desc: Successful request completion returned to the client.
+        lvl: INFO
+        msg: "req complete req_id={req_id} pop={pop} status=200 dur_ms={dur_ms} bytes={bytes} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [syd]}
+          dur_ms: {k: i, v: [5, 500]}
+          bytes: {k: i, v: [200, 250000]}
+          trace_id: {k: hex, v: 32}
+
+      worker_health:
+        desc: Periodic edge health sample for CPU and connection pressure.
+        lvl: INFO
+        msg: "worker health pop={pop} cpu_pct={cpu_pct} conn={conn} drop_pct={drop_pct}"
+        vars:
+          pop: {k: ch, v: [syd]}
+          cpu_pct: {k: i, v: [0, 100]}
+          conn: {k: i, v: [500, 60000]}
+          drop_pct: {k: f, v: [0.0, 8.0]}
+
+    beh:
+      n:
+        desc: Mostly quiet; periodic health samples.
+        emit:
+          - id: worker_health
+            per_min: 0.25
+            scope: per_host
+      f:
+        desc: Health samples continue; customer-facing errors are not expected for these POPs.
+        emit:
+          - id: worker_health
+            per_min: 0.25
+            scope: per_host
+
+  - id: backbone_router_atl
+    name: Atlanta Backbone Router
+    svc: bbone-atl
+    hosts: [atl01]
+    desc: >
+      Backbone router in Atlanta exchanging iBGP routes with peers. During the incident it exports
+      an unintended set of routes with higher local-preference, attracting large volumes of traffic
+      and becoming overloaded. After mitigation it is administratively removed from backbone participation.
+
+    to:
+      - dst: backbone_router_peer
+        proto: bgp
+        desc: iBGP sessions to other backbone routers/route reflectors.
+
+    logs:
+      config_commit:
+        desc: Configuration commit action on the router.
+        lvl: INFO
+        msg: "commit applied change_id={change_id} user={user} diff_lines={diff_lines}"
+        vars:
+          change_id: {k: hex, v: 8}
+          user: {k: ch, v: [neteng1, neteng2]}
+          diff_lines: {k: i, v: [1, 30]}
+
+      bgp_advertise_summary:
+        desc: Periodic summary of BGP export volume and effective local preference.
+        lvl: INFO
+        msg: "bgp export summary vrf=backbone adv_prefixes={adv_prefixes} local_pref={local_pref} peers={peers}"
+        vars:
+          adv_prefixes: {k: i, v: [500, 80000]}
+          local_pref: {k: i, v: [100, 200]}
+          peers: {k: i, v: [5, 25]}
+
+      cpu_overload:
+        desc: Router control-plane CPU is high.
+        lvl: WARN
+        msg: "re cpu high cpu_pct={cpu_pct} reason={reason}"
+        vars:
+          cpu_pct: {k: i, v: [75, 100]}
+          reason: {k: ch, v: [bgp_update_storm, forwarding_overload]}
+
+      forwarding_drops:
+        desc: Forwarding plane drops packets due to queue pressure.
+        lvl: WARN
+        msg: "fwd drops if={iface} pps_drop={pps_drop} qlen={qlen}"
+        vars:
+          iface: {k: ch, v: [xe-0/0/0, xe-0/0/1]}
+          pps_drop: {k: i, v: [0, 220000]}
+          qlen: {k: i, v: [0, 12000]}
+
+      router_disabled:
+        desc: Operational action disabling Atlanta from the backbone.
+        lvl: CRITICAL
+        msg: "backbone disabled action=shutdown_ibgp drain_s={drain_s}"
+        vars:
+          drain_s: {k: i, v: [10, 180]}
+
+      participation_status_disabled:
+        desc: Periodic marker that Atlanta is not participating in the backbone (post-mitigation state).
+        lvl: INFO
+        msg: "participation status vrf=backbone admin_state=disabled"
+        vars: {}
+
+    beh:
+      n:
+        desc: Normal steady BGP summaries; overload signals absent.
+        emit:
+          - id: bgp_advertise_summary
+            per_min: 0.4
+            scope: global
+      f:
+        desc: During the incident, export volume and overload warnings are elevated until mitigation.
+        emit:
+          - id: bgp_advertise_summary
+            per_min: 2.5
+            scope: global
+          - id: cpu_overload
+            per_min: 0.5
+            scope: global
+          - id: forwarding_drops
+            per_min: 0.7
+            scope: global
+          - id: participation_status_disabled
+            per_min: 0.4
+            scope: global
+
+  - id: backbone_router_peer
+    name: Backbone Peer Routers (Aggregate)
+    svc: bbone-peers
+    hosts: [ord01, ewr01, lon01]
+    desc: >
+      Represents other backbone routers that receive exports from Atlanta and select best paths.
+      Their logs show bestpath churn when Atlanta exports an unexpectedly large/attractive set of routes.
+      After mitigation they show Atlanta's iBGP session(s) down.
+
+    to:
+      - dst: backbone_router_atl
+        proto: bgp
+        desc: iBGP peering with Atlanta.
+
+    logs:
+      link_congestion_warn:
+        desc: Link utilization warning due to congestion.
+        lvl: WARN
+        msg: "link congested link={link} util_pct={util_pct}"
+        vars:
+          link: {k: ch, v: [ewr-ord, atl-iad]}
+          util_pct: {k: i, v: [70, 99]}
+
+      bgp_bestpath_change:
+        desc: Bestpath selection changes (often pointing at Atlanta during the incident).
+        lvl: INFO
+        msg: "bestpath change prefix={prefix} next_hop={next_hop} local_pref={local_pref}"
+        vars:
+          prefix: {k: str, v: "cidr"}
+          next_hop: {k: ch, v: [atl01, local]}
+          local_pref: {k: i, v: [100, 200]}
+
+      bgp_neighbor_down:
+        desc: BGP session down event (e.g., after Atlanta is disabled).
+        lvl: WARN
+        msg: "bgp neighbor down peer={peer} reason={reason}"
+        vars:
+          peer: {k: ch, v: [atl01]}
+          reason: {k: ch, v: [hold_timer, admin_down]}
+
+      neighbor_state_idle:
+        desc: Periodic marker that the Atlanta neighbor is not established (post-mitigation state).
+        lvl: INFO
+        msg: "bgp neighbor state peer=atl01 state=idle"
+        vars: {}
+
+      bgp_rib_summary:
+        desc: Periodic BGP RIB/updates summary.
+        lvl: INFO
+        msg: "rib summary learned_prefixes={learned_prefixes} updates_s={updates_s}"
+        vars:
+          learned_prefixes: {k: i, v: [500, 80000]}
+          updates_s: {k: i, v: [0, 6000]}
+
+    beh:
+      n:
+        desc: Low-level background routing noise and occasional congestion warnings.
+        emit:
+          - id: bgp_rib_summary
+            per_min: 0.4
+            scope: global
+          - id: link_congestion_warn
+            per_min: 0.12
+            scope: global
+      f:
+        desc: Bestpath churn and update rates rise as Atlanta exports more attractive routes.
+        emit:
+          - id: bgp_rib_summary
+            per_min: 1.2
+            scope: global
+          - id: bgp_bestpath_change
+            per_min: 3.5
+            scope: global
+          - id: neighbor_state_idle
+            per_min: 0.6
+            scope: global
+
+  - id: traffic_manager
+    name: Internal Traffic Manager
+    svc: tm
+    hosts: [tm01]
+    desc: >
+      Aggregates POP traffic and CPU telemetry for operators. During the incident it detects the
+      sudden concentration of traffic in Atlanta and drops in affected POPs.
+
+    to: []
+
+    logs:
+      pop_sample:
+        desc: Periodic snapshot of a POP's CPU and request rate.
+        lvl: INFO
+        msg: "pop sample pop={pop} cpu_pct={cpu_pct} req_rps={req_rps}"
+        vars:
+          pop: {k: ch, v: [atl, ewr, ord, sjc, lon, ams, syd]}
+          cpu_pct: {k: i, v: [0, 100]}
+          req_rps: {k: i, v: [0, 3000]}
+
+      anomaly_alert:
+        desc: Operator-facing alert for an abnormal traffic shift/overload.
+        lvl: WARN
+        msg: "anomaly detected region={region} dropped_pct={dropped_pct} top_pop={top_pop}"
+        vars:
+          region: {k: ch, v: [na, europe, apac, latam]}
+          dropped_pct: {k: i, v: [10, 80]}
+          top_pop: {k: ch, v: [atl, ord, sjc, lon]}
+
+      recovery_notice:
+        desc: Operator-facing notice that routing/traffic has normalized.
+        lvl: INFO
+        msg: "recovery backbone_normalized=true affected_pops_est={affected_pops_est}"
+        vars:
+          affected_pops_est: {k: i, v: [5, 30]}
+
+    beh:
+      n:
+        desc: Emits POP samples for routine monitoring.
+        emit:
+          - id: pop_sample
+            per_min: 8.0
+            scope: global
+      f:
+        desc: Continues emitting POP samples; alerts/notices are emitted as discrete operational markers.
+        emit:
+          - id: pop_sample
+            per_min: 8.0
+            scope: global
+
+  - id: core_observability
+    name: Core Observability Pipeline
+    svc: obs-ingest
+    hosts: [obs01, obs02]
+    desc: >
+      Central pipeline that ingests logs/metrics from the edge. After customer traffic is restored,
+      this pipeline can experience congestion and drops some telemetry, reducing observability while
+      the edge continues operating.
+
+    to: []
+
+    logs:
+      ingest_metric:
+        desc: Periodic stats about ingestion throughput and queue lag.
+        lvl: INFO
+        msg: "ingest stats queue_lag_s={queue_lag_s} ingest_eps={ingest_eps}"
+        vars:
+          queue_lag_s: {k: i, v: [0, 900]}
+          ingest_eps: {k: i, v: [10, 400]}
+
+      drop_warn:
+        desc: Warning that events were dropped due to backpressure.
+        lvl: WARN
+        msg: "ingest backpressure dropped_events={dropped_events} window_s={window_s}"
+        vars:
+          dropped_events: {k: i, v: [50, 20000]}
+          window_s: {k: i, v: [10, 60]}
+
+    beh:
+      n:
+        desc: Stable ingestion; no drops.
+        emit:
+          - id: ingest_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Ingestion remains active; explicit drop warnings are enabled later during the failure phase.
+        emit:
+          - id: ingest_metric
+            per_min: 1.2
+            scope: global
+          - id: drop_warn
+            per_min: 0.8
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_pop_affected, edge_pop_unaffected]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal POPs route locally and serve requests successfully with low latency.
+    req:
+      - id: http_req_affected_ok_n
+        desc: Requests from representative POPs that later become impacted, served locally in normal conditions.
+        rpm: 200.0
+        path: [edge_pop_affected]
+        emit: [edge_pop_affected.req_start, edge_pop_affected.route_selected_local, edge_pop_affected.req_complete_ok]
+        latency_ms: [[2, 6], [1, 4], [15, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_req_unaffected_ok_n
+        desc: Requests from a representative POP that remains unaffected, served locally in normal conditions.
+        rpm: 200.0
+        path: [edge_pop_unaffected]
+        emit: [edge_pop_unaffected.req_start, edge_pop_unaffected.route_selected_local, edge_pop_unaffected.req_complete_ok]
+        latency_ms: [[2, 6], [1, 4], [15, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      During the failure, affected POPs prefer Atlanta due to a route leak; internal upstream fetches to Atlanta
+      are retried and often fail, and client requests complete with 5xx/timeouts. After Atlanta is removed from
+      the backbone, customer traffic recovers but core observability later drops telemetry.
+    req:
+      - id: http_req_affected_ok_f
+        desc: Affected POP traffic served locally after routing is corrected (suppressed during the route leak interval).
+        rpm: 200.0
+        path: [edge_pop_affected]
+        emit: [edge_pop_affected.req_start, edge_pop_affected.route_selected_local, edge_pop_affected.req_complete_ok]
+        latency_ms: [[2, 6], [1, 4], [15, 160]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_req_unaffected_ok_f
+        desc: Unaffected POP traffic continues to succeed; entry rate dips during the backbone outage and returns after mitigation.
+        rpm: 200.0
+        path: [edge_pop_unaffected]
+        emit: [edge_pop_unaffected.req_start, edge_pop_unaffected.route_selected_local, edge_pop_unaffected.req_complete_ok]
+        latency_ms: [[2, 6], [1, 4], [15, 160]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_req_affected_client_err_f
+        desc: Client-facing requests at affected POPs that are misrouted toward Atlanta and complete with 5xx/timeouts during the Atlanta attraction window.
+        rpm: 200.0
+        path: [edge_pop_affected, backbone_router_peer, backbone_router_atl]
+        emit: [edge_pop_affected.req_start, edge_pop_affected.route_selected_bbone_atl, edge_pop_affected.req_complete_err]
+        latency_ms: [[2, 6], [1, 6], [900, 6500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_req_affected_to_atl_fail_f
+        desc: Internal upstream fetch attempts from affected POPs routed across the backbone toward Atlanta; often time out and are retried during overload.
+        rpm: 200.0
+        path: [edge_pop_affected, backbone_router_peer, backbone_router_atl]
+        emit: [edge_pop_affected.upstream_fetch_start, edge_pop_affected.upstream_fetch_fail]
+        latency_ms: [[1, 3], [600, 3200]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.0
+          emit_per_retry: [edge_pop_affected.retrying_upstream]
+          backoff_ms: [[50, 200], [100, 400]]
+        trace: true
+
+assumptions:
+  - |
+    To prevent contradictory location labeling in generated logs, the edge proxy is split into two components:
+    edge_pop_affected emits only affected POP codes [ewr, ord, sjc, lon, ams] and edge_pop_unaffected emits only [syd].
+    Atlanta (atl) is represented in router/traffic-manager telemetry rather than as an edge request origin in this slice.
+  - |
+    The backbone outage is modeled as an iBGP route export/policy mistake at the Atlanta router that makes many prefixes
+    prefer Atlanta (higher local preference), causing traffic concentration and overload.
+  - |
+    To keep retry chronology correct, upstream retries are modeled as an internal upstream-fetch flow
+    (http_req_affected_to_atl_fail_f) that emits per-attempt start/fail logs plus retry markers, while the
+    client-facing completion log (edge_pop_affected.req_complete_err) is emitted once via a separate non-retrying flow
+    (http_req_affected_client_err_f).
+  - |
+    The client-error flow path explicitly includes backbone/Atlanta hops even though only edge logs are emitted, so the
+    coarse route context reflects the central misrouting mechanism.
+  - |
+    The later "core congestion" is modeled as the central observability pipeline emitting lag and explicit drop warnings;
+    missing logs themselves are not modeled, only explicit drop indicators.
+  - |
+    ingest_eps in core_observability.ingest_metric is intended to reflect the ingestion rate for the modeled log stream
+    (a representative slice), not backbone-wide telemetry volume.
+  - |
+    Normal-phase volume estimate: ~400 rpm * 3 logs/request ~= ~1200 logs/min from flows, plus ~5-20 logs/min background.
+  - |
+    Total scenario volume estimate: ~50k-70k logs total (flows dominate; background and one-shots are small),
+    within the target 20k..100k envelope.
+  - |
+    Key diagnostic visibility: config commit (one-shot), elevated BGP export summaries and peer bestpath churn (background),
+    frequent client 5xx/504 completions plus upstream retry markers (flows), mitigation marker (router disabled one-shot)
+    plus post-mitigation neighbor/participation status (background), and later ingest drop warnings (background).
+```

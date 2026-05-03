@@ -1,0 +1,245 @@
+```yaml
+scenario:
+  id: agg_switch_mac_learning_incident
+  title: Access↔Aggregation saturation and 18-minute outage during network migration
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally serves web and Git traffic through an edge load balancer to application and Git backends.
+    During a planned network migration to an access/aggregation topology, abnormal flooding and saturated uplinks caused widespread slowness and timeouts.
+    While troubleshooting, an unsupported link watchdog setting err-disabled redundant uplinks, isolating multiple cabinets and producing ~18 minutes of complete unavailability.
+    Connectivity returned after the watchdog setting was removed, but performance remained degraded due to ongoing MAC learning issues and a small subset of repositories saw storage errors from a degraded fileserver HA pair.
+
+  trigger_desc: |
+    A planned migration step connected the final access-switch A-side uplink into the new aggregation network, after which loop protection triggered on one cabinet and the aggregation layer began exhibiting abnormal flooding/learning behavior.
+
+  time:
+    total_minutes: 55
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 55}
+
+  phases:
+    n:
+      desc: |
+        Web requests and Git operations complete quickly with low error rates. Network monitoring shows moderate uplink utilization and stable MAC table stats. Synthetic probes to the homepage and API status endpoint pass consistently.
+      flows: [web_page_view_ok, git_clone_ok, synthetic_probe_ok]
+      manifestation:
+        - edge_lb.access_web_200
+        - edge_lb.access_git_200
+        - net_monitor.uplink_utilization
+        - aggregation_switch.mac_table_stats
+        - net_monitor.probe_ok
+
+    f:
+      desc: |
+        After the final cutover, the aggregation layer begins missing MAC entries and floods traffic, saturating access↔aggregation links. This creates persistent high latency and intermittent timeouts in web and Git operations. During troubleshooting, shutting down a single uplink triggers an unsupported link watchdog that disables redundant links, isolating multiple cabinets and causing a hard outage. After the watchdog setting is removed and links are re-enabled, connectivity returns but the MAC-learning/flooding problem continues, and the fileserver HA pair remains degraded for some repositories.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: access_switch
+          event: |
+            The final cutover uplink is connected; loop-guard blocks a port in one cabinet and saturation begins to show on access↔aggregation uplinks.
+          why: |
+            A switch-pair misconfiguration briefly forms a bridge loop and triggers STP/loop-guard (directly observable via access switch loop-guard logs).
+            Independently, aggregation switches fail to learn a portion of MAC addresses and start flooding unknown-destination frames (observable via increased fdb miss/flood logs and utilization telemetry).
+          flows:
+            - web_page_view_slow_ok
+            - web_page_view_timeout_504
+            - git_clone_slow_ok
+            - git_clone_timeout_504
+            - synthetic_probe_timeout_504
+          rate_multipliers:
+            web_page_view_hard_down_503: 0.0
+            git_clone_hard_down_503: 0.0
+            synthetic_probe_no_upstreams_503: 0.0
+            access_switch.watchdog_errdisable: 0.0
+            net_monitor.poll_failed: 0.0
+            fileserver_cluster.ha_peer_disconnected: 0.0
+          latency_multipliers:
+            web_page_view_slow_ok: {p50: 1.0, p95: 1.0}
+            web_page_view_timeout_504: {p50: 1.0, p95: 1.0}
+            git_clone_slow_ok: {p50: 1.0, p95: 1.0}
+            git_clone_timeout_504: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: net_monitor.change_connect_uplink
+              count: 1
+              hosts: [netmon-1]
+            - ref: access_switch.stp_loop_guard
+              count: 1
+              hosts: [asw-7a]
+          manifestation:
+            - net_monitor.change_connect_uplink
+            - access_switch.stp_loop_guard
+            - net_monitor.alert_saturation
+            - aggregation_switch.fdb_miss_flood
+            - edge_lb.access_web_504
+
+        - order: 2
+          at_min: 30
+          component: net_monitor
+          event: |
+            During troubleshooting, an uplink is shut down; the access switch's watchdog erroneously err-disables its remaining redundant uplink as well, isolating multiple cabinets and causing complete unavailability.
+          why: |
+            A link watchdog setting intended to detect partial failures is unsupported between the access and aggregation switch models. When one link is intentionally disabled, the watchdog falsely triggers and disables both redundant links (observable via watchdog errdisable logs and a spike in monitoring poll failures).
+          flows:
+            - web_page_view_hard_down_503
+            - git_clone_hard_down_503
+            - synthetic_probe_no_upstreams_503
+          rate_multipliers:
+            web_page_view_slow_ok: 0.0
+            web_page_view_timeout_504: 0.0
+            git_clone_slow_ok: 0.0
+            git_clone_timeout_504: 0.0
+            git_clone_repo_unavailable_500: 0.0
+            synthetic_probe_ok_f: 0.0
+            synthetic_probe_timeout_504: 0.0
+            web_page_view_hard_down_503: 1.0
+            git_clone_hard_down_503: 1.0
+            synthetic_probe_no_upstreams_503: 1.0
+            access_switch.watchdog_errdisable: 25.0
+            net_monitor.poll_failed: 20.0
+            fileserver_cluster.ha_peer_disconnected: 6.0
+          latency_multipliers:
+            web_page_view_hard_down_503: {p50: 1.0, p95: 1.0}
+            git_clone_hard_down_503: {p50: 1.0, p95: 1.0}
+            synthetic_probe_no_upstreams_503: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: net_monitor.change_shutdown_uplink
+              count: 1
+              hosts: [netmon-1]
+          manifestation:
+            - net_monitor.change_shutdown_uplink
+            - edge_lb.access_web_503
+            - net_monitor.poll_failed
+            - access_switch.watchdog_errdisable
+            - edge_lb.access_probe_503
+
+        - order: 3
+          at_min: 48
+          component: access_switch
+          event: |
+            The watchdog setting is removed and uplinks are re-enabled; service connectivity returns, but uplink saturation and flooding continue and a fileserver HA pair remains degraded.
+          why: |
+            Removing the unsupported watchdog prevents redundant uplinks from being erroneously disabled (observable via config apply markers and a sharp drop in watchdog errdisable logs).
+            The underlying vendor bug in aggregation switches still prevents learning a significant share of MAC addresses, keeping flooding and link saturation elevated (observable via continued fdb miss/flood logs and saturation alerts).
+          flows:
+            - web_page_view_slow_ok
+            - web_page_view_timeout_504
+            - git_clone_slow_ok
+            - git_clone_timeout_504
+            - git_clone_repo_unavailable_500
+            - synthetic_probe_ok_f
+            - synthetic_probe_timeout_504
+          rate_multipliers:
+            web_page_view_hard_down_503: 0.0
+            git_clone_hard_down_503: 0.0
+            synthetic_probe_no_upstreams_503: 0.0
+            web_page_view_slow_ok: 1.0
+            web_page_view_timeout_504: 1.0
+            git_clone_slow_ok: 1.0
+            git_clone_timeout_504: 1.0
+            git_clone_repo_unavailable_500: 1.0
+            synthetic_probe_ok_f: 1.0
+            synthetic_probe_timeout_504: 1.0
+            net_monitor.poll_failed: 0.0
+            access_switch.watchdog_errdisable: 0.0
+            fileserver_cluster.ha_peer_disconnected: 3.0
+            aggregation_switch.fdb_miss_flood: 1.3
+            net_monitor.alert_saturation: 1.2
+          latency_multipliers:
+            web_page_view_slow_ok: {p50: 1.0, p95: 1.0}
+            web_page_view_timeout_504: {p50: 1.0, p95: 1.0}
+            git_clone_slow_ok: {p50: 1.0, p95: 1.0}
+            git_clone_timeout_504: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: net_monitor.change_remove_watchdog_setting
+              count: 1
+              hosts: [netmon-1]
+            - ref: net_monitor.change_enable_uplink
+              count: 2
+              hosts: [netmon-1]
+            - ref: access_switch.config_apply
+              count: 2
+              hosts: [asw-7a, asw-7b]
+            - ref: fileserver_cluster.node_fenced
+              count: 1
+              hosts: [fs-1]
+          manifestation:
+            - net_monitor.change_remove_watchdog_setting
+            - access_switch.config_apply
+            - net_monitor.change_enable_uplink
+            - aggregation_switch.fdb_miss_flood
+            - net_monitor.alert_saturation
+            - fileserver_cluster.ha_peer_disconnected
+            - edge_lb.access_web_504
+
+      steady:
+        - component: aggregation_switch
+          condition: |
+            Aggregation switches continue missing MAC entries, flooding unknown-destination frames and saturating access↔aggregation links.
+          user_impact: |
+            Widespread degraded performance: high latency and intermittent 504 timeouts for web and Git operations.
+          manifestation:
+            - aggregation_switch.fdb_miss_flood
+            - net_monitor.uplink_utilization
+            - net_monitor.alert_saturation
+            - edge_lb.access_web_504
+            - edge_lb.access_git_504
+
+        - component: fileserver_cluster
+          condition: |
+            HA clustering remains degraded after network instability, leaving one fileserver pair partially unavailable.
+          user_impact: |
+            A small percentage of repositories intermittently fail with storage-related errors (HTTP 500 on Git endpoints).
+          manifestation:
+            - fileserver_cluster.ha_peer_disconnected
+            - git_service.clone_failed_storage
+            - edge_lb.access_git_500
+
+      feedback_loops:
+        - id: flooding_saturation_loop
+          desc: |
+            Missing MAC learning causes flooding, flooding saturates uplinks, saturation increases drops/latency, and higher latency increases timeouts.
+            Timeouts often lead to external client retries (not explicitly modeled as retries in flows), which adds more traffic and worsens saturation.
+
+      flows:
+        - web_page_view_slow_ok
+        - web_page_view_timeout_504
+        - web_page_view_hard_down_503
+        - git_clone_slow_ok
+        - git_clone_timeout_504
+        - git_clone_hard_down_503
+        - git_clone_repo_unavailable_500
+        - synthetic_probe_ok_f
+        - synthetic_probe_timeout_504
+        - synthetic_probe_no_upstreams_503
+      manifestation:
+        - net_monitor.uplink_utilization
+        - aggregation_switch.mac_table_stats
+        - aggregation_switch.fdb_miss_flood
+        - access_switch.uplink_crc_errors
+        - edge_lb.access_web_504
+        - net_monitor.poll_failed
+
+  assumptions:
+    - "The full-day degradation is condensed into a 55-minute window capturing (1) onset after final cutover, (2) an 18-minute hard outage during troubleshooting, and (3) a degraded-but-up steady state."
+    - |
+      Failure-phase breakdown (effective behavior):
+      - 25-30 (5 min): degraded service (slow successes + 504 timeouts); hard-down flows suppressed; watchdog_errdisable/poll_failed/ha_peer_disconnected suppressed.
+      - 30-48 (18 min): complete unavailability (503 hard-down flows + probe 503); watchdog_errdisable and poll_failed amplified; ha_peer_disconnected elevated.
+      - 48-55 (7 min): service returns but remains degraded; watchdog_errdisable and poll_failed suppressed; flooding and saturation remain elevated; ha_peer_disconnected persists at lower rate.
+    - |
+      Rough volume estimate:
+      - Normal (25 min): ~24k flow logs + ~200 telemetry/background logs.
+      - Failure (30 min): ~19k flow logs + ~1.1k telemetry/background logs (including outage spikes).
+      - Total ~44k logs (target 20k..100k).
+    - |
+      Visibility rationale:
+      - Root-cause indicators (aggregation_switch.fdb_miss_flood, net_monitor.alert_saturation/uplink_utilization) are frequent in failure.
+      - Hard outage is unmistakable via sustained edge_lb access 503 logs, net_monitor poll_failed spikes, and elevated access_switch watchdog_errdisable.
+      - Operator actions are unambiguous because each one-shot uses an action-specific log ID.
+      - The rare fileserver side effect remains diagnosable via HA peer-disconnect background logs and low-rate Git 500/storage failures.
+```

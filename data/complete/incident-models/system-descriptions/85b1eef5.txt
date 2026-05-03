@@ -1,0 +1,795 @@
+```yaml
+sys:
+  id: cloud_edge_service_tokens_incident_2023_01_24
+  desc: >
+    A simplified model of Cloudflare-internal services that authenticate to each other using service tokens
+    (client_id + client_secret) enforced at an edge authentication gateway. A token-management service updates
+    token metadata and triggers propagation of updated token material to the global edge configuration. During
+    the incident, a buggy “last seen at” updater overwrote client_secret with an empty string for a small set
+    of internal accounts, and once the invalid token synced to the edge, downstream services began to receive
+    authorization failures and user-facing errors.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: access_token_service
+    name: Access Token Service
+    svc: access-token
+    hosts: [access-1, access-2]
+    desc: >
+      Manages service tokens and token metadata. In the incident, a newly released “last seen at” updater
+      wrote back token records using a redacted read that omitted client_secret, resulting in empty-string
+      secrets being persisted for some internal accounts.
+
+    to:
+      - dst: config_sync
+        proto: kafka
+        desc: Publishes token update events for global propagation.
+
+    logs:
+      deploy_started:
+        desc: Deployment marker for enabling token last-seen updater.
+        lvl: INFO
+        msg: "deploy started service={service} version={version} feature={feature}"
+        vars:
+          service: {k: ch, v: [access-token]}
+          version: {k: ch, v: [2023.01.24.1655]}
+          feature: {k: ch, v: [service_token_last_seen]}
+
+      deploy_rolled_back:
+        desc: Deployment rollback marker that stops further overwrites.
+        lvl: INFO
+        msg: "deploy rolled back service={service} version={version} feature={feature}"
+        vars:
+          service: {k: ch, v: [access-token]}
+          version: {k: ch, v: [2023.01.24.1705]}
+          feature: {k: ch, v: [service_token_last_seen]}
+
+      last_seen_consumer_poll:
+        desc: Periodic poll of auth/login events for last-seen detection.
+        lvl: INFO
+        msg: "last_seen poll scanned_events={scanned} candidate_tokens={candidates} lag_ms={lag_ms}"
+        vars:
+          scanned: {k: i, v: [50, 400]}
+          candidates: {k: i, v: [0, 40]}
+          lag_ms: {k: i, v: [10, 1500]}
+
+      token_update_write_bug:
+        desc: Token metadata write caused by the last-seen updater; buggy writes persist an empty secret.
+        lvl: INFO
+        msg: "token write account={account} token_id={token_id} fields={fields} client_secret_len={secret_len} txn_ms={txn_ms}"
+        vars:
+          account: {k: ch, v: [warp_internal, api_internal]}
+          token_id: {k: uuid, v: null}
+          fields: {k: ch, v: ["last_seen_at,client_secret"]}
+          secret_len: {k: i, v: [0, 0]}
+          txn_ms: {k: i, v: [8, 80]}
+
+      token_admin_update:
+        desc: Occasional normal administrative token update (non-incident noise).
+        lvl: INFO
+        msg: "token admin_update account={account} token_id={token_id} fields={fields} client_secret_len={secret_len}"
+        vars:
+          account: {k: ch, v: [customer_account_a, customer_account_b]}
+          token_id: {k: uuid, v: null}
+          fields: {k: ch, v: [rotate_secret, update_expiry]}
+          secret_len: {k: i, v: [32, 64]}
+
+      account_changes_locked:
+        desc: Operational action to prevent further internal account changes during investigation.
+        lvl: WARN
+        msg: "ops lock enabled scope={scope} reason={reason}"
+        vars:
+          scope: {k: ch, v: [internal_accounts]}
+          reason: {k: ch, v: [incident_mitigation]}
+
+      manual_token_restore_warp:
+        desc: Manual restoration of the WARP/Zero Trust internal account service token.
+        lvl: INFO
+        msg: "token restore account={account} token_id={token_id} method={method}"
+        vars:
+          account: {k: ch, v: [warp_internal]}
+          token_id: {k: uuid, v: null}
+          method: {k: ch, v: [manual_revert]}
+
+    beh:
+      n:
+        desc: Normal operation with occasional administrative token changes.
+        emit:
+          - id: token_admin_update
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: During the buggy release window, the last-seen consumer polls and writes empty-string secrets.
+        emit:
+          - id: last_seen_consumer_poll
+            per_min: 2.0
+            scope: per_host
+          - id: token_update_write_bug
+            per_min: 1.2
+            scope: per_host
+
+  - id: config_sync
+    name: Global Config Sync
+    svc: config-sync
+    hosts: [sync-1]
+    desc: >
+      Distributes updated service token material to the global edge configuration. Invalid token material
+      becomes effective only after it is synced and applied at the edge.
+
+    to:
+      - dst: edge_auth_gateway
+        proto: grpc
+        desc: Pushes token configuration updates to edge gateways.
+
+    logs:
+      sync_cycle:
+        desc: Background sync cycle tick.
+        lvl: DEBUG
+        msg: "sync cycle tick batch_id={batch_id} pending_updates={pending} duration_ms={dur_ms}"
+        vars:
+          batch_id: {k: hex, v: 16}
+          pending: {k: i, v: [0, 50]}
+          dur_ms: {k: i, v: [20, 400]}
+
+      token_applied_invalid_warp:
+        desc: Corrupted WARP token update applied to edge config (empty client_secret).
+        lvl: INFO
+        msg: "edge_config applied account={account} token_id={token_id} client_secret_len={secret_len} rev={rev}"
+        vars:
+          account: {k: ch, v: [warp_internal]}
+          token_id: {k: uuid, v: null}
+          secret_len: {k: i, v: [0, 0]}
+          rev: {k: i, v: [1000, 5000]}
+
+      token_applied_invalid_api:
+        desc: Corrupted API token update applied to edge config (empty client_secret).
+        lvl: INFO
+        msg: "edge_config applied account={account} token_id={token_id} client_secret_len={secret_len} rev={rev}"
+        vars:
+          account: {k: ch, v: [api_internal]}
+          token_id: {k: uuid, v: null}
+          secret_len: {k: i, v: [0, 0]}
+          rev: {k: i, v: [1000, 5000]}
+
+      token_applied_valid_warp:
+        desc: Valid WARP token update applied to edge config after manual restoration.
+        lvl: INFO
+        msg: "edge_config applied account={account} token_id={token_id} client_secret_len={secret_len} rev={rev}"
+        vars:
+          account: {k: ch, v: [warp_internal]}
+          token_id: {k: uuid, v: null}
+          secret_len: {k: i, v: [32, 64]}
+          rev: {k: i, v: [5001, 9000]}
+
+      sync_health:
+        desc: Periodic health summary.
+        lvl: INFO
+        msg: "sync health ok=true edge_push_backlog={backlog} apply_errors={errors}"
+        vars:
+          backlog: {k: i, v: [0, 20]}
+          errors: {k: i, v: [0, 3]}
+
+    beh:
+      n:
+        desc: Regular sync cycles with low backlog.
+        emit:
+          - id: sync_cycle
+            per_min: 2.0
+            scope: per_host
+          - id: sync_health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Sync continues while invalid token data may be applied via one-shot updates.
+        emit:
+          - id: sync_cycle
+            per_min: 2.0
+            scope: per_host
+          - id: sync_health
+            per_min: 0.5
+            scope: per_host
+
+  - id: edge_auth_gateway
+    name: Edge Auth Gateway
+    svc: edge-access
+    hosts: [edge-ams-1, edge-fra-1, edge-sjc-1]
+    desc: >
+      Enforces service-token authentication on protected internal routes and forwards allowed requests to
+      origin services. When an account’s token secret is empty at the edge, requests using that token are
+      rejected with authorization failures and downstream services experience degraded behavior.
+
+    to:
+      - dst: device_state_service
+        proto: https
+        desc: Forwards authorized device posture/enrollment traffic to origin.
+      - dst: gateway_policy_engine
+        proto: https
+        desc: Returns posture-read responses to the Gateway policy engine (modeled as a logical return hop).
+      - dst: api_orchestrator_service
+        proto: https
+        desc: Returns internal API call responses to the control-plane orchestrator (modeled as a logical return hop).
+
+    logs:
+      edge_access_ok_posture:
+        desc: Completion access log for authorized device posture requests.
+        lvl: INFO
+        msg: "request ok req_id={req_id} method={method} route={route} account={account} token_id={token_id} status=200 latency_ms={lat_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/device/posture/upload, /device/posture/read]}
+          account: {k: ch, v: [warp_internal]}
+          token_id: {k: uuid, v: null}
+          lat_ms: {k: i, v: [5, 140]}
+          trace_id: {k: hex, v: 32}
+
+      edge_access_denied_posture:
+        desc: Completion access log for rejected device posture requests due to invalid service token.
+        lvl: WARN
+        msg: "request denied req_id={req_id} method={method} route={route} account={account} token_id={token_id} status=403 reason={reason} latency_ms={lat_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/device/posture/upload, /device/posture/read]}
+          account: {k: ch, v: [warp_internal]}
+          token_id: {k: uuid, v: null}
+          reason: {k: ch, v: [invalid_service_token]}
+          lat_ms: {k: i, v: [1, 60]}
+          trace_id: {k: hex, v: 32}
+
+      edge_access_ok_internal:
+        desc: Completion access log for authorized internal API requests.
+        lvl: INFO
+        msg: "request ok req_id={req_id} method={method} route={route} account={account} token_id={token_id} status=200 latency_ms={lat_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/internal/api]}
+          account: {k: ch, v: [api_internal]}
+          token_id: {k: uuid, v: null}
+          lat_ms: {k: i, v: [5, 140]}
+          trace_id: {k: hex, v: 32}
+
+      edge_access_denied_internal:
+        desc: Completion access log for rejected internal API requests due to invalid service token.
+        lvl: WARN
+        msg: "request denied req_id={req_id} method={method} route={route} account={account} token_id={token_id} status=403 reason={reason} latency_ms={lat_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/internal/api]}
+          account: {k: ch, v: [api_internal]}
+          token_id: {k: uuid, v: null}
+          reason: {k: ch, v: [invalid_service_token]}
+          lat_ms: {k: i, v: [1, 60]}
+          trace_id: {k: hex, v: 32}
+
+      edge_health:
+        desc: Periodic edge health metrics.
+        lvl: INFO
+        msg: "edge health cpu_pct={cpu} mem_pct={mem} active_conns={conns}"
+        vars:
+          cpu: {k: i, v: [10, 85]}
+          mem: {k: i, v: [20, 90]}
+          conns: {k: i, v: [200, 5000]}
+
+      auth_denied_metric:
+        desc: Periodic global metric for denied requests (baseline rollup series).
+        lvl: INFO
+        msg: "metric auth_denied_per_min={denied} route_group={group}"
+        vars:
+          group: {k: ch, v: [device_posture, internal_api]}
+        state_vars:
+          n:
+            denied: {k: i, v: [0, 80]}
+          f:
+            denied: {k: i, v: [0, 120]}
+
+      auth_denied_metric_spike_posture:
+        desc: Elevated denied-request metric for device posture routes once corrupted tokens are applied.
+        lvl: INFO
+        msg: "metric auth_denied_per_min={denied} route_group={group}"
+        vars:
+          denied: {k: i, v: [250, 900]}
+          group: {k: ch, v: [device_posture]}
+
+      auth_denied_metric_spike_internal:
+        desc: Elevated denied-request metric for internal API routes once corrupted tokens are applied.
+        lvl: INFO
+        msg: "metric auth_denied_per_min={denied} route_group={group}"
+        vars:
+          denied: {k: i, v: [80, 350]}
+          group: {k: ch, v: [internal_api]}
+
+      http_5xx_metric:
+        desc: Periodic global metric for 5xx responses at the edge (baseline rollup series).
+        lvl: INFO
+        msg: "metric http_5xx_per_min={errs} product={product}"
+        vars:
+          product: {k: ch, v: [zero_trust_gateway, control_plane]}
+        state_vars:
+          n:
+            errs: {k: i, v: [0, 120]}
+          f:
+            errs: {k: i, v: [0, 200]}
+
+      http_5xx_metric_spike_zero_trust:
+        desc: Elevated edge 5xx metric attributed to Zero Trust Gateway behavior during posture failures.
+        lvl: INFO
+        msg: "metric http_5xx_per_min={errs} product={product}"
+        vars:
+          errs: {k: i, v: [50, 400]}
+          product: {k: ch, v: [zero_trust_gateway]}
+
+      http_5xx_metric_spike_control_plane:
+        desc: Elevated edge 5xx metric attributed to control-plane product failures during internal API auth failures.
+        lvl: INFO
+        msg: "metric http_5xx_per_min={errs} product={product}"
+        vars:
+          errs: {k: i, v: [20, 250]}
+          product: {k: ch, v: [control_plane]}
+
+    beh:
+      n:
+        desc: Normal edge health and low background error rates.
+        emit:
+          - id: edge_health
+            per_min: 1.0
+            scope: per_host
+          - id: auth_denied_metric
+            per_min: 1.0
+            scope: global
+          - id: http_5xx_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: >
+          Same periodic metrics; incident "spike" rollups are modeled as additional background sources toggled by scenario events.
+          To avoid conflicting readings for the same metric series, scenario events suppress the baseline rollups while a spike rollup
+          for that series is enabled.
+        emit:
+          - id: edge_health
+            per_min: 1.0
+            scope: per_host
+          - id: auth_denied_metric
+            per_min: 1.0
+            scope: global
+          - id: auth_denied_metric_spike_posture
+            per_min: 1.0
+            scope: global
+          - id: auth_denied_metric_spike_internal
+            per_min: 1.0
+            scope: global
+          - id: http_5xx_metric
+            per_min: 1.0
+            scope: global
+          - id: http_5xx_metric_spike_zero_trust
+            per_min: 1.0
+            scope: global
+          - id: http_5xx_metric_spike_control_plane
+            per_min: 1.0
+            scope: global
+
+  - id: device_state_service
+    name: Device State Service
+    svc: device-state
+    hosts: [devstate-1, devstate-2]
+    desc: >
+      Receives device posture uploads and serves posture reads for Zero Trust policy evaluation.
+      During the incident, many requests never reached this service because the edge gateway rejected them.
+
+    to:
+      - dst: edge_auth_gateway
+        proto: https
+        desc: Sends posture responses back via the edge gateway (modeled as a logical return hop).
+
+    logs:
+      posture_ingest_ok:
+        desc: Successful posture upload persisted.
+        lvl: INFO
+        msg: "posture ingest ok device_id={device_id} bytes={bytes} latency_ms={lat_ms}"
+        vars:
+          device_id: {k: hex, v: 12}
+          bytes: {k: i, v: [200, 6000]}
+          lat_ms: {k: i, v: [5, 250]}
+
+      posture_read_ok:
+        desc: Successful posture read.
+        lvl: INFO
+        msg: "posture read ok subject_id={subj} cache={cache} latency_ms={lat_ms}"
+        vars:
+          subj: {k: hex, v: 10}
+          cache: {k: ch, v: [hit, miss]}
+          lat_ms: {k: i, v: [3, 160]}
+
+      svc_health:
+        desc: Periodic service health.
+        lvl: INFO
+        msg: "svc health ok=true req_queue={q} db_latency_ms={db_ms}"
+        vars:
+          q: {k: i, v: [0, 200]}
+          db_ms: {k: i, v: [2, 60]}
+
+    beh:
+      n:
+        desc: Normal health.
+        emit:
+          - id: svc_health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Health remains mostly normal; traffic drops due to edge rejects.
+        emit:
+          - id: svc_health
+            per_min: 0.5
+            scope: per_host
+
+  - id: gateway_policy_engine
+    name: Zero Trust Gateway Policy Engine
+    svc: zt-gateway
+    hosts: [gateway-1, gateway-2]
+    desc: >
+      Periodically fetches device posture state to enforce Gateway/Access policies. When posture reads fail,
+      policy evaluation defaults to block for some rules, contributing to user-visible drops and 5xx errors.
+
+    to:
+      - dst: edge_auth_gateway
+        proto: https
+        desc: Fetches device posture state via protected endpoints.
+
+    logs:
+      posture_fetch_ok:
+        desc: Posture fetch completed successfully and was used for policy evaluation.
+        lvl: INFO
+        msg: "posture fetch ok subject_id={subj} upstream_status=200 duration_ms={dur_ms} applied_action={action}"
+        vars:
+          subj: {k: hex, v: 10}
+          dur_ms: {k: i, v: [10, 350]}
+          action: {k: ch, v: [allow]}
+
+      posture_fetch_error:
+        desc: Posture fetch completed with error; policy may default to block.
+        lvl: ERROR
+        msg: "posture fetch error subject_id={subj} upstream_status={up_status} duration_ms={dur_ms} applied_action={action}"
+        vars:
+          subj: {k: hex, v: 10}
+          up_status: {k: ch, v: ["401", "403", "503"]}
+          dur_ms: {k: i, v: [5, 400]}
+          action: {k: ch, v: [block]}
+
+      policy_block_metric:
+        desc: Periodic baseline summary of policy blocks due to posture state unavailable.
+        lvl: WARN
+        msg: "metric policy_blocks_per_min={blocks} reason={reason}"
+        vars:
+          reason: {k: ch, v: [posture_unavailable]}
+        state_vars:
+          n:
+            blocks: {k: i, v: [0, 80]}
+          f:
+            blocks: {k: i, v: [0, 120]}
+
+      policy_block_metric_spike:
+        desc: Elevated policy block summary during widespread posture failures.
+        lvl: WARN
+        msg: "metric policy_blocks_per_min={blocks} reason={reason}"
+        vars:
+          blocks: {k: i, v: [80, 300]}
+          reason: {k: ch, v: [posture_unavailable]}
+
+      alert_posture_upload_drop:
+        desc: Alert raised when successful posture uploads drop sharply.
+        lvl: CRITICAL
+        msg: "alert posture_uploads_success dropped observed_rpm={rpm} window_min={window}"
+        vars:
+          rpm: {k: i, v: [0, 20]}
+          window: {k: i, v: [3, 10]}
+
+      gateway_health:
+        desc: Periodic service health.
+        lvl: INFO
+        msg: "gateway health ok=true worker_lag_ms={lag_ms}"
+        vars:
+          lag_ms: {k: i, v: [0, 1200]}
+
+    beh:
+      n:
+        desc: Normal periodic health and low background block rate.
+        emit:
+          - id: gateway_health
+            per_min: 0.5
+            scope: per_host
+          - id: policy_block_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: >
+          Baseline block metric continues; elevated spike metric is enabled when posture reads are denied.
+          Scenario events suppress the baseline rollup while the spike rollup is enabled to avoid conflicting series.
+        emit:
+          - id: gateway_health
+            per_min: 0.5
+            scope: per_host
+          - id: policy_block_metric
+            per_min: 1.0
+            scope: global
+          - id: policy_block_metric_spike
+            per_min: 1.0
+            scope: global
+
+  - id: api_orchestrator_service
+    name: Internal API Orchestrator
+    svc: control-plane
+    hosts: [cp-1, cp-2]
+    desc: >
+      Represents Cloudflare control-plane services making authenticated internal API calls (e.g., cache purge,
+      storage administration). When the API account’s service token is invalid at the edge, calls are denied,
+      retries increase, and customer-facing operations fail.
+
+    to:
+      - dst: edge_auth_gateway
+        proto: https
+        desc: Makes authenticated internal API calls through the edge auth gateway.
+
+    logs:
+      api_call_ok:
+        desc: Internal API call completed successfully.
+        lvl: INFO
+        msg: "api call ok op={op} account={account} upstream_status=200 duration_ms={dur_ms} attempt={attempt} trace_id={trace_id}"
+        vars:
+          op: {k: ch, v: [cache_purge, r2_admin, images_purge]}
+          account: {k: ch, v: [api_internal]}
+          dur_ms: {k: i, v: [15, 500]}
+          attempt: {k: i, v: [1, 1]}
+          trace_id: {k: hex, v: 32}
+
+      api_call_denied:
+        desc: Internal API call completed with authorization denial due to invalid service token.
+        lvl: ERROR
+        msg: "api call denied op={op} account={account} upstream_status=403 duration_ms={dur_ms} attempt={attempt} trace_id={trace_id}"
+        vars:
+          op: {k: ch, v: [cache_purge, r2_admin, images_purge]}
+          account: {k: ch, v: [api_internal]}
+          dur_ms: {k: i, v: [10, 400]}
+          attempt: {k: i, v: [1, 3]}
+          trace_id: {k: hex, v: 32}
+
+      api_retry_scheduled:
+        desc: Retry scheduled after a denied call attempt.
+        lvl: WARN
+        msg: "api retry scheduled op={op} next_attempt={attempt} backoff_ms={backoff}"
+        vars:
+          op: {k: ch, v: [cache_purge, r2_admin, images_purge]}
+          attempt: {k: i, v: [2, 3]}
+          backoff: {k: i, v: [50, 600]}
+
+      cp_health:
+        desc: Periodic control-plane worker health.
+        lvl: INFO
+        msg: "cp health ok=true inflight={inflight} q_depth={q}"
+        vars:
+          inflight: {k: i, v: [0, 500]}
+          q: {k: i, v: [0, 2000]}
+
+    beh:
+      n:
+        desc: Normal health.
+        emit:
+          - id: cp_health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Health continues while calls may be denied and retried.
+        emit:
+          - id: cp_health
+            per_min: 0.5
+            scope: per_host
+
+  - id: incident_bot
+    name: Incident Bot
+    svc: incident-bot
+    hosts: [ops-1]
+    desc: Emits incident lifecycle markers used by on-call responders.
+
+    to: []
+
+    logs:
+      incident_declared:
+        desc: Incident declared in response to alerts and impact.
+        lvl: WARN
+        msg: "incident declared id={inc_id} severity={sev} primary_signal={signal}"
+        vars:
+          inc_id: {k: ch, v: [inc_2023_01_24_service_tokens]}
+          sev: {k: ch, v: [sev2]}
+          signal: {k: ch, v: [posture_upload_drop]}
+
+      scope_expanded:
+        desc: Incident scope expanded to include additional impacted products.
+        lvl: WARN
+        msg: "incident scope expanded id={inc_id} added={added}"
+        vars:
+          inc_id: {k: ch, v: [inc_2023_01_24_service_tokens]}
+          added: {k: ch, v: [control_plane_products]}
+
+      bot_heartbeat:
+        desc: Low-rate heartbeat.
+        lvl: DEBUG
+        msg: "incident-bot heartbeat ok=true"
+        vars: {}
+
+    beh:
+      n:
+        desc: Low-rate heartbeat.
+        emit:
+          - id: bot_heartbeat
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Low-rate heartbeat.
+        emit:
+          - id: bot_heartbeat
+            per_min: 0.2
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_auth_gateway, gateway_policy_engine, api_orchestrator_service]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operations where device posture uploads/reads and internal control-plane API calls succeed.
+      Token updates are rare, and edge metrics show low denied and low 5xx rates.
+    req:
+      - id: posture_upload_ok
+        desc: Device posture upload accepted at the edge and persisted by device state service.
+        rpm: 300.0
+        path: [edge_auth_gateway, device_state_service, edge_auth_gateway]
+        emit: [device_state_service.posture_ingest_ok, edge_auth_gateway.edge_access_ok_posture]
+        latency_ms: [[10, 80], [8, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: posture_read_ok
+        desc: Gateway policy engine reads posture state for policy evaluation.
+        rpm: 150.0
+        path: [gateway_policy_engine, edge_auth_gateway, device_state_service, edge_auth_gateway, gateway_policy_engine]
+        emit: [device_state_service.posture_read_ok, edge_auth_gateway.edge_access_ok_posture, gateway_policy_engine.posture_fetch_ok]
+        latency_ms: [[6, 45], [6, 30], [12, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_api_call_ok
+        desc: Control plane makes an authenticated internal API call (purge/storage/images) successfully.
+        rpm: 80.0
+        path: [api_orchestrator_service, edge_auth_gateway, api_orchestrator_service]
+        emit: [edge_auth_gateway.edge_access_ok_internal, api_orchestrator_service.api_call_ok]
+        latency_ms: [[6, 40], [18, 320]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      Failure state includes a latent period (tokens overwritten but not yet applied globally) and then
+      staggered impact as invalid tokens sync to the edge. Some mitigations restore a subset of accounts
+      during the failure window.
+    req:
+      - id: posture_upload_ok_f
+        desc: Same as normal posture uploads; used before/after the invalid WARP token is applied.
+        rpm: 300.0
+        path: [edge_auth_gateway, device_state_service, edge_auth_gateway]
+        emit: [device_state_service.posture_ingest_ok, edge_auth_gateway.edge_access_ok_posture]
+        latency_ms: [[10, 90], [8, 45]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: posture_upload_denied_f
+        desc: Posture uploads denied at the edge due to invalid service token (device state not reached).
+        rpm: 300.0
+        path: [edge_auth_gateway]
+        emit: [edge_auth_gateway.edge_access_denied_posture]
+        latency_ms: [[2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: posture_read_ok_f
+        desc: Same as normal posture reads; used before/after the invalid WARP token is applied.
+        rpm: 150.0
+        path: [gateway_policy_engine, edge_auth_gateway, device_state_service, edge_auth_gateway, gateway_policy_engine]
+        emit: [device_state_service.posture_read_ok, edge_auth_gateway.edge_access_ok_posture, gateway_policy_engine.posture_fetch_ok]
+        latency_ms: [[6, 55], [6, 35], [12, 260]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: posture_read_denied_f
+        desc: Posture reads denied at the edge; gateway logs completion error and policy defaults to block.
+        rpm: 150.0
+        path: [gateway_policy_engine, edge_auth_gateway, gateway_policy_engine]
+        emit: [edge_auth_gateway.edge_access_denied_posture, gateway_policy_engine.posture_fetch_error]
+        latency_ms: [[2, 20], [10, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_api_call_ok_f
+        desc: Same as normal internal API calls; used before the invalid API token is applied.
+        rpm: 80.0
+        path: [api_orchestrator_service, edge_auth_gateway, api_orchestrator_service]
+        emit: [edge_auth_gateway.edge_access_ok_internal, api_orchestrator_service.api_call_ok]
+        latency_ms: [[6, 45], [18, 360]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: internal_api_call_denied_f
+        desc: Internal API calls denied due to invalid API account service token; orchestrator retries.
+        rpm: 80.0
+        path: [api_orchestrator_service, edge_auth_gateway, api_orchestrator_service]
+        emit: [edge_auth_gateway.edge_access_denied_internal, api_orchestrator_service.api_call_denied]
+        latency_ms: [[2, 20], [12, 260]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [api_orchestrator_service.api_retry_scheduled]
+          backoff_ms: [[60, 220], [120, 500]]
+        trace: true
+
+assumptions:
+  - |
+    Names and architecture are simplified: multiple Cloudflare products are represented by a small set of internal services behind a single edge auth gateway.
+  - |
+    The “last seen at” updater is modeled as background polling + token writes on Access Token Service; the bug is modeled as writes with client_secret_len=0.
+  - |
+    Staggered impact is modeled by switching between success/denied flow variants via scenario rate multipliers when Config Sync applies invalid tokens.
+  - |
+    Return hops in flow paths (e.g., device_state_service -> edge_auth_gateway, edge_auth_gateway -> callers) are modeled as explicit `to` edges to satisfy path connectivity,
+    even though they represent logical responses rather than new independent upstream RPCs.
+  - |
+    Metric-like spike logs (denied/5xx/blocks) are modeled as global rollups of this executable scenario’s modeled traffic subset; their value domains are scaled to be
+    order-of-magnitude consistent with the modeled request rates (e.g., ~450 posture requests/min; ~80 internal API requests/min with retries).
+  - |
+    To avoid conflicting/ambiguous metric readings for the same labeled series, scenario events suppress baseline rollup metrics when the corresponding spike rollup is enabled.
+  - |
+    Flow emit chains are ordered chronologically: downstream completion logs (device-state) occur before edge completion logs; caller completion logs occur after edge completion logs.
+    Return hops are included in flow paths where needed to keep ordering realizable.
+  - |
+    Normal-phase estimate: ~1.21k flow-logs/min (posture upload/read + internal API calls) plus ~8–12 background logs/min.
+  - |
+    Total scenario estimate (with the scenario below): ~60k–85k logs, within the 20k–100k target, driven primarily by per-request edge logs and posture traffic.
+  - |
+    Visibility anchors: access_token_service.token_update_write_bug during the release window; config_sync.token_applied_invalid_* one-shots;
+    edge_auth_gateway.edge_access_denied_* bursts; gateway_policy_engine.alert_posture_upload_drop; api_orchestrator_service.api_call_denied with retries;
+    access_token_service.manual_token_restore_warp + config_sync.token_applied_valid_warp during mitigation.
+```

@@ -1,0 +1,198 @@
+```yaml
+scenario:
+  id: dec22_mlag_churn_fileserver_split_brain
+  title: MLAG disruptive failover triggers fileserver HA fencing race and maintenance mode
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system serves git-over-HTTP requests that depend on an HA fileserver fleet for repository storage.
+    During a network maintenance window, an internal MLAG agent was terminated on one aggregation switch to collect state.
+    The peer switch observed missed heartbeats while links stayed up, fell back to standalone behavior, and triggered L2/spanning-tree churn that briefly blocked east/west traffic.
+    Fileserver pairs exceeded heartbeat timeouts and issued STONITH actions that were partially undeliverable, leading to stop/stop outcomes and widespread storage unavailability; the site was placed into maintenance mode.
+
+  trigger_desc: |
+    Vendor-led forensic step during switch maintenance: terminate the MLAG agent on one switch to force a state dump while peer links remain physically up.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Git operations complete normally and storage calls return quickly.
+        Aggregation switches emit routine MLAG peer health markers and low-rate upgrade progress logs without user impact.
+        Fileserver HA telemetry shows healthy DRBD replication snapshots.
+      flows: [git_request_ok]
+      manifestation: [web_app.access_ok, fileserver_cluster.storage_op_ok, agg_switch_pair.mlag_peer_ok]
+
+    f:
+      desc: |
+        A disruptive MLAG behavior change causes L2 reconvergence and a brief but severe connectivity freeze.
+        After the network resumes forwarding, the fileserver HA layer has already experienced heartbeat timeouts and fencing actions, and some pairs end in stop/stop due to conflicting expectations about which node is active.
+        User git requests begin failing with upstream timeouts and 5xx responses until operators switch the site into maintenance mode to stabilize user experience while manual recovery proceeds; operator recovery tracking logs begin after escalation.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: agg_switch_pair
+          event: |
+            The MLAG agent on agg-1 is terminated for a state dump; agg-2 misses heartbeats while peer links stay up and falls back to standalone behavior, triggering spanning-tree churn and a short forwarding pause.
+          why: |
+            The peer's heartbeat timeout expires before the physical peer links drop, so the MLAG pair cannot perform a stateful takeover and instead reverts to disruptive standalone semantics; the resulting L2 changes are directly observable via switch syslogs.
+          flows: [git_request_storage_timeout]
+          rate_multipliers:
+            maintenance_request: 0.0
+            agg_switch_pair.mlag_heartbeat_missed: 15.0
+            agg_switch_pair.stp_topology_change: 20.0
+            fileserver_cluster.heartbeat_timeout: 0.0
+            fileserver_cluster.stonith_sent: 0.0
+            fileserver_cluster.stonith_ack_timeout: 0.0
+            fileserver_cluster.resource_stop: 0.0
+            fileserver_cluster.resource_start: 0.0
+            ops_control.recovery_progress: 0.0
+          latency_multipliers:
+            git_request_storage_timeout: {p50: 1.05, p95: 1.05}
+          one_shots:
+            - ref: agg_switch_pair.agent_state_dump
+              count: 1
+              hosts: [agg-1]
+            - ref: agg_switch_pair.mlag_mode_change
+              count: 1
+              hosts: [agg-2]
+            - ref: agg_switch_pair.l2_forwarding_pause
+              count: 2
+              hosts: [agg-2]
+          manifestation: [agg_switch_pair.agent_state_dump, agg_switch_pair.mlag_mode_change, agg_switch_pair.stp_topology_change]
+
+        - order: 2
+          at_min: 22
+          component: fileserver_cluster
+          event: |
+            As forwarding resumes, multiple fileserver pairs cross heartbeat timeouts and begin fencing actions; some fence acknowledgements are missing, and resources are stopped to avoid unsafe dual-writer conditions.
+          why: |
+            The short connectivity freeze disrupts Pacemaker/Heartbeat and DRBD coordination between nodes in different racks; partial message loss makes some STONITH outcomes ambiguous, producing fencing timeouts and stop decisions. This is directly observable in HA logs but the undelivered messages are only inferable.
+          flows: [git_request_storage_timeout]
+          rate_multipliers:
+            fileserver_cluster.heartbeat_timeout: 12.0
+            fileserver_cluster.stonith_sent: 10.0
+            fileserver_cluster.stonith_ack_timeout: 6.0
+            fileserver_cluster.resource_stop: 8.0
+            fileserver_cluster.resource_start: 2.0
+          latency_multipliers:
+            git_request_storage_timeout: {p50: 1.02, p95: 1.02}
+          one_shots: []
+          manifestation: [fileserver_cluster.heartbeat_timeout, fileserver_cluster.stonith_ack_timeout, fileserver_cluster.resource_stop]
+
+        - order: 3
+          at_min: 26
+          component: ops_control
+          event: |
+            Operators page the full operations team, initiate rollback to the prior aggregation-switch software, enable maintenance mode, and begin tracking coordinated fileserver recovery steps.
+          why: |
+            With widespread storage errors and uncertain HA state, operators reduce load and user impact by short-circuiting requests; paging, rollback initiation, the maintenance toggle, and subsequent recovery tracking are directly observable via control-plane and web-tier logs.
+          flows: [git_request_storage_timeout, maintenance_request]
+          rate_multipliers:
+            git_request_storage_timeout: 0.0
+            maintenance_request: 1.0
+            ops_control.recovery_progress: 1.0
+          latency_multipliers:
+            maintenance_request: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_control.page_allhands
+              count: 1
+              hosts: [ops-1]
+            - ref: ops_control.rollback_initiated
+              count: 1
+              hosts: [ops-1]
+            - ref: web_app.maintenance_mode_enabled
+              count: 1
+              hosts: [web-1]
+          manifestation: [ops_control.page_allhands, ops_control.rollback_initiated, web_app.maintenance_mode_enabled, web_app.access_maintenance]
+
+        - order: 4
+          at_min: 32
+          component: agg_switch_pair
+          event: |
+            Aggregation switch rollback completes and network churn subsides, but fileserver HA recovery continues and some resources are still stopped.
+          why: |
+            Returning to the known-good switch software removes the disruptive MLAG behavior under this timing edge case; however, stopped resources require careful manual decisions about the last-primary node before restart, so storage availability does not immediately return. Rollback is directly observable; lingering HA recovery is observed in fileserver logs.
+          flows: [maintenance_request]
+          rate_multipliers:
+            agg_switch_pair.mlag_heartbeat_missed: 1.2
+            agg_switch_pair.stp_topology_change: 1.0
+            fileserver_cluster.heartbeat_timeout: 4.0
+            fileserver_cluster.stonith_sent: 4.0
+            fileserver_cluster.stonith_ack_timeout: 2.0
+            fileserver_cluster.resource_stop: 3.0
+            fileserver_cluster.resource_start: 4.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: agg_switch_pair.rollback_completed
+              count: 2
+              hosts: [agg-1, agg-2]
+          manifestation: [agg_switch_pair.rollback_completed, fileserver_cluster.resource_start, ops_control.recovery_progress]
+
+      steady:
+        - component: web_app
+          condition: |
+            The site remains in maintenance mode, returning fast 503 responses to git requests to avoid prolonged timeouts while backend recovery proceeds.
+          user_impact: |
+            Users cannot perform git operations; requests are consistently rejected with maintenance responses rather than completing.
+          manifestation: [web_app.access_maintenance]
+        - component: fileserver_cluster
+          condition: |
+            A subset of fileserver pairs remains in an inconsistent HA state (fencing uncertainty / role conflicts), causing resources to remain stopped until operators safely identify the last-primary and restart.
+          user_impact: |
+            Storage-backed operations are unavailable until HA pairs are recovered; direct storage calls would time out or be blocked by stopped resources.
+          manifestation: [fileserver_cluster.stonith_ack_timeout, fileserver_cluster.resource_stop, fileserver_cluster.resource_start]
+
+      feedback_loops:
+        - id: fencing_uncertainty_stop_stop
+          desc: |
+            Network disruption causes heartbeat loss, which triggers fencing; if fence acknowledgements are lost,
+            both sides may take protective actions and stop resources, prolonging storage unavailability and increasing the need for manual intervention.
+
+      flows: [git_request_storage_timeout, maintenance_request]
+      manifestation:
+        - agg_switch_pair.mlag_heartbeat_missed
+        - agg_switch_pair.stp_topology_change
+        - fileserver_cluster.heartbeat_timeout
+        - fileserver_cluster.stonith_ack_timeout
+        - web_app.access_error
+        - web_app.access_maintenance
+        - ops_control.recovery_progress
+
+  assumptions:
+    - |
+      The real incident lasted hours; this scenario compresses it to 40 minutes while preserving the causal ordering
+      (MLAG fallback → L2 churn/freeze → HA timeouts/fencing → stop/stop → maintenance mode).
+    - |
+      Failure-onset cleanliness: ops_control.recovery_progress is modeled as a failure-state background source but is explicitly suppressed
+      at minute 20 (multiplier 0.0) and only enabled at minute 26 when recovery coordination begins.
+    - |
+      Alignment fix: maintenance_request is suppressed from failure start and is only introduced as an active flow at minute 26 when maintenance mode is enabled.
+    - |
+      Latency-multiplier repair: the git_request_storage_timeout latency multipliers are kept near 1.0 so implied p95 latencies remain
+      consistent with web_app.upstream_timeout.waited_ms (<=6000) and web_app.access_error.dur_ms (<=8000), enabling coherent log generation.
+    - |
+      Semantic binding repair: agg_switch_pair.mlag_heartbeat_missed.peer_link is fixed to 'up' so the emitted log cannot contradict
+      the incident’s defining condition (heartbeat missed while link remains up).
+    - |
+      Traffic modeling: normal 20 minutes at 300 rpm with 3 logs/request (~18k logs).
+      Failure 20 minutes: first 6 minutes dominated by git_request_storage_timeout; after minute 26, maintenance_request dominates.
+    - |
+      Failure-phase rough piecewise volume (order-of-magnitude):
+        - min 20-22 (2m): ~300 rpm failing requests (~900 logs/min) + elevated switch churn (~70 logs/min) + HA logs suppressed + ops progress suppressed → ~2.0k logs
+        - min 22-26 (4m): failing requests continue + HA fencing/timeouts activate (tens to low-hundreds per min) → ~4.5k-6.0k logs
+        - min 26-32 (6m): maintenance enabled; ~300 rpm maintenance (~300 logs/min) + HA logs continue elevated + ops progress (~<1 log/min) → ~3.0k-4.6k logs
+        - min 32-40 (8m): switch churn reduced; HA recovery continues; maintenance remains; ops progress continues → ~2.6k-4.1k logs
+      Total expected logs ≈ 28k-35k (within 20k..100k).
+    - |
+      Visibility rationale: MLAG fallback is made highly visible via one-shots and elevated agg_switch_pair background logs;
+      HA fencing/race is visible via increased fileserver_cluster heartbeat/STONITH/resource logs; user impact is visible via
+      web_app access logs shifting from 200 → 5xx → 503; recovery coordination is visible after minute 26 via ops_control.recovery_progress.
+```

@@ -1,0 +1,157 @@
+```yaml
+scenario:
+  id: global_edge_502_from_waf_regex_cpu
+  title: Global 502 outage from misconfigured WAF managed rule regex causing CPU exhaustion
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system is a global edge proxy that applies WAF managed rules on each HTTP request. A routine deployment pushes a
+    new managed ruleset in simulated mode, but one rule contains an expensive regular expression that pegs WAF CPU near
+    100% worldwide. As saturation persists, request latency rises and many requests are returned as 502, leading to a
+    sharp drop in successful traffic. The scenario ends while mitigation is being initiated but before it takes effect.
+
+  trigger_desc: |
+    A globally-scoped deployment publishes a new WAF Managed Ruleset version (simulated mode) that includes a regex with
+    catastrophic backtracking behavior.
+
+  time:
+    total_minutes: 44
+    phases:
+      n: {start_min: 0, end_min: 22}
+      f: {start_min: 22, end_min: 44}
+
+  phases:
+    n:
+      desc: |
+        Edge proxies handle steady traffic and return mostly 200 responses with typical latencies. WAF engines emit
+        normal CPU and regex evaluation statistics, and monitoring emits only heartbeats.
+      flows: [http_request_2xx]
+      manifestation: [edge_proxy.access_2xx, waf_engine.cpu_sample, waf_engine.regex_stats, monitoring.heartbeat]
+
+    f:
+      desc: |
+        After a global managed-rules deployment, WAF regex evaluation becomes extremely expensive and pegs CPU across PoPs.
+        The edge becomes slow and begins returning 502 errors when internal budgets are exceeded. Shortly after onset,
+        monitoring alerts begin firing as the global CPU and 502 rates breach thresholds. Near the end of the scenario,
+        responders request a global termination of the managed rulesets; the request is logged, but the effect is not yet
+        visible before the scenario ends.
+
+      events:
+        - order: 1
+          at_min: 22
+          component: ruleset_control_plane
+          event: |
+            A new WAF Managed Ruleset is deployed globally in simulated mode, and WAF workers load the updated ruleset.
+            Immediately after the deploy, WAF CPU metrics show saturation and edge request latencies increase with a
+            growing fraction of 502 responses.
+          why: |
+            The deployed ruleset includes a misconfigured regex that is still evaluated even in simulated mode; expensive
+            evaluation consumes CPU and reduces available worker time, leading to slow request processing and timeouts.
+            CPU saturation is directly observable via waf_engine.cpu_sample; the specific regex root cause is inferred.
+          flows: [http_request_2xx_degraded, http_request_502]
+          rate_multipliers:
+            monitoring.alert_cpu_global: 0.0
+            monitoring.alert_502_rate: 0.0
+            ruleset_control_plane.apply_status: 0.0
+          latency_multipliers:
+            http_request_2xx_degraded: {p50: 1.2, p95: 1.4}
+            http_request_502: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: ruleset_control_plane.deploy_ruleset
+              count: 1
+              hosts: [cp-1]
+            - ref: waf_engine.managed_rules_loaded
+              count: 3
+              hosts: [waf-sfo-1, waf-lhr-1, waf-sin-1]
+          manifestation: [ruleset_control_plane.deploy_ruleset, waf_engine.cpu_sample, edge_proxy.access_502]
+
+        - order: 2
+          at_min: 30
+          component: monitoring
+          event: |
+            Sustained CPU exhaustion drives higher queueing and deadline overruns: more requests return 502 and the
+            remaining 200 responses become slower. Global monitoring begins emitting CPU and 502-rate alerts.
+          why: |
+            When CPU remains saturated, per-request work cannot keep up with arrivals; latency inflation and timeouts
+            increase the observed 5xx rate. Alerting is based on aggregated indicators and becomes visible as alert_firing
+            logs.
+          flows: [http_request_2xx_degraded, http_request_502]
+          rate_multipliers:
+            http_request_2xx_degraded: 0.4
+            http_request_502: 2.0
+            monitoring.alert_cpu_global: 1.0
+            monitoring.alert_502_rate: 1.0
+          latency_multipliers:
+            http_request_2xx_degraded: {p50: 1.4, p95: 1.7}
+            http_request_502: {p50: 1.3, p95: 1.6}
+          one_shots: []
+          manifestation: [monitoring.alert_cpu_global, monitoring.alert_502_rate, edge_proxy.access_502]
+
+        - order: 3
+          at_min: 42
+          component: ruleset_control_plane
+          event: |
+            Responders request a global termination of WAF Managed Rulesets as traffic volume drops sharply, but the
+            termination has not yet completed by the end of the scenario.
+          why: |
+            The termination request is an operator action recorded by the control plane. The traffic drop is modeled as
+            an external response to widespread errors (clients back off and some requests fail fast), observed via lower
+            request log volume and elevated 5xx in edge pop health summaries.
+          flows: [http_request_2xx_degraded, http_request_502]
+          rate_multipliers:
+            http_request_2xx_degraded: 0.05
+            http_request_502: 0.4
+            ruleset_control_plane.apply_status: 1.0
+          latency_multipliers:
+            http_request_2xx_degraded: {p50: 1.5, p95: 1.8}
+            http_request_502: {p50: 1.4, p95: 1.7}
+          one_shots:
+            - ref: ruleset_control_plane.termination_requested
+              count: 1
+              hosts: [cp-1]
+          manifestation: [ruleset_control_plane.termination_requested, ruleset_control_plane.apply_status, edge_proxy.pop_health]
+
+      steady:
+        - component: waf_engine
+          condition: |
+            WAF workers remain CPU-saturated due to expensive regex evaluation in the deployed managed ruleset.
+          user_impact: |
+            Requests experience severe latency inflation and contribute to downstream timeouts at the edge.
+          manifestation: [waf_engine.cpu_sample, waf_engine.regex_stats]
+
+        - component: edge_proxy
+          condition: |
+            The edge continues returning a high fraction of 502 responses and overall request volume is depressed.
+          user_impact: |
+            Visitors to proxied domains frequently see 502 "Bad Gateway" and pages fail to load.
+          manifestation: [edge_proxy.access_502, edge_proxy.pop_health]
+
+        - component: monitoring
+          condition: |
+            Global CPU and 502-rate alerts remain firing through the end of the scenario.
+          user_impact: |
+            On-call visibility increases, but mitigation is not yet reflected in data within this scenario window.
+          manifestation: [monitoring.alert_cpu_global, monitoring.alert_502_rate]
+
+      feedback_loops:
+        - id: saturation_queueing_loop
+          desc: |
+            Slow WAF evaluation increases per-request CPU time, which raises queue depth and run queue length, which in
+            turn increases end-to-end latency and timeout-driven 502s; higher concurrency further stresses CPU.
+
+      flows: [http_request_2xx_degraded, http_request_502]
+      manifestation: [waf_engine.cpu_sample, waf_engine.regex_stats, edge_proxy.access_502, monitoring.alert_502_rate]
+
+  assumptions:
+    - "Timeline is mapped to a 44-minute window with failure starting at minute 22; the trigger corresponds to the global managed-rules deploy, followed by alerting and then a termination request near the end."
+    - "The real incident recovered after global termination; this scenario intentionally ends before termination completes to satisfy the 'ends in failure' requirement while preserving the causal core."
+    - |
+      Failure-phase piecewise rates (approx):
+      - min 22-30 (8 min): 800 rpm 2xx_degraded + 400 rpm 502 => ~1200 request logs/min; alerts suppressed; +~9 bg logs/min.
+      - min 30-42 (12 min): multipliers shift to ~320 rpm 2xx_degraded and ~800 rpm 502 => ~1120 request logs/min; alerts ~2/min; +~9 bg logs/min.
+      - min 42-44 (2 min): traffic drop to ~40 rpm 2xx_degraded and ~160 rpm 502 => ~200 request logs/min; control-plane apply_status enabled (~0.5/min baseline).
+    - "One-shots: 1 deploy marker + 3 WAF load markers at trigger; 1 termination request marker near the end."
+    - "Visibility rationale: sustained waf_engine.cpu_sample at 90-100% plus elevated edge_proxy.access_502 volume and monitoring.alert_* logs after minute 30 make the incident diagnosable without relying on rare symptoms."
+    - "Total expected log volume across the scenario is ~50k (dominated by per-request edge access logs), within the 20k..100k target."
+```

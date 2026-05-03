@@ -1,0 +1,490 @@
+```yaml
+sys:
+  id: travis_osx_ci_vsphere
+  desc: >
+    A CI platform that runs macOS builds by provisioning ephemeral build VMs on a vSphere cluster.
+    A scheduler dequeues jobs from the .com and .org queues and asks a VM manager to clone and power on a VM.
+    A separate cleanup service (vsphere-janitor) deletes finished/expired build VMs and reports VM inventory metrics.
+    The modeled incident is driven by janitor authentication breakage after a password rotation, leaking VMs until vSphere
+    cannot satisfy VM CPU reservations; after cleanup, a separate CPU reservation misconfiguration still causes boot failures under high load.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: build_scheduler
+    name: OS X Build Scheduler
+    svc: travis-dispatcher
+    hosts: [sched-1, sched-2]
+    desc: >
+      Dequeues OS X build jobs from the .com and .org queues, requests a build VM, and re-queues on infrastructure failures.
+      Operators can pause/resume the OS X queues and set reduced-capacity limits during incidents.
+    to:
+      - dst: osx_vm_manager
+        proto: grpc
+        desc: Requests creation/power-on of a build VM for a specific build job.
+      - dst: metrics_alerting
+        proto: tcp
+        desc: Emits queue depth and operational signals to the metrics/alerting system.
+    logs:
+      dequeue_build:
+        desc: A build job is taken from the queue for provisioning.
+        lvl: INFO
+        msg: "Dequeued build {build_id} repo={repo} queue={queue}"
+        vars:
+          build_id: {k: uuid, v: null}
+          repo: {k: str, v: "owner/repo"}
+          queue: {k: ch, v: ["com", "org"]}
+      build_started:
+        desc: The scheduler marks a build as started after the VM is ready.
+        lvl: INFO
+        msg: "Build {build_id} started vm={vm_id} queue={queue}"
+        vars:
+          build_id: {k: uuid, v: null}
+          vm_id: {k: hex, v: 12}
+          queue: {k: ch, v: ["com", "org"]}
+      build_requeued:
+        desc: The scheduler re-queues a build because provisioning did not succeed.
+        lvl: WARN
+        msg: "Re-queued build {build_id} reason={reason} queue={queue}"
+        vars:
+          build_id: {k: uuid, v: null}
+          reason: {k: ch, v: ["vm_boot_failed", "capacity_paused"]}
+          queue: {k: ch, v: ["com", "org"]}
+      queue_backlog_metric:
+        desc: Periodic queue depth observation used by operators for backlog tracking.
+        lvl: INFO
+        msg: "Queue backlog queue={queue} depth={depth}"
+        vars:
+          queue: {k: ch, v: ["com", "org"]}
+        state_vars:
+          n:
+            depth: {k: i, v: [0, 200]}
+          f:
+            depth: {k: i, v: [800, 5000]}
+      pause_toggle:
+        desc: Operator pauses or resumes OS X build queues.
+        lvl: INFO
+        msg: "OSX builds {action} by={actor} scope={scope}"
+        vars:
+          action: {k: ch, v: ["paused", "resumed"]}
+          actor: {k: ch, v: ["oncall", "infra"]}
+          scope: {k: ch, v: ["com+org", "com", "org"]}
+      capacity_limit_set:
+        desc: Operator reduces allowed concurrent OS X builds to stabilize the cluster.
+        lvl: INFO
+        msg: "Set OS X capacity limit max_concurrent={max_concurrent} scope={scope}"
+        vars:
+          max_concurrent: {k: i, v: [20, 200]}
+          scope: {k: ch, v: ["com+org", "com", "org"]}
+    beh:
+      n:
+        desc: Normal steady scheduling with small OS X queue depth.
+        emit:
+          - id: queue_backlog_metric
+            per_min: 2.0
+            scope: per_host
+      f:
+        desc: During incident, backlog grows and is checked more frequently.
+        emit:
+          - id: queue_backlog_metric
+            per_min: 3.0
+            scope: per_host
+
+  - id: osx_vm_manager
+    name: OS X VM Manager
+    svc: osx-vm-manager
+    hosts: [vm-mgr-1, vm-mgr-2]
+    desc: >
+      Clones and powers on macOS build VMs via vSphere APIs. Emits boot success/failure logs that drive build re-queues.
+    to:
+      - dst: vsphere_cluster
+        proto: https
+        desc: Uses vSphere APIs to clone and power on VMs in the OS X cluster.
+      - dst: build_scheduler
+        proto: grpc
+        desc: Returns VM provisioning result back to the scheduler (success or failure).
+    logs:
+      vm_create_req:
+        desc: VM creation/power-on attempt started for a build.
+        lvl: INFO
+        msg: "Create VM request build={build_id} template={template} reservation_mhz={res_mhz}"
+        vars:
+          build_id: {k: uuid, v: null}
+          template: {k: ch, v: ["xcode6_3"]}
+          res_mhz: {k: i, v: [800, 2000]}
+      vm_poweron_ok:
+        desc: VM successfully powered on.
+        lvl: INFO
+        msg: "VM {vm_id} powered on host={esx_host} boot_ms={boot_ms}"
+        vars:
+          vm_id: {k: hex, v: 12}
+          esx_host: {k: ch, v: ["esx01", "esx02", "esx03", "esx04"]}
+          boot_ms: {k: i, v: [20000, 180000]}
+      vm_poweron_failed_admission:
+        desc: Power-on failed because the cluster could not satisfy reservation/admission constraints.
+        lvl: ERROR
+        msg: "Power on failed vm={vm_id} err=reservation_unmet needed_res_mhz={need_mhz} available_res_mhz={avail_mhz}"
+        vars:
+          vm_id: {k: hex, v: 12}
+          need_mhz: {k: i, v: [800, 2000]}
+          avail_mhz: {k: i, v: [0, 700]}
+      vm_poweron_failed_cpu_reservation:
+        desc: Power-on failed due to CPU reservation configuration limiting bootable concurrency.
+        lvl: ERROR
+        msg: "Power on failed vm={vm_id} err=cpu_reservation_limit needed_res_mhz={need_mhz} available_res_mhz={avail_mhz}"
+        vars:
+          vm_id: {k: hex, v: 12}
+          need_mhz: {k: i, v: [800, 2000]}
+          avail_mhz: {k: i, v: [0, 700]}
+    beh:
+      n:
+        desc: VM manager is mostly quiet outside per-request logs.
+        emit: []
+      f:
+        desc: VM manager is mostly quiet outside per-request logs.
+        emit: []
+
+  - id: vsphere_janitor
+    name: vSphere Janitor
+    svc: vsphere-janitor
+    hosts: [janitor-1]
+    desc: >
+      Periodically cleans up build VMs and reports VM inventory metrics. If it cannot authenticate to vSphere,
+      cleanup stops; in this incident it also continues reporting a stale vm_total metric value.
+    to:
+      - dst: vsphere_cluster
+        proto: https
+        desc: Lists and deletes VMs through vSphere APIs.
+      - dst: metrics_alerting
+        proto: tcp
+        desc: Reports vm_total metrics used by alerting.
+    logs:
+      cleanup_cycle_normal:
+        desc: Periodic cleanup cycle in normal mode.
+        lvl: INFO
+        msg: "Cleanup cycle started mode=normal"
+        vars: {}
+      cleanup_cycle_aggressive:
+        desc: Periodic cleanup cycle in aggressive mode.
+        lvl: INFO
+        msg: "Cleanup cycle started mode=aggressive"
+        vars: {}
+      auth_failed:
+        desc: Janitor could not authenticate to vSphere, preventing cleanup.
+        lvl: ERROR
+        msg: "vSphere auth failed user={user} err={err}"
+        vars:
+          user: {k: ch, v: ["travis-janitor"]}
+          err: {k: ch, v: ["invalid_credentials", "account_locked"]}
+      vm_total_report_live:
+        desc: vm_total metric reported from a successful inventory query.
+        lvl: INFO
+        msg: "Reported vm_total={vm_total} cluster={cluster}"
+        vars:
+          vm_total: {k: i, v: [0, 7000]}
+          cluster: {k: ch, v: ["osx-cluster"]}
+      vm_total_report_stale:
+        desc: vm_total metric reported even though inventory could not be refreshed (stale value).
+        lvl: INFO
+        msg: "Reported vm_total={vm_total} cluster={cluster} (stale)"
+        vars:
+          vm_total: {k: i, v: [150, 220]}
+          cluster: {k: ch, v: ["osx-cluster"]}
+      delete_vm_ok_normal:
+        desc: VM deleted during normal cleanup.
+        lvl: INFO
+        msg: "Deleted VM vm={vm_id} reason=build_finished"
+        vars:
+          vm_id: {k: hex, v: 12}
+      delete_vm_ok_aggressive:
+        desc: VM deleted during aggressive sweep cleanup.
+        lvl: INFO
+        msg: "Deleted VM vm={vm_id} reason=aggressive_sweep"
+        vars:
+          vm_id: {k: hex, v: 12}
+      delete_vm_skipped:
+        desc: VM skipped because it was in an unexpected state for the current cleanup mode.
+        lvl: WARN
+        msg: "Skipped VM vm={vm_id} state={vm_state}"
+        vars:
+          vm_id: {k: hex, v: 12}
+          vm_state: {k: ch, v: ["poweron_failed", "orphaned", "unknown"]}
+      janitor_restart:
+        desc: Service restart after configuration update.
+        lvl: INFO
+        msg: "Service restarted reason={reason}"
+        vars:
+          reason: {k: ch, v: ["config_update", "manual_restart"]}
+      cleanup_mode_set:
+        desc: Operator switches janitor cleanup mode.
+        lvl: INFO
+        msg: "Set cleanup mode={mode}"
+        vars:
+          mode: {k: ch, v: ["aggressive"]}
+    beh:
+      n:
+        desc: Normal cleanup continuously deletes finished VMs and reports live vm_total.
+        emit:
+          - id: cleanup_cycle_normal
+            per_min: 1.0
+            scope: global
+          - id: vm_total_report_live
+            per_min: 1.0
+            scope: global
+          - id: delete_vm_ok_normal
+            per_min: 20.0
+            scope: global
+      f:
+        desc: Failure-mode emissions include auth errors, stale metrics, and (when enabled by events) elevated deletions.
+        emit:
+          - id: cleanup_cycle_normal
+            per_min: 1.0
+            scope: global
+          - id: cleanup_cycle_aggressive
+            per_min: 1.0
+            scope: global
+          - id: auth_failed
+            per_min: 1.0
+            scope: global
+          - id: vm_total_report_live
+            per_min: 1.0
+            scope: global
+          - id: vm_total_report_stale
+            per_min: 1.0
+            scope: global
+          - id: delete_vm_ok_normal
+            per_min: 25.0
+            scope: global
+          - id: delete_vm_ok_aggressive
+            per_min: 550.0
+            scope: global
+          - id: delete_vm_skipped
+            per_min: 8.0
+            scope: global
+
+  - id: vsphere_cluster
+    name: vSphere OS X Cluster
+    svc: vsphere
+    hosts: [vcenter-1]
+    desc: >
+      The virtualization cluster that hosts build VMs and enforces admission/reservation constraints.
+      Inventory metrics reveal leaked VM counts; admission denials correlate with VM power-on failures.
+    to:
+      - dst: osx_vm_manager
+        proto: https
+        desc: Returns task status/errors for power-on operations to the VM manager.
+    logs:
+      admission_denied_reservation:
+        desc: vSphere denied powerOn because reservation/admission constraints could not be satisfied.
+        lvl: WARN
+        msg: "Admission control denied powerOn vm={vm_id} reason=insufficient_reservations cpu_mhz_needed={cpu_mhz_needed} cpu_mhz_free={cpu_mhz_free}"
+        vars:
+          vm_id: {k: hex, v: 12}
+          cpu_mhz_needed: {k: i, v: [800, 2000]}
+          cpu_mhz_free: {k: i, v: [0, 700]}
+      admission_denied_cpu:
+        desc: vSphere denied powerOn due to CPU reservation limit reached at the configured concurrency.
+        lvl: WARN
+        msg: "Admission control denied powerOn vm={vm_id} reason=reservation_limit_reached cpu_mhz_needed={cpu_mhz_needed} cpu_mhz_free={cpu_mhz_free}"
+        vars:
+          vm_id: {k: hex, v: 12}
+          cpu_mhz_needed: {k: i, v: [800, 2000]}
+          cpu_mhz_free: {k: i, v: [0, 700]}
+      cluster_inventory_high:
+        desc: Periodic cluster inventory snapshot when VM counts are abnormally high.
+        lvl: INFO
+        msg: "Cluster inventory total_vms={total_vms} powered_on={powered_on} reserved_cpu_mhz={reserved_cpu_mhz} cpu_mhz_capacity={cpu_mhz_capacity}"
+        vars:
+          total_vms: {k: i, v: [4000, 6500]}
+          powered_on: {k: i, v: [1200, 4200]}
+          reserved_cpu_mhz: {k: i, v: [1500000, 7000000]}
+          cpu_mhz_capacity: {k: i, v: [2500000, 8000000]}
+      cluster_inventory_low:
+        desc: Periodic cluster inventory snapshot under normal VM counts.
+        lvl: INFO
+        msg: "Cluster inventory total_vms={total_vms} powered_on={powered_on} reserved_cpu_mhz={reserved_cpu_mhz} cpu_mhz_capacity={cpu_mhz_capacity}"
+        vars:
+          total_vms: {k: i, v: [150, 800]}
+          powered_on: {k: i, v: [80, 450]}
+          reserved_cpu_mhz: {k: i, v: [200000, 1200000]}
+          cpu_mhz_capacity: {k: i, v: [2500000, 8000000]}
+    beh:
+      n:
+        desc: Under normal conditions, inventory stays within expected low hundreds.
+        emit:
+          - id: cluster_inventory_low
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During incident, inventory can be very high until cleanup completes; both snapshots exist but are toggled by events.
+        emit:
+          - id: cluster_inventory_high
+            per_min: 1.0
+            scope: global
+          - id: cluster_inventory_low
+            per_min: 1.0
+            scope: global
+
+  - id: metrics_alerting
+    name: Metrics and Alerting
+    svc: metrics
+    hosts: [metrics-1]
+    desc: >
+      Collects VM inventory metrics and evaluates alert rules. In this incident, vm_total remained "within range"
+      because the janitor kept emitting a stale value, so alerts did not fire.
+    logs:
+      ingest_vm_total_live:
+        desc: vm_total gauge ingestion reflecting a live janitor inventory.
+        lvl: INFO
+        msg: "Ingested gauge osx_vm_total={value} source=vsphere-janitor"
+        vars:
+          value: {k: i, v: [0, 7000]}
+      ingest_vm_total_stale:
+        desc: vm_total gauge ingestion reflecting a stale janitor value while auth is failing.
+        lvl: INFO
+        msg: "Ingested gauge osx_vm_total={value} source=vsphere-janitor (stale)"
+        vars:
+          value: {k: i, v: [150, 220]}
+      alert_eval_ok:
+        desc: Periodic evaluation of the high-vm_total alert rule that remains non-firing.
+        lvl: DEBUG
+        msg: "Alert eval name=osx_vm_total_high value={value} status=ok"
+        vars:
+          value: {k: i, v: [0, 7000]}
+    beh:
+      n:
+        desc: Normal ingestion of live vm_total and routine alert evaluation.
+        emit:
+          - id: ingest_vm_total_live
+            per_min: 1.0
+            scope: global
+          - id: alert_eval_ok
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During the incident, ingestion switches between stale and live depending on janitor auth; alert eval stays ok.
+        emit:
+          - id: ingest_vm_total_live
+            per_min: 1.0
+            scope: global
+          - id: ingest_vm_total_stale
+            per_min: 1.0
+            scope: global
+          - id: alert_eval_ok
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [build_scheduler]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: OS X builds are provisioned successfully and start promptly; janitor keeps VM counts low.
+    req:
+      - id: osx_build_start_ok
+        desc: Successful VM provision and build start for a dequeued OS X job.
+        rpm: 20.0
+        path: [build_scheduler, osx_vm_manager, vsphere_cluster, osx_vm_manager, build_scheduler]
+        emit:
+          - build_scheduler.dequeue_build
+          - osx_vm_manager.vm_create_req
+          - osx_vm_manager.vm_poweron_ok
+          - build_scheduler.build_started
+        latency_ms:
+          - [1, 5]
+          - [5, 20]
+          - [60000, 120000]
+          - [10, 50]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: >
+      A leaked-VM overload first causes admission-control boot failures; after cleanup, a CPU reservation configuration
+      still causes boot failures under high backlog load, requiring reduced capacity to remain stable.
+    req:
+      - id: osx_build_start_ok
+        desc: Successful VM provision but slower due to incident pressure and contention.
+        rpm: 20.0
+        path: [build_scheduler, osx_vm_manager, vsphere_cluster, osx_vm_manager, build_scheduler]
+        emit:
+          - build_scheduler.dequeue_build
+          - osx_vm_manager.vm_create_req
+          - osx_vm_manager.vm_poweron_ok
+          - build_scheduler.build_started
+        latency_ms:
+          - [1, 5]
+          - [5, 25]
+          - [90000, 180000]
+          - [10, 80]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: osx_build_start_fail_leak
+        desc: VM power-on denied due to reservation/admission constraints amplified by leaked VMs; build is re-queued.
+        rpm: 160.0
+        path: [build_scheduler, osx_vm_manager, vsphere_cluster, osx_vm_manager, build_scheduler]
+        emit:
+          - build_scheduler.dequeue_build
+          - osx_vm_manager.vm_create_req
+          - vsphere_cluster.admission_denied_reservation
+          - osx_vm_manager.vm_poweron_failed_admission
+          - build_scheduler.build_requeued
+        latency_ms:
+          - [1, 5]
+          - [5, 25]
+          - [30000, 90000]
+          - [1, 10]
+          - [5, 60]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: osx_build_start_fail_cpu_resv
+        desc: VM power-on denied due to CPU reservation configuration limits at higher concurrency; build is re-queued.
+        rpm: 70.0
+        path: [build_scheduler, osx_vm_manager, vsphere_cluster, osx_vm_manager, build_scheduler]
+        emit:
+          - build_scheduler.dequeue_build
+          - osx_vm_manager.vm_create_req
+          - vsphere_cluster.admission_denied_cpu
+          - osx_vm_manager.vm_poweron_failed_cpu_reservation
+          - build_scheduler.build_requeued
+        latency_ms:
+          - [1, 5]
+          - [5, 25]
+          - [20000, 60000]
+          - [1, 10]
+          - [5, 60]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Names/infra are simplified: MacStadium/EMC/Xserve/vSphere are represented as a single vSphere cluster component plus three services (scheduler, VM manager, janitor) and a metrics/alerting component.
+  - |
+    The real leak accumulated over multiple days; the model compresses this into a short window where the consequences become visible (high VM inventory and admission denials).
+  - |
+    Normal-state rates are set so VM creation and deletion can balance while keeping inventory in the low-hundreds: ~20 successful VM starts/min with ~20 VM deletions/min.
+    This roughly corresponds to ~200 concurrent VMs with ~10 minute average build lifetime (not modeled explicitly).
+  - |
+    Janitor metric defect is modeled by switching between vm_total_report_stale (150..220) and vm_total_report_live (0..7000), with corresponding metrics ingestion logs; alert evaluation remains status=ok throughout.
+  - |
+    Normal-phase volume estimate: ~20 rpm * 4 logs ≈ 80 logs/min plus ~29 logs/min background ≈ 110 logs/min.
+  - |
+    Scenario total volume estimate (with leak-failure traffic and a high-rate aggressive cleanup burst) is ~21k logs, within the 20k..100k target, while keeping key diagnostic signals (auth failures, stale metrics, inventory-high snapshots, admission denials, re-queues, pauses) likely to appear.
+```

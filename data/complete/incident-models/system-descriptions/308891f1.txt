@@ -1,0 +1,380 @@
+```yaml
+sys:
+  id: azure_devops_tfs_scale_unit
+  desc: >
+    A single Azure DevOps (TFS) scale unit serves user API traffic (e.g., Git/Build) and manages build/release agent connectivity.
+    Requests enter through a regional load balancer and are processed by an Application Tier (AT) farm.
+    The AT depends on an external authentication/identity service (SPS) for token/identity operations.
+    During the modeled incident, a brief SPS latency spike triggers a large agent reconnect surge that saturates AT threadpool/message-queue processing and prevents health checks from completing.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Regional Load Balancer
+    svc: vip
+    hosts: [vip-1]
+    desc: Routes user and health probe traffic to the AT farm and removes backends when health probes repeatedly fail.
+    to:
+      - dst: tfs_at
+        proto: https
+        desc: Forwards HTTPS requests to the AT farm.
+    logs:
+      http_forward:
+        desc: Request forwarded to a backend (logged at receive/forward time; not a completion log).
+        lvl: INFO
+        msg: "forward {method} {route} from {client_ip} to {backend}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/_apis/git/repositories", "/_apis/build/builds", "/_apis/projects"]}
+          client_ip: {k: ip, v: "10.0.0.0/16"}
+          backend: {k: ch, v: [at1, at2, at3, at4]}
+      probe_timeout:
+        desc: Health probe timed out before receiving any response from the backend.
+        lvl: WARN
+        msg: "health probe to {backend} timed out after {timeout_ms}ms"
+        vars:
+          backend: {k: ch, v: [at1, at2, at3, at4]}
+          timeout_ms: {k: i, v: [1000, 15000]}
+      backend_state:
+        desc: Backend marked unhealthy after consecutive health probe failures.
+        lvl: WARN
+        msg: "backend {backend} marked {state} after {fail_count} consecutive probe failures"
+        vars:
+          backend: {k: ch, v: [at1, at2, at3, at4]}
+          state: {k: ch, v: [unhealthy]}
+          fail_count: {k: i, v: [3, 10]}
+      summary:
+        desc: Periodic summary of backend availability and throughput.
+        lvl: INFO
+        msg: "lb summary healthy_backends={healthy} total_backends={total} req_rps={rps}"
+        vars:
+          healthy: {k: i, v: [0, 4]}
+          total: {k: i, v: [4, 4]}
+          rps: {k: f, v: [0.0, 50.0]}
+    beh:
+      n:
+        desc: Periodic status snapshots.
+        emit:
+          - id: summary
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Periodic status snapshots during the incident.
+        emit:
+          - id: summary
+            per_min: 1.0
+            scope: global
+
+  - id: tfs_at
+    name: TFS Application Tier (AT)
+    svc: tfs-at
+    hosts: [at1, at2, at3, at4]
+    desc: >
+      Serves user APIs and processes agent heartbeats via an internal message-queue/threadpool-driven service.
+      Calls SPS for identity/token operations. Emits periodic metrics about threadpool/message-queue pressure.
+    to:
+      - dst: sps_auth
+        proto: https
+        desc: Performs identity/authentication related calls (token validation, identity cache lookups).
+    logs:
+      http_access:
+        desc: User API request completion log including overall request duration.
+        lvl: INFO
+        msg: "{req_id} {method} {route} user={user_type} status={status} total_ms={total_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: ["/_apis/git/repositories", "/_apis/build/builds", "/_apis/projects"]}
+          user_type: {k: ch, v: [interactive, service]}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 401]}
+            total_ms: {k: i, v: [10, 800]}
+          f:
+            status: {k: ch, v: [200, 503, 504]}
+            total_ms: {k: i, v: [50, 60000]}
+      agent_heartbeat:
+        desc: Agent heartbeat processing result for SetAgentOnline.
+        lvl: INFO
+        msg: "SetAgentOnline agent={agent_id} result={result} dur_ms={dur_ms} queued={queued}"
+        vars:
+          agent_id: {k: i, v: [100000, 999999]}
+        state_vars:
+          n:
+            result: {k: ch, v: [ok]}
+            dur_ms: {k: i, v: [1, 80]}
+            queued: {k: i, v: [0, 10]}
+          f:
+            result: {k: ch, v: [ok, timeout, queued]}
+            dur_ms: {k: i, v: [50, 60000]}
+            queued: {k: i, v: [0, 5000]}
+      health_access:
+        desc: Health endpoint request completion (used by probes); missing/slow responses imply AT cannot schedule work.
+        lvl: INFO
+        msg: "healthcheck status={status} dur_ms={dur_ms} inflight={inflight}"
+        vars: {}
+        state_vars:
+          n:
+            status: {k: i, v: [200, 200]}
+            dur_ms: {k: i, v: [1, 40]}
+            inflight: {k: i, v: [0, 200]}
+          f:
+            status: {k: i, v: [200, 503]}
+            dur_ms: {k: i, v: [5, 60000]}
+            inflight: {k: i, v: [50, 2000]}
+      mq_stats:
+        desc: Periodic metrics for the internal message queue/threadpool used for agent processing.
+        lvl: INFO
+        msg: "mq stats inflight_threads={threads} queue_depth={queue_depth} reconnect_batch={batch}"
+        vars: {}
+        state_vars:
+          n:
+            threads: {k: i, v: [40, 250]}
+            queue_depth: {k: i, v: [0, 200]}
+            batch: {k: i, v: [0, 20]}
+          f:
+            threads: {k: i, v: [40, 2000]}
+            queue_depth: {k: i, v: [0, 20000]}
+            batch: {k: i, v: [0, 5000]}
+      mq_starvation:
+        desc: Warning emitted when threadpool saturation is detected while work remains queued.
+        lvl: WARN
+        msg: "mq threadpool saturation detected: inflight_threads={threads} queue_depth={queue_depth}"
+        vars:
+          threads: {k: i, v: [500, 2000]}
+          queue_depth: {k: i, v: [5000, 20000]}
+    beh:
+      n:
+        desc: AT emits periodic message-queue metrics; saturation warnings are effectively absent.
+        emit:
+          - id: mq_stats
+            per_min: 1.0
+            scope: per_host
+          - id: mq_starvation
+            per_min: 0.0
+            scope: per_host
+      f:
+        desc: AT continues emitting periodic metrics; saturation warnings are near-zero at failure onset and become frequent only after the reconnect tailspin begins.
+        emit:
+          - id: mq_stats
+            per_min: 1.0
+            scope: per_host
+          - id: mq_starvation
+            per_min: 0.02
+            scope: per_host
+
+  - id: sps_auth
+    name: SPS Authentication Service
+    svc: sps
+    hosts: [sps-ncus-1]
+    desc: External identity/auth service used by AT; emits periodic latency/error metrics and occasional slow-spike notifications.
+    to: []
+    logs:
+      sps_latency:
+        desc: Periodic SPS health/latency snapshot.
+        lvl: INFO
+        msg: "sps metrics p95_ms={p95_ms} error_rate={err_rate} db_concurrency={db_cb}"
+        vars: {}
+        state_vars:
+          n:
+            p95_ms: {k: i, v: [60, 300]}
+            err_rate: {k: f, v: [0.0, 0.02]}
+            db_cb: {k: ch, v: [none, moderate]}
+          f:
+            p95_ms: {k: i, v: [80, 1500]}
+            err_rate: {k: f, v: [0.0, 0.08]}
+            db_cb: {k: ch, v: [none, moderate, high]}
+      sps_slow_spike:
+        desc: Marker log for a detected latency spike window.
+        lvl: WARN
+        msg: "elevated response times detected p95_ms={p95_ms} duration_s={duration_s}"
+        vars:
+          p95_ms: {k: i, v: [2000, 8000]}
+          duration_s: {k: i, v: [60, 180]}
+      sps_recovered:
+        desc: Marker log indicating SPS response times returned to typical levels.
+        lvl: INFO
+        msg: "response times back to normal p95_ms={p95_ms}"
+        vars:
+          p95_ms: {k: i, v: [80, 250]}
+    beh:
+      n:
+        desc: SPS emits periodic metrics in normal operation.
+        emit:
+          - id: sps_latency
+            per_min: 1.0
+            scope: global
+      f:
+        desc: SPS emits periodic metrics during the incident (the spike itself is modeled via one-shot markers).
+        emit:
+          - id: sps_latency
+            per_min: 1.0
+            scope: global
+
+  - id: ops_console
+    name: Operations Console
+    svc: ops
+    hosts: [op-1]
+    desc: Operators collect dumps and recycle AT application pools during mitigation.
+    to:
+      - dst: tfs_at
+        proto: https
+        desc: Triggers app pool recycle operations on ATs.
+      - dst: edge_lb
+        proto: https
+        desc: Queries load balancer/backend status during incidents.
+    logs:
+      collect_dump:
+        desc: Operator-initiated dump collection from an unhealthy AT.
+        lvl: INFO
+        msg: "collecting process dump from {backend} reason={reason}"
+        vars:
+          backend: {k: ch, v: [at1, at2, at3, at4]}
+          reason: {k: ch, v: [unhealthy, thread_growth]}
+      recycle_at:
+        desc: Operator-initiated recycle of an AT application pool (mode is restricted to one-by-one recycling in this model).
+        lvl: WARN
+        msg: "recycling application pool on {backend} mode={mode}"
+        vars:
+          backend: {k: ch, v: [at1, at2, at3, at4]}
+          mode: {k: ch, v: [single]}
+    beh:
+      n:
+        desc: No periodic emissions from ops console.
+        emit: []
+      f:
+        desc: No periodic emissions from ops console (actions are modeled as one-shots).
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user API traffic, steady agent heartbeats, and regular health checks.
+    req:
+      - id: user_api_request
+        desc: User/API request forwarded by LB and completed on an AT.
+        rpm: 200.0
+        path: [edge_lb, tfs_at]
+        emit: [edge_lb.http_forward, tfs_at.http_access]
+        latency_ms: [[1, 8], [30, 600]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: agent_heartbeat
+        desc: Build/release agent heartbeat calling SetAgentOnline on an AT.
+        rpm: 350.0
+        path: [tfs_at]
+        emit: [tfs_at.agent_heartbeat]
+        latency_ms: [[5, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: health_probe_ok
+        desc: Successful health probe request handled by an AT.
+        rpm: 100.0
+        path: [tfs_at]
+        emit: [tfs_at.health_access]
+        latency_ms: [[1, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: SPS latency spike triggers agent reconnect surge and AT threadpool/message-queue saturation; some health probes time out at the LB.
+    req:
+      - id: user_api_request_degraded
+        desc: User/API requests during incident; latency and error rate increase due to SPS slowness and AT queuing.
+        rpm: 160.0
+        path: [edge_lb, tfs_at]
+        emit: [edge_lb.http_forward, tfs_at.http_access]
+        latency_ms: [[1, 10], [200, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: agent_heartbeat_reconnect
+        desc: Elevated agent heartbeats/reconnect attempts; some are queued or time out as AT saturates.
+        rpm: 700.0
+        path: [tfs_at]
+        emit: [tfs_at.agent_heartbeat]
+        latency_ms: [[50, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: health_probe_ok_degraded
+        desc: Health probe requests that still reach an AT and return a response (may be slow or 503).
+        rpm: 100.0
+        path: [tfs_at]
+        emit: [tfs_at.health_access]
+        latency_ms: [[5, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: health_probe_timeout
+        desc: Health probes that time out at the LB (no AT log emitted); effectively absent at failure onset and activated later.
+        rpm: 0.5
+        path: [edge_lb, tfs_at]
+        emit: [edge_lb.probe_timeout]
+        latency_ms: [[1000, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    This model focuses on the Oct 4-style incident pattern: a brief SPS latency spike precipitates a prolonged AT outage via agent reconnect surges and internal threadpool/message-queue saturation.
+  - |
+    System repair for S8: tfs_at.mq_stats failure-state domains were widened to include near-normal lows (threads/queue_depth/batch) so early failure minutes can look only mildly impacted,
+    while later minutes show higher pressure correlated with the activation of mq_starvation and probe timeouts.
+  - |
+    SPS periodic telemetry (sps_latency) is state-conditioned so normal baselines do not look incident-level; the decisive spike/recovery remains represented by explicit one-shot markers.
+  - |
+    The internal mechanism described as sync-over-async/threadpool standstill is represented operationally via rising mq_stats (threads/queue_depth) and mq_starvation warnings; logs avoid root-cause narration.
+  - |
+    Failure-onset baselines for probe timeouts and mq_starvation are modeled as near-zero so the scenario can activate them later via event multipliers, matching the intended progression.
+  - |
+    Duration domains for failure-state request logs (http_access.total_ms, agent_heartbeat.dur_ms, health_access.dur_ms) are widened up to 60s to accommodate scenario latency multipliers applied to p95 latency hints.
+  - |
+    The AT per-request access log reports overall duration only; dependency/queue pressure is inferred from SPS telemetry (sps_latency + spike marker) and AT mq_stats/mq_starvation plus health probe behavior.
+  - |
+    edge_lb.backend_state only models transitions to "unhealthy" (not "healthy") to keep the template consistent with "consecutive probe failures".
+  - |
+    ops_console.recycle_at is restricted to mode=single to prevent generation of "all ATs" recycle actions unless explicitly modeled.
+  - |
+    http_access.status is modeled as an explicit set in each state (normal: 200/401; failure: 200/503/504) to align with scenario language and downstream validators expecting enumerated status codes.
+  - |
+    SPS per-request logging is not modeled; instead, SPS has periodic metrics plus one-shot spike/recovery markers to keep volume realistic.
+  - |
+    Traffic volumes are scaled to keep total logs in 20k..100k while preserving diagnostic visibility: ~200 user rpm, ~350 agent rpm, ~100 probe rpm in normal; higher agent rpm and timeouts during failure.
+  - |
+    Normal-phase expected logs/min ≈ 850–900 (user 400 + agent 350 + probe 100 + background ~6), over ~20 min ≈ 17k.
+  - |
+    Total expected logs across the scenario ≈ 40k–60k depending on failure multipliers (agent surge and probe timeouts) and mq_starvation amplification; kept within the required envelope.
+  - |
+    Key visibility anchors likely to appear include: sps_auth.sps_slow_spike (one-shot), tfs_at.mq_stats (1/min/host), tfs_at.mq_starvation (activated later in failure), edge_lb.probe_timeout (activated mid-failure), and ops_console recycle/dump actions (one-shots).
+```

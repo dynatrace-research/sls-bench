@@ -1,0 +1,457 @@
+```yaml
+sys:
+  id: cloud_us_backbone_control_plane
+  desc: >
+    A multi-region cloud platform runs customer-facing regional APIs over a shared US backbone network.
+    A regional network control plane programs routing and traffic engineering via BGP across multiple physical locations.
+    Datacenter maintenance automation uses a cluster manager to deschedule/reschedule jobs during maintenance events.
+    When the network control plane is absent long enough, parts of the backbone fail static briefly and then withdraw BGP,
+    reducing capacity and causing packet loss that surfaces as elevated latency and intermittent API timeouts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: maintenance_automation
+    name: Maintenance Automation Orchestrator
+    svc: dc-maint-orch
+    hosts: [auto-1]
+    desc: >
+      Orchestrates datacenter maintenance events and requests the cluster manager to deschedule in-scope jobs.
+      In this incident it issues an overly broad deschedule request affecting multiple independent clusters.
+    to:
+      - dst: cluster_manager
+        proto: grpc
+        desc: Issues deschedule/reschedule actions for clusters and jobs during maintenance events.
+    logs:
+      orchestrator_tick:
+        desc: Periodic orchestrator health tick.
+        lvl: DEBUG
+        msg: "tick loop_ok={loop_ok} queued_actions={queued_actions}"
+        vars:
+          loop_ok: {k: ch, v: ["true"]}
+          queued_actions: {k: i, v: [0, 5]}
+      maintenance_start:
+        desc: Marks the start of a maintenance event and its computed scope.
+        lvl: INFO
+        msg: "maintenance started event_id={event_id} maint_type={maint_type} location={location} scope_clusters={scope_clusters}"
+        vars:
+          event_id: {k: hex, v: 16}
+          maint_type: {k: ch, v: [rare_power_switchover]}
+          location: {k: ch, v: [loc-sfo1]}
+          scope_clusters: {k: i, v: [5, 30]}
+      automation_halted:
+        desc: Marks automation being halted by oncall as a mitigation.
+        lvl: WARN
+        msg: "automation halted event_id={event_id} reason={reason} operator={operator}"
+        vars:
+          event_id: {k: hex, v: 16}
+          reason: {k: ch, v: [incident_mitigation]}
+          operator: {k: str, v: "eng-oncall-*"}
+    beh:
+      n:
+        desc: Low-rate periodic orchestration tick.
+        emit:
+          - id: orchestrator_tick
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Orchestrator tick continues while automation actions may be halted.
+        emit:
+          - id: orchestrator_tick
+            per_min: 0.5
+            scope: per_host
+
+  - id: cluster_manager
+    name: Cluster Manager
+    svc: cluster-mgr
+    hosts: [cm-1, cm-2]
+    desc: >
+      Schedules and deschedules jobs within logical clusters. During the incident it evicts network control plane
+      jobs across multiple locations due to a buggy maintenance request, and later reschedules them.
+    to:
+      - dst: net_control_plane
+        proto: grpc
+        desc: Starts/stops network control plane workloads and supporting config-store jobs.
+    logs:
+      scheduler_tick:
+        desc: Periodic scheduler health tick.
+        lvl: DEBUG
+        msg: "scheduler tick leader={leader} pending={pending} running={running}"
+        vars:
+          leader: {k: ch, v: ["true", "false"]}
+          pending: {k: i, v: [0, 50]}
+          running: {k: i, v: [500, 1200]}
+      job_evicted:
+        desc: Job eviction triggered by a maintenance deschedule action.
+        lvl: WARN
+        msg: "job evicted job={job} cluster={cluster} location={location} reason={reason}"
+        vars:
+          job: {k: ch, v: [net-control-plane, net-config-store]}
+          cluster: {k: ch, v: [netcp-a, netcp-b]}
+          location: {k: ch, v: [loc-sfo1, loc-ord1, loc-iad1]}
+          reason: {k: ch, v: [maintenance_deschedule]}
+      job_rescheduled:
+        desc: Job rescheduled after mitigation.
+        lvl: INFO
+        msg: "job rescheduled job={job} cluster={cluster} location={location} placement_host={placement_host}"
+        vars:
+          job: {k: ch, v: [net-control-plane, net-config-store]}
+          cluster: {k: ch, v: [netcp-a, netcp-b]}
+          location: {k: ch, v: [loc-sfo1, loc-ord1, loc-iad1]}
+          placement_host: {k: str, v: "cm-node-[01-99]"}
+      reschedule_batch_start:
+        desc: Marker for beginning a batch reschedule of network control plane jobs.
+        lvl: INFO
+        msg: "reschedule batch start batch_id={batch_id} targets={targets}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          targets: {k: i, v: [2, 20]}
+    beh:
+      n:
+        desc: Scheduler runs normally with periodic tick logging.
+        emit:
+          - id: scheduler_tick
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Scheduler continues; eviction/reschedule logs appear depending on incident stage.
+        emit:
+          - id: scheduler_tick
+            per_min: 0.5
+            scope: per_host
+          - id: job_evicted
+            per_min: 0.2
+            scope: per_host
+          - id: job_rescheduled
+            per_min: 0.2
+            scope: per_host
+
+  - id: net_control_plane
+    name: Network Control Plane
+    svc: net-control
+    hosts: [ncp-1, ncp-2]
+    desc: >
+      Programs routing configuration and distributes it to backbone routers. If fully descheduled,
+      it stops producing heartbeats; once rescheduled it must rebuild and redistribute configuration.
+    to:
+      - dst: backbone_router
+        proto: grpc
+        desc: Publishes routing/config changes to the backbone routers.
+    logs:
+      heartbeat:
+        desc: Heartbeat indicating control plane instance is running and programming routes.
+        lvl: INFO
+        msg: "heartbeat instance={instance} location={location} routes_programmed={routes_programmed}"
+        vars:
+          instance: {k: ch, v: [ncp-1, ncp-2]}
+          location: {k: ch, v: [loc-sfo1, loc-ord1, loc-iad1]}
+          routes_programmed: {k: i, v: [1000, 6000]}
+      ncp_process_start:
+        desc: Process start marker when the control plane is rescheduled.
+        lvl: INFO
+        msg: "process start instance={instance} location={location} build={build}"
+        vars:
+          instance: {k: ch, v: [ncp-1, ncp-2]}
+          location: {k: ch, v: [loc-sfo1, loc-ord1, loc-iad1]}
+          build: {k: ch, v: [2019.06.02]}
+      config_rebuild_step:
+        desc: Progress log for rebuilding lost configuration and distributing it.
+        lvl: INFO
+        msg: "config rebuild location={location} step={step} progress_pct={progress_pct}"
+        vars:
+          location: {k: ch, v: [loc-sfo1, loc-ord1, loc-iad1]}
+          step: {k: ch, v: [rebuild_kv, regenerate_bgp, distribute]}
+          progress_pct: {k: i, v: [0, 100]}
+      config_publish_started:
+        desc: Marker that a new config version rollout has started.
+        lvl: INFO
+        msg: "config publish started location={location} version={version}"
+        vars:
+          location: {k: ch, v: [loc-sfo1, loc-ord1, loc-iad1]}
+          version: {k: str, v: "cfg-20190602-*"}
+    beh:
+      n:
+        desc: Control plane instances periodically emit heartbeats.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: When rescheduled, control plane rebuilds configuration and emits progress.
+        emit:
+          - id: config_rebuild_step
+            per_min: 1.0
+            scope: per_host
+
+  - id: backbone_router
+    name: US Backbone Router Cluster
+    svc: backbone-rtr
+    hosts: [rtr-a, rtr-b]
+    desc: >
+      Represents routing and forwarding across US backbone links between physical locations/regions.
+      When BGP routes are withdrawn due to prolonged control plane absence, capacity is reduced and packet loss rises.
+    to:
+      - dst: storage_api
+        proto: tcp
+        desc: Carries customer/API traffic and return traffic between regions and the regional API layer.
+    logs:
+      link_utilization:
+        desc: Periodic utilization metric for backbone links.
+        lvl: INFO
+        msg: "link util link_id={link_id} util_pct={util_pct}"
+        vars:
+          link_id: {k: ch, v: [bb-central-east, bb-central-northeast]}
+        state_vars:
+          n:
+            util_pct: {k: i, v: [10, 60]}
+          f:
+            util_pct: {k: i, v: [30, 100]}
+      packet_loss_high:
+        desc: Packet loss metric when congestion is severe.
+        lvl: WARN
+        msg: "packet loss high region_pair={region_pair} loss_pct={loss_pct}"
+        vars:
+          region_pair: {k: ch, v: [us-central1->us-east4, us-central1->us-west2]}
+          loss_pct: {k: f, v: [5.0, 40.0]}
+      packet_loss_low:
+        desc: Packet loss metric during partial recovery (still elevated vs normal).
+        lvl: INFO
+        msg: "packet loss elevated region_pair={region_pair} loss_pct={loss_pct}"
+        vars:
+          region_pair: {k: ch, v: [us-central1->us-east4, us-central1->us-west2]}
+          loss_pct: {k: f, v: [0.2, 5.0]}
+      bgp_session_down:
+        desc: BGP session down/withdrawal observed on impacted neighbors.
+        lvl: ERROR
+        msg: "bgp session down neighbor_ip={neighbor_ip} neighbor_asn={neighbor_asn} reason={reason}"
+        vars:
+          neighbor_ip: {k: ip, v: null}
+          neighbor_asn: {k: i, v: [64512, 65534]}
+          reason: {k: ch, v: [hold_timer_expired, route_withdrawn]}
+      qos_policy_update:
+        desc: QoS policy update to deprioritize less critical traffic classes.
+        lvl: WARN
+        msg: "qos policy update policy={policy} class={class} drop_pct={drop_pct}"
+        vars:
+          policy: {k: ch, v: [deprioritize_best_effort]}
+          class: {k: ch, v: [besteffort]}
+          drop_pct: {k: i, v: [5, 30]}
+    beh:
+      n:
+        desc: Emits periodic utilization metrics under healthy conditions.
+        emit:
+          - id: link_utilization
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Emits utilization and packet loss metrics depending on congestion stage.
+        emit:
+          - id: link_utilization
+            per_min: 1.0
+            scope: per_host
+          - id: packet_loss_high
+            per_min: 1.0
+            scope: per_host
+          - id: packet_loss_low
+            per_min: 1.0
+            scope: per_host
+
+  - id: storage_api
+    name: Regional Storage API
+    svc: storage-api
+    hosts: [st-api-1, st-api-2, st-api-3]
+    desc: >
+      Customer-facing API for object storage in a representative affected US region.
+      It issues backend fetches over the backbone and is sensitive to packet loss, surfacing as high latency and 504 timeouts.
+    to:
+      - dst: backbone_router
+        proto: tcp
+        desc: Uses the backbone to reach backend storage components and other internal services.
+    logs:
+      req_start:
+        desc: Start of an API request.
+        lvl: INFO
+        msg: "request start method={method} bucket={bucket} region={region} object={object} client_ip={client_ip} request_id={request_id} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, PUT, LIST]}
+          bucket: {k: ch, v: [img-prod, logs-archive, app-data]}
+          region: {k: ch, v: [us-east4]}
+          object: {k: str, v: "obj/*"}
+          client_ip: {k: ip, v: null}
+          request_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      req_end_200:
+        desc: Successful completion of an API request.
+        lvl: INFO
+        msg: "request end request_id={request_id} status=200 bytes={bytes} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          bytes: {k: i, v: [200, 200000]}
+          dur_ms: {k: i, v: [5, 20000]}
+          trace_id: {k: hex, v: 32}
+      req_end_504:
+        desc: Timeout completion of an API request due to upstream/network issues.
+        lvl: ERROR
+        msg: "request end request_id={request_id} status=504 err=upstream_timeout dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          request_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [3000, 30000]}
+          trace_id: {k: hex, v: 32}
+      retry_attempt:
+        desc: Retry marker for an internal attempt after a transient upstream failure/timeout.
+        lvl: WARN
+        msg: "retrying request_id={request_id} attempt={attempt} max_attempts={max_attempts} backoff_ms={backoff_ms}"
+        vars:
+          request_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 3]}
+          max_attempts: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [50, 1200]}
+      request_stats:
+        desc: Per-minute per-host aggregate stats for the API host (counts approximate).
+        lvl: INFO
+        msg: "stats region={region} ok_rpm={ok_rpm} err_rpm={err_rpm} p95_ms={p95_ms}"
+        vars:
+          region: {k: ch, v: [us-east4]}
+        state_vars:
+          n:
+            ok_rpm: {k: i, v: [70, 130]}
+            err_rpm: {k: i, v: [0, 2]}
+            p95_ms: {k: i, v: [40, 140]}
+          f:
+            ok_rpm: {k: i, v: [20, 120]}
+            err_rpm: {k: i, v: [0, 80]}
+            p95_ms: {k: i, v: [120, 30000]}
+    beh:
+      n:
+        desc: Emits low-rate periodic aggregates under healthy conditions.
+        emit:
+          - id: request_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Continues emitting aggregates while error rates and tail latency rise.
+        emit:
+          - id: request_stats
+            per_min: 1.0
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring & Alerting
+    svc: mon-alert
+    hosts: [mon-1]
+    desc: >
+      Performs periodic scrapes and opens alerts. During congestion, scrapes and internal queries time out,
+      slowing diagnosis and coordination.
+    to:
+      - dst: storage_api
+        proto: https
+        desc: Probes the regional API endpoints and collects health metrics.
+      - dst: net_control_plane
+        proto: https
+        desc: Checks control plane heartbeats/health endpoints when reachable.
+    logs:
+      scrape_ok:
+        desc: Successful monitoring scrape.
+        lvl: INFO
+        msg: "scrape ok target={target} latency_ms={latency_ms}"
+        vars:
+          target: {k: ch, v: [storage_api, net_control_plane]}
+          latency_ms: {k: i, v: [20, 400]}
+      scrape_timeout:
+        desc: Monitoring scrape timed out.
+        lvl: WARN
+        msg: "scrape timeout target={target} timeout_ms={timeout_ms}"
+        vars:
+          target: {k: ch, v: [storage_api, net_control_plane]}
+          timeout_ms: {k: i, v: [500, 5000]}
+      tool_query_timeout:
+        desc: Timeout/errors in internal operational tools due to congested network paths.
+        lvl: WARN
+        msg: "tool query timeout tool={tool} dur_ms={dur_ms}"
+        vars:
+          tool: {k: ch, v: [status_dashboard, log_search]}
+          dur_ms: {k: i, v: [800, 15000]}
+      alert_open:
+        desc: Alert opened/paged to oncall.
+        lvl: CRITICAL
+        msg: "alert open alert={alert} severity={severity} details={details}"
+        vars:
+          alert: {k: ch, v: [net_control_plane_heartbeat_missing, packet_loss_high]}
+          severity: {k: ch, v: [SEV1]}
+          details: {k: str, v: "summary:*"}
+    beh:
+      n:
+        desc: Periodic scrapes succeed under normal conditions.
+        emit:
+          - id: scrape_ok
+            per_min: 2.0
+            scope: global
+      f:
+        desc: Scrapes and tool queries can time out during congestion; alerts are opened as one-shots.
+        emit:
+          - id: scrape_timeout
+            per_min: 2.0
+            scope: global
+          - id: tool_query_timeout
+            per_min: 0.5
+            scope: global
+
+tracing:
+  on: true
+  origins: [storage_api, monitoring]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Customer requests to the regional storage API complete quickly with low error rates.
+    req:
+      - id: storage_object_get_n
+        desc: Typical object/metadata read against the regional storage API.
+        rpm: 300.0
+        path: [storage_api, backbone_router, storage_api]
+        emit: [storage_api.req_start, storage_api.req_end_200]
+        latency_ms: [[5, 15], [20, 80]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [storage_api.retry_attempt]
+          backoff_ms: [[50, 150]]
+        trace: true
+  f:
+    desc: With reduced backbone capacity, request latency and 504 timeouts increase; retries become common.
+    req:
+      - id: storage_object_get_ok_f
+        desc: Request completes but experiences elevated latency due to backbone congestion.
+        rpm: 260.0
+        path: [storage_api, backbone_router, storage_api]
+        emit: [storage_api.req_start, storage_api.req_end_200]
+        latency_ms: [[5, 20], [60, 250]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.2
+          emit_per_retry: [storage_api.retry_attempt]
+          backoff_ms: [[100, 300], [200, 600]]
+        trace: true
+      - id: storage_object_get_timeout_f
+        desc: Request fails with upstream timeout after retries during packet loss/congestion.
+        rpm: 10.0
+        path: [storage_api, backbone_router, storage_api]
+        emit: [storage_api.req_start, storage_api.req_end_504]
+        latency_ms: [[3000, 12000], [2000, 18000]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.8
+          emit_per_retry: [storage_api.retry_attempt]
+          backoff_ms: [[200, 600], [400, 1200]]
+        trace: true
+
+assumptions:
+  - "The model focuses on one representative affected regional API (storage_api in us-east4) to capture the causal core: control plane descheduled → BGP withdrawal → backbone congestion/packet loss → timeouts."
+  - "Multiple impacted regions and services from the post-mortem are represented implicitly via backbone_router region_pair metrics rather than modeling each service/region separately."
+  - "Flow rpm values are global for the modeled region; per-host aggregates (storage_api.request_stats ok_rpm/err_rpm) reflect an approximate split across 3 API hosts."
+  - "Control-plane absence is modeled primarily via cluster_manager evictions and monitoring alerts, not via direct net_control_plane logs (since the control plane cannot log while descheduled)."
+  - "BGP neighbor IPs are modeled as realistic single IPs (not CIDR strings) to keep router logs plausible."
+  - "Timeout request duration is modeled as seconds-scale (>=3s) to match retry/timeout behavior and the 504 dur_ms domain."
+  - "Normal-phase volume estimate: ~600 logs/min (mostly storage request start/end), plus ~10 logs/min background."
+  - "Expected total logs for the paired scenario (60 minutes) are ~40k (within the 20k–100k target), dominated by per-request API logs with moderate retries during failure."
+```

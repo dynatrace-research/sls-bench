@@ -1,0 +1,425 @@
+```yaml
+sys:
+  id: stackexchange_stackegg_lb_incident
+  desc: >
+    A multi-site Q&A web platform serves HTML pages and a lightweight game feature ("StackEgg") to logged-in users.
+    Browsers connect through HAProxy load balancers to the web application tier.
+    StackEgg adds an extra AJAX call for game state, increasing request rate and—because of long HTTP keep-alive—concurrent
+    sessions on the load balancers. The incident models the load balancer hitting a configured concurrent-session cap,
+    leading to queued TCP connects and client timeouts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: haproxy_lb
+    name: HAProxy Frontend Load Balancers
+    svc: haproxy
+    hosts: [lb-a, lb-b]
+    desc: >
+      Terminates client TCP/HTTP connections and forwards requests to the web tier.
+      Uses HTTP keep-alive to reduce connection setup overhead, but long keep-alive increases concurrent session counts.
+      Enforces a max concurrent sessions limit (maxconn) to prevent CPU overload, queuing excess connects.
+    to:
+      - dst: web_app
+        proto: https
+        desc: Forwards HTTP requests to the web application tier over an internal network.
+    logs:
+      frontend_accept:
+        desc: Per-request accept/start line for a client HTTP request.
+        lvl: INFO
+        msg: "accept fe={fe} src={src_ip} method={method} uri={uri} req={req_id}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          src_ip: {k: ip, v: "203.0.113.0/24"}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: [/questions, /search, /users, /stackegg/state]}
+          req_id: {k: hex, v: 16}
+
+      frontend_close_ok:
+        desc: Per-request completion line for successful responses observed by HAProxy.
+        lvl: INFO
+        msg: "close fe={fe} status={status} dur_ms={dur_ms} bytes={bytes} req={req_id}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          status: {k: ch, v: [200, 304]}
+          dur_ms: {k: i, v: [10, 6000]}
+          bytes: {k: i, v: [300, 250000]}
+          req_id: {k: hex, v: 16}
+
+      frontend_connect_timeout:
+        desc: Client connection establishment times out while waiting in the accept/queue path.
+        lvl: ERROR
+        msg: "connect timeout fe={fe} src={src_ip} waited_ms={waited_ms}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          src_ip: {k: ip, v: "203.0.113.0/24"}
+          waited_ms: {k: i, v: [1000, 15000]}
+
+      stats_sample_40k:
+        desc: Periodic snapshot of frontend concurrency during rising load while the session cap is at its initial setting.
+        lvl: INFO
+        msg: "stats fe={fe} cur_sess={cur_sess} queued={queued} maxconn={maxconn} keepalive_s={ka_s}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          maxconn: {k: i, v: [140, 140]}
+          ka_s: {k: i, v: [15, 15]}
+        state_vars:
+          n:
+            cur_sess: {k: i, v: [40, 120]}
+            queued: {k: i, v: [0, 5]}
+          f:
+            cur_sess: {k: i, v: [90, 130]}
+            queued: {k: i, v: [0, 30]}
+
+      stats_sample_40k_cap:
+        desc: Periodic snapshot while the initial session cap is at/near saturation with significant queuing.
+        lvl: INFO
+        msg: "stats fe={fe} cur_sess={cur_sess} queued={queued} maxconn={maxconn} keepalive_s={ka_s}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          maxconn: {k: i, v: [140, 140]}
+          ka_s: {k: i, v: [15, 15]}
+        state_vars:
+          n:
+            cur_sess: {k: i, v: [40, 120]}
+            queued: {k: i, v: [0, 5]}
+          f:
+            cur_sess: {k: i, v: [130, 140]}
+            queued: {k: i, v: [20, 500]}
+
+      stats_sample_60k:
+        desc: Periodic snapshot of frontend concurrency and queuing after the session cap is raised.
+        lvl: INFO
+        msg: "stats fe={fe} cur_sess={cur_sess} queued={queued} maxconn={maxconn} keepalive_s={ka_s}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          maxconn: {k: i, v: [210, 210]}
+          ka_s: {k: i, v: [15, 15]}
+        state_vars:
+          n:
+            cur_sess: {k: i, v: [40, 120]}
+            queued: {k: i, v: [0, 5]}
+          f:
+            cur_sess: {k: i, v: [150, 210]}
+            queued: {k: i, v: [0, 120]}
+
+      maxconn_queue_warn_40k:
+        desc: Warning emitted when the frontend reaches the initial maxconn and begins queuing.
+        lvl: WARN
+        msg: "maxconn reached fe={fe} maxconn={maxconn} queued={queued}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          maxconn: {k: i, v: [140, 140]}
+          queued: {k: i, v: [20, 500]}
+
+      maxconn_queue_warn_60k:
+        desc: Warning emitted when the frontend approaches the raised maxconn and begins queuing.
+        lvl: WARN
+        msg: "maxconn reached fe={fe} maxconn={maxconn} queued={queued}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          maxconn: {k: i, v: [210, 210]}
+          queued: {k: i, v: [20, 200]}
+
+      reload_applied:
+        desc: Log marker for an HAProxy reload that applied updated connection limits.
+        lvl: INFO
+        msg: "reload applied fe={fe} maxconn={maxconn} keepalive_s={ka_s}"
+        vars:
+          fe: {k: ch, v: [fe_public]}
+          maxconn: {k: i, v: [210, 210]}
+          ka_s: {k: i, v: [15, 15]}
+
+    beh:
+      n:
+        desc: Normal operation shows stable session counts with minimal queuing.
+        emit:
+          - id: stats_sample_40k
+            per_min: 1.0
+            scope: per_host
+          - id: maxconn_queue_warn_40k
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Failure operation includes elevated session counts; once maxconn is hit, queuing warnings can become frequent.
+        emit:
+          - id: stats_sample_40k
+            per_min: 1.0
+            scope: per_host
+          - id: stats_sample_40k_cap
+            per_min: 1.0
+            scope: per_host
+          - id: stats_sample_60k
+            per_min: 1.0
+            scope: per_host
+          - id: maxconn_queue_warn_40k
+            per_min: 6.0
+            scope: global
+          - id: maxconn_queue_warn_60k
+            per_min: 6.0
+            scope: global
+
+  - id: web_app
+    name: Web Application Tier
+    svc: webapp
+    hosts: [web-1, web-2, web-3, web-4]
+    desc: >
+      Serves HTML pages and the StackEgg game-state endpoint.
+      StackEgg introduces an extra asynchronous request per page view for logged-in users.
+    to:
+      - dst: feature_flag_db
+        proto: jdbc
+        desc: Reads feature flags and rollout configuration from a small configuration database.
+      - dst: haproxy_lb
+        proto: https
+        desc: Returns HTTP responses back through the HAProxy frontend (response path modeled for log ordering).
+    logs:
+      http_req:
+        desc: Per-request entry log for normal page endpoints.
+        lvl: INFO
+        msg: "req {req_id} {method} {uri} user={user_tier}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET]}
+          uri: {k: ch, v: [/questions, /search, /users]}
+          user_tier: {k: ch, v: [anon, logged_in, employee]}
+
+      http_resp_200:
+        desc: Per-request completion log for successful page responses.
+        lvl: INFO
+        msg: "resp {req_id} 200 dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [5, 5000]}
+          bytes: {k: i, v: [2000, 400000]}
+
+      stackegg_req:
+        desc: Per-request entry log for the StackEgg game-state AJAX endpoint.
+        lvl: INFO
+        msg: "req {req_id} GET /stackegg/state user={user_tier}"
+        vars:
+          req_id: {k: hex, v: 16}
+          user_tier: {k: ch, v: [logged_in, employee]}
+
+      stackegg_resp_200:
+        desc: Per-request completion log for StackEgg game-state responses.
+        lvl: INFO
+        msg: "resp {req_id} 200 stackegg_state_age_s={age_s} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          age_s: {k: i, v: [0, 10]}
+          dur_ms: {k: i, v: [5, 3000]}
+
+    beh:
+      n:
+        desc: Web tier has no important background logs for this incident model.
+        emit: []
+      f:
+        desc: Web tier has no important background logs for this incident model.
+        emit: []
+
+  - id: feature_flag_db
+    name: Feature Flag Database
+    svc: configdb
+    hosts: [db-1]
+    desc: Stores rollout flags (including StackEgg enablement) and is modified during rollout actions.
+    to: []
+    logs:
+      flag_update:
+        desc: Audit log of a feature flag being changed.
+        lvl: INFO
+        msg: "feature_flag {flag} set to {value} by {actor}"
+        vars:
+          flag: {k: ch, v: [stackegg_enabled]}
+          value: {k: ch, v: [true, false]}
+          actor: {k: ch, v: [deploy_bot, oncall_eng, dba]}
+    beh:
+      n:
+        desc: No routine background logs modeled.
+        emit: []
+      f:
+        desc: No routine background logs modeled.
+        emit: []
+
+  - id: ops_puppet
+    name: Ops Automation (Puppet)
+    svc: puppet
+    hosts: [puppet-1]
+    desc: Applies configuration changes (e.g., HAProxy maxconn) to the load balancers.
+    to:
+      - dst: haproxy_lb
+        proto: ssh
+        desc: Pushes configuration and triggers HAProxy reload on the load balancers.
+    logs:
+      puppet_change:
+        desc: Marker that an automated configuration change was applied.
+        lvl: INFO
+        msg: "puppet applied change={change} target={target} result=success"
+        vars:
+          change: {k: ch, v: [set_haproxy_maxconn_210]}
+          target: {k: ch, v: [lb_fleet]}
+    beh:
+      n:
+        desc: No routine background logs modeled.
+        emit: []
+      f:
+        desc: No routine background logs modeled.
+        emit: []
+
+  - id: monitor_pingdom
+    name: External Monitoring
+    svc: pingdom
+    hosts: [pingdom]
+    desc: Periodically checks the public site and raises an alert when it becomes unreachable.
+    to:
+      - dst: haproxy_lb
+        proto: https
+        desc: Performs HTTP checks against the public frontend.
+    logs:
+      check_ok:
+        desc: Periodic monitoring check success.
+        lvl: INFO
+        msg: "check site={site} status=OK rtt_ms={rtt_ms}"
+        vars:
+          site: {k: ch, v: [stackoverflow]}
+          rtt_ms: {k: i, v: [40, 400]}
+      check_fail:
+        desc: Periodic monitoring check failure (e.g., TCP connect timeout) during an outage.
+        lvl: ERROR
+        msg: "check site={site} status=DOWN reason={reason} waited_ms={waited_ms}"
+        vars:
+          site: {k: ch, v: [stackoverflow]}
+          reason: {k: ch, v: [tcp_connect_timeout, http_503, high_latency]}
+          waited_ms: {k: i, v: [800, 15000]}
+      check_alert:
+        desc: Monitoring alert opened when checks fail.
+        lvl: ERROR
+        msg: "ALERT site={site} status=DOWN reason={reason}"
+        vars:
+          site: {k: ch, v: [stackoverflow]}
+          reason: {k: ch, v: [tcp_connect_timeout, http_503, high_latency]}
+    beh:
+      n:
+        desc: Regular checks pass under normal conditions.
+        emit:
+          - id: check_ok
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During the incident, monitoring continues; OK vs DOWN outcomes are controlled in the scenario via rate multipliers.
+        emit:
+          - id: check_ok
+            per_min: 1.0
+            scope: global
+          - id: check_fail
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal browsing: page views traverse HAProxy to the web tier with low latency and minimal queuing.
+    req:
+      - id: page_view
+        desc: Standard HTML page request (no StackEgg AJAX enabled).
+        rpm: 250.0
+        path: [haproxy_lb, web_app, haproxy_lb]
+        emit:
+          - haproxy_lb.frontend_accept
+          - web_app.http_req
+          - web_app.http_resp_200
+          - haproxy_lb.frontend_close_ok
+        latency_ms: [[1, 3], [2, 6], [30, 180], [1, 3]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Failure browsing: StackEgg adds AJAX load and long keep-alive drives HAProxy concurrency to its session cap, causing queuing and timeouts.
+    req:
+      - id: page_view_ok_slow
+        desc: Page views that still succeed but with elevated latency due to LB queuing and backend contention.
+        rpm: 220.0
+        path: [haproxy_lb, web_app, haproxy_lb]
+        emit:
+          - haproxy_lb.frontend_accept
+          - web_app.http_req
+          - web_app.http_resp_200
+          - haproxy_lb.frontend_close_ok
+        latency_ms: [[1, 5], [5, 20], [120, 700], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: page_view_connect_timeout
+        desc: Page views that fail because the client TCP connect waits in the queue and times out.
+        rpm: 80.0
+        path: [haproxy_lb]
+        emit:
+          - haproxy_lb.frontend_connect_timeout
+        latency_ms: [[8000, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: stackegg_state_ajax
+        desc: StackEgg game-state AJAX request issued by logged-in clients after page load.
+        rpm: 300.0
+        path: [haproxy_lb, web_app, haproxy_lb]
+        emit:
+          - haproxy_lb.frontend_accept
+          - web_app.stackegg_req
+          - web_app.stackegg_resp_200
+          - haproxy_lb.frontend_close_ok
+        latency_ms: [[1, 4], [2, 8], [40, 250], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    Traffic volumes are scaled down (rpm) to keep generated log volume practical while preserving the incident mechanism
+    (keep-alive driven session concurrency hitting HAProxy maxconn and causing queued connects/timeouts).
+  - >
+    To keep the overload mechanism quantitatively realizable with scaled rpm, HAProxy concurrency-related values are also scaled down:
+    maxconn=140 represents the real-world 40k cap, and maxconn=210 represents the later raised cap (real-world ~60k). The keep-alive
+    duration remains 15s because that parameter (not its absolute scale) is central to the failure.
+  - >
+    The maxconn value is treated as a time-consistent semantic carrier by splitting HAProxy stats/queue-warning logs into
+    pre-change (maxconn=140) and post-change (maxconn=210) templates, with scenario multipliers switching which templates emit.
+  - >
+    To avoid "at-cap" HAProxy stats appearing before the modeled saturation transition, the initial-cap stats are split into
+    a rising-load template (stats_sample_40k) and an at-cap template (stats_sample_40k_cap); the scenario switches between them.
+  - >
+    In HAProxy stats snapshots, cur_sess is constrained to be <= maxconn; overflow pressure is represented by queued, which can rise
+    when new connects are waiting to be accepted.
+  - >
+    Monitoring is modeled with distinct background logs for OK vs DOWN checks in failure state; the scenario uses rate multipliers
+    to avoid contradictory OK checks during the outage window while still emitting monitoring traffic.
+  - >
+    Normal phase log volume estimate: ~250 rpm * 4 logs/request ≈ 1000 logs/min, plus ~3–5 background logs/min across components.
+  - >
+    Total scenario log volume estimate (with failure multipliers): ~60k–70k logs, within the 20k–100k target.
+  - >
+    Key diagnostic anchors intended to be visible: haproxy_lb.stats_sample_40k then stats_sample_40k_cap then stats_sample_60k (1/min/host),
+    haproxy_lb.maxconn_queue_warn_40k (activated during saturation), haproxy_lb.frontend_connect_timeout (per-failed-request),
+    monitor_pingdom.check_fail during the outage window, and the feature_flag_db.flag_update / ops_puppet.puppet_change / haproxy_lb.reload_applied one-shots.
+```

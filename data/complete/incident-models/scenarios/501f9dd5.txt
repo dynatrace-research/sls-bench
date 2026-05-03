@@ -1,0 +1,177 @@
+```yaml
+scenario:
+  id: incident_2105_git_push_401_partial_deploy
+  title: Partial deploy without config synchronization causes git push 401s
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The Git gateway normally authorizes each git push by calling an internal authorization API and then completes the push.
+    A production deploy introduced a new internal auth method that required a config token to be synchronized to instances.
+    New code was deployed to a batch before that config was transmitted, so those instances called the internal API without auth and received 401,
+    which was propagated back to customers as intermittent git push failures.
+
+  trigger_desc: |
+    A production batch deploy of the Git gateway is started using new code that expects a new auth configuration, but the production instances
+    have not yet received the synchronized configuration update.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Traffic to the git push HTTPS endpoint is steady. The edge router forwards requests to the Git gateway,
+        which calls the internal authorization API and completes pushes successfully. Unauthorized responses from the
+        internal API are near-zero and the router returns mostly 200 responses.
+      flows: [git_push_http_success]
+      manifestation:
+        - edge_router.http_resp_200
+        - git_gateway.push_complete_200
+        - internal_auth_api.auth_ok
+        - internal_auth_api.auth_metrics
+        - git_gateway.health_ok
+
+    f:
+      desc: |
+        A rolling deploy begins for the Git gateway. A batch of instances starts running new code that uses a new internal auth method,
+        but those instances do not yet have the required config token applied. Requests routed to that batch fail quickly with 401 due to
+        internal API authorization rejection, while other requests continue to succeed on unaffected instances. As poisoned instances stop
+        taking new requests, traffic concentrates further onto the misconfigured batch, increasing the rate of 401s. Operators later trigger
+        config synchronization and restart some processes, reducing (but not fully eliminating) the 401s by the end of the captured window.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: deploy_orchestrator
+          event: |
+            A production batch deploy starts and poisons a subset of Git gateway instances; the updated batch begins serving traffic
+            while lacking the newly required auth configuration, leading to immediate 401s on some git pushes.
+          why: |
+            The new code path calls the internal authorization API using a token from instance config; without the synchronized token,
+            calls are unauthenticated and the internal API responds 401, which is propagated to the edge response.
+            This is directly observable via internal_auth_api.auth_denied and edge_router.http_resp_401.
+          flows: [git_push_http_ok, git_push_http_401]
+          rate_multipliers:
+            git_push_http_ok: 1.0
+            git_push_http_401: 1.0
+            deploy_orchestrator.deploy_status: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: deploy_orchestrator.batch_deploy_start
+              count: 1
+              hosts: [deploy-01]
+            - ref: deploy_orchestrator.instance_poisoned
+              count: 2
+              hosts: [deploy-01]
+          manifestation:
+            - deploy_orchestrator.batch_deploy_start
+            - internal_auth_api.auth_denied
+            - git_gateway.push_complete_401
+            - edge_router.http_resp_401
+
+        - order: 2
+          at_min: 24
+          component: alerting
+          event: |
+            An alert fires for elevated 401 rates, and the proportion of failing pushes increases as traffic shifts away from poisoned instances
+            toward the updated (but misconfigured) batch.
+          why: |
+            Poisoned instances stop taking new requests during the deploy, reducing the pool of unaffected targets; the router therefore
+            sends a higher share of pushes to the misconfigured instances, increasing observed 401s.
+            The elevated 401 rate is directly observable; the traffic-shift mechanism is partially inferable from deploy status.
+          flows: [git_push_http_ok, git_push_http_401]
+          rate_multipliers:
+            git_push_http_ok: 0.75
+            git_push_http_401: 2.0
+          latency_multipliers:
+            git_push_http_ok: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: alerting.alert_401_rate_high
+              count: 1
+              hosts: [mon-01]
+          manifestation:
+            - alerting.alert_401_rate_high
+            - edge_router.http_resp_401
+            - internal_auth_api.auth_metrics
+
+        - order: 3
+          at_min: 30
+          component: config_distributor
+          event: |
+            Operators trigger configuration synchronization to instances and restart some Git gateway processes so they reload config,
+            reducing the 401 rate and easing latency, but leaving a residual set of 401s for requests that still land on not-yet-restarted processes.
+          why: |
+            Config propagation makes the token available on hosts, but running processes may need restart to pick it up; restarting some
+            instances reduces how often requests hit stale processes. This is directly observable via config_distributor sync logs and
+            git_gateway.proc_restart, while residual 401s remain visible in internal_auth_api.auth_denied and edge_router.http_resp_401.
+          flows: [git_push_http_ok, git_push_http_401]
+          rate_multipliers:
+            git_push_http_ok: 1.125
+            git_push_http_401: 0.5
+            deploy_orchestrator.deploy_status: 0.2
+          latency_multipliers:
+            git_push_http_ok: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: config_distributor.config_sync_trigger
+              count: 1
+              hosts: [cfg-01]
+            - ref: config_distributor.config_sync_complete
+              count: 1
+              hosts: [cfg-01]
+            - ref: git_gateway.proc_restart
+              count: 2
+              hosts: [git-01, git-02]
+            - ref: deploy_orchestrator.deploy_pause
+              count: 1
+              hosts: [deploy-01]
+          manifestation:
+            - config_distributor.config_sync_trigger
+            - git_gateway.proc_restart
+            - edge_router.http_resp_401
+
+      steady:
+        - component: git_gateway
+          condition: |
+            Mixed runtime state persists: config is largely synchronized, but a subset of running Git gateway processes still operate without
+            the new auth token until restarted, producing intermittent upstream 401 failures.
+          user_impact: |
+            Git pushes intermittently fail with HTTP 401 depending on which instance receives the request; most pushes succeed.
+          manifestation:
+            - git_gateway.auth_token_missing
+            - git_gateway.push_complete_401
+            - edge_router.http_resp_401
+        - component: deploy_orchestrator
+          condition: |
+            Deployment remains paused mid-batch to limit further customer impact, leaving the fleet in a partially rolled state with only low-rate
+            deploy status updates continuing.
+          user_impact: |
+            Reduced operational agility; incident response focuses on stabilizing the current rollout before continuing.
+          manifestation:
+            - deploy_orchestrator.deploy_status
+
+      feedback_loops:
+        - id: poisoning_concentrates_traffic
+          desc: |
+            Poisoning reduces the pool of unaffected instances that can accept new requests, concentrating traffic on the remaining targets.
+            When some of those targets are misconfigured, the increased concentration amplifies the observed 401 rate and triggers alerts.
+
+      flows: [git_push_http_ok, git_push_http_401]
+      manifestation:
+        - internal_auth_api.auth_denied
+        - edge_router.http_resp_401
+        - git_gateway.push_complete_401
+        - deploy_orchestrator.deploy_status
+        - internal_auth_api.auth_metrics
+
+  assumptions:
+    - 'The captured scenario ends while residual failures remain (incident window truncated) to satisfy the requirement that the scenario ends in failure.'
+    - 'Failure-phase breakdown approx: min 20-24 (4m) ok=240 rpm and 401=60 rpm => ~1560 request-flow logs/min plus ~5 background logs/min; plus 3 one-shots at minute 20.'
+    - 'Failure-phase breakdown approx: min 24-30 (6m) multipliers ok*0.75 and 401*2.0 => ok=180 rpm and 401=120 rpm => ~1620 request-flow logs/min plus ~5 background logs/min; plus 1 one-shot at minute 24.'
+    - 'Failure-phase breakdown approx: min 30-40 (10m) multipliers ok*1.125 and 401*0.5 => ok=270 rpm and 401=30 rpm => ~1530 request-flow logs/min plus ~4 background logs/min; plus 5 one-shots at minute 30.'
+    - 'Total log estimate across 40 minutes is ~61k (dominantly request-flow logs), within the 20k–100k target.'
+    - 'Visibility rationale: edge_router.http_resp_401 and internal_auth_api.auth_denied repeat frequently once failure starts; alert/deploy/config actions are guaranteed via one-shots.'
+```

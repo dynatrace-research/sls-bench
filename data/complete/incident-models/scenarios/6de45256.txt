@@ -1,0 +1,209 @@
+```yaml
+scenario:
+  id: lb_stale_config_rollback_gfe_gc_20170405
+  title: Stale LB config rollback triggers GFE GC/restarts and later config-update freeze
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally serves HTTPS traffic from a fleet of GFE proxies and applies configuration updates via a master-controlled push process.
+    A mastership transition to a replica that could not read recent configuration snapshots caused the control plane to revert to an out-of-date "known good" config.
+    Recently modified load balancers lost required config entries (100% 502s for that subset) and later the large deletion set triggered heavy GC on GFEs, leading to health check failures and frequent restarts (overall ~25% 502s).
+    Operators switched to a healthy master and forced a fresh config reload to mitigate 502s, then paused further configuration updates, causing some deployments to fail.
+
+  trigger_desc: |
+    A configuration-master replica loses access to the distributed file system, then becomes leader and initiates a config push; its canary validation fails and it reverts all GFEs to the newest configuration snapshot it can read (stale).
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        GFEs serve stable load balancers successfully with low background GC and occasional storage RPC warnings.
+        Deployments submit config changes which are accepted and pushed via routine push cycles (canary passes, then global apply).
+      flows: [client_https_request_ok_n, lb_config_push_cycle_n, app_flex_deploy_success_n]
+      manifestation: [gfe.access_200, config_master.heartbeat, gfe.cpu_sample]
+
+    f:
+      desc: |
+        A newly elected config master leader cannot read recent snapshots and treats a canary failure as a signal to revert to "known good",
+        but because it only sees older snapshots the rollback is substantially out of date.
+        Recently modified load balancers immediately begin failing due to missing config entries, and shortly after, GFEs experience GC pressure
+        from deleting many configurations; health checks fail, frequent restarts occur, and stable load balancers experience intermittent 502s.
+        Near the end, operators switch to a healthy master and force a one-time reload of a fresh configuration to mitigate errors; regular configuration updates are then paused.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: config_master
+          event: |
+            Mastership changes to cm-02 which lacks access to recent snapshots; a push cycle's canary fails and the leader initiates a rollback to the latest readable (stale) configuration.
+            Recently modified load balancers begin returning 502 due to missing configuration entries.
+          why: |
+            The new leader cannot read recent config files from the distributed file system. On canary failure, the process reverts to "known good",
+            but "known good" is effectively "latest readable by this leader", which is out of date. Missing config entries for recently modified LBs are directly observable via 502 logs.
+          flows: [client_https_request_stable_ok_f, client_https_request_recent_502_config_f, lb_config_push_cycle_f, app_flex_deploy_success_f]
+          rate_multipliers:
+            client_https_request_stable_ok_f: 1.28
+            client_https_request_stable_502_restart_f: 0.0
+            client_https_request_recent_502_config_f: 1.0
+            app_flex_deploy_success_f: 1.0
+            app_flex_deploy_fail_paused_f: 0.0
+            config_master.pause_state: 0.0
+            gfe.gc_stats: 0.0
+            health_checker.hc_failed: 0.0
+            gfe.process_restart: 0.0
+          latency_multipliers:
+            client_https_request_stable_ok_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: config_master.leader_elected
+              count: 1
+              hosts: [cm-02]
+            - ref: config_master.rollback_to_known_good
+              count: 1
+              hosts: [cm-02]
+            - ref: gfe.bulk_config_reload
+              count: 1
+              hosts: [gfe-01]
+          manifestation: [config_master.gfs_read_fail, config_master.rollback_to_known_good, gfe.access_502_config, gfe.proxy_error_config]
+
+        - order: 2
+          at_min: 21
+          component: gfe
+          event: |
+            After the stale rollback deletes many configurations, GFE garbage collection spikes; health checks begin failing and frequent restarts of some GFEs occur,
+            producing intermittent 502s for otherwise stable load balancers and increasing tail latency.
+          why: |
+            The out-of-date configuration implies a large set of "deleted" config objects. Freeing those objects increases GC CPU share,
+            which can starve health check endpoints and trigger watchdog restarts. This is directly observable in elevated gc_stats, health check failures, and restart logs.
+          flows: [client_https_request_stable_ok_f, client_https_request_stable_502_restart_f]
+          rate_multipliers:
+            client_https_request_stable_ok_f: 1.0
+            client_https_request_stable_502_restart_f: 1.0
+            gfe.gc_stats: 4.0
+            health_checker.hc_failed: 8.0
+            gfe.process_restart: 14.0
+          latency_multipliers:
+            client_https_request_stable_ok_f: {p50: 1.1, p95: 1.6}
+            client_https_request_stable_502_restart_f: {p50: 1.0, p95: 1.2}
+          one_shots: []
+          manifestation: [gfe.gc_stats, health_checker.hc_failed, gfe.process_restart, gfe.access_502_restart]
+
+        - order: 3
+          at_min: 27
+          component: monitoring
+          event: |
+            Monitoring detects sustained 502 and health check failure rates and pages on-call engineers.
+          why: |
+            Alerting is based on aggregated error-rate and health-check-failure signals; the page itself is directly observable as an action marker.
+          flows: []
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: monitoring.page_sent
+              count: 1
+              hosts: [mon-01]
+          manifestation: [monitoring.page_sent]
+
+        - order: 4
+          at_min: 39
+          component: config_master
+          event: |
+            Engineers switch the config update process to a different master (cm-01) that can read recent snapshots and trigger a one-time forced reload of a fresh configuration onto GFEs.
+            Missing-config 502s stop for recently modified load balancers and restart-driven 502s drop sharply as the fleet stabilizes; regular configuration push cycles remain paused and deploy-driven changes are rejected.
+          why: |
+            Switching away from the leader with broken file-system access allows operators to read a current configuration snapshot.
+            A forced reload applies that snapshot to GFEs (directly observable via forced-push and forced-apply markers), restoring the missing entries.
+            Updates are then paused to prevent further automated pushes while the root cause is confirmed.
+          flows: [client_https_request_stable_ok_f, client_https_request_stable_502_restart_f, app_flex_deploy_fail_paused_f]
+          rate_multipliers:
+            client_https_request_recent_502_config_f: 0.0
+            client_https_request_stable_502_restart_f: 0.1
+            client_https_request_stable_ok_f: 1.3
+            lb_config_push_cycle_f: 0.0
+            config_master.gfs_read_fail: 0.0
+            gfe.gc_stats: 0.6
+            health_checker.hc_failed: 0.5
+            gfe.process_restart: 1.0
+            app_flex_deploy_success_f: 0.0
+            app_flex_deploy_fail_paused_f: 1.0
+            config_master.pause_state: 1.0
+          latency_multipliers:
+            client_https_request_stable_ok_f: {p50: 1.0, p95: 1.1}
+          one_shots:
+            - ref: config_master.ops_switch_master
+              count: 1
+              hosts: [cm-01]
+            - ref: config_master.ops_force_config_push
+              count: 1
+              hosts: [cm-01]
+            - ref: gfe.config_apply_forced
+              count: 6
+              hosts: [gfe-01, gfe-02, gfe-03, gfe-04, gfe-05, gfe-06]
+            - ref: config_master.ops_pause_updates
+              count: 1
+              hosts: [cm-01]
+          manifestation: [config_master.ops_force_config_push, gfe.config_apply_forced, config_master.pause_state, deploy_manager.deploy_done_paused]
+
+      steady:
+        - component: config_master
+          condition: |
+            Configuration updates remain paused; push cycles are suppressed and deploy-driven change requests are rejected.
+          user_impact: |
+            Deployments that require load balancer configuration changes fail until the pause is lifted.
+          manifestation: [config_master.pause_state, config_master.deploy_change_rejected_paused, deploy_manager.deploy_done_paused]
+
+        - component: gfe
+          condition: |
+            Most client traffic succeeds again, but a small residual rate of restart-related 502s and elevated GC noise persists briefly.
+          user_impact: |
+            Client-facing 502s drop substantially, but may still occur sporadically while the fleet stabilizes.
+          manifestation: [gfe.access_502_restart, gfe.gc_stats, gfe.process_restart]
+
+      feedback_loops:
+        - id: stale_config_deletion_gc_loop
+          desc: |
+            Stale rollback deletes many configuration objects -> GC CPU increases -> health checks fail -> restarts occur -> client 502s increase.
+            Restarts and retries can increase load and exacerbate the impact while the stale configuration remains active.
+
+      flows:
+        - client_https_request_stable_ok_f
+        - client_https_request_stable_502_restart_f
+        - client_https_request_recent_502_config_f
+        - lb_config_push_cycle_f
+        - app_flex_deploy_success_f
+        - app_flex_deploy_fail_paused_f
+      manifestation:
+        - config_master.gfs_read_fail
+        - config_master.rollback_to_known_good
+        - gfe.access_502_config
+        - gfe.gc_stats
+        - health_checker.hc_failed
+        - gfe.process_restart
+        - config_master.ops_force_config_push
+        - gfe.config_apply_forced
+        - config_master.pause_state
+        - deploy_manager.deploy_done_paused
+
+  assumptions:
+    - |
+      Timeline is compressed to 40 minutes: 18 minutes normal + 22 minutes failure matching the incident duration, plus the beginning of the post-incident update pause.
+    - |
+      Piecewise failure breakdown (approx):
+        * min 18-21 (3m): stale rollback active; recent-LB 502-config active; GC/health-check/restart background signals suppressed to avoid early appearance.
+        * min 21-27 (6m): GC/health-check failures spike; stable restart-502 activated; tail latency increases; restarts become frequent and longer-lived (10s–90s downtime).
+        * min 27-39 (12m): sustained elevated GC/health-check failures and ~25% 502 overall.
+        * min 39-40 (1m): master switched; a one-time forced config reload is logged; missing-config 502s stop; updates paused; deploy failures begin.
+    - |
+      One-shots per event: E1=3 (leader_elected, rollback_to_known_good, bulk_config_reload), E3=1 (page_sent), E4=9 (ops_switch_master, ops_force_config_push, 6x gfe.config_apply_forced, ops_pause_updates).
+    - |
+      Normal-phase background logs/min estimate: ~12/min; failure-phase effective logs/min dominated by ~700 rpm access logging plus event-amplified GFE/health-check metrics.
+      Total expected log volume is ~33k–37k, dominated by client access logs and augmented by error detail logs on 502s and elevated GC/health-check/restart background logs.
+    - |
+      Visibility rationale: recent-LB 502-config evidence is frequent during min 18-39; GC/health-check/restart symptoms are forced to start at min 21 via event multipliers (and are suppressed before that);
+      mitigation is made unambiguous by one-shot markers for the forced config push and forced GFE applies at min 39; operator actions and paging are emitted as one-shots at precise minutes.
+```

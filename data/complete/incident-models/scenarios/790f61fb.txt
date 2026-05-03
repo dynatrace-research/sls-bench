@@ -1,0 +1,342 @@
+```yaml
+scenario:
+  id: circleci_queue_db_lock_webhook_surge
+  title: Webhook surge locks scheduler DB, stalling build queue and triggering emergency mitigations
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally ingests GitHub webhooks, enqueues builds into a DB-backed scheduler queue, and continuously dequeues builds onto builders.
+    During the modeled pre-incident window, GitHub push hook delivery is effectively absent while the platform remains otherwise healthy.
+    When hook delivery resumes as a sustained surge, DB write pressure climbs quickly and then nonlinearly tips the shared DB into lock contention, collapsing dequeue throughput and stalling the build queue.
+    Operators attempt LB throttling and a DB stepdown, then mitigate by disabling auto re-enqueue, reducing builder activity, live patching hot queries, and draining queues; the scenario ends while the system is still degraded and draining.
+
+  trigger_desc: |
+    GitHub webhook delivery returns after an upstream interruption and comes back as a sustained high-rate surge that is several multiples of normal peak, flooding the build enqueue path.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Customer API traffic and a small amount of background scheduling operate normally.
+        GitHub push hook deliveries are largely absent (a known external issue), so new build enqueues are near-zero while the service remains up.
+        DB pool stats show low waiting/lock counts; slow query and statement timeout logging is effectively absent.
+      flows: [customer_api_ok, scheduler_dequeue_ok]
+      manifestation:
+        - postgres_db.pool_stats
+        - scheduler_service.queue_stats
+        - api_service.api_req_ok
+        - scheduler_service.dequeue_ok
+
+    f:
+      desc: |
+        Failure begins when webhook delivery resumes as a sustained surge, increasing enqueue write pressure on the shared database.
+        For a short period the system appears to cope (enqueues and dequeues still succeed), but the additional write load sets up a non-linear DB degradation.
+        The database then becomes lock/contention bound: timeouts and slow queries appear and scheduler dequeue success collapses while queues grow.
+        Mitigation attempts (LB throttling, DB stepdown) are followed by disabling auto re-enqueue, reducing builders, live patching hot queries, and draining queues.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: api_service
+          event: |
+            GitHub webhook delivery resumes and immediately returns as a sustained surge, rapidly increasing enqueue writes into the DB-backed run queue.
+            During the first couple minutes, most enqueues and dequeues still complete, so the system initially appears to be coping.
+          why: |
+            The upstream GitHub interruption ends and buffered/renewed webhook delivery returns at a higher sustained rate than typical.
+            This change is directly observable via increased webhook-related request logs before DB contention becomes dominant.
+          flows:
+            - github_webhook_enqueue_ok
+            - customer_api_ok
+            - scheduler_dequeue_ok
+          rate_multipliers:
+            github_webhook_enqueue_timeout: 0.0
+            github_webhook_lb_503: 0.0
+            scheduler_dequeue_timeout: 0.0
+            customer_api_backend_500: 0.0
+            customer_api_lb_503: 0.0
+            postgres_db.pool_stats: 0.0
+            postgres_db.lock_alert: 0.0
+            postgres_db.query_timeout: 0.0
+            postgres_db.slow_query: 0.0
+            scheduler_service.queue_stats: 0.0
+            scheduler_service.queue_pressure: 0.0
+            scheduler_service.reenqueue_build: 0.0
+            ops_repl.drain_progress: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - api_service.webhook_received
+            - api_service.enqueue_ok
+            - scheduler_service.dequeue_ok
+
+        - order: 2
+          at_min: 27
+          component: postgres_db
+          event: |
+            The shared DB becomes lock/contention bound; query latency jumps, lock-wait alarms begin, and scheduler dequeue success collapses while the queue grows quickly.
+          why: |
+            High-rate build insertions and associated state writes amplify DB contention; once lock waits rise, throughput falls nonlinearly and timeouts appear across clients.
+            This is directly observable in DB lock/timeouts/slow-query logs and in scheduler dequeue timeout logs; the specific root mechanism (lock contention) is inferred from correlated lock-wait signals.
+          flows:
+            - github_webhook_enqueue_ok
+            - github_webhook_enqueue_timeout
+            - scheduler_dequeue_timeout
+            - customer_api_ok
+            - customer_api_backend_500
+          rate_multipliers:
+            postgres_db.pool_stats: 1.0
+            postgres_db.lock_alert: 1.0
+            scheduler_service.queue_stats: 1.0
+            scheduler_service.queue_pressure: 1.0
+            github_webhook_enqueue_ok: 0.6
+            github_webhook_enqueue_timeout: 0.8
+            scheduler_dequeue_ok: 0.01
+            scheduler_dequeue_timeout: 1.0
+            customer_api_ok: 0.9
+            customer_api_backend_500: 0.6
+            postgres_db.query_timeout: 1.0
+            postgres_db.slow_query: 1.0
+          latency_multipliers:
+            github_webhook_enqueue_ok: {p50: 2.5, p95: 4.0}
+            github_webhook_enqueue_timeout: {p50: 2.0, p95: 3.0}
+            customer_api_ok: {p50: 2.0, p95: 4.0}
+            customer_api_backend_500: {p50: 1.5, p95: 2.5}
+            scheduler_dequeue_timeout: {p50: 1.2, p95: 1.5}
+          one_shots: []
+          manifestation:
+            - postgres_db.lock_alert
+            - postgres_db.query_timeout
+            - postgres_db.slow_query
+            - scheduler_service.dequeue_timeout
+            - scheduler_service.queue_pressure
+
+        - order: 3
+          at_min: 31
+          component: edge_lb
+          event: |
+            Operators attempt to throttle inbound webhook load at the load balancer, but the surge overwhelms constrained inflight capacity and customers begin receiving widespread 503s.
+          why: |
+            Reducing capacity/limits at the LB is a fast lever to stop new builds from joining the queue, but webhook traffic dominates request volume and consumes the constrained inflight budget.
+            This is directly observable as LB access logs with 503 and a throttling configuration-change marker.
+          flows:
+            - github_webhook_lb_503
+            - customer_api_lb_503
+          rate_multipliers:
+            github_webhook_lb_503: 1.0
+            github_webhook_enqueue_ok: 0.2
+            github_webhook_enqueue_timeout: 0.3
+            customer_api_lb_503: 1.0
+            customer_api_ok: 0.2
+            customer_api_backend_500: 0.2
+          latency_multipliers: {}
+          one_shots:
+            - ref: edge_lb.capacity_throttle
+              count: 1
+              hosts: [lb1]
+          manifestation:
+            - edge_lb.capacity_throttle
+            - edge_lb.access
+
+        - order: 4
+          at_min: 33
+          component: ops_repl
+          event: |
+            The LB throttling is rolled back to restore customer access, and a DB stepdown/promote-secondary is initiated to try to flush queued operations and regain control.
+          why: |
+            The rollback is observable via a rapid reduction of LB-level 503s and an explicit rollback marker.
+            The DB stepdown is an operational action; its effectiveness is only partially observable via subsequent DB pressure signals and queue behavior.
+          flows:
+            - customer_api_ok
+            - github_webhook_enqueue_timeout
+            - scheduler_dequeue_timeout
+          rate_multipliers:
+            github_webhook_lb_503: 0.0
+            customer_api_lb_503: 0.0
+            customer_api_ok: 0.9
+            customer_api_backend_500: 0.7
+            github_webhook_enqueue_ok: 0.5
+            github_webhook_enqueue_timeout: 0.9
+            postgres_db.query_timeout: 1.3
+            postgres_db.slow_query: 1.2
+            scheduler_service.reenqueue_build: 1.5
+          latency_multipliers: {}
+          one_shots:
+            - ref: edge_lb.capacity_rollback
+              count: 1
+              hosts: [lb1]
+            - ref: ops_repl.db_stepdown
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - edge_lb.capacity_rollback
+            - ops_repl.db_stepdown
+            - scheduler_service.reenqueue_build
+            - postgres_db.lock_alert
+
+        - order: 5
+          at_min: 40
+          component: ops_repl
+          event: |
+            The stepdown does not relieve load and re-enqueueing is amplifying DB writes, so operators disable auto re-enqueue, terminate builders to reduce activity, and live-patch hot queries.
+            As part of triage, slow-query inspection becomes a focus, and slow-query logging becomes more prominent even as statement timeouts begin to drop.
+          why: |
+            Automatic re-enqueue turns infrastructure/stepdown failures into additional queue writes, sustaining the overload.
+            Disabling re-enqueue and reducing builders lowers the volume of state updates, which can reduce timeouts; however, remaining inefficient queries still run slowly under large queue sizes and become more visible when the team actively collects slow-query evidence.
+            The actions are directly observable via ops one-shot markers; timeouts decreasing and slow-query lines increasing are directly observable in DB logs.
+          flows:
+            - scheduler_dequeue_timeout
+            - github_webhook_enqueue_timeout
+            - customer_api_backend_500
+          rate_multipliers:
+            scheduler_service.reenqueue_build: 0.0
+            builder_fleet.heartbeat: 0.3
+            postgres_db.query_timeout: 0.7
+            postgres_db.slow_query: 2.0
+            github_webhook_enqueue_ok: 0.5
+            github_webhook_enqueue_timeout: 0.7
+            customer_api_ok: 0.95
+            customer_api_backend_500: 0.4
+            scheduler_dequeue_ok: 0.02
+            scheduler_dequeue_timeout: 0.8
+          latency_multipliers:
+            github_webhook_enqueue_timeout: {p50: 0.9, p95: 0.9}
+            customer_api_backend_500: {p50: 0.9, p95: 0.9}
+          one_shots:
+            - ref: ops_repl.auto_reenqueue_disabled
+              count: 1
+              hosts: [ops1]
+            - ref: ops_repl.terminate_builders
+              count: 1
+              hosts: [ops1]
+            - ref: ops_repl.repl_patch
+              count: 2
+              hosts: [ops1]
+            - ref: ops_repl.collect_slow_queries
+              count: 1
+              hosts: [ops1]
+          manifestation:
+            - ops_repl.auto_reenqueue_disabled
+            - ops_repl.terminate_builders
+            - ops_repl.collect_slow_queries
+            - postgres_db.query_timeout
+            - postgres_db.slow_query
+
+        - order: 6
+          at_min: 46
+          component: ops_repl
+          event: |
+            With DB pressure partially reduced, operators start queue-drain scripts for the usage and run queues; progress logging begins and dequeue success becomes slightly more frequent, but the platform remains degraded.
+          why: |
+            Purging queued state requires DB reads/writes, so draining is only possible once contention is reduced enough for administrative scripts to make progress.
+            This is directly observable via drain script start markers and periodic drain progress logs; improved dequeueing is inferred from a higher rate of scheduler dequeue success logs.
+          flows:
+            - scheduler_dequeue_ok
+            - scheduler_dequeue_timeout
+          rate_multipliers:
+            ops_repl.drain_progress: 1.0
+            scheduler_dequeue_ok: 0.05
+            scheduler_dequeue_timeout: 0.7
+            customer_api_backend_500: 0.3
+            github_webhook_enqueue_timeout: 0.6
+          latency_multipliers:
+            scheduler_dequeue_timeout: {p50: 0.9, p95: 0.9}
+          one_shots:
+            - ref: ops_repl.drain_script_start
+              count: 2
+              hosts: [ops1]
+          manifestation:
+            - ops_repl.drain_script_start
+            - ops_repl.drain_progress
+            - scheduler_service.queue_stats
+
+      steady:
+        - component: postgres_db
+          condition: |
+            DB remains under elevated contention (high lock waits), with continued slow queries and intermittent timeouts despite mitigations.
+          user_impact: |
+            Builds are significantly delayed; enqueue and API operations are slow and occasionally fail.
+          manifestation:
+            - postgres_db.lock_alert
+            - postgres_db.query_timeout
+            - postgres_db.slow_query
+            - postgres_db.pool_stats
+
+        - component: scheduler_service
+          condition: |
+            Scheduler dequeue success is far below normal while the run/usage queues remain large; draining scripts are actively reducing backlog.
+          user_impact: |
+            The build queue appears stuck or extremely slow-moving; some builds may be canceled/drained rather than executed.
+          manifestation:
+            - scheduler_service.dequeue_timeout
+            - scheduler_service.queue_pressure
+            - ops_repl.drain_progress
+
+      feedback_loops:
+        - id: reenqueue_amplifies_db_load
+          desc: |
+            DB disruption (timeouts/failover) causes build attempts to fail, and automatic re-enqueue writes more queue state back into the same contended DB.
+            The additional writes further increase lock contention and slow query execution, prolonging the stall until re-enqueue is disabled and load is forcibly reduced.
+
+      flows:
+        - github_webhook_enqueue_ok
+        - github_webhook_enqueue_timeout
+        - github_webhook_lb_503
+        - customer_api_ok
+        - customer_api_backend_500
+        - customer_api_lb_503
+        - scheduler_dequeue_ok
+        - scheduler_dequeue_timeout
+      manifestation:
+        - api_service.enqueue_timeout
+        - scheduler_service.dequeue_timeout
+        - postgres_db.lock_alert
+        - postgres_db.query_timeout
+        - edge_lb.access
+        - ops_repl.db_stepdown
+        - ops_repl.drain_progress
+
+  assumptions:
+    - |
+        Repair for narrative/control alignment (S8): removed the Event 4 customer_api_ok latency reset so API latencies remain elevated under ongoing DB contention;
+        Event 2's latency multipliers persist through Event 4 unless changed later.
+    - |
+        Timeline is compressed into a 50-minute scenario while preserving the causal progression
+        (pause → surge → DB lock → bad throttle attempt → failover/re-enqueue storm → mitigations → draining).
+    - |
+        Failure-onset cleanliness: during minutes 25–27, failure-only background signals that could look incident-like
+        (postgres_db.pool_stats, postgres_db.lock_alert, scheduler_service.queue_stats, scheduler_service.queue_pressure) and failure error flows are suppressed to avoid contradicting
+        the narrative that the system initially appears to cope; they are activated at minute 27 when contention becomes dominant.
+    - |
+        After ops_repl.auto_reenqueue_disabled at minute 40, scheduler_service.reenqueue_build is driven to 0.0
+        so re-enqueueing is truly disabled (not merely reduced).
+    - |
+        Slow-query visibility alignment: at minute 40, postgres_db.query_timeout is reduced (multiplier 0.7) while postgres_db.slow_query increases (multiplier 2.0),
+        reflecting increased focus/collection of slow-query evidence alongside partial reduction in outright timeouts.
+    - |
+        Piecewise failure-phase volume (rough, using effective multipliers; includes builder heartbeats and active DB/scheduler metrics):
+          - min 25-27 (2m, surge; most failure-only background + API 500s suppressed): ~0.9k–1.2k logs/min ≈ 2k–3k logs
+          - min 27-31 (4m, DB lock + timeouts + pressure logs): ~1.1k–1.4k logs/min ≈ 4k–6k logs
+          - min 31-33 (2m, LB throttling & 503 burst): ~0.7k–1.0k logs/min ≈ 1k–2k logs
+          - min 33-40 (7m, stepdown + re-enqueue storm): ~1.1k–1.5k logs/min ≈ 8k–11k logs
+          - min 40-46 (6m, mitigations + reduced load; re-enqueue fully disabled): ~1.0k–1.25k logs/min ≈ 6k–8k logs
+          - min 46-50 (4m, draining active): ~0.9k–1.2k logs/min ≈ 4k–5k logs
+        Failure total ≈ 25k–35k logs; normal total ≈ 8k–10k logs; whole scenario ≈ 33k–45k logs (within 20k..100k).
+    - |
+        One-shot counts per event:
+          - event3: 1 LB throttle marker
+          - event4: 1 LB rollback marker + 1 DB stepdown marker
+          - event5: 1 auto-reenqueue-disabled marker + 1 terminate-builders + 2 live patches + 1 slow-query-collection marker
+          - event6: 2 queue-drain script starts
+    - |
+        Visibility rationale: the incident remains diagnosable even with early suppression of DB/queue background metrics and early API 500 suppression because
+        (a) event1 is visible via webhook_received/enqueue_ok starting from near-zero baseline,
+        (b) event2 is visible via postgres_db.lock_alert/query_timeout/slow_query plus scheduler dequeue_timeout dominance and queue_pressure,
+        (c) event3 is visible via edge_lb.access 503s and a capacity_throttle one-shot, and
+        (d) ops one-shots and drain_progress prove the later mitigation and draining steps.
+```

@@ -1,0 +1,272 @@
+```yaml
+scenario:
+  id: use1_ddb_dns_race_cascade
+  title: DynamoDB endpoint DNS plan race triggers EC2 and NLB cascading degradation (compressed)
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The region normally serves DynamoDB API calls via a public DNS name while also supporting EC2 instance launches and NLB traffic.
+    A latent race condition in the DynamoDB DNS enactors produces an empty Route53 record for the regional endpoint, causing widespread DNS
+    resolution failures and preventing new connections to DynamoDB. As DWFM cannot complete DynamoDB-backed state checks, droplet leases begin
+    expiring, which later turns EC2 launches into InsufficientCapacity and RequestLimitExceeded errors. The delayed lease/network recovery
+    creates network propagation lag that destabilizes NLB health checks and produces intermittent TCP connection failures.
+
+  trigger_desc: |
+    Two independent DynamoDB DNS enactors interleave an older plan application with a newer plan’s cleanup, deleting the active plan and
+    leaving the regional endpoint record set empty and subsequent plan updates blocked by inconsistent state.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        DynamoDB DNS plans are generated and enacted continuously; clients resolve the DynamoDB regional endpoint and complete API calls.
+        EC2 RunInstances succeeds at a low rate and enqueues network propagation work. NLB health checks run steadily and clients connect normally.
+      flows: [ddb_api_call, ec2_run_instances, nlb_tcp_connect_ok]
+      manifestation:
+        - customer_app.ddb_call_ok
+        - ddb_api.http_200
+        - ddb_dns_planner.plan_generated
+        - ddb_dns_enactor.enact_ok
+        - network_manager.netprop_metric
+        - nlb_controlplane.hc_result
+
+    f:
+      desc: |
+        The DynamoDB public endpoint DNS becomes empty and remains stuck due to a plan/enactor inconsistency. Client-side DNS failures dominate
+        DynamoDB call attempts. DWFM’s DynamoDB-dependent state checks fail, leases expire over time, and recovery attempts later overload DWFM.
+        As EC2 launch capacity is gated by active leases, RunInstances shifts from ServiceUnavailable to InsufficientCapacity and then throttling.
+        Network propagation lag grows as delayed state changes are processed, leading to NLB health check flapping and intermittent connection errors.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: ddb_dns_enactor
+          event: |
+            A DNS enactor race results in the DynamoDB regional endpoint record set becoming empty; most clients immediately fail DNS resolution
+            and cannot establish new connections to DynamoDB.
+          why: |
+            An older plan overwrites a newer plan late, then a newer enactor’s cleanup deletes the older plan generation, removing all A records.
+            This is directly observable via client DNS failures and elevated Route53/enactor churn; the exact race interleaving is not fully
+            observable from logs alone.
+          flows: [ddb_api_call_dns_fail, ec2_run_instances_service_unavailable]
+          rate_multipliers:
+            ddb_api_call_ok_f: 0.0
+            ec2_run_instances_insufficient_capacity: 0.0
+            ec2_run_instances_throttled: 0.0
+            nlb_tcp_connect_err_f: 0.0
+            ddb_dns_enactor.plan_missing: 0.0
+            dwfm.lease_recover: 0.0
+            network_manager.netprop_lag_high: 0.0
+            nlb_controlplane.az_failover: 0.0
+            route53_controlplane.rrset_change: 2.0
+            ddb_dns_enactor.route53_txn_conflict: 2.5
+            ddb_dns_enactor.cleanup_plans: 2.0
+          latency_multipliers:
+            ddb_api_call_dns_fail: {p50: 1.0, p95: 1.0}
+            ec2_run_instances_service_unavailable: {p50: 1.4, p95: 1.8}
+          one_shots: []
+          manifestation:
+            - customer_app.dns_resolve_fail
+            - route53_controlplane.rrset_change
+            - ddb_dns_enactor.route53_txn_conflict
+            - dwfm.state_check_fail
+
+        - order: 2
+          at_min: 26
+          component: ddb_dns_enactor
+          event: |
+            Engineers investigate and repeatedly attempt to drive DNS updates, but enactors encounter missing/blocked plan application and
+            conflicts; meanwhile DWFM leases begin expiring at a higher rate and EC2 launch failures become more common.
+          why: |
+            Because the active plan generation is deleted and the system state is inconsistent, subsequent enactor attempts can fail to find
+            or apply a coherent plan, leading to plan-missing errors and retry churn. Lease expiry is delayed (minutes) after state checks fail.
+          flows: [ddb_api_call_dns_fail, ec2_run_instances_service_unavailable]
+          rate_multipliers:
+            ddb_dns_enactor.plan_missing: 3.0
+            ddb_dns_enactor.route53_txn_conflict: 3.5
+            dwfm.lease_timeout: 4.0
+            ec2_run_instances_service_unavailable: 1.3
+            route53_controlplane.rrset_change: 1.5
+          latency_multipliers:
+            ddb_api_call_dns_fail: {p50: 1.2, p95: 1.6}
+            ec2_run_instances_service_unavailable: {p50: 2.0, p95: 2.5}
+          one_shots: []
+          manifestation:
+            - ddb_dns_enactor.plan_missing
+            - ddb_dns_enactor.route53_txn_conflict
+            - dwfm.lease_timeout
+            - ec2_api.api_resp_unavailable
+
+        - order: 3
+          at_min: 34
+          component: ddb_dns_enactor
+          event: |
+            Operators manually restore the DynamoDB endpoint A records in Route53 and disable DNS automation; DynamoDB API calls begin succeeding
+            while a shrinking subset of clients still fail until cached DNS results expire. DWFM starts large-scale lease recovery, and EC2 launch
+            errors shift to InsufficientCapacity.
+          why: |
+            Manual Route53 upsert restores resolvable addresses, but some clients continue failing until cached DNS results (including cached
+            empty/failed responses) expire. With DynamoDB reachable again, DWFM can attempt to re-establish leases; however, many droplets remain
+            without leases initially, so launch capacity is still constrained.
+          flows: [ddb_api_call_ok_f, ddb_api_call_dns_fail, ec2_run_instances_insufficient_capacity]
+          rate_multipliers:
+            ddb_api_call_dns_fail: 0.3
+            ddb_api_call_ok_f: 0.7
+            ec2_run_instances_service_unavailable: 0.2
+            ec2_run_instances_insufficient_capacity: 1.0
+            dwfm.lease_recover: 1.0
+            dwfm.queue_depth: 2.5
+            route53_controlplane.rrset_change: 0.6
+            ddb_dns_enactor.enact_start: 0.0
+            ddb_dns_enactor.enact_ok: 0.0
+            ddb_dns_enactor.cleanup_plans: 0.0
+            ddb_dns_enactor.route53_txn_conflict: 0.0
+            ddb_dns_enactor.plan_missing: 0.0
+          latency_multipliers:
+            ddb_api_call_ok_f: {p50: 1.1, p95: 1.2}
+            ec2_run_instances_insufficient_capacity: {p50: 1.3, p95: 1.5}
+          one_shots:
+            - ref: ddb_dns_enactor.automation_disabled
+              count: 1
+              hosts: [ddb-enactor-az2-1]
+            - ref: ddb_dns_enactor.manual_route53_upsert
+              count: 1
+              hosts: [ddb-enactor-az2-1]
+          manifestation:
+            - ddb_dns_enactor.manual_route53_upsert
+            - customer_app.ddb_call_ok
+            - customer_app.dns_resolve_fail
+            - dwfm.queue_depth
+            - ec2_api.api_resp_insufficient
+
+        - order: 4
+          at_min: 40
+          component: customer_app
+          event: |
+            Cached DNS failures continue to age out across clients; DynamoDB endpoint resolution converges and only a small tail of DNS failures remains.
+          why: |
+            DNS caching (including negative/empty-answer caching in resolvers and client stacks) can persist for multiple minutes after the
+            authoritative record is repaired; as TTLs expire, clients refresh and obtain the restored A records. This is directly observable
+            as a declining rate of client-side dns_resolve failures without needing further Route53 changes.
+          flows: [ddb_api_call_ok_f, ddb_api_call_dns_fail, ec2_run_instances_insufficient_capacity]
+          rate_multipliers:
+            ddb_api_call_dns_fail: 0.05
+            ddb_api_call_ok_f: 0.95
+            ec2_run_instances_service_unavailable: 0.0
+            route53_controlplane.rrset_change: 0.4
+          latency_multipliers:
+            ddb_api_call_ok_f: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - customer_app.ddb_call_ok
+            - customer_app.dns_resolve_fail
+
+        - order: 5
+          at_min: 42
+          component: dwfm
+          event: |
+            DWFM recovery work overwhelms processing; operators throttle and restart selected DWFM hosts to reduce queue pressure. EC2 launches
+            increasingly return RequestLimitExceeded while leases recover. Network propagation lag becomes visible and NLB health checks begin
+            triggering AZ failovers, increasing NLB-related DNS updates and producing intermittent NLB TCP connection errors.
+          why: |
+            High queue depth increases processing time, preventing leases from being established before additional work is queued (a congestive
+            collapse pattern). Throttling and restarts clear work and allow some forward progress but at the cost of API throttling. Network state
+            propagation backlog causes health checks to flap for nodes brought into service before network config is fully applied, triggering
+            automatic AZ DNS failovers that change NLB DNS records.
+          flows: [ec2_run_instances_throttled, nlb_tcp_connect_err_f, nlb_tcp_connect_ok_f]
+          rate_multipliers:
+            dwfm.lease_recover: 2.0
+            dwfm.queue_depth: 1.0
+            ec2_run_instances_insufficient_capacity: 0.5
+            ec2_run_instances_throttled: 1.0
+            network_manager.netprop_lag_high: 1.0
+            nlb_controlplane.az_failover: 2.0
+            route53_controlplane.rrset_change: 2.0
+            nlb_tcp_connect_ok_f: 0.8
+            nlb_tcp_connect_err_f: 1.0
+          latency_multipliers:
+            ec2_run_instances_throttled: {p50: 1.2, p95: 1.4}
+            nlb_tcp_connect_err_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: dwfm.throttle_enabled
+              count: 1
+              hosts: [dwfm-az1-1]
+            - ref: dwfm.host_restart
+              count: 2
+              hosts: [dwfm-az1-1, dwfm-az2-1]
+          manifestation:
+            - dwfm.throttle_enabled
+            - ec2_api.api_resp_throttle
+            - network_manager.netprop_lag_high
+            - nlb_controlplane.az_failover
+            - route53_controlplane.rrset_change
+            - customer_app.nlb_connect_err
+
+      steady:
+        - component: ec2_api
+          condition: |
+            EC2 launches remain impaired due to incomplete lease recovery and throttling applied to protect DWFM.
+          user_impact: |
+            RunInstances frequently fails with InsufficientCapacity or RequestLimitExceeded; new instance capacity is unreliable.
+          manifestation: [ec2_api.api_resp_insufficient, ec2_api.api_resp_throttle]
+        - component: nlb_controlplane
+          condition: |
+            Health checks flap under network propagation lag, triggering AZ failovers and intermittent connection errors on some load balancers.
+          user_impact: |
+            A subset of NLB connections fail (resets/timeouts) when remaining capacity is insufficient during failover oscillation.
+          manifestation: [nlb_controlplane.az_failover, customer_app.nlb_connect_err]
+
+      feedback_loops:
+        - id: dwfm_congestive_collapse
+          desc: |
+            Failed/slow lease recovery increases DWFM queue depth; higher queue depth further slows processing, causing more leases to remain
+            inactive and more recovery work to accumulate until throttling/restarts break the loop.
+        - id: nlb_healthcheck_flap
+          desc: |
+            Network propagation lag causes health checks to intermittently fail; failovers remove capacity, increasing load on remaining nodes,
+            which can further destabilize health checks and increase client connection failures.
+
+      flows:
+        - ddb_api_call_dns_fail
+        - ddb_api_call_ok_f
+        - ec2_run_instances_service_unavailable
+        - ec2_run_instances_insufficient_capacity
+        - ec2_run_instances_throttled
+        - nlb_tcp_connect_ok_f
+        - nlb_tcp_connect_err_f
+      manifestation:
+        - customer_app.dns_resolve_fail
+        - route53_controlplane.rrset_change
+        - ddb_dns_enactor.plan_missing
+        - dwfm.lease_timeout
+        - dwfm.queue_depth
+        - ec2_api.api_resp_insufficient
+        - network_manager.netprop_lag_high
+        - nlb_controlplane.az_failover
+        - customer_app.nlb_connect_err
+
+  assumptions:
+    - |
+      The post-mortem’s multi-hour incident is represented as a 50-minute slice; minutes correspond to relative ordering, not wall-clock times.
+    - |
+      Failure-phase piecewise breakdown (approximate):
+        * min 18-26 (8m): DynamoDB DNS empty dominates; ~450-650 logs/min (ddb dns-fail + retries + Route53/enactor churn + DWFM check failures).
+        * min 26-34 (8m): plan-missing + lease-expiry rise; ~500-750 logs/min (adds more DWFM lease_timeout and EC2 503 errors).
+        * min 34-40 (6m): manual DNS restore; mixed ddb successes and residual dns failures; ~450-700 logs/min; DWFM queue growth begins.
+        * min 40-42 (2m): cache expiry converges; dns-fail tail shrinks toward ~0; ~450-750 logs/min (more ddb successes, fewer dns_fail logs).
+        * min 42-50 (8m): DWFM throttling/restarts; EC2 throttling and network/NLB symptoms appear; includes increased Route53 rrset changes due to NLB AZ DNS failovers; ~450-780 logs/min.
+    - |
+      One-shot counts: event3 (2 one-shots), event5 (3 one-shots).
+    - |
+      Visibility rationale: client DNS failures are high-rate early via ddb_api_call_dns_fail; the manual restore and automation disable are guaranteed via one-shots;
+      cache-expiry convergence is visible as a sharp reduction in dns_resolve_fail after event4; DWFM congestion is visible via queue_depth and lease_timeout;
+      later cascade is visible via netprop_lag_high, az_failover, route53 rrset_change, and nlb_connect_err.
+    - |
+      Total estimated log volume: ~26k logs, within the required 20k..100k envelope.
+```

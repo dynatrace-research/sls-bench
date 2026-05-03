@@ -1,0 +1,304 @@
+```yaml
+scenario:
+  id: inc_2023_01_24_service_tokens_overwrite_staggered_sync
+  title: Service token secrets overwritten by last-seen updater; staggered global sync causes auth failures
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Cloudflare-internal services authenticate to protected endpoints using service tokens enforced at an edge gateway.
+    A release to add “last seen at” token metadata accidentally wrote back tokens with an empty client_secret due to
+    redacted reads, silently corrupting a few internal accounts’ tokens. The impact was delayed and staggered because
+    invalid token material only became effective after it synced to the edge configuration, causing bursts of 403
+    denials and downstream product errors (notably Zero Trust posture flows and later control-plane API calls).
+
+  trigger_desc: |
+    Access engineering deploys a “service_token_last_seen” feature that updates token metadata based on login events.
+    The updater reads tokens with secrets redacted and then writes updates, persisting an empty-string client_secret.
+
+  time:
+    total_minutes: 56
+    phases:
+      n: {start_min: 0, end_min: 28}
+      f: {start_min: 28, end_min: 56}
+
+  phases:
+    n:
+      desc: |
+        Device posture uploads and reads succeed through the edge gateway, and control-plane internal API calls
+        succeed. Token updates are rare and limited to normal administrative maintenance.
+      flows: [posture_upload_ok, posture_read_ok, internal_api_call_ok]
+      manifestation:
+        - edge_auth_gateway.edge_access_ok_posture
+        - device_state_service.posture_ingest_ok
+        - gateway_policy_engine.posture_fetch_ok
+        - api_orchestrator_service.api_call_ok
+        - edge_auth_gateway.auth_denied_metric
+        - edge_auth_gateway.http_5xx_metric
+
+    f:
+      desc: |
+        A buggy token metadata updater runs briefly and overwrites client_secret with an empty string for a small set
+        of internal accounts. A rollback stops further overwrites, but already-corrupted tokens remain in storage.
+        As Config Sync applies those corrupted tokens to the global edge configuration, the edge gateway begins to
+        reject requests using those tokens with 403, first impacting Zero Trust posture paths and later control-plane
+        internal API calls. Mitigation restores the WARP/Zero Trust account token, while the API account remains
+        degraded at the end of this modeled window.
+
+      events:
+        - order: 1
+          at_min: 28
+          component: access_token_service
+          event: |
+            The “service_token_last_seen” release starts; the last-seen updater begins polling auth events and writing
+            token updates, unintentionally persisting empty-string client_secret for internal accounts.
+          why: |
+            Token reads used for last-seen updates redact client_secret; the write transaction uses that redacted view.
+            This corruption is directly observable as token-write logs with client_secret_len=0; user impact is not yet
+            visible because invalid token material has not been applied to the edge configuration.
+          flows: [posture_upload_ok_f, posture_read_ok_f, internal_api_call_ok_f]
+          rate_multipliers:
+            posture_upload_denied_f: 0.0
+            posture_read_denied_f: 0.0
+            internal_api_call_denied_f: 0.0
+            edge_auth_gateway.auth_denied_metric_spike_posture: 0.0
+            edge_auth_gateway.auth_denied_metric_spike_internal: 0.0
+            edge_auth_gateway.http_5xx_metric_spike_zero_trust: 0.0
+            edge_auth_gateway.http_5xx_metric_spike_control_plane: 0.0
+            gateway_policy_engine.policy_block_metric_spike: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: access_token_service.deploy_started
+              count: 1
+              hosts: [access-1]
+          manifestation:
+            - access_token_service.last_seen_consumer_poll
+            - access_token_service.token_update_write_bug
+
+        - order: 2
+          at_min: 31
+          component: access_token_service
+          event: |
+            The release is rolled back, stopping further last-seen polling and token overwrites.
+          why: |
+            Disabling the updater halts additional corrupt writes, but previously overwritten tokens remain and may be
+            propagated later when config sync applies the updated token record.
+          flows: [posture_upload_ok_f, posture_read_ok_f, internal_api_call_ok_f]
+          rate_multipliers:
+            access_token_service.last_seen_consumer_poll: 0.0
+            access_token_service.token_update_write_bug: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: access_token_service.deploy_rolled_back
+              count: 1
+              hosts: [access-2]
+          manifestation:
+            - access_token_service.deploy_rolled_back
+
+        - order: 3
+          at_min: 39
+          component: config_sync
+          event: |
+            Config Sync applies the first corrupted token (warp_internal) to edge configuration; posture uploads and
+            posture reads using that token begin receiving 403 denials and policy evaluation begins default-blocking.
+          why: |
+            The invalid client_secret becomes effective only after the updated token record is pushed to the edge.
+            This is observable as a config apply with client_secret_len=0 followed by edge 403 denials and elevated
+            denied/5xx and policy-block metrics for Zero Trust posture behavior.
+          flows: [posture_upload_denied_f, posture_read_denied_f]
+          rate_multipliers:
+            posture_upload_ok_f: 0.0
+            posture_upload_denied_f: 1.0
+            posture_read_ok_f: 0.0
+            posture_read_denied_f: 1.0
+            edge_auth_gateway.auth_denied_metric: 0.0
+            edge_auth_gateway.http_5xx_metric: 0.0
+            gateway_policy_engine.policy_block_metric: 0.0
+            edge_auth_gateway.auth_denied_metric_spike_posture: 1.0
+            edge_auth_gateway.http_5xx_metric_spike_zero_trust: 1.0
+            gateway_policy_engine.policy_block_metric_spike: 1.0
+          latency_multipliers:
+            posture_read_denied_f: {p50: 1.0, p95: 1.1}
+          one_shots:
+            - ref: config_sync.token_applied_invalid_warp
+              count: 1
+              hosts: [sync-1]
+          manifestation:
+            - config_sync.token_applied_invalid_warp
+            - edge_auth_gateway.edge_access_denied_posture
+            - gateway_policy_engine.posture_fetch_error
+            - edge_auth_gateway.auth_denied_metric_spike_posture
+
+        - order: 4
+          at_min: 43
+          component: gateway_policy_engine
+          event: |
+            An internal alert triggers due to a sharp drop in successful posture uploads; an incident is declared and
+            responders begin correlating the failures with authentication denials.
+          why: |
+            The posture upload success rate collapses after the edge begins rejecting requests using the corrupted
+            token. This is observable via the alert marker and concurrent elevated denied-request and policy-block
+            metrics already present since the token was applied.
+          flows: [posture_upload_denied_f, posture_read_denied_f]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: gateway_policy_engine.alert_posture_upload_drop
+              count: 1
+              hosts: [gateway-1]
+            - ref: incident_bot.incident_declared
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - gateway_policy_engine.alert_posture_upload_drop
+            - incident_bot.incident_declared
+            - edge_auth_gateway.edge_access_denied_posture
+
+        - order: 5
+          at_min: 45
+          component: config_sync
+          event: |
+            A second corrupted token (api_internal) is applied to edge configuration; control-plane internal API calls
+            begin failing with 403 and retries increase. Incident scope is expanded and internal account changes are locked.
+          why: |
+            Once the api_internal token with empty client_secret is active at the edge, control-plane calls using that
+            token are denied. The orchestrator retries, which amplifies error volume but cannot succeed until the token
+            is corrected. Scope expansion and change-lock are operational actions and appear as one-shot markers.
+          flows: [internal_api_call_denied_f]
+          rate_multipliers:
+            internal_api_call_ok_f: 0.0
+            internal_api_call_denied_f: 1.0
+            edge_auth_gateway.auth_denied_metric_spike_internal: 1.0
+            edge_auth_gateway.http_5xx_metric_spike_control_plane: 1.0
+          latency_multipliers:
+            internal_api_call_denied_f: {p50: 1.0, p95: 1.2}
+          one_shots:
+            - ref: config_sync.token_applied_invalid_api
+              count: 1
+              hosts: [sync-1]
+            - ref: incident_bot.scope_expanded
+              count: 1
+              hosts: [ops-1]
+            - ref: access_token_service.account_changes_locked
+              count: 1
+              hosts: [access-1]
+          manifestation:
+            - config_sync.token_applied_invalid_api
+            - api_orchestrator_service.api_call_denied
+            - api_orchestrator_service.api_retry_scheduled
+            - edge_auth_gateway.auth_denied_metric_spike_internal
+
+        - order: 6
+          at_min: 51
+          component: access_token_service
+          event: |
+            Responders manually restore the WARP/Zero Trust account’s token to a valid value and push it; posture flows recover,
+            while the API account remains impacted in this scenario window.
+          why: |
+            Reverting the token to a non-empty client_secret and applying it to edge config removes the 403 rejections for
+            warp_internal, returning posture uploads/reads to the success path. This is observable via a restore marker,
+            a valid edge-config apply, and the posture-related denials and spike rollups dropping away.
+          flows: [posture_upload_ok_f, posture_read_ok_f]
+          rate_multipliers:
+            posture_upload_ok_f: 1.0
+            posture_upload_denied_f: 0.0
+            posture_read_ok_f: 1.0
+            posture_read_denied_f: 0.0
+            edge_auth_gateway.auth_denied_metric_spike_posture: 0.0
+            edge_auth_gateway.http_5xx_metric_spike_zero_trust: 0.0
+            gateway_policy_engine.policy_block_metric_spike: 0.0
+            gateway_policy_engine.policy_block_metric: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: access_token_service.manual_token_restore_warp
+              count: 1
+              hosts: [access-2]
+            - ref: config_sync.token_applied_valid_warp
+              count: 1
+              hosts: [sync-1]
+          manifestation:
+            - access_token_service.manual_token_restore_warp
+            - config_sync.token_applied_valid_warp
+            - edge_auth_gateway.edge_access_ok_posture
+
+      steady:
+        - component: api_orchestrator_service
+          condition: |
+            api_internal service-token authentication remains invalid at the edge, so internal API calls continue to receive 403
+            and are retried, sustaining elevated denied-request and 5xx spike rollups for control-plane routes.
+          user_impact: |
+            Control-plane operations (modeled as cache purge / storage admin / images purge) fail or are delayed for affected products.
+          manifestation:
+            - api_orchestrator_service.api_call_denied
+            - api_orchestrator_service.api_retry_scheduled
+            - edge_auth_gateway.edge_access_denied_internal
+            - edge_auth_gateway.auth_denied_metric_spike_internal
+            - edge_auth_gateway.http_5xx_metric_spike_control_plane
+
+        - component: gateway_policy_engine
+          condition: |
+            WARP/Zero Trust posture flows have recovered after manual token restoration, reducing posture-related denials and policy blocks.
+          user_impact: |
+            New device enrollment and posture-based policy evaluation recover for affected users, while control-plane issues persist.
+          manifestation:
+            - gateway_policy_engine.posture_fetch_ok
+            - edge_auth_gateway.edge_access_ok_posture
+            - gateway_policy_engine.policy_block_metric
+
+      feedback_loops:
+        - id: control_plane_retry_amplification
+          desc: |
+            Control-plane services retry denied internal API calls, increasing request volume and error logs at the edge and orchestrator,
+            but retries cannot succeed until the token secret is corrected.
+        - id: posture_default_block
+          desc: |
+            When posture reads fail, some policy evaluations default to block, increasing perceived user impact beyond the internal fetch failures.
+
+      flows:
+        - posture_upload_ok_f
+        - posture_upload_denied_f
+        - posture_read_ok_f
+        - posture_read_denied_f
+        - internal_api_call_ok_f
+        - internal_api_call_denied_f
+      manifestation:
+        - access_token_service.token_update_write_bug
+        - config_sync.token_applied_invalid_warp
+        - config_sync.token_applied_invalid_api
+        - edge_auth_gateway.edge_access_denied_posture
+        - edge_auth_gateway.edge_access_denied_internal
+        - edge_auth_gateway.auth_denied_metric_spike_posture
+        - edge_auth_gateway.auth_denied_metric_spike_internal
+
+  assumptions:
+    - |
+      Timeline is compressed to fit a 56-minute executable scenario while preserving causal ordering:
+      buggy writes → rollback stops writes → staggered edge sync (WARP then API) → alert/incident → partial recovery (WARP only).
+    - |
+      Failure-phase piecewise breakdown (approx):
+      - mins 28-31 (3 min): updater active; overwrite-related background logs present; no edge auth impact yet.
+      - mins 31-39 (8 min): updater stopped; traffic still succeeds; spike metrics suppressed.
+      - mins 39-45 (6 min): warp_internal token applied invalid; posture flows switch to denied; posture spike metrics enabled and baseline rollups suppressed.
+      - mins 45-51 (6 min): api_internal token applied invalid; internal API calls switch to denied with retries; internal spike metrics enabled (baseline rollups remain suppressed).
+      - mins 51-56 (5 min): warp_internal restored; posture flows recover and posture spike metrics disabled; internal API remains denied (steady degraded end-state).
+    - |
+      Expected log volume order-of-magnitude:
+      - Normal (28 min): ~1.21k flow-logs/min + ~8–12 background/min ≈ ~34k–35k logs.
+      - Failure (28 min): mix of success/denied flows + retries ≈ ~25k–45k logs, plus enabled spike metrics (~0–4 logs/min) depending on interval.
+      - One-shots: ~9 total.
+      - Total ≈ ~60k–85k logs (within 20k–100k target).
+    - |
+      Metric-series consistency adaptation:
+      - To avoid emitting contradictory values for the same labeled metric series, baseline rollup metrics
+        (edge_auth_gateway.auth_denied_metric, edge_auth_gateway.http_5xx_metric, gateway_policy_engine.policy_block_metric)
+        are suppressed in intervals where their corresponding spike rollups are enabled.
+    - |
+      Visibility rationale:
+      - Root cause evidence: access_token_service.token_update_write_bug with client_secret_len=0 appears during mins 28-31.
+      - Staggered propagation evidence: config_sync.token_applied_invalid_warp (min 39) then token_applied_invalid_api (min 45).
+      - Impact evidence: edge_auth_gateway.edge_access_denied_posture bursts after min 39; api_orchestrator_service.api_call_denied + retries after min 45.
+      - Partial recovery evidence: access_token_service.manual_token_restore_warp + config_sync.token_applied_valid_warp at min 51, followed by posture success flows returning.
+    - |
+      Metric value ranges (denied/5xx/blocks) are intentionally scaled to match the modeled request volumes in this executable scenario rather than Cloudflare’s full real-world traffic,
+      so metric values remain internally consistent with the modeled RPMs and retry behavior.
+```

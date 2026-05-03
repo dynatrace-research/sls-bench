@@ -1,0 +1,300 @@
+```yaml
+scenario:
+  id: aug11_autoscaler_zk_migration_outage
+  title: Autoscaler re-enabled during ZooKeeper migration triggers mass terminations
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally serves Reddit web and API traffic through an edge load balancer to an application cluster
+    backed by cache and database tiers, while an autoscaler uses ZooKeeper membership data to manage capacity.
+    During a ZooKeeper migration, the autoscaler was manually disabled, but configuration management reverted that
+    change and unexpectedly re-enabled it. The autoscaler then read partially migrated ZooKeeper data and issued
+    bulk terminations of application and cache instances, causing a full outage followed by prolonged high latency
+    and timeouts due to cold caches and database overload. Users experienced site/API unreachability (503) and then
+    slow responses and intermittent 504s.
+
+  trigger_desc: |
+    An engineer manually disabled the autoscaler as a safety step for a ZooKeeper migration, but the package/config
+    management system detected configuration drift and automatically reverted the change, re-enabling the autoscaler
+    while ZooKeeper still contained partially migrated membership state.
+
+  time:
+    total_minutes: 48
+    phases:
+      n: {start_min: 0, end_min: 24}
+      f: {start_min: 24, end_min: 48}
+
+  phases:
+    n:
+      desc: |
+        The edge load balancers route browser and API traffic to a healthy application fleet. The application tier
+        serves the main site and API endpoints, using the cache tier for hot content and falling back to the database
+        when needed. ZooKeeper quorum is stable, and the autoscaler periodically runs small reconcile loops based on
+        consistent ZooKeeper snapshots. Monitoring scrapes metrics continuously, and overall request latency is low
+        with few 5xx responses.
+      flows: [web_page_ok, api_get_ok, autoscaler_reconcile_ok]
+      manifestation: [edge_lb.hc_ok, app_cluster.req_end, edge_lb.access_log, zookeeper.quorum_status, monitoring.scrape_success]
+
+    f:
+      desc: |
+        Failure begins when configuration management re-enables the autoscaler during an in-progress ZooKeeper migration.
+        The autoscaler continues reconciling, but soon reads inconsistent/partial membership data from ZooKeeper and issues
+        bulk instance terminations via the cloud API. The edge quickly loses healthy upstreams and returns 503 for most
+        requests; API clients retry, amplifying load and log volume at the edge. To reduce strain and provide a consistent
+        user experience during restoration, operations enables down mode so the edge serves a static "restore in progress"
+        response for many requests.
+        After capacity is restored, the cache tier is largely empty; application requests shift to database reads, causing
+        DB connection contention and slow queries. This produces sustained tail latency and intermittent timeouts (504) that
+        persist through the end of the scenario.
+      events:
+        - order: 1
+          at_min: 24
+          component: pkg_manager
+          event: |
+            The package/config management system applies a remediation that flips the autoscaler from disabled to enabled,
+            and autoscaler reconciliation begins while the ZooKeeper migration is still in progress.
+          why: |
+            Configuration enforcement treats the manual disable as drift and converges the autoscaler to its desired-state
+            configuration (enabled). This is directly observable via pkg_manager.config_revert and autoscaler.enabled_state_change,
+            and indirectly by the start of autoscaler_reconcile_bad activity. The migration context is partially observable via
+            zookeeper.migration_stage, but the fact that enforcement was unintended typically requires external change context.
+          flows: [autoscaler_reconcile_bad, web_page_slow_ok, api_get_slow_ok]
+          rate_multipliers:
+            web_page_slow_ok: 1.0
+            api_get_slow_ok: 1.0
+            autoscaler_reconcile_bad: 1.0
+            web_page_503_no_backends: 0.0
+            api_get_503_retrying: 0.0
+            web_page_down_mode: 0.0
+            api_down_mode: 0.0
+            web_page_db_timeout: 0.0
+            api_db_timeout: 0.0
+            db_cluster.conn_pool_waiting: 0.2
+            cache_cluster.warmup_tick: 0.0
+          one_shots:
+            - ref: pkg_manager.config_revert
+              count: 2
+            - ref: autoscaler.enabled_state_change
+              count: 1
+              hosts: [as-01]
+          manifestation: [pkg_manager.config_revert, autoscaler.enabled_state_change, zookeeper.migration_stage]
+
+        - order: 2
+          at_min: 25
+          component: autoscaler
+          event: |
+            Autoscaler reconciliation reads an inconsistent ZooKeeper snapshot and issues a bulk termination burst via the cloud API,
+            after which the edge reports no healthy upstreams and most user requests fail with 503.
+          why: |
+            With partially migrated membership data, the autoscaler underestimates current healthy capacity and computes a large
+            termination set, then calls the cloud API to terminate instances. This is directly observable via the autoscaler_reconcile_bad
+            flow logs (zookeeper.read_inconsistent and autoscaler.scale_decision_bad) and by cloud_api.terminate_instances_batch one-shots.
+            The resulting lack of backends is directly observable at the edge via edge_lb.upstream_error and access logs with 503 statuses.
+          flows: [autoscaler_reconcile_bad, web_page_503_no_backends, api_get_503_retrying]
+          rate_multipliers:
+            web_page_slow_ok: 0.0
+            api_get_slow_ok: 0.0
+            web_page_503_no_backends: 1.2
+            api_get_503_retrying: 1.2
+            autoscaler_reconcile_bad: 1.0
+            app_cluster.gc_pause_warn: 0.1
+            cache_cluster.redis_stats: 0.0
+            cache_cluster.warmup_tick: 0.0
+            db_cluster.conn_pool_waiting: 0.1
+          one_shots:
+            - ref: autoscaler.bulk_termination_summary
+              count: 1
+            - ref: cloud_api.terminate_instances_batch
+              count: 3
+            - ref: monitoring.alert_firing
+              count: 2
+          manifestation: [autoscaler.scale_decision_bad, zookeeper.read_inconsistent, cloud_api.terminate_instances_batch, edge_lb.upstream_error, monitoring.alert_firing]
+
+        - order: 3
+          at_min: 30
+          component: ops_console
+          event: |
+            Operations enables down mode so that many requests are served a restore/maintenance response at the edge,
+            reducing direct pressure on the recovering backend fleet.
+          why: |
+            Down mode changes routing at the edge to return a static response without proxying to app backends.
+            This is directly observable via the ops_console.down_mode_enabled one-shot and increased edge_lb.down_mode_served logs,
+            along with reduced rates of edge_lb.upstream_error for "no_healthy_upstream". The operator intent (why down mode was chosen)
+            requires external incident context, but the effect is observable from logs.
+          flows: [web_page_down_mode, api_down_mode, web_page_503_no_backends, api_get_503_retrying]
+          rate_multipliers:
+            web_page_down_mode: 1.0
+            api_down_mode: 1.0
+            web_page_503_no_backends: 0.3
+            api_get_503_retrying: 0.2
+            autoscaler_reconcile_bad: 0.5
+            app_cluster.gc_pause_warn: 0.3
+            cache_cluster.redis_stats: 0.3
+            cache_cluster.warmup_tick: 0.2
+            db_cluster.conn_pool_waiting: 0.2
+          one_shots:
+            - ref: ops_console.down_mode_enabled
+              count: 1
+              hosts: [ops-01]
+          manifestation: [ops_console.down_mode_enabled, edge_lb.down_mode_served, edge_lb.upstream_error]
+
+        - order: 4
+          at_min: 38
+          component: edge_lb
+          event: |
+            Backend capacity is restored and down mode is removed; requests begin reaching the application tier again,
+            but caches are cold and DB work increases, making successful responses noticeably slower.
+          why: |
+            Restoring app and cache instances reintroduces healthy upstreams so edge routing succeeds more often, observable via a drop in
+            edge_lb.upstream_error and the reappearance of app_cluster.req_start/req_end traffic. Because the cache fleet was replaced and
+            empty, more requests miss cache and execute DB queries, observable via app_cluster.req_end cache=miss/miss_cold and continued
+            cache_cluster.warmup_tick with low keyspace/hit_rate. The cache-cold condition is directly observable; the exact restoration actions
+            (manual scaling, orchestration steps) require external operational context.
+          flows: [web_page_slow_ok, api_get_slow_ok, web_page_db_timeout, api_db_timeout]
+          rate_multipliers:
+            web_page_down_mode: 0.0
+            api_down_mode: 0.0
+            web_page_slow_ok: 0.9
+            api_get_slow_ok: 0.9
+            web_page_db_timeout: 0.3
+            api_db_timeout: 0.2
+            web_page_503_no_backends: 0.05
+            api_get_503_retrying: 0.02
+            autoscaler_reconcile_bad: 0.2
+            app_cluster.gc_pause_warn: 1.0
+            cache_cluster.redis_stats: 1.0
+            cache_cluster.warmup_tick: 1.0
+            db_cluster.conn_pool_waiting: 1.0
+            db_cluster.slow_query_warn: 1.0
+          latency_multipliers:
+            web_page_slow_ok: {p50: 1.2, p95: 1.5}
+            api_get_slow_ok: {p50: 1.2, p95: 1.6}
+          manifestation: [app_cluster.req_end, cache_cluster.warmup_tick, db_cluster.conn_pool_waiting]
+
+        - order: 5
+          at_min: 42
+          component: db_cluster
+          event: |
+            Database contention rises sharply as cold-cache load persists; slow queries and connection waits increase,
+            and timeouts (504) become more frequent for both web and API traffic.
+          why: |
+            Cache misses push read load to the database, increasing concurrent connections and saturating pools; queued requests wait longer,
+            and query execution time grows, leading to app-layer timeouts that propagate to edge 504s. This is directly observable in background
+            DB signals (db_cluster.conn_pool_waiting, db_cluster.slow_query_warn) and in request-path symptoms (app_cluster.db_timeout and
+            edge_lb.upstream_error with upstream_timeout). The reinforcing part (retries increasing load) is partially observable via
+            edge_lb.retry_scheduled and increased api_db_timeout attempts.
+          flows: [web_page_db_timeout, api_db_timeout, web_page_slow_ok, api_get_slow_ok]
+          rate_multipliers:
+            web_page_slow_ok: 0.8
+            api_get_slow_ok: 0.8
+            web_page_db_timeout: 2.0
+            api_db_timeout: 2.5
+            db_cluster.conn_pool_waiting: 3.0
+            db_cluster.slow_query_warn: 4.0
+            app_cluster.gc_pause_warn: 1.5
+            cache_cluster.warmup_tick: 1.2
+          latency_multipliers:
+            web_page_db_timeout: {p50: 1.3, p95: 2.0}
+            api_db_timeout: {p50: 1.3, p95: 2.2}
+            web_page_slow_ok: {p50: 1.5, p95: 2.0}
+            api_get_slow_ok: {p50: 1.5, p95: 2.2}
+          manifestation: [db_cluster.conn_pool_waiting, db_cluster.slow_query_warn, app_cluster.db_timeout, edge_lb.upstream_error, edge_lb.retry_scheduled]
+
+        - order: 6
+          at_min: 46
+          component: cache_cluster
+          event: |
+            Cache warmup progresses and some load shifts off the database, but elevated tail latency and intermittent timeouts persist
+            through the end of the incident window.
+          why: |
+            As keyspace refills and hit rate improves, fewer requests require DB reads, reducing (but not eliminating) connection waits.
+            This is directly observable via cache_cluster.redis_stats (key_count/hit_rate rising within the failure domain) and reduced
+            db_cluster.conn_pool_waiting and db_cluster.slow_query_warn rates relative to the previous interval. The remaining timeouts are
+            observable in app_cluster.db_timeout and edge_lb.upstream_error, indicating the system is still in a degraded steady state.
+          flows: [web_page_slow_ok, api_get_slow_ok, web_page_db_timeout, api_db_timeout]
+          rate_multipliers:
+            web_page_slow_ok: 0.9
+            api_get_slow_ok: 0.9
+            web_page_db_timeout: 1.2
+            api_db_timeout: 1.5
+            db_cluster.conn_pool_waiting: 2.0
+            db_cluster.slow_query_warn: 2.0
+            app_cluster.gc_pause_warn: 1.2
+          latency_multipliers:
+            web_page_slow_ok: {p50: 1.3, p95: 1.8}
+            api_get_slow_ok: {p50: 1.3, p95: 2.0}
+            web_page_db_timeout: {p50: 1.2, p95: 1.8}
+            api_db_timeout: {p50: 1.2, p95: 2.0}
+          manifestation: [cache_cluster.redis_stats, cache_cluster.warmup_tick, db_cluster.conn_pool_waiting, edge_lb.upstream_error]
+
+      steady:
+        - component: edge_lb
+          condition: |
+            The edge continues to see elevated 5xx responses, especially 504 gateway timeouts, and API traffic exhibits retry behavior.
+            Most requests complete, but tail latency remains high due to backend slowness.
+          user_impact: |
+            Users can often load pages, but experience slowness and occasional failures; API clients may see intermittent timeouts and retries.
+          manifestation: [edge_lb.upstream_error, edge_lb.retry_scheduled, edge_lb.access_log]
+
+        - component: cache_cluster
+          condition: |
+            Cache fleet is partially warmed; keyspace and hit rate are below normal, continuing to force some requests to the database.
+          user_impact: |
+            Slower page loads and API calls due to more frequent cache misses.
+          manifestation: [cache_cluster.redis_stats, cache_cluster.warmup_tick]
+
+        - component: db_cluster
+          condition: |
+            Database remains under heavy load with sustained connection pool waiting and slow query execution compared to normal.
+          user_impact: |
+            Backend slowness produces slow responses and intermittent timeouts.
+          manifestation: [db_cluster.conn_pool_waiting, db_cluster.slow_query_warn]
+
+      feedback_loops:
+        - id: retry_amplifies_backend_load
+          desc: |
+            As edge/API clients retry after 503/timeout responses, request volume effectively increases, which drives additional backend work.
+            Increased backend work raises latency and timeout probability, which triggers more retries, sustaining elevated error and log rates.
+
+        - id: cold_cache_to_db_saturation
+          desc: |
+            Replaced/empty caches reduce hit rate, shifting read traffic to the database. Higher DB concurrency increases connection pool waits
+            and slow queries, which lengthen request durations and can cause application timeouts; slower completions further increase in-flight
+            concurrency, keeping the DB under pressure.
+
+      flows:
+        - autoscaler_reconcile_bad
+        - web_page_503_no_backends
+        - api_get_503_retrying
+        - web_page_down_mode
+        - api_down_mode
+        - web_page_slow_ok
+        - api_get_slow_ok
+        - web_page_db_timeout
+        - api_db_timeout
+
+      manifestation:
+        - pkg_manager.config_revert
+        - autoscaler.enabled_state_change
+        - autoscaler.scale_decision_bad
+        - autoscaler.bulk_termination_summary
+        - zookeeper.read_inconsistent
+        - cloud_api.terminate_instances_batch
+        - edge_lb.upstream_error
+        - edge_lb.retry_scheduled
+        - ops_console.down_mode_enabled
+        - edge_lb.down_mode_served
+        - cache_cluster.warmup_tick
+        - db_cluster.conn_pool_waiting
+        - db_cluster.slow_query_warn
+        - app_cluster.db_timeout
+        - monitoring.alert_firing
+
+  assumptions:
+    - "The post-mortem’s absolute timestamps and 3-hour duration are compressed into a 48-minute scenario to satisfy the two-phase constraint, while preserving the causal sequence: autoscaler re-enabled → mass terminations → down mode → restore → cold-cache DB overload."
+    - "Down mode is modeled as an edge-served response (edge_lb.down_mode_served) controlled by ops_console.down_mode_enabled."
+    - "Autoscaler instance terminations are represented as one-shot summaries and cloud API batch termination logs to approximate a sub-minute burst."
+    - "Piecewise failure-volume estimate used for realism: 24–25m ~754 logs; 25–30m ~5,485; 30–38m ~3,808; 38–42m ~3,306; 42–46m ~6,431; 46–48m ~2,583; plus one-shots (~8) ⇒ failure total ~22.4k."
+    - "Normal phase estimate ~22.2k logs (24 min at ~927 logs/min). Total estimated logs ~44.6k, within target and consistent with increased failure noise from retries and DB contention."
+```

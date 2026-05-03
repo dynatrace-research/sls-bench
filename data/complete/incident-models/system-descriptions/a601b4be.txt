@@ -1,0 +1,392 @@
+```yaml
+sys:
+  id: cloudflare_recursive_dns_1111_oct2023
+  desc: >
+    A recursive DNS service (modeled after 1.1.1.1) answers client DNS queries and validates DNSSEC.
+    To speed resolution and provide resilience, edge resolvers use a locally served copy of the DNS root zone (RFC 7706)
+    provided by an embedded WebAssembly app ("static_zone").
+    Root zone updates are pulled and distributed internally, but a parser limitation prevents edge nodes from adopting
+    new root zone versions containing a newly introduced record type (ZONEMD), leaving some nodes on a stale root zone
+    until its DNSSEC signatures expire and SERVFAIL responses increase.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: recursor_edge
+    name: Edge Recursive Resolver
+    svc: edge-recursor
+    hosts: [ash01, fra01, sin01, syd01]
+    desc: >
+      Receives client DNS queries, consults static_zone root-zone data when needed, performs iterative resolution,
+      validates DNSSEC, and returns responses (NOERROR or SERVFAIL).
+      Some queries may be forwarded to a peer node for cache efficiency; forwarded queries do not carry custom tags.
+    to:
+      - dst: static_zone
+        proto: wasm
+        desc: Calls the embedded static_zone app to serve local root zone data when enabled.
+      - dst: dns_root_servers
+        proto: udp
+        desc: Queries DNS root servers directly when local root data is bypassed/unavailable.
+    logs:
+      query_rx:
+        desc: Incoming DNS query as seen by the resolver.
+        lvl: INFO
+        msg: "rx query {qname} {qtype} from {client_ip} id={qid} tags={tags}"
+        vars:
+          qname: {k: str, v: fqdn}
+          qtype: {k: ch, v: [A, AAAA, NS, DS, DNSKEY]}
+          client_ip: {k: ip, v: "0.0.0.0/0"}
+          qid: {k: i, v: [0, 65535]}
+          tags: {k: ch, v: [none, rec_disable_static]}
+      peer_forward:
+        desc: Query is forwarded to a peer node; forwarded requests omit local tags.
+        lvl: INFO
+        msg: "forward query {qname} {qtype} to_peer={peer} forwarded_tags={forwarded_tags}"
+        vars:
+          qname: {k: str, v: fqdn}
+          qtype: {k: ch, v: [A, AAAA, NS, DS, DNSKEY]}
+          peer: {k: ch, v: [ash02, fra02, sin02]}
+          forwarded_tags: {k: ch, v: [none]}
+      root_query:
+        desc: Resolver sends an iterative query to a DNS root server.
+        lvl: INFO
+        msg: "iter root query {qname} {qtype} server={root_ip} proto=udp timeout_ms={timeout_ms}"
+        vars:
+          qname: {k: str, v: fqdn}
+          qtype: {k: ch, v: [A, AAAA, NS, DS, DNSKEY]}
+          root_ip: {k: ip, v: "0.0.0.0/0"}
+          timeout_ms: {k: i, v: [200, 2000]}
+      dnssec_validate_failed:
+        desc: DNSSEC validation failed for the resolution path (e.g., due to expired root zone signatures).
+        lvl: WARN
+        msg: "dnssec validation failed root_serial={root_serial} rrset={rrset} err={err} keytag={keytag}"
+        vars:
+          root_serial: {k: i, v: [2023092100, 2023100500]}
+          rrset: {k: ch, v: [DNSKEY, DS, NS]}
+          err: {k: ch, v: [expired_signature, bad_signature]}
+          keytag: {k: i, v: [0, 65535]}
+      response_ok:
+        desc: Successful response returned to the client.
+        lvl: INFO
+        msg: "tx response NOERROR {qname} {qtype} answers={answers} ttl_s={ttl_s} dur_ms={dur_ms}"
+        vars:
+          qname: {k: str, v: fqdn}
+          qtype: {k: ch, v: [A, AAAA, NS, DS, DNSKEY]}
+          answers: {k: i, v: [0, 8]}
+          ttl_s: {k: i, v: [10, 3600]}
+          dur_ms: {k: i, v: [1, 1500]}
+      response_servfail:
+        desc: Error response returned to the client (SERVFAIL).
+        lvl: WARN
+        msg: "tx response SERVFAIL {qname} {qtype} reason={reason} dur_ms={dur_ms}"
+        vars:
+          qname: {k: str, v: fqdn}
+          qtype: {k: ch, v: [A, AAAA, NS, DS, DNSKEY]}
+          reason: {k: ch, v: [dnssec_validation_failed, upstream_timeout, format_error]}
+          dur_ms: {k: i, v: [1, 1500]}
+      stats_minute:
+        desc: Periodic per-PoP health metrics exported by the resolver.
+        lvl: INFO
+        msg: "stats pop={pop} qps={qps} servfail_pct={servfail_pct} stale_root_pct={stale_root_pct}"
+        vars:
+          pop: {k: ch, v: [ash, fra, sin, syd]}
+          qps: {k: i, v: [10000, 60000]}
+        state_vars:
+          n:
+            servfail_pct: {k: f, v: [2.0, 5.0]}
+            stale_root_pct: {k: f, v: [0.0, 5.0]}
+          f:
+            servfail_pct: {k: f, v: [8.0, 18.0]}
+            stale_root_pct: {k: f, v: [20.0, 90.0]}
+      override_config_applied:
+        desc: Host applies a new override rule configuration.
+        lvl: INFO
+        msg: "override rules updated rule_id={rule_id} tag=rec_disable_static phase=pre-cache"
+        vars:
+          rule_id: {k: str, v: "ovr-20231004-###"}
+    beh:
+      n:
+        desc: Normal operations export per-minute resolver metrics with a low baseline SERVFAIL percentage.
+        emit:
+          - id: stats_minute
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During failure, exported metrics show elevated SERVFAIL and stale-root usage.
+        emit:
+          - id: stats_minute
+            per_min: 1.0
+            scope: per_host
+
+  - id: static_zone
+    name: static_zone WebAssembly App
+    svc: static-zone
+    hosts: [ash01, fra01, sin01, syd01]
+    desc: >
+      Loads and holds an in-memory copy of the DNS root zone and serves it locally to the resolver.
+      When a new root zone cannot be parsed, the app keeps serving the old in-memory copy instead of switching.
+      An override tag can instruct the app to bypass local serving for that request.
+    to:
+      - dst: recursor_edge
+        proto: wasm
+        desc: Returns root-zone data (or bypass decision) back to the resolver call site.
+    logs:
+      static_answer:
+        desc: static_zone served data from its in-memory root zone copy for the request.
+        lvl: INFO
+        msg: "static_zone served root zone serial={serial} stale={stale}"
+        vars:
+          serial: {k: i, v: [2023092100, 2023100500]}
+        state_vars:
+          n:
+            stale: {k: ch, v: [false]}
+          f:
+            stale: {k: ch, v: [true]}
+      bypass_due_to_tag:
+        desc: Request-level bypass of static_zone due to an override tag.
+        lvl: INFO
+        msg: "static_zone bypassed due to tag {tag}"
+        vars:
+          tag: {k: ch, v: [rec_disable_static]}
+      zone_parse_error:
+        desc: Parsing of a newly published root zone fails due to an unknown RR type in presentation format.
+        lvl: ERROR
+        msg: "failed to load new root zone serial={serial} err=unknown_rrtype rrtype={rrtype}"
+        vars:
+          serial: {k: i, v: [2023092100, 2023100500]}
+          rrtype: {k: ch, v: [ZONEMD]}
+      zone_status_metric:
+        desc: Periodic status of the in-memory root zone (age and signature time-to-expiry).
+        lvl: INFO
+        msg: "root zone status serial={serial} age_s={age_s} sig_expires_in_s={sig_expires_in_s} in_memory=true"
+        vars:
+          serial: {k: i, v: [2023092100, 2023100500]}
+        state_vars:
+          n:
+            age_s: {k: i, v: [0, 200000]}
+            sig_expires_in_s: {k: i, v: [3600, 200000]}
+          f:
+            age_s: {k: i, v: [800000, 1400000]}
+            sig_expires_in_s: {k: i, v: [-7200, 3600]}
+      signature_expired:
+        desc: The cached root zone's DNSSEC signatures are detected as expired.
+        lvl: ERROR
+        msg: "root zone DNSSEC signatures expired for serial={serial}"
+        vars:
+          serial: {k: i, v: [2023092100, 2023100500]}
+    beh:
+      n:
+        desc: static_zone emits periodic status; parse errors for new root zone versions appear when updates arrive.
+        emit:
+          - id: zone_status_metric
+            per_min: 0.5
+            scope: per_host
+          - id: zone_parse_error
+            per_min: 0.03
+            scope: per_host
+      f:
+        desc: During failure, status shows an old root zone with expired/near-expired signatures; parse errors may continue.
+        emit:
+          - id: zone_status_metric
+            per_min: 0.5
+            scope: per_host
+          - id: zone_parse_error
+            per_min: 0.03
+            scope: per_host
+
+  - id: root_zone_pipeline
+    name: Root Zone Pull & Distribution Pipeline
+    svc: root-zone-pipeline
+    hosts: [core01]
+    desc: >
+      Pulls the published DNS root zone and redistributes it internally to edge sites.
+      After the introduction of ZONEMD, distribution continues, but some edge nodes cannot parse the new versions.
+    to:
+      - dst: static_zone
+        proto: https
+        desc: Publishes new root zone versions to edge sites.
+    logs:
+      root_zone_published:
+        desc: A new root zone version was published into internal distribution.
+        lvl: INFO
+        msg: "published root zone serial={serial} includes_rrtype={includes_rrtype}"
+        vars:
+          serial: {k: i, v: [2023092100, 2023100500]}
+          includes_rrtype: {k: ch, v: [ZONEMD]}
+    beh:
+      n:
+        desc: Root zone versions appear periodically (modeled as a low-rate background publish log).
+        emit:
+          - id: root_zone_published
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Root zone publishing continues during the incident.
+        emit:
+          - id: root_zone_published
+            per_min: 0.05
+            scope: global
+
+  - id: override_service
+    name: Override Rules Service
+    svc: override-rules
+    hosts: [cfg01]
+    desc: Deploys override rules that modify resolver behavior (e.g., tagging requests to bypass static_zone).
+    to:
+      - dst: recursor_edge
+        proto: https
+        desc: Pushes override rule updates to resolver nodes.
+    logs:
+      override_rule_deployed:
+        desc: A new override rule was deployed.
+        lvl: INFO
+        msg: "deployed override rule_id={rule_id} tag=rec_disable_static phase=pre-cache"
+        vars:
+          rule_id: {k: str, v: "ovr-20231004-###"}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+  - id: dns_root_servers
+    name: DNS Root Servers (external)
+    svc: null
+    hosts: [root]
+    desc: External DNS root servers queried directly when local root zone is bypassed/unavailable.
+    to:
+      - dst: recursor_edge
+        proto: udp
+        desc: Returns a DNS response/referral to the resolver.
+    logs:
+      root_response:
+        desc: A response/referral is returned from a root server to the resolver.
+        lvl: DEBUG
+        msg: "root response rcode={rcode} rtt_ms={rtt_ms}"
+        vars:
+          rcode: {k: ch, v: [NOERROR]}
+          rtt_ms: {k: i, v: [1, 80]}
+    beh:
+      n: {desc: External system; no periodic emissions modeled., emit: []}
+      f: {desc: External system; no periodic emissions modeled., emit: []}
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Sampled query logs represent normal query handling: most requests are answered successfully,
+      with a small baseline of SERVFAILs for ordinary DNS/DNSSEC/upstream reasons.
+    req:
+      - id: dns_query_noerror_static
+        desc: Resolver consults static_zone and returns a successful answer.
+        rpm: 420.0
+        path: [recursor_edge, static_zone, recursor_edge]
+        emit: [recursor_edge.query_rx, static_zone.static_answer, recursor_edge.response_ok]
+        latency_ms: [[0.2, 1.0], [0.4, 2.0], [3.0, 25.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dns_query_noerror_root_fallback
+        desc: Resolver performs iterative root query directly (e.g., when local root data is unavailable on some nodes).
+        rpm: 30.0
+        path: [recursor_edge, dns_root_servers, recursor_edge]
+        emit: [recursor_edge.query_rx, recursor_edge.root_query, dns_root_servers.root_response, recursor_edge.response_ok]
+        latency_ms: [[0.2, 1.0], [2.0, 15.0], [10.0, 70.0], [12.0, 90.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dns_query_servfail_baseline
+        desc: Baseline SERVFAIL due to upstream timeouts/format issues (not specific to static_zone).
+        rpm: 20.0
+        path: [recursor_edge]
+        emit: [recursor_edge.query_rx, recursor_edge.response_servfail]
+        latency_ms: [[0.2, 1.0], [20.0, 250.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Some nodes continue serving an older in-memory root zone because newer versions fail to parse (ZONEMD),
+      and once the old root zone DNSSEC signatures expire, DNSSEC validation fails and SERVFAIL increases.
+      An attempted override can bypass static_zone for some direct requests, but peer-forwarded requests do not carry tags.
+    req:
+      - id: dns_query_noerror_static
+        desc: Successful answers still served using static_zone for many queries.
+        rpm: 400.0
+        path: [recursor_edge, static_zone, recursor_edge]
+        emit: [recursor_edge.query_rx, static_zone.static_answer, recursor_edge.response_ok]
+        latency_ms: [[0.3, 1.5], [0.6, 3.5], [4.0, 35.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dns_query_servfail_dnssec_direct
+        desc: Direct requests fail DNSSEC validation due to expired signatures in the stale root zone.
+        rpm: 50.0
+        path: [recursor_edge, static_zone, recursor_edge]
+        emit: [recursor_edge.query_rx, static_zone.static_answer, recursor_edge.dnssec_validate_failed, recursor_edge.response_servfail]
+        latency_ms: [[0.3, 1.5], [0.6, 4.0], [1.0, 10.0], [10.0, 120.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dns_query_servfail_dnssec_forwarded
+        desc: Requests forwarded to a peer (without tags) still hit static_zone and fail DNSSEC validation.
+        rpm: 20.0
+        path: [recursor_edge, static_zone, recursor_edge]
+        emit:
+          - recursor_edge.query_rx
+          - recursor_edge.peer_forward
+          - static_zone.static_answer
+          - recursor_edge.dnssec_validate_failed
+          - recursor_edge.response_servfail
+        latency_ms: [[0.3, 1.5], [1.0, 8.0], [0.6, 4.5], [1.0, 12.0], [12.0, 160.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dns_query_noerror_root_fallback_tagged
+        desc: With override tag present, static_zone is bypassed and the resolver queries root servers directly.
+        rpm: 40.0
+        path: [recursor_edge, static_zone, recursor_edge, dns_root_servers, recursor_edge]
+        emit:
+          - recursor_edge.query_rx
+          - static_zone.bypass_due_to_tag
+          - recursor_edge.root_query
+          - dns_root_servers.root_response
+          - recursor_edge.response_ok
+        latency_ms: [[0.3, 1.5], [0.5, 3.0], [3.0, 20.0], [12.0, 90.0], [15.0, 110.0]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "DNSSEC validation outcomes are logged by the resolver (recursor_edge), while static_zone logs only zone serving/loading/bypass state."
+  - "Client-side logging is not modeled; flows start at the resolver to keep log volume within target while retaining diagnostic value."
+  - "Query-level logging is modeled as a representative sampled stream (hundreds of rpm) rather than full 1.1.1.1 traffic."
+  - "The root zone ingestion/distribution pipeline is simplified to one component emitting periodic 'published root zone' logs."
+  - "ZONEMD parsing failure is represented by periodic static_zone.zone_parse_error logs that are likely to appear within a 60-minute window."
+  - "Normal-phase volume estimate (30 min): ~42.8k logs (~1426 logs/min), dominated by sampled per-query logs."
+  - "Total scenario volume estimate (60 min): ~85.9k logs, within the 20k..100k target, dominated by sampled per-query logs."
+```

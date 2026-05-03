@@ -1,0 +1,710 @@
+```yaml
+sys:
+  id: internal_edge_congestion_us_east_1
+  desc: >
+    A regional control-plane environment where main-network API frontends depend on foundational services
+    (internal DNS, monitoring, and control-plane backends) hosted on an internal network. Connectivity
+    between the internal and main networks traverses a small set of edge gateway devices providing routing
+    and NAT. The incident models an unexpected internal-client connection storm that overwhelms these edge
+    gateways, degrading cross-network latency and causing cascading retries, DNS errors, and API timeouts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: autoscale_controller
+    name: Autoscale Controller
+    svc: autoscale
+    hosts: [autoscale-1]
+    desc: Runs automated scaling activities for a main-network service and records control actions.
+    to:
+      - dst: capacity_service
+        proto: https
+        desc: Triggers scale operations against the service being scaled.
+    logs:
+      scale_activity_start:
+        desc: Marker for the automated scaling activity that precedes the connection storm.
+        lvl: INFO
+        msg: "starting automated capacity scale activity for {service} in {az}"
+        vars:
+          service: {k: ch, v: [capacity-service]}
+          az: {k: ch, v: [use1-az1, use1-az2]}
+      scale_activity_disabled:
+        desc: Marker that the scaling activity was disabled during mitigation.
+        lvl: WARN
+        msg: "disabled automated scaling activity for {service}; reason={reason}"
+        vars:
+          service: {k: ch, v: [capacity-service]}
+          reason: {k: ch, v: [incident_mitigation, unexpected_connection_surge]}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+  - id: internal_client_fleet
+    name: Internal Client Fleet
+    svc: client-fleet
+    hosts: [int-cli-1, int-cli-2, int-cli-3]
+    desc: >
+      Represents internal-network clients that open connections to a main-network service.
+      During the incident, a latent backoff issue causes overly aggressive retries.
+    to:
+      - dst: edge_gateway
+        proto: tcp
+        desc: Opens outbound TCP connections through the edge gateway to reach main-network services.
+    logs:
+      connect_attempt:
+        desc: Start of a connection attempt from the internal network.
+        lvl: INFO
+        msg: "conn attempt to {dst_svc} via {edge} timeout_ms={timeout_ms}"
+        vars:
+          dst_svc: {k: ch, v: [capacity-service]}
+          edge: {k: ch, v: [edge-gw]}
+          timeout_ms: {k: i, v: [1500, 5000]}
+      connect_retry:
+        desc: Retry marker indicating backoff behavior.
+        lvl: WARN
+        msg: "retrying connection to {dst_svc} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          dst_svc: {k: ch, v: [capacity-service]}
+          attempt: {k: i, v: [2, 5]}
+        state_vars:
+          n:
+            backoff_ms: {k: i, v: [200, 1200]}
+          f:
+            backoff_ms: {k: i, v: [20, 120]}
+      connect_ok:
+        desc: Result of a single connection attempt that successfully establishes a connection.
+        lvl: INFO
+        msg: "connection established to {dst_svc} rtt_ms={rtt_ms}"
+        vars:
+          dst_svc: {k: ch, v: [capacity-service]}
+          rtt_ms: {k: i, v: [10, 800]}
+      connect_fail:
+        desc: Result of a single connection attempt that failed (may be followed by retries).
+        lvl: ERROR
+        msg: "connection failed to {dst_svc} err={err} waited_ms={waited_ms}"
+        vars:
+          dst_svc: {k: ch, v: [capacity-service]}
+          err: {k: ch, v: [timeout, reset, no_route]}
+          waited_ms: {k: i, v: [200, 6000]}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+  - id: edge_gateway
+    name: Internal/Main Edge Gateway
+    svc: null
+    hosts: [edge-gw-a, edge-gw-b]
+    desc: >
+      A set of networking devices providing routing and NAT between the internal network and the main AWS
+      network. Under heavy connection churn, queueing and conntrack pressure cause packet drops and latency.
+      Device counters reflect aggregate traffic through the gateways, not only the subset represented by request flows.
+    to:
+      - dst: internal_dns
+        proto: udp
+        desc: Forwards DNS requests to internal DNS services across the boundary.
+      - dst: ec2_control_plane
+        proto: grpc
+        desc: Routes control-plane RPC traffic to internal backends.
+      - dst: capacity_service
+        proto: tcp
+        desc: Routes internal-client connections to a main-network service endpoint.
+      - dst: ec2_api_frontend
+        proto: https
+        desc: Returns traffic/responses to the EC2 API frontend on the main network.
+      - dst: internal_client_fleet
+        proto: tcp
+        desc: Returns traffic/responses to internal clients on the internal network.
+    logs:
+      nat_stats:
+        desc: Periodic device stats showing connection attempts, queueing, and drops (aggregate view).
+        lvl: INFO
+        msg: "nat stats conn_attempts_s={conn_attempts_s} active_conns={active_conns} queue_depth={queue_depth} drop_pct={drop_pct}"
+        vars: {}
+        state_vars:
+          n:
+            conn_attempts_s: {k: i, v: [30, 250]}
+            active_conns: {k: i, v: [2000, 15000]}
+            queue_depth: {k: i, v: [0, 60]}
+            drop_pct: {k: f, v: [0.0, 0.3]}
+          f:
+            conn_attempts_s: {k: i, v: [200, 2500]}
+            active_conns: {k: i, v: [10000, 80000]}
+            queue_depth: {k: i, v: [80, 1200]}
+            drop_pct: {k: f, v: [0.5, 12.0]}
+      conntrack_overflow:
+        desc: Warning indicating conntrack/NAT table pressure leading to evictions.
+        lvl: WARN
+        msg: "conntrack table pressure active_conns={active_conns} max_conns={max_conns} evictions_s={evictions_s}"
+        vars: {}
+        state_vars:
+          n:
+            active_conns: {k: i, v: [5000, 15000]}
+            max_conns: {k: i, v: [200000, 200000]}
+            evictions_s: {k: i, v: [0, 2]}
+          f:
+            active_conns: {k: i, v: [20000, 80000]}
+            max_conns: {k: i, v: [200000, 200000]}
+            evictions_s: {k: i, v: [10, 400]}
+      device_health:
+        desc: Periodic health snapshot for the device.
+        lvl: INFO
+        msg: "device health cpu_pct={cpu_pct} mem_pct={mem_pct}"
+        vars:
+          cpu_pct: {k: i, v: [10, 95]}
+          mem_pct: {k: i, v: [20, 95]}
+    beh:
+      n:
+        desc: Edge gateways emit low-noise periodic stats; pressure warnings are rare.
+        emit:
+          - id: nat_stats
+            per_min: 2.0
+            scope: per_host
+          - id: device_health
+            per_min: 1.0
+            scope: per_host
+          - id: conntrack_overflow
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: Under congestion, stats remain frequent and pressure warnings become common.
+        emit:
+          - id: nat_stats
+            per_min: 4.0
+            scope: per_host
+          - id: device_health
+            per_min: 1.0
+            scope: per_host
+          - id: conntrack_overflow
+            per_min: 0.8
+            scope: per_host
+
+  - id: internal_dns
+    name: Internal DNS
+    svc: internal-dns
+    hosts: [dns-a, dns-b]
+    desc: >
+      Provides internal DNS resolution for services; when cross-network traffic is congested, requests may
+      queue and return SERVFAIL due to upstream/queue timeouts. During mitigation, DNS traffic is rerouted
+      away from congested paths and error rates drop back near normal.
+    to:
+      - dst: edge_gateway
+        proto: udp
+        desc: Sends DNS responses back across the edge gateway.
+    logs:
+      query_recv:
+        desc: Receipt of a DNS query.
+        lvl: INFO
+        msg: "query {qname} type={qtype} from {src} txid={txid}"
+        vars:
+          qname: {k: ch, v: [ec2.internal, auth.internal, monitoring.internal, deploy.internal, events.internal]}
+          qtype: {k: ch, v: [A, AAAA]}
+          src: {k: ch, v: [ec2-api, monitoring, deploy, other-service]}
+          txid: {k: hex, v: 8}
+      reply_ok:
+        desc: Successful DNS response.
+        lvl: INFO
+        msg: "reply {qname} rcode=NOERROR answer_rrs={rrs} latency_ms={latency_ms}"
+        vars:
+          qname: {k: ch, v: [ec2.internal, auth.internal, monitoring.internal, deploy.internal, events.internal]}
+          rrs: {k: i, v: [1, 6]}
+          latency_ms: {k: i, v: [1, 1200]}
+      reply_servfail:
+        desc: DNS response with SERVFAIL.
+        lvl: WARN
+        msg: "reply {qname} rcode=SERVFAIL latency_ms={latency_ms} reason={reason}"
+        vars:
+          qname: {k: ch, v: [ec2.internal, auth.internal, monitoring.internal, deploy.internal, events.internal]}
+          latency_ms: {k: i, v: [50, 4000]}
+          reason: {k: ch, v: [upstream_timeout, queue_overflow]}
+      dns_health_normal:
+        desc: Periodic DNS health snapshot during normal operation.
+        lvl: INFO
+        msg: "dns health qps={qps} servfail_pct={servfail_pct}"
+        vars:
+          qps: {k: f, v: [0.0, 5.0]}
+          servfail_pct: {k: f, v: [0.0, 0.2]}
+      dns_health_degraded:
+        desc: Periodic DNS health snapshot showing degraded SERVFAIL rate during congestion.
+        lvl: INFO
+        msg: "dns health qps={qps} servfail_pct={servfail_pct}"
+        vars:
+          qps: {k: f, v: [0.5, 12.0]}
+          servfail_pct: {k: f, v: [1.0, 30.0]}
+      dns_health_recovered:
+        desc: Periodic DNS health snapshot after DNS traffic is rerouted away from the congested path.
+        lvl: INFO
+        msg: "dns health qps={qps} servfail_pct={servfail_pct}"
+        vars:
+          qps: {k: f, v: [0.2, 10.0]}
+          servfail_pct: {k: f, v: [0.0, 0.5]}
+    beh:
+      n:
+        desc: DNS emits periodic health snapshots with low SERVFAIL.
+        emit:
+          - id: dns_health_normal
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the incident, DNS health snapshots reflect either degraded or recovered behavior depending on mitigation.
+        emit:
+          - id: dns_health_degraded
+            per_min: 1.0
+            scope: per_host
+          - id: dns_health_recovered
+            per_min: 1.0
+            scope: per_host
+
+  - id: ec2_api_frontend
+    name: EC2 API Frontend
+    svc: ec2-api
+    hosts: [ec2-api-1, ec2-api-2]
+    desc: >
+      Customer-facing API frontend in the main network. It depends on internal network backends reachable
+      via the edge gateway; during congestion it returns elevated 503s and higher latencies.
+    to:
+      - dst: edge_gateway
+        proto: https
+        desc: Sends RPC traffic and DNS traffic across the edge to the internal network.
+    logs:
+      http_req_describe:
+        desc: Incoming DescribeInstances request.
+        lvl: INFO
+        msg: "request DescribeInstances /ec2 from {client_ip} req_id={req_id} trace_id={trace_id}"
+        vars:
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      http_200_describe:
+        desc: Successful DescribeInstances response.
+        lvl: INFO
+        msg: "response DescribeInstances status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [20, 1500]}
+          req_id: {k: uuid, v: null}
+      http_503_describe:
+        desc: Failed DescribeInstances response due to upstream timeout.
+        lvl: ERROR
+        msg: "response DescribeInstances status=503 err=UpstreamTimeout dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [300, 8000]}
+          req_id: {k: uuid, v: null}
+      http_req_run:
+        desc: Incoming RunInstances request.
+        lvl: INFO
+        msg: "request RunInstances /ec2 from {client_ip} req_id={req_id} trace_id={trace_id}"
+        vars:
+          client_ip: {k: ip, v: "198.51.100.0/24"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      http_200_run:
+        desc: Successful RunInstances response.
+        lvl: INFO
+        msg: "response RunInstances status=200 dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [50, 4000]}
+          req_id: {k: uuid, v: null}
+      http_503_run:
+        desc: Failed RunInstances response due to upstream timeout.
+        lvl: ERROR
+        msg: "response RunInstances status=503 err=UpstreamTimeout dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [500, 12000]}
+          req_id: {k: uuid, v: null}
+      dns_resolve:
+        desc: DNS resolution attempt for an internal service name.
+        lvl: DEBUG
+        msg: "resolving {qname} for internal call req_id={req_id}"
+        vars:
+          qname: {k: ch, v: [ec2.internal, auth.internal, monitoring.internal, deploy.internal, events.internal]}
+          req_id: {k: uuid, v: null}
+      dns_ok:
+        desc: Successful DNS resolution.
+        lvl: DEBUG
+        msg: "dns resolved {qname} addr={addr} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          qname: {k: ch, v: [ec2.internal, auth.internal, monitoring.internal, deploy.internal, events.internal]}
+          addr: {k: ip, v: "10.0.0.0/16"}
+          dur_ms: {k: i, v: [1, 1200]}
+          req_id: {k: uuid, v: null}
+      dns_failed:
+        desc: DNS resolution failure observed by a client in the main network.
+        lvl: WARN
+        msg: "dns resolution failed {qname} err={err} waited_ms={waited_ms} req_id={req_id}"
+        vars:
+          qname: {k: ch, v: [ec2.internal, auth.internal, monitoring.internal, deploy.internal, events.internal]}
+          err: {k: ch, v: [SERVFAIL, timeout]}
+          waited_ms: {k: i, v: [50, 5000]}
+          req_id: {k: uuid, v: null}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+  - id: ec2_control_plane
+    name: EC2 Internal Control Plane
+    svc: ec2-control-plane
+    hosts: [ec2-cp-1, ec2-cp-2]
+    desc: >
+      Internal-network backend that executes EC2 control-plane operations. Under network congestion,
+      requests may exceed deadlines and appear as upstream timeouts to the API frontend.
+    to:
+      - dst: edge_gateway
+        proto: grpc
+        desc: Sends RPC responses back across the edge gateway.
+    logs:
+      rpc_start_describe:
+        desc: Start of DescribeInstances RPC.
+        lvl: INFO
+        msg: "rpc DescribeInstances recv req_id={req_id} from {caller}"
+        vars:
+          req_id: {k: uuid, v: null}
+          caller: {k: ch, v: [ec2-api]}
+      rpc_ok_describe:
+        desc: Successful DescribeInstances RPC completion.
+        lvl: INFO
+        msg: "rpc DescribeInstances ok dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [10, 900]}
+          req_id: {k: uuid, v: null}
+      rpc_deadline_describe:
+        desc: DescribeInstances RPC exceeded deadline.
+        lvl: WARN
+        msg: "rpc DescribeInstances deadline exceeded waited_ms={waited_ms} req_id={req_id}"
+        vars:
+          waited_ms: {k: i, v: [200, 8000]}
+          req_id: {k: uuid, v: null}
+      rpc_start_run:
+        desc: Start of RunInstances RPC.
+        lvl: INFO
+        msg: "rpc RunInstances recv req_id={req_id} from {caller}"
+        vars:
+          req_id: {k: uuid, v: null}
+          caller: {k: ch, v: [ec2-api]}
+      rpc_ok_run:
+        desc: Successful RunInstances RPC completion.
+        lvl: INFO
+        msg: "rpc RunInstances ok dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          dur_ms: {k: i, v: [30, 2500]}
+          req_id: {k: uuid, v: null}
+      rpc_deadline_run:
+        desc: RunInstances RPC exceeded deadline.
+        lvl: WARN
+        msg: "rpc RunInstances deadline exceeded waited_ms={waited_ms} req_id={req_id}"
+        vars:
+          waited_ms: {k: i, v: [400, 12000]}
+          req_id: {k: uuid, v: null}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+  - id: capacity_service
+    name: Capacity Service Endpoint
+    svc: capacity-service
+    hosts: [cap-svc-1, cap-svc-2]
+    desc: Main-network service endpoint being scaled; receives internal client connections through the edge.
+    to:
+      - dst: edge_gateway
+        proto: tcp
+        desc: Sends connection responses/traffic back through the edge gateway.
+    logs:
+      conn_accept:
+        desc: Accepts a client connection.
+        lvl: INFO
+        msg: "accepted client connection src={src} conn_id={conn_id}"
+        vars:
+          src: {k: ch, v: [internal-client]}
+          conn_id: {k: hex, v: 12}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+  - id: monitoring_pipeline
+    name: Monitoring Ingestion Pipeline
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Monitoring ingestion/aggregation used by operators; cross-network delays increase ingestion lag and
+      can drop samples, reducing real-time visibility during the incident.
+    to:
+      - dst: edge_gateway
+        proto: https
+        desc: Collects/ships telemetry across the network boundary.
+    logs:
+      metric_ingest_lag:
+        desc: Lag/drops observed in the ingestion pipeline.
+        lvl: WARN
+        msg: "metrics ingestion lag lag_s={lag_s} dropped_samples={dropped}"
+        vars: {}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 10]}
+            dropped: {k: i, v: [0, 50]}
+          f:
+            lag_s: {k: i, v: [60, 3600]}
+            dropped: {k: i, v: [100, 20000]}
+    beh:
+      n:
+        desc: Lag warnings are infrequent in healthy operation.
+        emit:
+          - id: metric_ingest_lag
+            per_min: 0.2
+            scope: global
+      f:
+        desc: During congestion, ingestion lag is consistently visible.
+        emit:
+          - id: metric_ingest_lag
+            per_min: 1.0
+            scope: global
+
+  - id: ops_tooling
+    name: Operations Tooling
+    svc: ops
+    hosts: [ops-1]
+    desc: Emits markers for manual remediation steps taken during the incident.
+    to:
+      - dst: edge_gateway
+        proto: https
+        desc: Applies network configuration changes and capacity actions.
+    logs:
+      dns_reroute_completed:
+        desc: Marker that internal DNS was rerouted away from congested paths.
+        lvl: INFO
+        msg: "completed reroute of internal DNS to alternate path change_id={change_id}"
+        vars:
+          change_id: {k: hex, v: 12}
+      capacity_added:
+        desc: Marker that additional edge capacity was brought online.
+        lvl: INFO
+        msg: "brought additional edge capacity online device_set={device_set} change_id={change_id}"
+        vars:
+          device_set: {k: ch, v: [edge-gw-extra-a, edge-gw-extra-b]}
+          change_id: {k: hex, v: 12}
+      remediation_step_failed:
+        desc: Marker that automation/deploy tooling is impaired, slowing mitigation.
+        lvl: WARN
+        msg: "remediation automation step failed step={step} err={err}"
+        vars:
+          step: {k: ch, v: [push_network_config, isolate_top_talker, add_capacity]}
+          err: {k: ch, v: [timeout, dns_error, auth_unavailable]}
+    beh:
+      n: {desc: No periodic emissions modeled., emit: []}
+      f: {desc: No periodic emissions modeled., emit: []}
+
+tracing:
+  on: true
+  origins: [ec2_api_frontend]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Customer control-plane API calls and routine internal DNS and connection activity traverse the edge normally.
+    req:
+      - id: ec2_describe_instances
+        desc: Customer DescribeInstances call reaching the internal EC2 control plane successfully.
+        rpm: 120.0
+        path: [ec2_api_frontend, edge_gateway, ec2_control_plane, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.http_req_describe
+          - ec2_control_plane.rpc_start_describe
+          - ec2_control_plane.rpc_ok_describe
+          - ec2_api_frontend.http_200_describe
+        latency_ms: [[3, 8], [10, 40], [10, 80], [20, 150]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+      - id: ec2_run_instances
+        desc: Customer RunInstances call reaching the internal EC2 control plane successfully.
+        rpm: 30.0
+        path: [ec2_api_frontend, edge_gateway, ec2_control_plane, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.http_req_run
+          - ec2_control_plane.rpc_start_run
+          - ec2_control_plane.rpc_ok_run
+          - ec2_api_frontend.http_200_run
+        latency_ms: [[5, 15], [20, 80], [40, 250], [60, 400]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+      - id: internal_dns_query_ok
+        desc: Main-network services resolve internal names via internal DNS successfully.
+        rpm: 80.0
+        path: [ec2_api_frontend, edge_gateway, internal_dns, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.dns_resolve
+          - internal_dns.query_recv
+          - internal_dns.reply_ok
+          - ec2_api_frontend.dns_ok
+        latency_ms: [[1, 3], [2, 10], [2, 20], [2, 25]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: internal_client_connect_ok
+        desc: Internal clients connect to the scaled service endpoint successfully (single-attempt model).
+        rpm: 50.0
+        path: [internal_client_fleet, edge_gateway, capacity_service, edge_gateway, internal_client_fleet]
+        emit:
+          - internal_client_fleet.connect_attempt
+          - capacity_service.conn_accept
+          - internal_client_fleet.connect_ok
+        latency_ms: [[2, 8], [5, 30], [5, 50]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: internal_client_connect_fail
+        desc: Rare failed internal client connection attempts; may include retries that also fail.
+        rpm: 3.0
+        path: [internal_client_fleet, edge_gateway, capacity_service, edge_gateway, internal_client_fleet]
+        emit:
+          - internal_client_fleet.connect_attempt
+          - internal_client_fleet.connect_fail
+        latency_ms: [[10, 30], [50, 300]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.2
+          emit_per_retry: [internal_client_fleet.connect_retry]
+          backoff_ms: [[250, 900], [400, 1200]]
+        trace: false
+
+  f:
+    desc: Edge congestion increases cross-network latency and drops, elevating DNS SERVFAILs and EC2 API timeouts while internal clients retry aggressively.
+    req:
+      - id: ec2_describe_instances
+        desc: Some DescribeInstances requests still succeed but are slower.
+        rpm: 50.0
+        path: [ec2_api_frontend, edge_gateway, ec2_control_plane, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.http_req_describe
+          - ec2_control_plane.rpc_start_describe
+          - ec2_control_plane.rpc_ok_describe
+          - ec2_api_frontend.http_200_describe
+        latency_ms: [[10, 50], [50, 300], [80, 700], [120, 1000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+      - id: ec2_describe_instances_timeout
+        desc: DescribeInstances requests that exceed deadlines and return 503 to customers.
+        rpm: 90.0
+        path: [ec2_api_frontend, edge_gateway, ec2_control_plane, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.http_req_describe
+          - ec2_control_plane.rpc_start_describe
+          - ec2_control_plane.rpc_deadline_describe
+          - ec2_api_frontend.http_503_describe
+        latency_ms: [[20, 80], [200, 1200], [500, 4000], [800, 8000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+      - id: ec2_run_instances
+        desc: A small fraction of RunInstances requests still succeed.
+        rpm: 3.0
+        path: [ec2_api_frontend, edge_gateway, ec2_control_plane, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.http_req_run
+          - ec2_control_plane.rpc_start_run
+          - ec2_control_plane.rpc_ok_run
+          - ec2_api_frontend.http_200_run
+        latency_ms: [[20, 80], [200, 800], [300, 2000], [400, 3000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+      - id: ec2_run_instances_timeout
+        desc: RunInstances requests frequently time out and return 503, blocking new launches.
+        rpm: 45.0
+        path: [ec2_api_frontend, edge_gateway, ec2_control_plane, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.http_req_run
+          - ec2_control_plane.rpc_start_run
+          - ec2_control_plane.rpc_deadline_run
+          - ec2_api_frontend.http_503_run
+        latency_ms: [[30, 120], [400, 2000], [800, 8000], [1200, 12000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+      - id: internal_dns_query_ok
+        desc: A reduced portion of DNS queries still succeeds while the edge is congested.
+        rpm: 20.0
+        path: [ec2_api_frontend, edge_gateway, internal_dns, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.dns_resolve
+          - internal_dns.query_recv
+          - internal_dns.reply_ok
+          - ec2_api_frontend.dns_ok
+        latency_ms: [[10, 60], [50, 300], [50, 600], [50, 800]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: internal_dns_query_servfail
+        desc: DNS queries returning SERVFAIL due to congestion/queueing.
+        rpm: 120.0
+        path: [ec2_api_frontend, edge_gateway, internal_dns, edge_gateway, ec2_api_frontend]
+        emit:
+          - ec2_api_frontend.dns_resolve
+          - internal_dns.query_recv
+          - internal_dns.reply_servfail
+          - ec2_api_frontend.dns_failed
+        latency_ms: [[20, 120], [100, 800], [200, 3000], [200, 5000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: internal_client_connect_ok
+        desc: Some internal client connection attempts still succeed, but more slowly (single-attempt model).
+        rpm: 20.0
+        path: [internal_client_fleet, edge_gateway, capacity_service, edge_gateway, internal_client_fleet]
+        emit:
+          - internal_client_fleet.connect_attempt
+          - capacity_service.conn_accept
+          - internal_client_fleet.connect_ok
+        latency_ms: [[20, 120], [50, 300], [50, 500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: internal_client_connect_fail
+        desc: Internal client connection attempts fail frequently and retry aggressively, contributing to congestion.
+        rpm: 120.0
+        path: [internal_client_fleet, edge_gateway, capacity_service, edge_gateway, internal_client_fleet]
+        emit:
+          - internal_client_fleet.connect_attempt
+          - internal_client_fleet.connect_fail
+        latency_ms: [[30, 150], [200, 3000]]
+        retry:
+          max_attempts: 5
+          expected_attempts: 3.0
+          emit_per_retry: [internal_client_fleet.connect_retry]
+          backoff_ms: [[20, 60], [30, 80], [40, 100], [60, 120]]
+        trace: false
+
+assumptions:
+  - |-
+      Time is compressed: the multi-hour regional event is modeled as a ~34-minute incident preserving the causal
+      sequence (connection storm → edge congestion → DNS/API/monitoring impairment → partial mitigations).
+  - |-
+      The "internal network" vs "main network" boundary is represented only by the edge_gateway component; downstream
+      services are simplified to internal_dns and ec2_control_plane plus a scaled capacity_service endpoint.
+  - |-
+      Reverse-direction connectivity (e.g., internal_dns -> edge_gateway) is modeled explicitly as component "to" edges
+      to make request paths with return hops traversable for log generation.
+  - |-
+      Retry semantics: flow emit chains are per-entry-request, so internal_client_connect_ok is modeled as single-attempt successes,
+      while internal_client_connect_fail includes retries to represent connection churn amplification. The backoff bug is
+      represented by smaller failure-state backoff_ms in internal_client_fleet.connect_retry and higher expected_attempts in
+      internal_client_connect_fail during failure.
+  - |-
+      edge_gateway.nat_stats and edge_gateway.conntrack_overflow counters represent aggregate gateway load including
+      unmodeled traffic; their quantitative envelopes were reduced to remain broadly consistent with the modeled traffic
+      scale while still showing clear incident-time elevation.
+  - |-
+      DNS health snapshot qps domains are aligned to the modeled DNS flow volumes (flows represent a small modeled subset of
+      cross-network DNS traffic for this incident-specific spec).
+  - |-
+      Variable envelopes were adjusted to avoid contradictions with modeled latency hints (e.g., dns_ok/reply_ok dur_ms and
+      http_200_run/rpc_ok_run dur_ms cover slower success cases during congestion).
+  - |-
+      Normal-phase log volume estimate: ~17k logs over 16 minutes (dominated by EC2 API calls and routine internal DNS resolutions).
+  - |-
+      Total scenario log volume estimate: ~55k–70k logs (target 20k–100k), dominated by failure-phase DNS/EC2 flows and
+      internal-client connection failures with retries; edge/monitoring background signals provide corroborating time-series evidence.
+  - |-
+      Visibility rationale: edge_gateway.nat_stats/conntrack_overflow show congestion, internal_dns.reply_servfail shows DNS impact,
+      ec2_api_frontend.http_503_* shows customer-facing control-plane errors, and monitoring_pipeline.metric_ingest_lag shows reduced
+      operational visibility.
+```

@@ -1,0 +1,610 @@
+```yaml
+sys:
+  id: pagerduty_notification_platform_2013
+  desc: >
+    A SaaS incident-management system that accepts events via an HTTP API and dispatches outbound
+    notifications (SMS/email/phone/push) through worker nodes. The dispatch subsystem relies on a
+    coordination quorum spanning three datacenters to safely process the notification queue. In the
+    modeled incident, a shared network peering point degrades connectivity between two AWS regions,
+    preventing quorum and stopping notification dispatch while the events API continues to accept events.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_gateway
+    name: API Gateway
+    svc: api-gateway
+    hosts: [api-r1-1, api-r2-1, api-l1-1]
+    desc: >
+      Public HTTP entrypoint for API clients. Proxies writes to event ingestion and serves some read endpoints.
+    to:
+      - dst: event_ingest
+        proto: https
+        desc: Forwards /v1/events to ingestion workers.
+    logs:
+      http_events_202:
+        desc: Access log for successful event ingestion requests.
+        lvl: INFO
+        msg: "POST /v1/events status=202 dur_ms={dur_ms} client_ip={client_ip} trace_id={trace_id}"
+        vars:
+          client_ip: {k: ip, v: null}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [10, 80]}
+          f:
+            dur_ms: {k: i, v: [20, 250]}
+      http_incident_200:
+        desc: Access log for successful incident read requests.
+        lvl: INFO
+        msg: "GET /v1/incidents/{inc_id} status=200 dur_ms={dur_ms}"
+        vars:
+          inc_id: {k: i, v: [1000, 9999]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [20, 150]}
+          f:
+            dur_ms: {k: i, v: [40, 800]}
+      http_incident_500:
+        desc: Access log for failed incident read requests (upstream timeout/error).
+        lvl: ERROR
+        msg: "GET /v1/incidents/{inc_id} status=500 dur_ms={dur_ms} upstream={upstream}"
+        vars:
+          inc_id: {k: i, v: [1000, 9999]}
+          upstream: {k: ch, v: [incident_svc]}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [200, 1500]}
+          f:
+            dur_ms: {k: i, v: [300, 5000]}
+      http_server_metric:
+        desc: Periodic gateway utilization snapshot.
+        lvl: DEBUG
+        msg: "http metrics active_conns={active_conns} req_per_min={req_per_min}"
+        vars:
+          active_conns: {k: i, v: [50, 900]}
+          req_per_min: {k: i, v: [100, 800]}
+    beh:
+      n:
+        desc: Low-rate server metrics useful as a baseline.
+        emit:
+          - id: http_server_metric
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Similar periodic metrics; failures are primarily downstream.
+        emit:
+          - id: http_server_metric
+            per_min: 0.5
+            scope: per_host
+
+  - id: event_ingest
+    name: Event Ingest Service
+    svc: event-ingest
+    hosts: [ingest-r1-1, ingest-r2-1]
+    desc: >
+      Validates and normalizes incoming events, then writes them to the durable queue.
+      In this incident it remains available.
+    to:
+      - dst: event_queue
+        proto: tcp
+        desc: Writes accepted events into the durable queue.
+    logs:
+      event_ingested:
+        desc: Event accepted and written to the queue.
+        lvl: INFO
+        msg: "event ingested event_id={event_id} source={source} trace_id={trace_id}"
+        vars:
+          event_id: {k: uuid, v: null}
+          source: {k: ch, v: [api, integrations, email]}
+          trace_id: {k: hex, v: 32}
+      ingest_lag_metric:
+        desc: Periodic ingest lag and inflight work.
+        lvl: INFO
+        msg: "ingest metrics lag_s={lag_s} inflight={inflight}"
+        vars: {}
+        state_vars:
+          n:
+            lag_s: {k: f, v: [0.0, 2.0]}
+            inflight: {k: i, v: [0, 500]}
+          f:
+            lag_s: {k: f, v: [0.0, 10.0]}
+            inflight: {k: i, v: [0, 3000]}
+    beh:
+      n:
+        desc: Small periodic metrics noise.
+        emit:
+          - id: ingest_lag_metric
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Metrics continue; queueing increases slightly due to downstream dispatch issues.
+        emit:
+          - id: ingest_lag_metric
+            per_min: 1.0
+            scope: per_host
+
+  - id: event_queue
+    name: Durable Event Queue
+    svc: event-queue
+    hosts: [queue-l1-1]
+    desc: >
+      Durable queue holding notifications to be dispatched. Depth increases when dispatch workers
+      cannot make progress.
+    to: []
+    logs:
+      queue_depth_metric:
+        desc: Periodic queue depth and age-of-oldest message.
+        lvl: INFO
+        msg: "queue depth depth={depth} oldest_age_s={oldest_age_s}"
+        vars: {}
+        state_vars:
+          n:
+            depth: {k: i, v: [0, 2000]}
+            oldest_age_s: {k: i, v: [0, 60]}
+          f:
+            depth: {k: i, v: [0, 20000]}
+            oldest_age_s: {k: i, v: [0, 3600]}
+      queue_depth_snapshot:
+        desc: One-off sampled queue depth used as an incident marker.
+        lvl: WARN
+        msg: "queue depth snapshot depth={depth} oldest_age_s={oldest_age_s}"
+        vars:
+          depth: {k: i, v: [2000, 20000]}
+          oldest_age_s: {k: i, v: [60, 3600]}
+    beh:
+      n:
+        desc: Queue stays relatively small during normal operations.
+        emit:
+          - id: queue_depth_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Depth/age continues to be reported and grows during dispatch outage.
+        emit:
+          - id: queue_depth_metric
+            per_min: 1.0
+            scope: global
+
+  - id: coordinator
+    name: Coordinator (ZooKeeper-like quorum)
+    svc: coordinator
+    hosts: [coord-r1-1, coord-r2-1, coord-l1-1]
+    desc: >
+      Coordination service providing leader election and quorum membership for notification dispatch.
+      High inter-datacenter latency causes session expirations and loss of quorum.
+    to:
+      - dst: dispatch_worker
+        proto: tcp
+        desc: Returns quorum/leadership results to dispatch workers during checks.
+    logs:
+      quorum_ok:
+        desc: Quorum check succeeded for a dispatch attempt.
+        lvl: INFO
+        msg: "quorum ok leader={leader} members_up={members_up} rtt_ms={rtt_ms}"
+        vars:
+          leader: {k: ch, v: [coord-r1-1, coord-r2-1, coord-l1-1]}
+          members_up: {k: i, v: [2, 3]}
+        state_vars:
+          n:
+            rtt_ms: {k: i, v: [5, 40]}
+          f:
+            rtt_ms: {k: i, v: [80, 2500]}
+      quorum_fail:
+        desc: Quorum check failed (no majority reachable).
+        lvl: ERROR
+        msg: "quorum unavailable members_up={members_up} rtt_ms={rtt_ms} reason={reason}"
+        vars:
+          members_up: {k: i, v: [0, 1]}
+          rtt_ms: {k: i, v: [200, 4000]}
+          reason: {k: ch, v: [no_majority, session_expired]}
+      leader_heartbeat:
+        desc: Background leader/follower heartbeat.
+        lvl: DEBUG
+        msg: "leader heartbeat state={state} zxid={zxid}"
+        vars:
+          state: {k: ch, v: [leading, following]}
+          zxid: {k: hex, v: 8}
+      session_expired:
+        desc: A peer session expired, usually due to latency spikes.
+        lvl: WARN
+        msg: "session expired peer={peer} rtt_ms={rtt_ms}"
+        vars:
+          peer: {k: ch, v: [coord-r1-1, coord-r2-1, coord-l1-1]}
+        state_vars:
+          n:
+            rtt_ms: {k: i, v: [10, 80]}
+          f:
+            rtt_ms: {k: i, v: [150, 4000]}
+      quorum_lost:
+        desc: Coordinator reports it cannot form a majority view (cluster state transition marker).
+        lvl: ERROR
+        msg: "lost quorum view={view_id} members_up={members_up}"
+        vars:
+          view_id: {k: hex, v: 6}
+          members_up: {k: i, v: [0, 1]}
+      config_warn:
+        desc: Configuration warning that can make timeouts overly aggressive.
+        lvl: WARN
+        msg: "config warning key={key} value={value}"
+        vars:
+          key: {k: ch, v: [tick_time_ms, init_limit, sync_limit, session_timeout_ms]}
+          value: {k: str, v: "numeric_string"}
+      config_reload:
+        desc: Manual configuration reload to adjust timeout settings.
+        lvl: INFO
+        msg: "reloaded config session_timeout_ms {old}->{new}"
+        vars:
+          old: {k: i, v: [2000, 10000]}
+          new: {k: i, v: [5000, 20000]}
+      proc_restart:
+        desc: Manual restart of coordinator processes.
+        lvl: INFO
+        msg: "restarted coordinator process reason={reason} pid={pid}"
+        vars:
+          reason: {k: ch, v: [manual_restart, watcher, crashloop]}
+          pid: {k: i, v: [1000, 50000]}
+    beh:
+      n:
+        desc: Stable coordinator with rare session warnings.
+        emit:
+          - id: leader_heartbeat
+            per_min: 1.0
+            scope: per_host
+          - id: session_expired
+            per_min: 0.05
+            scope: per_host
+          - id: config_warn
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: Session expirations become common under peering degradation; quorum loss is modeled as an event marker.
+        emit:
+          - id: leader_heartbeat
+            per_min: 1.0
+            scope: per_host
+          - id: session_expired
+            per_min: 0.25
+            scope: per_host
+          - id: config_warn
+            per_min: 0.05
+            scope: per_host
+
+  - id: dispatch_worker
+    name: Notification Dispatch Workers
+    svc: notif-dispatch
+    hosts: [dispatch-r1-1, dispatch-r2-1, dispatch-l1-1]
+    desc: >
+      Dequeues pending notifications and sends them to external providers. Requires coordinator quorum
+      to proceed; otherwise it requeues work. During the incident, workers requeue due to missing quorum
+      and later drain the backlog once quorum returns.
+    to:
+      - dst: event_queue
+        proto: tcp
+        desc: Reads queued notifications and requeues when needed.
+      - dst: coordinator
+        proto: tcp
+        desc: Checks quorum/membership before dispatching.
+    logs:
+      job_start:
+        desc: Start of processing a notification job.
+        lvl: INFO
+        msg: "notif job start notif_id={notif_id} channel={channel} trace_id={trace_id}"
+        vars:
+          notif_id: {k: hex, v: 16}
+          channel: {k: ch, v: [sms, email, phone, push]}
+          trace_id: {k: hex, v: 32}
+      job_done_success:
+        desc: Notification sent successfully in normal operations.
+        lvl: INFO
+        msg: "notif job done outcome=sent provider={provider} attempts={attempts} total_ms={total_ms} trace_id={trace_id}"
+        vars:
+          provider: {k: ch, v: [twilio, sendgrid, apns, nexmo]}
+          attempts: {k: i, v: [1, 2]}
+          total_ms: {k: i, v: [80, 900]}
+          trace_id: {k: hex, v: 32}
+      job_done_degraded:
+        desc: Notification job completes with higher latency and more errors.
+        lvl: WARN
+        msg: "notif job done outcome={outcome} provider={provider} attempts={attempts} total_ms={total_ms} trace_id={trace_id}"
+        vars:
+          outcome: {k: ch, v: [sent, provider_timeout, provider_5xx]}
+          provider: {k: ch, v: [twilio, sendgrid, apns, nexmo]}
+          attempts: {k: i, v: [1, 3]}
+          total_ms: {k: i, v: [200, 9000]}
+          trace_id: {k: hex, v: 32}
+      job_done_backlog:
+        desc: Successful send while draining backlog, with queue age included.
+        lvl: INFO
+        msg: "notif job done outcome=sent provider={provider} attempts={attempts} queue_age_s={queue_age_s} total_ms={total_ms} trace_id={trace_id}"
+        vars:
+          provider: {k: ch, v: [twilio, sendgrid, apns, nexmo]}
+          attempts: {k: i, v: [1, 3]}
+          queue_age_s: {k: i, v: [30, 1800]}
+          total_ms: {k: i, v: [300, 12000]}
+          trace_id: {k: hex, v: 32}
+      job_requeued:
+        desc: Job requeued because quorum is unavailable.
+        lvl: WARN
+        msg: "notif requeued reason=no_quorum queue_age_s={queue_age_s} trace_id={trace_id}"
+        vars:
+          queue_age_s: {k: i, v: [30, 1800]}
+          trace_id: {k: hex, v: 32}
+      dispatch_node_restart:
+        desc: Manual attempt to restart a dispatch node.
+        lvl: INFO
+        msg: "restart dispatch node host={host} result={result}"
+        vars:
+          host: {k: ch, v: [dispatch-r1-1, dispatch-r2-1, dispatch-l1-1]}
+          result: {k: ch, v: [success, failed]}
+      worker_pool_metric:
+        desc: Worker pool metrics (useful noise and backlog correlation).
+        lvl: INFO
+        msg: "worker pool active={active} queued_jobs={queued_jobs}"
+        vars:
+          active: {k: i, v: [0, 30]}
+          queued_jobs: {k: i, v: [0, 8000]}
+    beh:
+      n:
+        desc: Dispatch workers emit periodic pool metrics.
+        emit:
+          - id: worker_pool_metric
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Pool metrics continue; queued_jobs often grows when quorum is missing.
+        emit:
+          - id: worker_pool_metric
+            per_min: 0.5
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring & Alerting
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Runs health checks and raises alerts such as multi-provider delivery failures and quorum loss.
+      Sends pages to on-call and records incident severity changes.
+    to: []
+    logs:
+      health_tick:
+        desc: Periodic monitor heartbeat.
+        lvl: DEBUG
+        msg: "monitor tick checks_ok={checks_ok} checks_fail={checks_fail}"
+        vars:
+          checks_ok: {k: i, v: [20, 40]}
+          checks_fail: {k: i, v: [0, 8]}
+      alert_multi_provider_failure:
+        desc: Alert that multiple notification providers are failing or timing out.
+        lvl: ERROR
+        msg: "alert multi-provider notification failures rate={fail_rate} latency_p95_ms={lat_p95_ms} sev={sev}"
+        vars:
+          fail_rate: {k: f, v: [0.05, 0.9]}
+          lat_p95_ms: {k: i, v: [500, 10000]}
+          sev: {k: ch, v: [warning, critical]}
+      oncall_page_sent:
+        desc: A page sent to on-call engineer(s).
+        lvl: INFO
+        msg: "sent page to oncall reason={reason} sev={sev}"
+        vars:
+          reason: {k: ch, v: [dispatch_node_down, multi_provider_failure, dispatch_quorum_lost]}
+          sev: {k: ch, v: [sev2, sev1]}
+      incident_sev_set:
+        desc: Incident severity state change marker.
+        lvl: INFO
+        msg: "incident severity set to {sev} by={by}"
+        vars:
+          sev: {k: ch, v: [sev2, sev1]}
+          by: {k: ch, v: [oncall, incident_cmd]}
+    beh:
+      n:
+        desc: Heartbeat only; alerts are rare in normal operation.
+        emit:
+          - id: health_tick
+            per_min: 1.0
+            scope: global
+          - id: alert_multi_provider_failure
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Alerts can be emitted when failures are detected, but some are delayed in this incident.
+        emit:
+          - id: health_tick
+            per_min: 1.0
+            scope: global
+          - id: alert_multi_provider_failure
+            per_min: 0.6
+            scope: global
+
+  - id: net_probe
+    name: Inter-DC Network Probe
+    svc: net-probe
+    hosts: [netmon-r1, netmon-r2, netmon-l1]
+    desc: >
+      Synthetic probes measuring connectivity between datacenters. Peering degradation increases RTT and loss,
+      and provides an early signal of the underlying network issue.
+    to: []
+    logs:
+      ping_metric:
+        desc: Periodic ping/latency and packet loss between datacenters.
+        lvl: INFO
+        msg: "ping src={src} dst={dst} rtt_ms={rtt_ms} loss_pct={loss_pct}"
+        vars:
+          src: {k: ch, v: [aws_r1, aws_r2, linode]}
+          dst: {k: ch, v: [aws_r1, aws_r2, linode]}
+        state_vars:
+          n:
+            rtt_ms: {k: i, v: [10, 80]}
+            loss_pct: {k: f, v: [0.0, 2.0]}
+          f:
+            rtt_ms: {k: i, v: [80, 2500]}
+            loss_pct: {k: f, v: [0.0, 30.0]}
+      route_warn:
+        desc: Higher-level warning when degradation is sustained.
+        lvl: WARN
+        msg: "path degradation detected src={src} dst={dst} sample_rtt_ms={rtt_ms}"
+        vars:
+          src: {k: ch, v: [aws_r1, aws_r2, linode]}
+          dst: {k: ch, v: [aws_r1, aws_r2, linode]}
+          rtt_ms: {k: i, v: [200, 4000]}
+    beh:
+      n:
+        desc: Low-frequency baseline probes.
+        emit:
+          - id: ping_metric
+            per_min: 1.0
+            scope: per_host
+          - id: route_warn
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: Probes are run more frequently and show elevated RTT/loss.
+        emit:
+          - id: ping_metric
+            per_min: 1.5
+            scope: per_host
+          - id: route_warn
+            per_min: 0.1
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [api_gateway, dispatch_worker]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operations: events are accepted and queued, and dispatch workers send notifications with quorum available.
+    req:
+      - id: post_event
+        desc: Client posts an event; it is accepted and queued.
+        rpm: 300.0
+        path: [api_gateway, event_ingest]
+        emit: [api_gateway.http_events_202, event_ingest.event_ingested]
+        latency_ms: [[20, 70], [10, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: get_incident_200
+        desc: Client reads incident details successfully.
+        rpm: 30.0
+        path: [api_gateway]
+        emit: [api_gateway.http_incident_200]
+        latency_ms: [[40, 150]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dispatch_notification
+        desc: Worker dequeues a notification and sends it with quorum available.
+        rpm: 200.0
+        path: [dispatch_worker, coordinator, dispatch_worker]
+        emit: [dispatch_worker.job_start, coordinator.quorum_ok, dispatch_worker.job_done_success]
+        latency_ms: [[5, 20], [20, 120], [80, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: >
+      Failure operations: events are still accepted, but peering degradation causes coordinator session expirations.
+      Dispatch may proceed with higher latency and error rates, then later becomes blocked without quorum, and finally
+      partially recovers to drain backlog.
+    req:
+      - id: post_event
+        desc: Client posts an event; it is still accepted and queued during the outage.
+        rpm: 300.0
+        path: [api_gateway, event_ingest]
+        emit: [api_gateway.http_events_202, event_ingest.event_ingested]
+        latency_ms: [[35, 120], [15, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: get_incident_200
+        desc: Some reads still succeed despite partial instability.
+        rpm: 20.0
+        path: [api_gateway]
+        emit: [api_gateway.http_incident_200]
+        latency_ms: [[80, 600]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: get_incident_500
+        desc: Some reads fail with upstream errors/timeouts.
+        rpm: 10.0
+        path: [api_gateway]
+        emit: [api_gateway.http_incident_500]
+        latency_ms: [[300, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: dispatch_degraded
+        desc: Dispatch proceeds but with elevated latency and provider timeouts/5xx.
+        rpm: 180.0
+        path: [dispatch_worker, coordinator, dispatch_worker]
+        emit: [dispatch_worker.job_start, coordinator.quorum_ok, dispatch_worker.job_done_degraded]
+        latency_ms: [[5, 30], [120, 1500], [300, 9000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dispatch_blocked_no_quorum
+        desc: Dispatch worker cannot proceed and requeues because quorum is unavailable.
+        rpm: 20.0
+        path: [dispatch_worker, coordinator, dispatch_worker]
+        emit: [dispatch_worker.job_start, coordinator.quorum_fail, dispatch_worker.job_requeued]
+        latency_ms: [[5, 30], [200, 2500], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: dispatch_backlog_drain
+        desc: After partial recovery, workers drain backlog (higher queue age, still slow).
+        rpm: 250.0
+        path: [dispatch_worker, coordinator, dispatch_worker]
+        emit: [dispatch_worker.job_start, coordinator.quorum_ok, dispatch_worker.job_done_backlog]
+        latency_ms: [[5, 30], [150, 2000], [500, 12000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Names are genericized; "coordinator" represents the ZooKeeper-like quorum service, and "event_queue" abstracts the durable store used to buffer notifications.
+  - |
+    Three datacenters are modeled as aws_r1, aws_r2, and linode; quorum requires at least 2 of 3 coordinator nodes to be mutually reachable.
+  - |
+    Only a small subset of API endpoints is modeled: /v1/events (write path) stays healthy; a read endpoint shows intermittent 500s to reflect broader platform impact without adding extra components.
+  - |
+    coordinator.quorum_lost is treated as a discrete cluster-state transition log (emitted via scenario one_shots) rather than a continuous background stream, to support a clear phase boundary when quorum is first lost.
+  - |
+    Normal-phase expected log volume is dominated by post_event (~300 rpm, 2 logs) and dispatch_notification (~200 rpm, 3 logs): roughly ~1.2k logs/min plus background.
+  - |
+    Total scenario log volume is designed to be ~70k (within 20k..100k) by keeping request RPM moderate and limiting per-request logs.
+  - |
+    Diagnostic visibility anchors: net_probe.ping_metric (early network degradation), coordinator.session_expired (quorum mechanism pressure), dispatch_worker.job_requeued + coordinator.quorum_fail (dispatch stop), coordinator.quorum_lost (quorum transition marker), event_queue.queue_depth_metric/snapshot (backlog growth), and monitoring.alert_multi_provider_failure (provider-facing symptom corroboration).
+```

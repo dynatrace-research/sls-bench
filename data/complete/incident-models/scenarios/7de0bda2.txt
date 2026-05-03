@@ -1,0 +1,203 @@
+```yaml
+scenario:
+  id: tiered_cache_tracing_headers_530
+  title: Buggy tiered-cache tracing clears control headers causing intermittent 530s
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The CDN normally serves most assets from local edge cache, using Tiered Cache to consult an upper tier on misses.
+    A canary release on upper-tier POPs adds tracing instrumentation that clears internal control headers.
+    When tiered requests reach an affected upper tier, required host context is missing, internal DNS lookups are made with an empty qname, and the edge returns HTTP 530.
+    Impact grows as rollout reaches more/larger upper tiers, then begins to decline after a partial rollback, but the scenario ends before full recovery.
+
+  trigger_desc: |
+    A software release is started on upper-tier cache POPs enabling an opentracing wrapper that clears routing control headers needed for tiered-cache internal traffic.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Edge POPs serve the majority of requests from local cache with low latency.
+        For a smaller fraction of cache misses with Tiered Cache enabled, the edge queries an upper-tier POP,
+        which either serves from its cache or resolves origin hostnames via internal DNS and fetches from origin.
+        530 rates are near-zero and no incident/alert activity is present.
+      flows: [client_asset_local_cache_hit, client_asset_tiered_upper_cache_hit, client_asset_tiered_upper_miss_origin_ok]
+      manifestation: [edge_cache.access_hit_local, upper_tier_cache.upper_served_cache, internal_dns.dns_resolve_ok, observability.sli_530_sample]
+
+    f:
+      desc: |
+        After the upper-tier release starts, some tiered requests arriving at affected upper-tier POPs lose required host context
+        because control headers are cleared by the tracing wrapper. Upper tiers then cannot determine the origin hostname to resolve,
+        internal DNS logs empty-qname SERVFAILs, and the edge returns 530 to clients.
+        As rollout expands, the fraction of tiered requests hitting buggy upper tiers rises, causing a sharp increase in 530s and alerting activity.
+        A partial rollback confirms the cause and reduces errors, but some upper tiers remain on the bad build by the end of this scenario.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: upper_tier_cache
+          event: |
+            Canary deploy of the upper-tier cache build with tracing wrapper begins; low-rate tiered requests start failing with 530 when they hit the affected upper tier.
+          why: |
+            The tracing wrapper clears internal control headers before tiered-cache routing reads them; some internal tiered requests then arrive without hostname context.
+            The deploy start is directly observable via a deploy log; the header-clearing side effect is inferred from missing control context and DNS empty-qname errors.
+          flows: [client_asset_tiered_dns_error_530]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: upper_tier_cache.release_started
+              count: 1
+              hosts: [atl1]
+            - ref: internal_dns.dns_release_started
+              count: 1
+              hosts: [dns1]
+          manifestation: [upper_tier_cache.release_started, upper_tier_cache.upper_recv_missing, internal_dns.dns_err_empty_qname, edge_cache.access_tiered_530]
+
+        - order: 2
+          at_min: 28
+          component: observability
+          event: |
+            Rollout reaches more upper-tier traffic paths; customer-reported 5xx and SLI sampling activity increase as 530s become more noticeable.
+          why: |
+            As more tiered requests traverse upper tiers running the new build, the probability of missing control context increases, creating more empty-qname DNS errors and 530s.
+            Alerts are directly observable in alerting logs, while exact rollout coverage is only partially observable from request outcomes.
+          flows: [client_asset_tiered_dns_error_530]
+          rate_multipliers:
+            client_asset_tiered_dns_error_530: 3.0
+            client_asset_tiered_upper_cache_hit: 0.9
+            client_asset_tiered_upper_miss_origin_ok: 0.9
+            observability.sli_530_sample: 2.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: observability.alert_fired
+              count: 1
+              hosts: [mon1]
+          manifestation: [observability.alert_fired, edge_cache.access_tiered_530, upper_tier_cache.upper_no_host_error]
+
+        - order: 3
+          at_min: 31
+          component: edge_cache
+          event: |
+            A small edge POP is removed from tiered routing during investigation, slightly reducing 530 volume but not eliminating the symptom.
+          why: |
+            Draining one POP reduces the share of tiered requests reaching affected upper tiers, but the buggy build remains active elsewhere.
+            The routing action is directly observable; the limited effect indicates the issue is not isolated to a single POP.
+          flows: [client_asset_tiered_dns_error_530]
+          rate_multipliers:
+            client_asset_tiered_dns_error_530: 2.5
+            client_asset_tiered_upper_cache_hit: 0.92
+            client_asset_tiered_upper_miss_origin_ok: 0.92
+            observability.sli_530_sample: 2.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: edge_cache.routing_change
+              count: 1
+              hosts: [lhr1]
+          manifestation: [edge_cache.routing_change, internal_dns.dns_err_empty_qname, edge_cache.access_tiered_530]
+
+        - order: 4
+          at_min: 34
+          component: observability
+          event: |
+            Rollout reaches larger upper tiers; 530s spike sharply and an incident is declared.
+          why: |
+            Large upper tiers serve as upstream for many lower tiers, amplifying the impact of the header-clearing bug and increasing the failing request share.
+            The spike is directly observable via 530 access logs and alerts.
+          flows: [client_asset_tiered_dns_error_530]
+          rate_multipliers:
+            client_asset_tiered_dns_error_530: 5.5
+            client_asset_tiered_upper_cache_hit: 0.75
+            client_asset_tiered_upper_miss_origin_ok: 0.75
+            observability.sli_530_sample: 4.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: observability.alert_fired
+              count: 1
+              hosts: [mon1]
+            - ref: observability.incident_declared
+              count: 1
+              hosts: [mon1]
+          manifestation: [observability.incident_declared, observability.alert_fired, edge_cache.access_tiered_530, upper_tier_cache.upper_no_host_error]
+
+        - order: 5
+          at_min: 40
+          component: upper_tier_cache
+          event: |
+            Rollback completes on one major upper-tier POP, confirming the bad release and reducing 530s, but errors persist due to remaining upper tiers still running the buggy build.
+          why: |
+            Reverting the tracing wrapper stops clearing control headers on the rolled-back POP, restoring hostname context and preventing empty-qname DNS lookups there.
+            The rollback is directly observable; continued 530s indicate incomplete rollout reversal.
+          flows: [client_asset_tiered_dns_error_530]
+          rate_multipliers:
+            client_asset_tiered_dns_error_530: 3.0
+            client_asset_tiered_upper_cache_hit: 0.8
+            client_asset_tiered_upper_miss_origin_ok: 0.8
+            observability.sli_530_sample: 3.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: upper_tier_cache.rollback_completed
+              count: 1
+              hosts: [atl1]
+          manifestation: [upper_tier_cache.rollback_completed, upper_tier_cache.upper_cache_stats, edge_cache.access_tiered_530, internal_dns.dns_err_empty_qname]
+
+        - order: 6
+          at_min: 45
+          component: upper_tier_cache
+          event: |
+            An accelerated rollback is initiated across upper tiers, further reducing 530s but not completing before the scenario ends.
+          why: |
+            As more upper tiers revert, fewer tiered requests encounter the header-clearing behavior; however, some affected capacity remains.
+            The action is directly observable; partial improvement is visible in reduced error-flow rate and continued DNS empty-qname errors.
+          flows: [client_asset_tiered_dns_error_530]
+          rate_multipliers:
+            client_asset_tiered_dns_error_530: 2.0
+            client_asset_tiered_upper_cache_hit: 0.9
+            client_asset_tiered_upper_miss_origin_ok: 0.9
+            observability.sli_530_sample: 2.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: upper_tier_cache.accelerated_rollback_started
+              count: 1
+              hosts: [iad1]
+          manifestation: [upper_tier_cache.accelerated_rollback_started, edge_cache.access_tiered_530, upper_tier_cache.upper_recv_missing]
+
+      steady:
+        - component: upper_tier_cache
+          condition: |
+            Some upper-tier POPs remain on the tracing-wrapped build that clears tiered-cache control headers, intermittently stripping hostname context from internal tiered requests.
+          user_impact: |
+            A subset of tiered-cache-eligible requests fail with HTTP 530 (DNS error), while local-cache-hit traffic remains unaffected.
+          manifestation: [upper_tier_cache.upper_no_host_error, internal_dns.dns_err_empty_qname, edge_cache.access_tiered_530]
+        - component: observability
+          condition: |
+            Elevated 530 SLI samples continue while rollback is incomplete.
+          user_impact: |
+            Operators see sustained elevated 530 rates in monitoring during the degraded period.
+          manifestation: [observability.sli_530_sample]
+
+      feedback_loops:
+        - id: misattribution_to_dns_release
+          desc: |
+            A concurrent internal DNS deploy creates a plausible but incorrect hypothesis, delaying identification of the true cause (missing host context upstream).
+        - id: upper_tier_amplification
+          desc: |
+            Upper-tier POPs serve many lower-tier POPs; once large upper tiers receive the buggy build, a small code change produces a disproportionate increase in client-visible 530s.
+
+      flows: [client_asset_local_cache_hit, client_asset_tiered_upper_cache_hit, client_asset_tiered_upper_miss_origin_ok, client_asset_tiered_dns_error_530]
+      manifestation: [upper_tier_cache.upper_recv_missing, internal_dns.dns_err_empty_qname, edge_cache.access_tiered_530, observability.sli_530_sample]
+
+  assumptions:
+    - "Repair (S7): dns_health.servfail_pct is treated as percent for the incident-scoped tiered/origin-resolution path; failure domain widened to [0.0,80.0] so snapshots can align with high empty-qname SERVFAIL shares during peak rollout."
+    - "The scenario compresses ~6 hours into 50 minutes; event ordering mirrors the post-mortem (canary → spread → large-tier spike → partial rollback → accelerated rollback in progress)."
+    - "Failure-phase piecewise controls (minutes): 20-28 baseline f rates; 28-31 multipliers (dns_error 3.0); 31-34 (dns_error 2.5); 34-40 peak (dns_error 5.5); 40-45 partial rollback (dns_error 3.0); 45-50 accelerated rollback ongoing (dns_error 2.0)."
+    - "Approx effective request-log rates in failure (logs/min, excluding background): ~1.6k/min throughout due to tradeoff between successful tiered traffic and dns_error flow; peak window increases the fraction of error logs but keeps overall volume stable."
+    - "One-shots per event: E1 deploy markers=2; E2 alerts=1; E3 routing change=1; E4 alerts+incident=2; E5 rollback complete=1; E6 accelerated rollback start=1."
+    - "Visibility rationale: even early failure (dns_error flow baseline 10 rpm) produces dozens of edge 530 logs plus matching upper-tier missing-context and DNS empty-qname errors; later events amplify these signals and add explicit deploy/rollback/incident one-shots for timeline anchoring."
+    - "Total estimated log volume for the full scenario is ~80k (normal ~32k, failure ~48k, background/one-shots ~0.4k), within the 20k–100k target."
+```

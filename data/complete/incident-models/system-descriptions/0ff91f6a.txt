@@ -1,0 +1,723 @@
+```yaml
+sys:
+  id: slack_like_messaging
+  desc: >
+    A Slack-like messaging system where clients must "boot" a session before the UI becomes usable.
+    Booting fetches membership and conversation metadata that is normally served from a memcached tier via mcrouter,
+    with Vitess/MySQL as the backing datastore on cache misses. Cache membership and mcrouter ring configuration
+    are managed by a control plane (mcrib) watching service discovery (consul).
+
+states: {n: normal, f: failure}
+
+components:
+  - id: slack_client
+    name: Slack Client (telemetry)
+    svc: client
+    hosts: [client_pool]
+    desc: >
+      Client devices initiating API calls (boot and messaging). Client-side retries with exponential backoff
+      are modeled via retry-only telemetry logs.
+    to:
+      - dst: edge_gateway
+        proto: https
+        desc: Client connects to the service edge for API requests.
+    logs:
+      boot_req_send:
+        desc: Client begins a boot request attempt.
+        lvl: INFO
+        msg: "boot attempt send req_id={req_id} user_id={user_id} client_ver={client_ver}"
+        vars:
+          req_id: {k: uuid, v: null}
+          user_id: {k: i, v: [100000, 199999]}
+          client_ver: {k: ch, v: [desktop_4.29, desktop_4.30, web_2024.02]}
+      boot_retry:
+        desc: Client decides to retry boot after a failure/timeout.
+        lvl: WARN
+        msg: "boot retry scheduled req_id={req_id} next_attempt={next_attempt} backoff_ms={backoff_ms} reason={reason}"
+        vars:
+          req_id: {k: uuid, v: null}
+          backoff_ms: {k: i, v: [300, 15000]}
+          reason: {k: ch, v: [http_503, http_429, timeout]}
+        state_vars:
+          n:
+            next_attempt: {k: i, v: [2, 3]}
+          f:
+            next_attempt: {k: i, v: [2, 4]}
+      boot_resp_ok:
+        desc: Client received a successful boot response.
+        lvl: INFO
+        msg: "boot attempt result req_id={req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [80, 2500]}
+      boot_resp_503:
+        desc: Client received a boot failure response due to overload.
+        lvl: ERROR
+        msg: "boot attempt result req_id={req_id} status=503 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [400, 9000]}
+      boot_resp_429:
+        desc: Client received a boot rate-limit response.
+        lvl: WARN
+        msg: "boot attempt result req_id={req_id} status=429 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 400]}
+      msg_req_send:
+        desc: Client begins a send-message request.
+        lvl: INFO
+        msg: "send_message send req_id={req_id} user_id={user_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          user_id: {k: i, v: [100000, 199999]}
+      msg_resp_ok:
+        desc: Client received a successful send-message response.
+        lvl: INFO
+        msg: "send_message result req_id={req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 900]}
+    beh:
+      n:
+        desc: Client background telemetry is not modeled beyond request-attempt logs.
+        emit: []
+      f:
+        desc: Client background telemetry is not modeled beyond request-attempt logs.
+        emit: []
+
+  - id: edge_gateway
+    name: Edge Gateway
+    svc: edge
+    hosts: [edge-a, edge-b]
+    desc: >
+      Terminates TLS, starts trace IDs, and forwards API requests to the web application.
+      Emits access logs per request.
+    to:
+      - dst: webapp_api
+        proto: https
+        desc: Routes API calls to the web application tier.
+      - dst: slack_client
+        proto: https
+        desc: Returns responses to clients (modeled as a logical edge for path traversal).
+    logs:
+      boot_access_200:
+        desc: Access log for a successful boot request.
+        lvl: INFO
+        msg: "access op=boot status=200 dur_ms={dur_ms} req_id={req_id} trace_id={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [50, 3000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      boot_access_503:
+        desc: Access log for a failed boot request due to upstream overload.
+        lvl: WARN
+        msg: "access op=boot status=503 dur_ms={dur_ms} req_id={req_id} trace_id={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [200, 10000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      boot_access_429:
+        desc: Access log for a rate-limited boot request.
+        lvl: INFO
+        msg: "access op=boot status=429 dur_ms={dur_ms} req_id={req_id} trace_id={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [10, 600]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      msg_access_200:
+        desc: Access log for successful send-message requests.
+        lvl: INFO
+        msg: "access op=send_message status=200 dur_ms={dur_ms} req_id={req_id} trace_id={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [20, 1500]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      edge_health:
+        desc: Periodic edge health marker.
+        lvl: INFO
+        msg: "edge health ok active_upstreams={active_upstreams}"
+        vars:
+          active_upstreams: {k: i, v: [2, 6]}
+    beh:
+      n:
+        desc: Low-rate health markers.
+        emit:
+          - id: edge_health
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Low-rate health markers continue during incidents.
+        emit:
+          - id: edge_health
+            per_min: 0.2
+            scope: per_host
+
+  - id: webapp_api
+    name: Web Application API
+    svc: webapp
+    hosts: [app-a, app-b]
+    desc: >
+      Implements Slack API endpoints, including client boot. Reads through mcrouter/memcached and falls back to Vitess
+      on cache misses. Can throttle boot requests to protect the datastore.
+    to:
+      - dst: mcrouter_cache
+        proto: tcp
+        desc: Issues cache lookups via mcrouter.
+      - dst: vitess_vtgate
+        proto: grpc
+        desc: Runs datastore reads in Vitess on cache misses.
+      - dst: edge_gateway
+        proto: https
+        desc: Returns API responses to the edge (modeled as a logical edge for path traversal).
+    logs:
+      boot_start:
+        desc: Boot handler begins processing a request.
+        lvl: INFO
+        msg: "boot start req_id={req_id} user_id={user_id} workspace_id={workspace_id} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          user_id: {k: i, v: [100000, 199999]}
+          workspace_id: {k: i, v: [1000, 1999]}
+          trace_id: {k: hex, v: 32}
+      boot_complete_200:
+        desc: Boot handler returns success.
+        lvl: INFO
+        msg: "boot complete req_id={req_id} status=200 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [80, 3000]}
+          trace_id: {k: hex, v: 32}
+      boot_complete_503:
+        desc: Boot handler returns failure due to dependency timeout/overload.
+        lvl: ERROR
+        msg: "boot complete req_id={req_id} status=503 dur_ms={dur_ms} err={err} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [400, 10000]}
+          err: {k: ch, v: [vitess_timeout, vitess_overloaded, upstream_unavailable]}
+          trace_id: {k: hex, v: 32}
+      boot_throttled_429:
+        desc: Boot handler rejects due to rate limiting.
+        lvl: WARN
+        msg: "boot throttled req_id={req_id} status=429 limit_rpm={limit_rpm} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          limit_rpm: {k: i, v: [40, 160]}
+          trace_id: {k: hex, v: 32}
+      boot_throttle_updated:
+        desc: Operator changes boot throttle configuration.
+        lvl: INFO
+        msg: "boot throttle updated new_limit_rpm={limit_rpm} actor={actor}"
+        vars:
+          limit_rpm: {k: i, v: [40, 200]}
+          actor: {k: ch, v: [incident_commander, oncall_webapp, sre]}
+      deploy_query_patch:
+        desc: Webapp deploy marker for a query behavior change.
+        lvl: INFO
+        msg: "deploy applied change={change} rollout_id={rollout_id}"
+        vars:
+          change: {k: ch, v: [gdm_query_targeted_misses_read_replicas]}
+          rollout_id: {k: hex, v: 8}
+      msg_start:
+        desc: Send-message handler begins.
+        lvl: INFO
+        msg: "send_message start req_id={req_id} user_id={user_id} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          user_id: {k: i, v: [100000, 199999]}
+          trace_id: {k: hex, v: 32}
+      msg_complete_200:
+        desc: Send-message handler completes successfully.
+        lvl: INFO
+        msg: "send_message complete req_id={req_id} status=200 dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [20, 1500]}
+          trace_id: {k: hex, v: 32}
+      app_health:
+        desc: Periodic webapp health marker.
+        lvl: INFO
+        msg: "webapp health ok in_flight={in_flight}"
+        vars:
+          in_flight: {k: i, v: [10, 400]}
+    beh:
+      n:
+        desc: Low-rate health markers.
+        emit:
+          - id: app_health
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Low-rate health markers continue during incidents.
+        emit:
+          - id: app_health
+            per_min: 0.5
+            scope: per_host
+
+  - id: memcached_fleet
+    name: Memcached Fleet
+    svc: memcached
+    hosts: [memcached-12, memcached-34, memcached-57, memcached-81]
+    desc: >
+      A representative subset of the memcached cache nodes. Node-level health is modeled via low-rate stats logs;
+      churn and flushing is primarily observed indirectly via Consul catalog changes and mcrib actions.
+    to:
+      - dst: consul
+        proto: tcp
+        desc: Nodes run Consul agents that register/deregister services in the catalog.
+    logs:
+      memcached_stats:
+        desc: Periodic memcached stats snapshot from a node.
+        lvl: INFO
+        msg: "memcached stats uptime_s={uptime_s} curr_items={curr_items} evictions={evictions}"
+        vars:
+          uptime_s: {k: i, v: [1000, 250000]}
+        state_vars:
+          n:
+            curr_items: {k: i, v: [200000, 800000]}
+            evictions: {k: i, v: [0, 50]}
+          f:
+            curr_items: {k: i, v: [10000, 300000]}
+            evictions: {k: i, v: [0, 200]}
+    beh:
+      n:
+        desc: Low-rate node stats; caches are generally warm and stable.
+        emit:
+          - id: memcached_stats
+            per_min: 0.1
+            scope: per_host
+      f:
+        desc: Node stats continue; average item counts skew lower due to flush/promotions during churn.
+        emit:
+          - id: memcached_stats
+            per_min: 0.1
+            scope: per_host
+
+  - id: mcrouter_cache
+    name: Mcrouter Cache Router
+    svc: mcrouter
+    hosts: [mcrouter-a, mcrouter-b]
+    desc: >
+      Routes cache requests to memcached based on a consistent-hash ring configuration. Emits per-request hit/miss logs
+      for the GDM membership key and periodic cache health stats (hit rate and ring version).
+    to:
+      - dst: memcached_fleet
+        proto: tcp
+        desc: Forwards cache gets/sets to the memcached fleet using a consistent-hash ring.
+      - dst: webapp_api
+        proto: tcp
+        desc: Returns cache results to the webapp over the established connection (logical edge for path traversal).
+    logs:
+      mc_get_hit:
+        desc: Cache lookup hit for GDM membership data.
+        lvl: INFO
+        msg: "mc get hit key={key} ring_ver={ring_ver} trace_id={trace_id}"
+        vars:
+          key: {k: str, v: "gdm_membership:{channel_id}"}
+          ring_ver: {k: i, v: [1200, 1400]}
+          trace_id: {k: hex, v: 32}
+      mc_get_miss:
+        desc: Cache lookup miss for GDM membership data.
+        lvl: WARN
+        msg: "mc get miss key={key} ring_ver={ring_ver} trace_id={trace_id}"
+        vars:
+          key: {k: str, v: "gdm_membership:{channel_id}"}
+          ring_ver: {k: i, v: [1200, 1400]}
+          trace_id: {k: hex, v: 32}
+      mcrouter_stats:
+        desc: Periodic cache stats snapshot, primarily used to see hit-rate drops during churn.
+        lvl: INFO
+        msg: "mcrouter stats hit_rate={hit_rate} ring_ver={ring_ver} active_nodes={active_nodes}"
+        vars:
+          active_nodes: {k: i, v: [850, 1000]}
+        state_vars:
+          n:
+            hit_rate: {k: f, v: [0.92, 0.99]}
+            ring_ver: {k: i, v: [1200, 1215]}
+          f:
+            hit_rate: {k: f, v: [0.25, 0.70]}
+            ring_ver: {k: i, v: [1210, 1350]}
+    beh:
+      n:
+        desc: Periodic cache health stats at low volume.
+        emit:
+          - id: mcrouter_stats
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Periodic cache health stats continue, showing degraded hit rates and higher ring versions.
+        emit:
+          - id: mcrouter_stats
+            per_min: 1.0
+            scope: global
+
+  - id: mcrib_control
+    name: Mcrib Cache Control Plane
+    svc: mcrib
+    hosts: [mcrib-1]
+    desc: >
+      Watches Consul for memcached membership changes and generates/pushes updated mcrouter ring configurations.
+      Flushes cache nodes that rejoin after unavailability.
+    to:
+      - dst: consul
+        proto: http
+        desc: Watches service discovery catalog for cache node health.
+      - dst: mcrouter_cache
+        proto: http
+        desc: Pushes updated ring configurations to mcrouter.
+      - dst: memcached_fleet
+        proto: tcp
+        desc: Issues cache flush commands to nodes that rejoin after unavailability.
+    logs:
+      ring_push:
+        desc: Mcrib pushed an updated mcrouter ring configuration.
+        lvl: INFO
+        msg: "mcrib pushed ring ring_ver={ring_ver} active_nodes={active_nodes} spares_used={spares_used} reason={reason}"
+        vars:
+          ring_ver: {k: i, v: [1200, 1400]}
+          active_nodes: {k: i, v: [850, 1000]}
+          spares_used: {k: i, v: [0, 80]}
+          reason: {k: ch, v: [consul_deregister, node_flap, maintenance_restart]}
+      node_flush:
+        desc: A cache node was flushed before being returned to active service.
+        lvl: WARN
+        msg: "mcrib flushed node={node} reason={reason}"
+        vars:
+          node: {k: ch, v: [memcached-12, memcached-34, memcached-57, memcached-81]}
+          reason: {k: ch, v: [rejoin_after_unavailable, stale_data_risk]}
+    beh:
+      n:
+        desc: Occasional ring maintenance; flushes are rare.
+        emit:
+          - id: ring_push
+            per_min: 0.2
+            scope: global
+          - id: node_flush
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Elevated ring churn and flushes during cache node instability.
+        emit:
+          - id: ring_push
+            per_min: 1.2
+            scope: global
+          - id: node_flush
+            per_min: 0.4
+            scope: global
+
+  - id: consul
+    name: Consul Service Discovery
+    svc: consul
+    hosts: [consul-ops-1]
+    desc: >
+      Service catalog and health state for cache nodes. During agent restarts, nodes deregister and re-register,
+      which mcrib treats as membership changes.
+    to:
+      - dst: mcrib_control
+        proto: http
+        desc: Exposes catalog updates consumed by mcrib.
+    logs:
+      rollout_step:
+        desc: Maintenance rollout step marker for Consul agent upgrades.
+        lvl: INFO
+        msg: "consul maintenance step={step} percent={percent}"
+        vars:
+          step: {k: ch, v: [pbr_binary_update, sequential_agent_restart]}
+          percent: {k: i, v: [10, 50]}
+      agent_restart:
+        desc: A Consul agent restart on a cache node is initiated.
+        lvl: INFO
+        msg: "consul agent restart initiated node={node} service=memcached"
+        vars:
+          node: {k: ch, v: [memcached-12, memcached-34, memcached-57, memcached-81]}
+      service_deregister:
+        desc: Cache node leaves the service catalog during restart/outage.
+        lvl: WARN
+        msg: "consul service deregistered node={node} service=memcached"
+        vars:
+          node: {k: ch, v: [memcached-12, memcached-34, memcached-57, memcached-81]}
+      service_register:
+        desc: Cache node rejoins the service catalog after restart.
+        lvl: INFO
+        msg: "consul service registered node={node} service=memcached"
+        vars:
+          node: {k: ch, v: [memcached-12, memcached-34, memcached-57, memcached-81]}
+      rollout_paused:
+        desc: Operator pauses the rollout/restarts.
+        lvl: INFO
+        msg: "consul maintenance paused step=sequential_agent_restart by={by}"
+        vars:
+          by: {k: ch, v: [incident_commander, sre]}
+    beh:
+      n:
+        desc: Minimal background service membership churn during normal operations.
+        emit:
+          - id: service_deregister
+            per_min: 0.02
+            scope: global
+          - id: service_register
+            per_min: 0.02
+            scope: global
+      f:
+        desc: During the incident onset, sequential restarts produce sustained deregistration/re-registration noise until paused.
+        emit:
+          - id: agent_restart
+            per_min: 1.0
+            scope: global
+          - id: service_deregister
+            per_min: 1.5
+            scope: global
+          - id: service_register
+            per_min: 1.5
+            scope: global
+
+  - id: vitess_vtgate
+    name: Vitess VTGate (Channel membership keyspace)
+    svc: vitess
+    hosts: [vtgate-1, vtgate-2]
+    desc: >
+      Query router for the Vitess keyspace that contains channel membership sharded by user. Boot-time GDM membership
+      lookups can become scatter queries across many shards, leading to overload and timeouts when cache hit rates fall.
+    to:
+      - dst: webapp_api
+        proto: grpc
+        desc: Returns query results (or timeouts) to the webapp.
+    logs:
+      scatter_query_ok:
+        desc: Scatter query succeeded (fan-out to many shards).
+        lvl: INFO
+        msg: "vitess query ok keyspace={keyspace} query={query} scatter=true shards={shards} tablet={tablet} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          keyspace: {k: ch, v: [chan_membership_user]}
+          query: {k: ch, v: [gdm_membership_lookup]}
+          shards: {k: i, v: [64, 128]}
+          tablet: {k: ch, v: [primary]}
+          dur_ms: {k: i, v: [50, 1500]}
+          trace_id: {k: hex, v: 32}
+      scatter_query_timeout:
+        desc: Scatter query timed out under overload.
+        lvl: ERROR
+        msg: "vitess query timeout keyspace={keyspace} query={query} scatter=true shards={shards} timeout_ms={timeout_ms} trace_id={trace_id}"
+        vars:
+          keyspace: {k: ch, v: [chan_membership_user]}
+          query: {k: ch, v: [gdm_membership_lookup]}
+          shards: {k: i, v: [64, 128]}
+          timeout_ms: {k: i, v: [800, 4000]}
+          trace_id: {k: hex, v: 32}
+      targeted_query_ok:
+        desc: Targeted query for only missing keys, allowed to read from replicas.
+        lvl: INFO
+        msg: "vitess query ok keyspace={keyspace} query={query} scatter=false shards={shards} tablet={tablet} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          keyspace: {k: ch, v: [chan_membership_user]}
+          query: {k: ch, v: [gdm_membership_lookup_missing_only]}
+          shards: {k: i, v: [1, 4]}
+          tablet: {k: ch, v: [replica]}
+          dur_ms: {k: i, v: [30, 900]}
+          trace_id: {k: hex, v: 32}
+      simple_query_ok:
+        desc: Non-scatter query for routine messaging operations.
+        lvl: INFO
+        msg: "vitess query ok keyspace={keyspace} query={query} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          keyspace: {k: ch, v: [messages]}
+          query: {k: ch, v: [insert_message]}
+          dur_ms: {k: i, v: [5, 350]}
+          trace_id: {k: hex, v: 32}
+      keyspace_load:
+        desc: Periodic snapshot of keyspace load and timeouts.
+        lvl: WARN
+        msg: "vitess load keyspace={keyspace} qps={qps} timeouts_per_min={timeouts_per_min} cpu_pct={cpu_pct}"
+        vars:
+          keyspace: {k: ch, v: [chan_membership_user]}
+        state_vars:
+          n:
+            qps: {k: i, v: [200, 450]}
+            timeouts_per_min: {k: i, v: [0, 5]}
+            cpu_pct: {k: i, v: [25, 60]}
+          f:
+            qps: {k: i, v: [800, 1600]}
+            timeouts_per_min: {k: i, v: [150, 650]}
+            cpu_pct: {k: i, v: [80, 99]}
+    beh:
+      n:
+        desc: Low-rate load snapshot to provide baseline datastore health.
+        emit:
+          - id: keyspace_load
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Load snapshot continues during incidents and shows elevated qps/timeouts.
+        emit:
+          - id: keyspace_load
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic consists of successful client boots served mostly from cache and routine messaging operations
+      with low datastore latency and near-zero timeouts.
+    req:
+      - id: client_boot_cache_hit
+        desc: "Client boot where GDM membership data is served from cache."
+        rpm: 70
+        path: [slack_client, edge_gateway, webapp_api, mcrouter_cache, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.boot_req_send
+          - webapp_api.boot_start
+          - mcrouter_cache.mc_get_hit
+          - webapp_api.boot_complete_200
+          - edge_gateway.boot_access_200
+          - slack_client.boot_resp_ok
+        latency_ms: [[3, 10], [5, 15], [2, 8], [80, 220], [2, 8], [2, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.03
+          emit_per_retry: [slack_client.boot_retry]
+          backoff_ms: [[200, 600], [500, 1200]]
+        trace: true
+
+      - id: client_boot_cache_miss_scatter_ok
+        desc: "Client boot where a rare cache miss triggers a scatter query that succeeds."
+        rpm: 3
+        path: [slack_client, edge_gateway, webapp_api, mcrouter_cache, webapp_api, vitess_vtgate, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.boot_req_send
+          - webapp_api.boot_start
+          - mcrouter_cache.mc_get_miss
+          - vitess_vtgate.scatter_query_ok
+          - webapp_api.boot_complete_200
+          - edge_gateway.boot_access_200
+          - slack_client.boot_resp_ok
+        latency_ms: [[3, 10], [5, 20], [3, 10], [120, 450], [150, 600], [2, 10], [2, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.08
+          emit_per_retry: [slack_client.boot_retry]
+          backoff_ms: [[250, 800], [800, 2000]]
+        trace: true
+
+      - id: send_message_ok
+        desc: "Routine send-message operation."
+        rpm: 240
+        path: [slack_client, edge_gateway, webapp_api, vitess_vtgate, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.msg_req_send
+          - webapp_api.msg_start
+          - vitess_vtgate.simple_query_ok
+          - webapp_api.msg_complete_200
+          - edge_gateway.msg_access_200
+          - slack_client.msg_resp_ok
+        latency_ms: [[2, 6], [3, 10], [6, 25], [25, 90], [2, 8], [2, 6]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      Failure traffic is dominated by boot-related cache misses that trigger expensive scatter queries in the
+      channel-membership-by-user keyspace, producing timeouts and 503s. Operators apply boot throttling to reduce
+      datastore pressure; later, a query patch reduces fan-out and allows replica reads, partially improving boot
+      success while the system remains degraded.
+    req:
+      - id: client_boot_cache_miss_scatter_timeout
+        desc: "Boot request hits cache miss, triggers scatter query, which times out; webapp returns 503."
+        rpm: 100
+        path: [slack_client, edge_gateway, webapp_api, mcrouter_cache, webapp_api, vitess_vtgate, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.boot_req_send
+          - webapp_api.boot_start
+          - mcrouter_cache.mc_get_miss
+          - vitess_vtgate.scatter_query_timeout
+          - webapp_api.boot_complete_503
+          - edge_gateway.boot_access_503
+          - slack_client.boot_resp_503
+        latency_ms: [[3, 12], [8, 25], [4, 12], [900, 4000], [1200, 6500], [3, 12], [3, 12]]
+        retry:
+          max_attempts: 4
+          expected_attempts: 2.6
+          emit_per_retry: [slack_client.boot_retry]
+          backoff_ms: [[500, 1500], [1500, 4000], [3000, 9000]]
+        trace: true
+
+      - id: client_boot_throttled_429
+        desc: "Boot request is rejected by webapp boot throttling (429) to protect datastore."
+        rpm: 35
+        path: [slack_client, edge_gateway, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.boot_req_send
+          - webapp_api.boot_throttled_429
+          - edge_gateway.boot_access_429
+          - slack_client.boot_resp_429
+        latency_ms: [[2, 8], [5, 20], [2, 8], [2, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.5
+          emit_per_retry: [slack_client.boot_retry]
+          backoff_ms: [[2000, 6000], [5000, 15000]]
+        trace: true
+
+      - id: client_boot_cache_miss_targeted_replica_ok
+        desc: "Boot request uses patched query to fetch only missing cache keys and read from replicas; slower but succeeds."
+        rpm: 25
+        path: [slack_client, edge_gateway, webapp_api, mcrouter_cache, webapp_api, vitess_vtgate, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.boot_req_send
+          - webapp_api.boot_start
+          - mcrouter_cache.mc_get_miss
+          - vitess_vtgate.targeted_query_ok
+          - webapp_api.boot_complete_200
+          - edge_gateway.boot_access_200
+          - slack_client.boot_resp_ok
+        latency_ms: [[3, 10], [6, 20], [4, 12], [80, 350], [250, 1200], [2, 10], [2, 10]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.3
+          emit_per_retry: [slack_client.boot_retry]
+          backoff_ms: [[800, 2000], [1500, 5000]]
+        trace: true
+
+      - id: send_message_degraded_ok
+        desc: "Send-message remains mostly successful but experiences modest latency variance during datastore pressure."
+        rpm: 220
+        path: [slack_client, edge_gateway, webapp_api, vitess_vtgate, webapp_api, edge_gateway, slack_client]
+        emit:
+          - slack_client.msg_req_send
+          - webapp_api.msg_start
+          - vitess_vtgate.simple_query_ok
+          - webapp_api.msg_complete_200
+          - edge_gateway.msg_access_200
+          - slack_client.msg_resp_ok
+        latency_ms: [[2, 8], [4, 15], [8, 60], [30, 180], [2, 10], [2, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - >
+    This model represents a single region / sampled slice of traffic (not full Slack global RPM), so request rates are
+    intentionally reduced while keeping relative patterns (boot vs messaging) and retry behavior.
+  - >
+    Cache tier details are simplified: mcrouter emits per-request hit/miss logs for the GDM membership key plus a
+    periodic hit-rate snapshot; memcached node logs are modeled only as low-rate stats and the incident is observed
+    primarily through mcrib/consul activity and hit-rate drops.
+  - >
+    The causal core preserved is: Consul agent restarts -> cache membership churn via mcrib -> reduced cache hit rate
+    -> boot cache misses -> Vitess scatter queries -> keyspace overload/timeouts -> inability to refill cache (cascade).
+  - >
+    Normal-phase log volume estimate: ~1.88k logs/min from flows + ~3–5 logs/min background ≈ ~1.89k logs/min.
+    With a 40-minute scenario and failure retries, total is estimated ~80k logs (within 20k–100k).
+```

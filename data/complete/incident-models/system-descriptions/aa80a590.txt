@@ -1,0 +1,408 @@
+```yaml
+sys:
+  id: ravendb_cloud_tls_split_incident
+  desc: >
+    A managed RavenDB Cloud fleet runs secured RavenDB clusters where nodes and external clients authenticate using TLS/X509.
+    Nodes maintain long-lived pooled connections, so new TLS handshakes are relatively infrequent under normal load.
+    The incident models a partial loss of trust for a Let’s Encrypt chain after an OS trust-store update, causing new node-to-node
+    and occasional client connections to fail TLS validation while existing connections keep working.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ravendb_node
+    name: RavenDB Node
+    svc: ravendb
+    hosts: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]
+    desc: >
+      Database server node handling client HTTP API and node-to-node cluster traffic secured with TLS.
+      Periodically reports cluster link health and logs TLS handshake outcomes for new outbound (client-side) connections.
+
+    to:
+      - dst: ravendb_node
+        proto: tcp
+        desc: Node-to-node cluster connections (TLS over TCP).
+      - dst: monitoring
+        proto: https
+        desc: Responds to monitoring health probes.
+
+    logs:
+      http_access:
+        desc: Per-request HTTP access log for database operations.
+        lvl: INFO
+        msg: "HTTP {method} /databases/{db}/{endpoint} -> {status} in {dur_ms}ms"
+        vars:
+          method: {k: ch, v: [GET, POST, PUT]}
+          db: {k: ch, v: [orders, users, inventory]}
+          endpoint: {k: ch, v: [docs, queries, attachments]}
+          status: {k: i, v: [200, 204]}
+          dur_ms: {k: i, v: [2, 160]}
+
+      cluster_link_state:
+        desc: Periodic snapshot of cluster connectivity from this node’s perspective.
+        lvl: INFO
+        msg: "Cluster links: connected={connected} disconnected={disconnected} leader={leader}"
+        vars:
+          leader: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+        state_vars:
+          n:
+            connected: {k: i, v: [4, 5]}
+            disconnected: {k: i, v: [0, 1]}
+          f:
+            connected: {k: i, v: [0, 4]}
+            disconnected: {k: i, v: [1, 5]}
+
+      cluster_connect_ok:
+        desc: Successful node-to-node TLS connection establishment.
+        lvl: INFO
+        msg: "Cluster TLS connection established to {peer} proto={proto} handshake_ms={handshake_ms}"
+        vars:
+          peer: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          proto: {k: ch, v: [tls1.2, tls1.3]}
+          handshake_ms: {k: i, v: [15, 140]}
+
+      cluster_connect_attempt:
+        desc: Start of an attempted node-to-node connection (may later fail).
+        lvl: INFO
+        msg: "Attempting cluster TLS connection to {peer} attempt={attempt}"
+        vars:
+          peer: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          attempt: {k: i, v: [1, 3]}
+
+      cluster_connect_retry:
+        desc: Retry marker for a failed cluster connection attempt.
+        lvl: WARN
+        msg: "Retrying cluster connection to {peer} in {backoff_ms}ms (attempt {attempt}/{max_attempts})"
+        vars:
+          peer: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          backoff_ms: {k: i, v: [100, 1200]}
+          attempt: {k: i, v: [2, 3]}
+          max_attempts: {k: i, v: [3, 3]}
+
+      cluster_peer_untrusted:
+        desc: Node-to-node connection rejected due to certificate chain validation failure (client-side validation on the connecting node).
+        lvl: WARN
+        msg: "Cluster connection rejected: peer_cert_untrusted peer={peer} err={err} chain={chain} elapsed_ms={elapsed_ms}"
+        vars:
+          peer: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          err: {k: ch, v: [unable to get local issuer certificate, remote certificate is invalid because of errors in the certificate chain]}
+          chain: {k: ch, v: [dst_root_ca_x3]}
+          elapsed_ms: {k: i, v: [120, 1600]}
+
+      inbound_tls_handshake_failed:
+        desc: Inbound TLS handshake failed; server observes an alert/EOF but typically cannot know the peer's exact trust-chain decision.
+        lvl: WARN
+        msg: "Inbound TLS handshake failed peer={client_ip}:{client_port} sni={sni} alert={alert} reason={reason}"
+        vars:
+          client_ip: {k: ip, v: "10.0.0.0/8"}
+          client_port: {k: i, v: [1024, 65535]}
+          sni: {k: str, v: "cluster-or-customer-domain"}
+          alert: {k: ch, v: [unknown_ca, bad_certificate, handshake_failure, internal_error]}
+          reason: {k: ch, v: [tls_alert, eof, timeout]}
+
+      cluster_command_ok:
+        desc: Successful completion of a cluster-wide command.
+        lvl: INFO
+        msg: "Cluster command {cmd} completed in {dur_ms}ms"
+        vars:
+          cmd: {k: ch, v: [DeployIndex, UpdateTopology]}
+          dur_ms: {k: i, v: [40, 900]}
+
+      raft_quorum_lost:
+        desc: Cluster-wide command failed because quorum could not be reached due to degraded node connectivity.
+        lvl: ERROR
+        msg: "Cluster command {cmd} failed: no quorum (required={required} reachable={reachable}) wait_ms={wait_ms}"
+        vars:
+          cmd: {k: ch, v: [DeployIndex, UpdateTopology]}
+          required: {k: i, v: [3, 4]}
+          reachable: {k: i, v: [0, 3]}
+          wait_ms: {k: i, v: [500, 7000]}
+
+    beh:
+      n:
+        desc: Nodes periodically report cluster connectivity; client requests are handled normally.
+        emit:
+          - id: cluster_link_state
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Nodes continue reporting connectivity; disconnected peer counts rise as new TLS handshakes fail.
+        emit:
+          - id: cluster_link_state
+            per_min: 1.0
+            scope: per_host
+
+  - id: host_os
+    name: Linux Host / Trust Store
+    svc: null
+    hosts: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]
+    desc: >
+      OS-level package update and certificate trust-store maintenance logs for the RavenDB hosts.
+      During the incident an unattended ca-certificates update changes the set of trusted roots.
+
+    to:
+      - dst: ravendb_node
+        proto: file
+        desc: Certificate trust store updates affect processes performing TLS validation on the host.
+      - dst: ops_automation
+        proto: ssh
+        desc: Receives operational commands for remediation.
+
+    logs:
+      unattended_upgrades:
+        desc: Periodic summary log from unattended upgrades.
+        lvl: INFO
+        msg: "unattended-upgrades: packages upgraded={count}"
+        vars:
+          count: {k: i, v: [0, 6]}
+
+      ca_certs_update:
+        desc: Package update event for ca-certificates affecting trusted roots.
+        lvl: INFO
+        msg: "apt: installed ca-certificates {ver}; trust anchor removed={anchor}"
+        vars:
+          ver: {k: ch, v: [2021.09.01, 2021.09.10]}
+          anchor: {k: ch, v: [DST Root CA X3]}
+
+      trust_store_refresh:
+        desc: Trust store refresh output after remediation actions.
+        lvl: INFO
+        msg: "update-ca-certificates: added={added} removed={removed}"
+        vars:
+          added: {k: i, v: [0, 2]}
+          removed: {k: i, v: [0, 2]}
+
+    beh:
+      n:
+        desc: Low-rate unattended upgrade summaries.
+        emit:
+          - id: unattended_upgrades
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Unattended upgrades continue to log at a low rate during the incident.
+        emit:
+          - id: unattended_upgrades
+            per_min: 0.05
+            scope: per_host
+
+  - id: monitoring
+    name: Fleet Monitoring / Alerting
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Runs periodic TLS health probes to nodes and emits alerts when cluster connectivity degrades.
+
+    to:
+      - dst: ravendb_node
+        proto: https
+        desc: Periodic probes to node endpoints.
+
+    logs:
+      probe_ok:
+        desc: Successful TLS probe to a node.
+        lvl: INFO
+        msg: "probe target={target} result=ok lat_ms={lat_ms}"
+        vars:
+          target: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          lat_ms: {k: i, v: [5, 120]}
+
+      probe_tls_fail:
+        desc: TLS probe failed due to certificate chain validation on the probing client.
+        lvl: WARN
+        msg: "probe target={target} result=tls_error err={err}"
+        vars:
+          target: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          err: {k: ch, v: [unable to get local issuer certificate, certificate chain incomplete]}
+
+      alert_cluster_connectivity:
+        desc: Alert that multiple clusters/nodes show degraded internal connectivity symptoms.
+        lvl: CRITICAL
+        msg: "ALERT cluster-connectivity degraded clusters_affected={clusters} nodes_affected={nodes}"
+        vars:
+          clusters: {k: i, v: [10, 80]}
+          nodes: {k: i, v: [20, 240]}
+
+    beh:
+      n:
+        desc: Probes mostly succeed under normal conditions.
+        emit:
+          - id: probe_ok
+            per_min: 10.0
+            scope: global
+      f:
+        desc: Probes include a mix of successes and TLS failures; alerts fire when thresholds are crossed.
+        emit:
+          - id: probe_ok
+            per_min: 8.0
+            scope: global
+          - id: probe_tls_fail
+            per_min: 6.0
+            scope: global
+          - id: alert_cluster_connectivity
+            per_min: 1.0
+            scope: global
+
+  - id: ops_automation
+    name: Ops Automation / Runbook Runner
+    svc: ops
+    hosts: [ops-1]
+    desc: >
+      Operational automation used by the ops team to run commands across the fleet and track rollout progress.
+      During the incident it is used to refresh trust stores and clear cached certificate chain artifacts.
+
+    to:
+      - dst: host_os
+        proto: ssh
+        desc: Executes remediation commands on hosts.
+      - dst: monitoring
+        proto: https
+        desc: Emits status updates that operators correlate with alert changes.
+
+    logs:
+      rollout_status:
+        desc: Periodic progress update during a fleet-wide remediation rollout.
+        lvl: INFO
+        msg: "rollout {plan} progress={done}/{total} phase={phase}"
+        vars:
+          plan: {k: ch, v: [ca-certificates-hotfix]}
+          done: {k: i, v: [0, 200]}
+          total: {k: i, v: [200, 200]}
+          phase: {k: ch, v: [prepare, apply, verify]}
+
+      cmd_exec:
+        desc: Discrete operator-initiated command execution on a target host.
+        lvl: INFO
+        msg: "ops exec target={target} cmd='{cmd}' result={result}"
+        vars:
+          target: {k: ch, v: [rdb-a, rdb-b, rdb-c, rdb-d, rdb-e, rdb-f]}
+          cmd: {k: ch, v: ["sudo update-ca-certificates --fresh", "rm ~/.dotnet/corefx/cryptography/x509stores/ca/DAC9024F54D8F6DF94935FB1732638CA6AD77C13.pfx", "rm ~/.dotnet/corefx/cryptography/x509stores/ca/48504E974C0DAC5B5CD476C8202274B24C8C7172.pfx"]}
+          result: {k: ch, v: [ok, failed]}
+
+    beh:
+      n:
+        desc: Ops automation is mostly idle during normal operations.
+        emit:
+          - id: rollout_status
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Rollout status is available but only emitted when a remediation campaign is active.
+        emit:
+          - id: rollout_status
+            per_min: 2.0
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operations where client API traffic and rare new node-to-node handshakes succeed.
+    req:
+      - id: client_api_request_n
+        desc: Typical client read/write requests over existing healthy TLS connections.
+        rpm: 900.0
+        path: [ravendb_node]
+        emit: [ravendb_node.http_access]
+        latency_ms: [[8, 45]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: cluster_connect_n
+        desc: New node-to-node TLS connections (connection pool replenishment) that succeed.
+        rpm: 18.0
+        path: [ravendb_node, ravendb_node]
+        emit: [ravendb_node.cluster_connect_ok]
+        latency_ms: [[25, 110]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 1.07
+          emit_per_retry: [ravendb_node.cluster_connect_retry]
+          backoff_ms: [[120, 260], [240, 520]]
+        trace: false
+
+      - id: cluster_task_deploy_index_n
+        desc: Cluster-wide task requiring quorum (e.g., index deployment) succeeds.
+        rpm: 2.0
+        path: [ravendb_node]
+        emit: [ravendb_node.cluster_command_ok]
+        latency_ms: [[120, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Failure mode where existing connections often keep working, but new TLS handshakes can fail due to trust chain issues,
+      producing partial cluster splits and cluster-wide task failures.
+    req:
+      - id: client_api_request_f
+        desc: Client requests continue to succeed in most cases (reads/writes remain available).
+        rpm: 850.0
+        path: [ravendb_node]
+        emit: [ravendb_node.http_access]
+        latency_ms: [[10, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: cluster_connect_tls_fail_f
+        desc: New node-to-node TLS connection attempts fail because peers are not trusted due to certificate chain validation.
+        rpm: 15.0
+        path: [ravendb_node, ravendb_node]
+        emit: [ravendb_node.cluster_connect_attempt, ravendb_node.cluster_peer_untrusted]
+        latency_ms: [[2, 8], [220, 1050]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [ravendb_node.cluster_connect_retry]
+          backoff_ms: [[220, 900], [450, 1200]]
+        trace: false
+
+      - id: inbound_client_handshake_fail_f
+        desc: Rare inbound client-to-node TLS handshakes fail/abort; server records TLS alerts/EOF (remote may be rejecting the served chain).
+        rpm: 1.0
+        path: [ravendb_node]
+        emit: [ravendb_node.inbound_tls_handshake_failed]
+        latency_ms: [[20, 160]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: cluster_task_deploy_index_fail_f
+        desc: Cluster-wide tasks fail due to reduced connectivity / loss of quorum.
+        rpm: 3.0
+        path: [ravendb_node]
+        emit: [ravendb_node.raft_quorum_lost]
+        latency_ms: [[900, 6500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - The fleet is modeled as 6 RavenDB nodes to represent many isolated customer clusters across regions/providers; connectivity issues affect a subset but are modeled via flow rates rather than per-cluster topology.
+  - The core mechanism is an OS trust-store change (ca-certificates update removing DST Root CA X3) combined with serving/using an older Let’s Encrypt chain (represented as chain=dst_root_ca_x3), causing new TLS handshakes to fail while established pooled connections often continue.
+  - Cluster splits primarily impact cluster-wide/quorum tasks (modeled as cluster_task_deploy_index_fail_f) while regular reads/writes remain mostly available (client_api_request_f continues with high RPM and success status codes).
+  - Normal-state cluster_connect_n allows up to 3 attempts to align with the shared retry log template (cluster_connect_retry) used in both normal and failure flows; retries remain rare via expected_attempts≈1.07.
+  - Inbound client handshake failures are modeled as server-side observations (TLS alert/EOF) rather than client-side chain-validation details; explicit chain-validation evidence comes from ravendb_node.cluster_peer_untrusted and monitoring.probe_tls_fail.
+  - Normal-phase expected logs/min ≈ 900 (client) + small background/probe/connect/task noise; scenario-sized to yield ~29k–35k total logs (target 20k–100k) while keeping rare client-facing handshake failures visible but low-rate.
+```

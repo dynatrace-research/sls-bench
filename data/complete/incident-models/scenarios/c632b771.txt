@@ -1,0 +1,264 @@
+```yaml
+scenario:
+  id: hostco_hotwallet_backdoor_apr9
+  title: Host wallet backdoor drains funds and triggers maintenance shutdown
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The swap API normally processes client swaps end-to-end, resulting in routine hot-wallet broadcasts.
+    During the incident, unauthorized BTC and ETH withdrawals to attacker-controlled addresses begin from a hot wallet host,
+    and an SSH login using a compromised ops key fingerprint is observed. Operators place the site into maintenance mode,
+    rotate credentials, and begin triage while the attacker later truncates logs and stops log forwarding, causing centralized
+    logging to report missing wallet-host logs. After wallet-host logs disappear, continued theft is inferred via blockchain-based
+    monitoring alerts rather than local wallet logs; the site remains down through the end of the scenario.
+
+  trigger_desc: |
+    A pre-existing backdoor on the hot wallet host is activated using compromised access (stolen SSH key),
+    initiating unauthorized BTC/ETH withdrawals; monitoring detects unexpected hot-wallet transfers and the on-call team begins incident response.
+
+  time:
+    total_minutes: 32
+    phases:
+      n: {start_min: 0, end_min: 16}
+      f: {start_min: 16, end_min: 32}
+
+  phases:
+    n:
+      desc: |
+        The public API serves steady swap traffic. The core accepts swaps and requests withdrawals on the
+        hot wallet host, which signs and broadcasts normal transactions.
+        Central logging shows stable ingestion and only rare transient gaps.
+      flows: [swap_request_success]
+      manifestation:
+        - api_gateway.http_out_200
+        - hot_wallet_server.tx_broadcast_swap
+        - log_aggregator.ingest_summary
+
+    f:
+      desc: |
+        Unauthorized BTC and ETH withdrawals begin from the hot wallet host to attacker-controlled addresses.
+        Monitoring flags unexpected hot-wallet transfers, and operators quickly switch the site into maintenance mode
+        to stop new swaps and focus on investigation. The attacker intermittently uses a stolen SSH key to
+        run privileged commands. Later, cleanup activity truncates logs and stops wallet-host log forwarding; shortly
+        after, centralized logging begins issuing sustained missing-source gap warnings and wallet-host logs largely disappear
+        from the central log stream. Even with reduced host visibility, blockchain-based monitoring continues to flag
+        additional unexpected transfers, implying the drain may be continuing out-of-band from what operators can see on hosts.
+
+      events:
+        - order: 1
+          at_min: 16
+          component: hot_wallet_server
+          event: |
+            The wallet host starts broadcasting BTC and ETH transactions to attacker-controlled addresses, and an SSH login
+            using a specific ops key fingerprint is observed; monitoring raises unexpected-transfer alerts and
+            on-call enables maintenance mode and declares an incident. No log-wipe activity is observed yet.
+          why: |
+            The backdoor causes unauthorized withdrawals and uses compromised SSH credentials for access. The attacker destinations
+            and key fingerprint are directly observable in wallet host logs; the alerts are directly observable in sec-ops
+            logs reflecting monitoring heuristics. The deeper origin of the compromised key is external to this time window.
+          flows: [unauthorized_withdrawal, unauthorized_withdrawal_eth, attacker_ssh_session, swap_request_maintenance]
+          rate_multipliers:
+            unauthorized_withdrawal: 6.0
+            unauthorized_withdrawal_eth: 6.0
+            unauthorized_withdrawal_unobserved: 0.0
+            unauthorized_withdrawal_eth_unobserved: 0.0
+            attacker_ssh_session: 2.0
+            attacker_log_wipe: 0.0
+            sec_ops.wallet_anomaly_alert: 2.0
+            sec_ops.wallet_anomaly_alert_eth: 2.0
+          latency_multipliers:
+            swap_request_maintenance: {p50: 0.6, p95: 0.6}
+          one_shots:
+            - ref: sec_ops.incident_page
+              count: 1
+              hosts: [secops-1]
+            - ref: exchange_core.maintenance_enabled
+              count: 1
+              hosts: [core-1]
+          manifestation:
+            - hot_wallet_server.tx_broadcast_malware
+            - hot_wallet_server.tx_broadcast_malware_eth
+            - sec_ops.wallet_anomaly_alert
+            - sec_ops.wallet_anomaly_alert_eth
+            - hot_wallet_server.ssh_login_success
+            - exchange_core.maintenance_enabled
+            - api_gateway.http_out_503_maint
+
+        - order: 2
+          at_min: 18
+          component: sec_ops
+          event: |
+            Containment actions proceed: operators rotate credentials used for administration and wallet access.
+          why: |
+            Key rotation is an operational response to suspected credential compromise. It is directly
+            observable via operator tooling logs, but may not immediately remove an already-installed backdoor.
+          flows: [swap_request_maintenance]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: sec_ops.keys_rotated
+              count: 1
+              hosts: [secops-1]
+          manifestation:
+            - sec_ops.keys_rotated
+            - api_gateway.http_out_503_maint
+
+        - order: 3
+          at_min: 22
+          component: hot_wallet_server
+          event: |
+            Cleanup activity begins on the wallet hosts: privileged tampering truncates log files and log forwarding is stopped,
+            increasing the likelihood that wallet-host logs will soon stop reaching centralized logging.
+          why: |
+            Truncation and forwarding disruption reduce observability. The tampering commands and truncation markers are directly
+            observable on the wallet hosts; the downstream effect (missing-source warnings) is observed later at the aggregator
+            when it stops receiving wallet-host logs.
+          flows: [attacker_log_wipe]
+          rate_multipliers:
+            attacker_log_wipe: 20.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: hot_wallet_server.log_forwarder_stopped
+              count: 2
+              hosts: [wallet-1, wallet-2]
+          manifestation:
+            - hot_wallet_server.sudo_exec_tamper
+            - hot_wallet_server.audit_log_truncate
+            - hot_wallet_server.log_forwarder_stopped
+
+        - order: 4
+          at_min: 23
+          component: log_aggregator
+          event: |
+            Centralized logging begins reporting sustained gaps for wallet-host sources; wallet-host logs largely disappear from the
+            central log stream while maintenance mode remains enabled. Continued unexpected transfers are inferred via monitoring
+            alerts rather than wallet-host transaction logs.
+          why: |
+            With wallet-host log forwarding stopped, the log aggregator no longer receives wallet-host events and emits missing-source
+            warnings. This is directly observable at the aggregator. Subsequent on-chain transfer anomalies remain visible via
+            monitoring alerts even when host logs are missing, indicating potential continued draining without host-level observability.
+          flows: [swap_request_maintenance]
+          rate_multipliers:
+            unauthorized_withdrawal: 0.0
+            unauthorized_withdrawal_eth: 0.0
+            attacker_ssh_session: 0.0
+            attacker_log_wipe: 0.0
+            hot_wallet_server.hotwallet_balance: 0.0
+            unauthorized_withdrawal_unobserved: 6.0
+            unauthorized_withdrawal_eth_unobserved: 6.0
+            log_aggregator.source_gap_warn: 150.0
+            sec_ops.wallet_anomaly_alert: 3.0
+            sec_ops.wallet_anomaly_alert_eth: 3.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - log_aggregator.source_gap_warn
+            - log_aggregator.ingest_summary
+            - sec_ops.wallet_anomaly_alert
+            - sec_ops.wallet_anomaly_alert_eth
+            - api_gateway.http_out_503_maint
+
+        - order: 5
+          at_min: 26
+          component: sec_ops
+          event: |
+            Forensic triage flags a suspicious binary on a wallet host named udevd-bridge, linking the earlier unauthorized withdrawals
+            to a persistent backdoor on the host.
+          why: |
+            The forensic scan result is directly observable in security tooling logs; determining the original installation path and
+            actor attribution requires investigation outside this short incident window.
+          flows: [swap_request_maintenance]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: sec_ops.forensic_scan_found
+              count: 1
+              hosts: [secops-1]
+          manifestation:
+            - sec_ops.forensic_scan_found
+            - log_aggregator.source_gap_warn
+
+      steady:
+        - component: api_gateway
+          condition: |
+            The API remains in maintenance mode, rejecting swap requests while the incident is investigated.
+          user_impact: |
+            Users experience service downtime (503 maintenance) and cannot complete swaps.
+          manifestation:
+            - api_gateway.http_out_503_maint
+            - exchange_core.maintenance_reject
+
+        - component: log_aggregator
+          condition: |
+            Central logging reports sustained gaps and missing sources for wallet hosts after log forwarding is stopped.
+          user_impact: |
+            Incident response is slowed by reduced observability, prolonging downtime and increasing uncertainty about wallet activity.
+          manifestation:
+            - log_aggregator.source_gap_warn
+            - log_aggregator.ingest_summary
+
+        - component: sec_ops
+          condition: |
+            Blockchain-based monitoring continues to flag unexpected BTC/ETH hot-wallet transfers even while wallet-host logs are missing.
+          user_impact: |
+            Company hot-wallet funds are stolen; customers do not lose account funds, but swaps remain unavailable.
+          manifestation:
+            - sec_ops.wallet_anomaly_alert
+            - sec_ops.wallet_anomaly_alert_eth
+
+      feedback_loops:
+        - id: observability_loss_prolongs_outage
+          desc: |
+            Truncated logs and stopped forwarding reduce visibility into attacker actions, slowing containment
+            and increasing the time the service must remain in maintenance mode.
+        - id: persistent_backdoor_survives_rotations
+          desc: |
+            Rotating administrative keys may not stop a backdoor already present on the wallet host, allowing
+            continued unauthorized withdrawals that are then inferred primarily through monitoring once host logs are missing.
+
+      flows:
+        - swap_request_maintenance
+        - unauthorized_withdrawal
+        - unauthorized_withdrawal_eth
+        - unauthorized_withdrawal_unobserved
+        - unauthorized_withdrawal_eth_unobserved
+        - attacker_ssh_session
+        - attacker_log_wipe
+      manifestation:
+        - exchange_core.maintenance_enabled
+        - sec_ops.wallet_anomaly_alert
+        - sec_ops.wallet_anomaly_alert_eth
+        - log_aggregator.source_gap_warn
+        - sec_ops.forensic_scan_found
+
+  assumptions:
+    - >
+      Timeline is compressed into a 32-minute window to make the incident executable and diagnosable in a single
+      log stream; real-world investigation steps (including deeper attribution) occurred over days.
+    - >
+      Failure-phase piecewise rates (approx):
+      - Minutes 16–22: unauthorized_withdrawal ≈ 1 rpm * 6 = 6 rpm (≈ 12 logs/min; 2 logs/flow),
+        unauthorized_withdrawal_eth ≈ 1 rpm * 6 = 6 rpm (≈ 12 logs/min; 2 logs/flow),
+        attacker_ssh_session ≈ 0.5 rpm * 2 = 1 rpm (≈ 2 logs/min),
+        attacker_log_wipe suppressed to 0.0 (≈ 0 logs/min),
+        maintenance responses ≈ 500 rpm (≈ 1,500 logs/min),
+        background health/balance/ingestion ≈ ~7 logs/min,
+        sec_ops alerts ≈ (0.35+0.25)/min * 2 ≈ 1.2 logs/min.
+      - Minutes 22–23: attacker_log_wipe ≈ 0.1 rpm * 20 = 2 rpm (≈ 4 logs/min) plus two one-shot forwarder-stopped logs.
+      - Minutes 23–32: wallet-host visible flows are suppressed (modeling missing centralized wallet logs),
+        while unauthorized_withdrawal*_unobserved remain active (6 rpm each but emit no logs),
+        maintenance responses continue (≈ 1,500 logs/min), aggregator gap warnings become frequent
+        (≈ 0.02/min * 150 = 3 logs/min), and sec_ops alerts increase
+        (≈ (0.35+0.25)/min * 3 = 1.8 logs/min).
+      One-shots: 6 total (incident_page, maintenance_enabled, keys_rotated, log_forwarder_stopped x2, forensic_scan_found).
+    - >
+      Total logs estimate: normal ≈ 16 min * (500 rpm * 5 logs) ≈ 40k plus background; failure ≈ 16 min * ~1.5k logs/min
+      plus low-rate attacker activity (when visible), gap warnings, and one-shots ≈ 24k–26k; overall ≈ 64k–76k.
+    - >
+      Visibility rationale: maintenance responses are frequent; early attacker-destination BTC/ETH broadcasts are made likely via
+      elevated per-asset withdrawal flows before wallet log forwarding is stopped; the specific SSH key fingerprint appears via
+      attacker_ssh_session; after minute 23, wallet-host logs are intentionally suppressed to align with the "missing logs" beat and
+      to make log_aggregator.source_gap_warn very likely; continued theft is represented by elevated sec_ops anomaly alerts even when
+      host logs are missing; and the malware name becomes visible at minute 26 via a forensic scan one-shot (sec_ops.forensic_scan_found).
+```

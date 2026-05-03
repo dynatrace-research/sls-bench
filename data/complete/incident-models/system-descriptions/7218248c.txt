@@ -1,0 +1,1020 @@
+```yaml
+sys:
+  id: travis_ci_platform
+  desc: >
+    A hosted CI/CD platform that authenticates users via GitHub, renders a web UI, receives webhook events,
+    enqueues build jobs, and executes them on worker fleets. The platform relies on a PostgreSQL primary
+    database for user and build metadata and a Redis-backed job queue for dispatching jobs to workers.
+    During the incident, the production database tables were truncated (emptied), services briefly continued
+    against an almost empty dataset (creating new user rows with non-reset sequences), and later the platform
+    was taken offline for restore. After restore, some clients held tokens pointing at post-truncate user IDs,
+    causing session/user mismatches.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_router
+    name: Edge Router (nginx/Envoy)
+    svc: edge-router
+    hosts: [edge-1, edge-2]
+    desc: >
+      Terminates TLS and routes requests to the web application and API service. In normal operation it emits
+      lightweight request-start logs and periodic status metrics. During incident response it returns 503
+      responses when upstream services are intentionally taken offline.
+    to:
+      - dst: web_app
+        proto: https
+        desc: Routes browser traffic to the web UI service.
+      - dst: api_service
+        proto: https
+        desc: Routes API and webhook traffic to the API service.
+    logs:
+      request_received:
+        desc: Request received at the edge before proxying upstream.
+        lvl: INFO
+        msg: "ingress {method} {path} ip={client_ip} req_id={req_id} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: ["GET", "POST", "PUT", "DELETE"]}
+          path: {k: str, v: "path"}
+          client_ip: {k: ip, v: "0.0.0.0/0"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      upstream_unavailable:
+        desc: Edge returns 503 because upstream is down or intentionally drained.
+        lvl: ERROR
+        msg: "upstream unavailable route={route} status=503 req_id={req_id} trace_id={trace_id}"
+        vars:
+          route: {k: ch, v: ["web_app", "api_service"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      nginx_stub_status:
+        desc: Periodic status line used for dashboards.
+        lvl: DEBUG
+        msg: "stub_status active={active} reading={reading} writing={writing} waiting={waiting}"
+        vars:
+          active: {k: i, v: [50, 5000]}
+          reading: {k: i, v: [0, 200]}
+          writing: {k: i, v: [0, 500]}
+          waiting: {k: i, v: [0, 5000]}
+    beh:
+      n:
+        desc: Routes traffic normally; emits periodic status metrics.
+        emit:
+          - id: nginx_stub_status
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Continues to emit status metrics; returns 503s while upstream apps are offline.
+        emit:
+          - id: nginx_stub_status
+            per_min: 0.5
+            scope: per_host
+
+  - id: web_app
+    name: Web Application (travis-web backend)
+    svc: web-app
+    hosts: [web-1, web-2]
+    desc: >
+      Serves the UI and calls the API service to authenticate and fetch user/build data. In normal operation it
+      renders dashboards using API responses. During the incident it rendered blank profiles when the API returned
+      empty/missing user data and later forced logout when JWTs mapped to mismatched users after restore.
+    to:
+      - dst: api_service
+        proto: https
+        desc: Calls the API service for auth and data (profiles, repos, builds).
+    logs:
+      route_login:
+        desc: Web app handles the login route and delegates auth to the API.
+        lvl: INFO
+        msg: "route /login provider=github req_id={req_id} trace_id={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      session_established:
+        desc: Web app stores a token and considers the session established.
+        lvl: INFO
+        msg: "session established user_id={user_id} token_id={token_id} profile_state={profile_state} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          token_id: {k: uuid, v: null}
+          profile_state: {k: ch, v: ["complete", "blank"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      render_start:
+        desc: Start rendering dashboard; will call API for profile data.
+        lvl: INFO
+        msg: "render dashboard user_id={user_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      render_ok:
+        desc: Dashboard rendered with expected data.
+        lvl: INFO
+        msg: "render ok user_id={user_id} repos={repo_count} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          repo_count: {k: i, v: [0, 5000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      render_blank_profile:
+        desc: Dashboard rendered without user data (blank profile).
+        lvl: WARN
+        msg: "render blank profile user_id={user_id} reason={reason} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          reason: {k: ch, v: ["user_missing", "no_repos", "api_empty_response"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      forced_logout:
+        desc: Web app forces logout due to token/user mismatch.
+        lvl: WARN
+        msg: "forced logout token_id={token_id} reason={reason} req_id={req_id} trace_id={trace_id}"
+        vars:
+          token_id: {k: uuid, v: null}
+          reason: {k: ch, v: ["jwt_user_mismatch", "user_not_found", "token_revoked"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      heartbeat:
+        desc: Periodic app heartbeat/health log.
+        lvl: DEBUG
+        msg: "heartbeat version={version} rss_mb={rss_mb}"
+        vars:
+          version: {k: str, v: "semver"}
+          rss_mb: {k: i, v: [150, 2000]}
+      shutdown_initiated:
+        desc: One-shot marker when the web app is intentionally taken offline.
+        lvl: INFO
+        msg: "shutdown initiated reason={reason}"
+        vars:
+          reason: {k: ch, v: ["incident_response", "maintenance_mode"]}
+      startup_complete:
+        desc: One-shot marker when the web app comes back online.
+        lvl: INFO
+        msg: "startup complete version={version}"
+        vars:
+          version: {k: str, v: "semver"}
+    beh:
+      n:
+        desc: Renders dashboards with API data; emits periodic heartbeats.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: When online, continues heartbeats; during the offline window heartbeats are suppressed by the scenario.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+
+  - id: api_service
+    name: API Service (Rails)
+    svc: api-service
+    hosts: [api-1, api-2, api-3]
+    desc: >
+      Authenticates users, reads/writes user and build metadata in PostgreSQL, and enqueues build jobs to Redis.
+      Under normal conditions it returns consistent user profiles and issues JWTs tied to stable user IDs. During
+      the incident, PostgreSQL tables were truncated (emptied); the API briefly operated against the mostly-empty data,
+      creating fresh user records for logins and syncs. After restore, some JWTs referenced post-truncate user IDs that
+      no longer matched restored data, producing user/token mismatches.
+    to:
+      - dst: postgres_primary
+        proto: jdbc
+        desc: Reads/writes users, repos, builds, tokens and job state.
+      - dst: job_queue
+        proto: redis
+        desc: Enqueues build jobs for worker consumption.
+      - dst: web_app
+        proto: https
+        desc: Logical response hop back to the web app (modeled to represent the HTTP response path in flows).
+    logs:
+      login_ok:
+        desc: Successful authentication callback processing.
+        lvl: INFO
+        msg: "login ok github_id={github_id} user_id={user_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          github_id: {k: i, v: [1, 400000000]}
+          user_id: {k: i, v: [1, 7000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      user_created_after_truncate:
+        desc: User row created because expected record was missing after data loss.
+        lvl: WARN
+        msg: "user created after truncate github_id={github_id} new_user_id={user_id} seq_last_value={seq_last_value} req_id={req_id} trace_id={trace_id}"
+        vars:
+          github_id: {k: i, v: [1, 400000000]}
+          user_id: {k: i, v: [1, 7000000]}
+          seq_last_value: {k: i, v: [1000, 8000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      jwt_issued:
+        desc: Issues a signed token to the client for later API calls.
+        lvl: INFO
+        msg: "jwt issued token_id={token_id} sub_user_id={user_id} exp_s={exp_s} req_id={req_id} trace_id={trace_id}"
+        vars:
+          token_id: {k: uuid, v: null}
+          user_id: {k: i, v: [1, 7000000]}
+          exp_s: {k: i, v: [900, 2592000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      profile_query:
+        desc: API begins fetching profile data from the database.
+        lvl: DEBUG
+        msg: "profile query user_id={user_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      profile_ok:
+        desc: API returned profile data successfully.
+        lvl: INFO
+        msg: "profile ok user_id={user_id} repos={repo_count} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          repo_count: {k: i, v: [0, 5000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      profile_not_found:
+        desc: API could not find profile data for a user (tables emptied / missing row).
+        lvl: WARN
+        msg: "profile not found user_id={user_id} reason={reason} req_id={req_id} trace_id={trace_id}"
+        vars:
+          user_id: {k: i, v: [1, 7000000]}
+          reason: {k: ch, v: ["user_row_missing", "repos_missing", "db_empty"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      webhook_received:
+        desc: GitHub webhook received and validated.
+        lvl: INFO
+        msg: "webhook received event={event} repo_id={repo_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          event: {k: ch, v: ["push", "pull_request", "cron"]}
+          repo_id: {k: i, v: [1, 90000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      build_enqueued:
+        desc: API enqueued a build job in Redis after recording metadata in DB.
+        lvl: INFO
+        msg: "build enqueued repo_id={repo_id} build_id={build_id} queue={queue} req_id={req_id} trace_id={trace_id}"
+        vars:
+          repo_id: {k: i, v: [1, 90000000]}
+          build_id: {k: i, v: [1, 200000000]}
+          queue: {k: ch, v: ["builds-ec2", "builds-gce", "builds-macos"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      enqueue_failed_db:
+        desc: Enqueue failed because DB writes violated constraints or required rows were missing.
+        lvl: ERROR
+        msg: "enqueue failed db repo_id={repo_id} err={err} req_id={req_id} trace_id={trace_id}"
+        vars:
+          repo_id: {k: i, v: [1, 90000000]}
+          err: {k: str, v: "err"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      authn_from_jwt:
+        desc: API authenticates a request by looking up the JWT subject in DB.
+        lvl: DEBUG
+        msg: "authn from jwt token_id={token_id} sub_user_id={sub_user_id} req_id={req_id} trace_id={trace_id}"
+        vars:
+          token_id: {k: uuid, v: null}
+          sub_user_id: {k: i, v: [1, 7000000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      jwt_user_mismatch:
+        desc: Token subject does not match restored DB user mapping (wrong user / missing user).
+        lvl: ERROR
+        msg: "jwt user mismatch token_id={token_id} sub_user_id={sub_user_id} db_user_id={db_user_id} action={action} req_id={req_id} trace_id={trace_id}"
+        vars:
+          token_id: {k: uuid, v: null}
+          sub_user_id: {k: i, v: [1, 7000000]}
+          db_user_id: {k: i, v: [0, 7000000]}
+          action: {k: ch, v: ["deny_401", "force_logout"]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      healthcheck:
+        desc: Periodic health check including basic DB connectivity status.
+        lvl: DEBUG
+        msg: "health ok db={db} puma_workers={puma_workers}"
+        vars:
+          db: {k: ch, v: ["ok", "degraded"]}
+          puma_workers: {k: i, v: [2, 32]}
+      pool_stats:
+        desc: Periodic ActiveRecord pool stats snapshot.
+        lvl: DEBUG
+        msg: "db pool size={size} busy={busy} dead={dead} waiting={waiting}"
+        vars:
+          size: {k: i, v: [5, 100]}
+          busy: {k: i, v: [0, 100]}
+          dead: {k: i, v: [0, 20]}
+          waiting: {k: i, v: [0, 200]}
+      scheduled_job_missed:
+        desc: Background warning when scheduled jobs are not being fired (e.g., scheduler down).
+        lvl: WARN
+        msg: "scheduled job missed name={job_name} expected_interval_s={interval_s}"
+        vars:
+          job_name: {k: ch, v: ["cron_build_trigger", "repo_sync", "cache_prune"]}
+          interval_s: {k: i, v: [60, 3600]}
+      shutdown_initiated:
+        desc: One-shot marker when the API is intentionally taken offline.
+        lvl: INFO
+        msg: "shutdown initiated reason={reason}"
+        vars:
+          reason: {k: ch, v: ["incident_response", "maintenance_mode"]}
+      startup_complete:
+        desc: One-shot marker when the API comes back online.
+        lvl: INFO
+        msg: "startup complete version={version} migrated={migrated}"
+        vars:
+          version: {k: str, v: "semver"}
+          migrated: {k: ch, v: ["true", "false"]}
+    beh:
+      n:
+        desc: Serves API traffic and emits periodic health and DB pool stats.
+        emit:
+          - id: healthcheck
+            per_min: 1.0
+            scope: per_host
+          - id: pool_stats
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: When online, continues health/pool logs; during the offline interval these are suppressed by the scenario.
+        emit:
+          - id: healthcheck
+            per_min: 1.0
+            scope: per_host
+          - id: pool_stats
+            per_min: 0.5
+            scope: per_host
+          - id: scheduled_job_missed
+            per_min: 0.2
+            scope: per_host
+
+  - id: postgres_primary
+    name: PostgreSQL Primary
+    svc: postgres
+    hosts: [pg-1]
+    desc: >
+      System-of-record database for users, repos, builds, and tokens. Normally serves reads/writes with low latency
+      and periodic checkpoint logs. During the incident it executed a TRUNCATE across tables, removing rows while
+      leaving relations intact; reads therefore continued to succeed but returned empty result sets, while some writes
+      failed due to missing referenced rows (foreign key violations). Later it was restored from snapshot; restoration
+      progress is logged while provisioning is in flight.
+    to:
+      - dst: api_service
+        proto: tcp
+        desc: Logical response path to the API service over established DB connections (modeled for return hops in flows).
+      - dst: build_scheduler
+        proto: tcp
+        desc: Logical response path to the scheduler over established DB connections (modeled for return hops in flows).
+      - dst: worker_pool
+        proto: tcp
+        desc: Logical response path to workers over established DB connections (modeled for return hops in flows).
+      - dst: github_syncer
+        proto: tcp
+        desc: Logical response path to the syncer over established DB connections (modeled for return hops in flows).
+    logs:
+      sql_exec:
+        desc: Successful SQL execution (sampled); rows may be 0 when tables are empty.
+        lvl: DEBUG
+        msg: "sql ok db={db} duration_ms={duration_ms} rows={rows} app={app} pid={pid}"
+        vars:
+          db: {k: ch, v: ["travis_production"]}
+          duration_ms: {k: i, v: [1, 2000]}
+          app: {k: ch, v: ["api-service", "build-scheduler", "worker", "github-syncer"]}
+          pid: {k: i, v: [1000, 99999]}
+        state_vars:
+          n:
+            rows: {k: i, v: [0, 50000]}
+          f:
+            rows: {k: i, v: [0, 50]}
+      sql_error:
+        desc: SQL error (sampled), commonly constraint violations when referenced rows are missing.
+        lvl: ERROR
+        msg: "sql error db={db} sqlstate={sqlstate} err={err} duration_ms={duration_ms} app={app} pid={pid}"
+        vars:
+          db: {k: ch, v: ["travis_production"]}
+          sqlstate: {k: ch, v: ["23503", "23505", "40001"]}
+          err: {k: str, v: "err"}
+          duration_ms: {k: i, v: [1, 5000]}
+          app: {k: ch, v: ["api-service", "build-scheduler", "worker", "github-syncer"]}
+          pid: {k: i, v: [1000, 99999]}
+      ddl_truncate_all_tables:
+        desc: One-shot log for the TRUNCATE execution.
+        lvl: CRITICAL
+        msg: "statement executed client_ip={client_ip} app={app} duration_ms={duration_ms} statement={statement}"
+        vars:
+          client_ip: {k: ip, v: "0.0.0.0/0"}
+          app: {k: ch, v: ["psql", "ruby-test-suite", "unknown"]}
+          duration_ms: {k: i, v: [1, 900000]}
+          statement: {k: str, v: "sql"}
+      restore_progress:
+        desc: Periodic restore/provisioning progress log while recovering from snapshot.
+        lvl: INFO
+        msg: "restore in progress pct={pct} eta_min={eta_min} snapshot_id={snapshot_id}"
+        vars:
+          pct: {k: i, v: [0, 100]}
+          eta_min: {k: i, v: [0, 600]}
+          snapshot_id: {k: str, v: "snapshot-id"}
+      restore_started:
+        desc: One-shot marker for restore start.
+        lvl: INFO
+        msg: "restore started snapshot_id={snapshot_id}"
+        vars:
+          snapshot_id: {k: str, v: "snapshot-id"}
+      restore_completed:
+        desc: One-shot marker for restore completion.
+        lvl: INFO
+        msg: "restore completed snapshot_id={snapshot_id} recovered_lag_min={lag_min}"
+        vars:
+          snapshot_id: {k: str, v: "snapshot-id"}
+          lag_min: {k: i, v: [0, 60]}
+      checkpoint_complete:
+        desc: Periodic checkpoint completion log.
+        lvl: DEBUG
+        msg: "checkpoint complete buffers_written={buffers} wal_mb={wal_mb}"
+        vars:
+          buffers: {k: i, v: [1000, 500000]}
+          wal_mb: {k: i, v: [10, 5000]}
+    beh:
+      n:
+        desc: Serves queries and emits low-rate checkpoint logs.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Continues checkpoint logs; restore progress logs are present but suppressed until restore begins.
+        emit:
+          - id: checkpoint_complete
+            per_min: 0.2
+            scope: global
+          - id: restore_progress
+            per_min: 2.0
+            scope: global
+
+  - id: job_queue
+    name: Job Queue (Redis)
+    svc: job-queue
+    hosts: [redis-1, redis-2, redis-3]
+    desc: >
+      Redis-backed queue used to enqueue build jobs and allow workers to dequeue them. In normal operation it emits
+      periodic queue depth metrics. During the incident it reflects growing backlog when the platform is offline and
+      when workers slow down, and it may emit latency warnings under load.
+    to:
+      - dst: worker_pool
+        proto: redis
+        desc: Workers connect to Redis to dequeue jobs (modeled as a logical hop from queue to worker).
+    logs:
+      enqueue:
+        desc: Job enqueued to a Redis list/stream.
+        lvl: INFO
+        msg: "enqueue queue={queue} job_id={job_id} build_id={build_id} repo_id={repo_id} trace_id={trace_id}"
+        vars:
+          queue: {k: ch, v: ["builds-ec2", "builds-gce", "builds-macos"]}
+          job_id: {k: i, v: [1, 400000000]}
+          build_id: {k: i, v: [1, 200000000]}
+          repo_id: {k: i, v: [1, 90000000]}
+          trace_id: {k: hex, v: 32}
+      dequeue:
+        desc: Worker dequeues a job for execution.
+        lvl: INFO
+        msg: "dequeue queue={queue} job_id={job_id} trace_id={trace_id}"
+        vars:
+          queue: {k: ch, v: ["builds-ec2", "builds-gce", "builds-macos"]}
+          job_id: {k: i, v: [1, 400000000]}
+          trace_id: {k: hex, v: 32}
+      queue_depth:
+        desc: Periodic depth metric per queue.
+        lvl: INFO
+        msg: "queue depth queue={queue} depth={depth}"
+        vars:
+          queue: {k: ch, v: ["builds-ec2", "builds-gce", "builds-macos"]}
+          depth: {k: i, v: [0, 200000]}
+      redis_latency_warn:
+        desc: Periodic warning when Redis latency rises.
+        lvl: WARN
+        msg: "redis latency high p95_ms={p95_ms} ops_s={ops_s}"
+        vars:
+          p95_ms: {k: i, v: [1, 2000]}
+          ops_s: {k: i, v: [100, 200000]}
+    beh:
+      n:
+        desc: Emits queue depth and occasional latency warnings.
+        emit:
+          - id: queue_depth
+            per_min: 1.0
+            scope: per_host
+          - id: redis_latency_warn
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Emits higher queue depth and more frequent latency warnings as backlog accumulates.
+        emit:
+          - id: queue_depth
+            per_min: 1.5
+            scope: per_host
+          - id: redis_latency_warn
+            per_min: 0.5
+            scope: per_host
+
+  - id: worker_pool
+    name: Build Worker Pool
+    svc: worker
+    hosts: [worker-1, worker-2, worker-3, worker-4, worker-5]
+    desc: >
+      Fleet that pulls jobs from Redis and executes builds, persisting status/log references into PostgreSQL.
+      Normally jobs complete and write results successfully. During the incident, workers may fail when expected
+      build rows are missing (updates affect zero rows and are treated as record-not-found), and later spend time
+      reconnecting or waiting while backlog is processed.
+    to:
+      - dst: job_queue
+        proto: redis
+        desc: Dequeues build jobs.
+      - dst: postgres_primary
+        proto: jdbc
+        desc: Writes build state and metadata to PostgreSQL.
+    logs:
+      job_start:
+        desc: Worker begins executing a job.
+        lvl: INFO
+        msg: "job start queue={queue} job_id={job_id} build_id={build_id} repo_id={repo_id} trace_id={trace_id}"
+        vars:
+          queue: {k: ch, v: ["builds-ec2", "builds-gce", "builds-macos"]}
+          job_id: {k: i, v: [1, 400000000]}
+          build_id: {k: i, v: [1, 200000000]}
+          repo_id: {k: i, v: [1, 90000000]}
+          trace_id: {k: hex, v: 32}
+      job_finish:
+        desc: Worker finishes a job and reports result.
+        lvl: INFO
+        msg: "job finish job_id={job_id} result={result} duration_s={duration_s} trace_id={trace_id}"
+        vars:
+          job_id: {k: i, v: [1, 400000000]}
+          result: {k: ch, v: ["passed", "failed", "errored"]}
+          duration_s: {k: i, v: [10, 7200]}
+          trace_id: {k: hex, v: 32}
+      job_fail_db:
+        desc: Worker cannot write/read required DB state for a job (e.g., record missing).
+        lvl: ERROR
+        msg: "job failed db job_id={job_id} err={err} trace_id={trace_id}"
+        vars:
+          job_id: {k: i, v: [1, 400000000]}
+          err: {k: str, v: "err"}
+          trace_id: {k: hex, v: 32}
+      worker_heartbeat:
+        desc: Periodic worker heartbeat.
+        lvl: DEBUG
+        msg: "heartbeat running_jobs={running} idle={idle} rss_mb={rss_mb}"
+        vars:
+          running: {k: i, v: [0, 50]}
+          idle: {k: i, v: [0, 50]}
+          rss_mb: {k: i, v: [200, 6000]}
+      db_reconnect_attempt:
+        desc: Periodic DB reconnect attempts under failure or heavy load.
+        lvl: WARN
+        msg: "db reconnect attempt outcome={outcome} backoff_ms={backoff_ms}"
+        vars:
+          outcome: {k: ch, v: ["success", "timeout", "refused"]}
+          backoff_ms: {k: i, v: [50, 60000]}
+    beh:
+      n:
+        desc: Emits frequent heartbeats; DB reconnect attempts are rare.
+        emit:
+          - id: worker_heartbeat
+            per_min: 2.0
+            scope: per_host
+          - id: db_reconnect_attempt
+            per_min: 0.1
+            scope: per_host
+      f:
+        desc: Emits heartbeats and more frequent DB reconnect attempts while DB is empty/restoring or overloaded.
+        emit:
+          - id: worker_heartbeat
+            per_min: 2.0
+            scope: per_host
+          - id: db_reconnect_attempt
+            per_min: 1.0
+            scope: per_host
+
+  - id: build_scheduler
+    name: Cron/Scheduler Service
+    svc: build-scheduler
+    hosts: [sched-1, sched-2]
+    desc: >
+      Periodically finds repositories with cron schedules and enqueues builds. Under normal operation it queries
+      PostgreSQL, then enqueues jobs into Redis. During the incident it may observe an empty result set after truncation
+      (no cron-able repos found), and after restore it may remain stopped due to a missed restart step, leading to missing
+      scheduled builds.
+    to:
+      - dst: postgres_primary
+        proto: jdbc
+        desc: Queries scheduled builds and records scheduling state.
+      - dst: job_queue
+        proto: redis
+        desc: Enqueues cron-triggered build jobs.
+    logs:
+      cron_trigger:
+        desc: Scheduler begins a cron scan/tick.
+        lvl: INFO
+        msg: "cron tick window_min={window_min} trace_id={trace_id}"
+        vars:
+          window_min: {k: i, v: [1, 60]}
+          trace_id: {k: hex, v: 32}
+      cron_enqueued:
+        desc: Cron-triggered build enqueued.
+        lvl: INFO
+        msg: "cron enqueued repo_id={repo_id} build_id={build_id} queue={queue} trace_id={trace_id}"
+        vars:
+          repo_id: {k: i, v: [1, 90000000]}
+          build_id: {k: i, v: [1, 200000000]}
+          queue: {k: ch, v: ["builds-ec2", "builds-gce", "builds-macos"]}
+          trace_id: {k: hex, v: 32}
+      cron_scan_complete:
+        desc: Cron scan completes; can find zero repos after truncation.
+        lvl: INFO
+        msg: "cron scan complete candidates={candidates} enqueued={enqueued} trace_id={trace_id}"
+        vars:
+          candidates: {k: i, v: [0, 500000]}
+          enqueued: {k: i, v: [0, 500000]}
+          trace_id: {k: hex, v: 32}
+      cron_query_failed:
+        desc: Cron scan failed due to DB errors.
+        lvl: ERROR
+        msg: "cron query failed err={err} trace_id={trace_id}"
+        vars:
+          err: {k: str, v: "err"}
+          trace_id: {k: hex, v: 32}
+      sched_heartbeat:
+        desc: Scheduler heartbeat/leadership log.
+        lvl: DEBUG
+        msg: "heartbeat leader={leader} tick_lag_s={tick_lag_s}"
+        vars:
+          leader: {k: ch, v: ["true", "false"]}
+          tick_lag_s: {k: i, v: [0, 3600]}
+      scheduler_not_running:
+        desc: Background warning that the scheduler process is not running after restore.
+        lvl: ERROR
+        msg: "scheduler not running expected=true last_seen_s={last_seen_s}"
+        vars:
+          last_seen_s: {k: i, v: [0, 86400]}
+      scheduler_not_started_after_restore:
+        desc: One-shot marker when on-call realizes scheduler was not restarted.
+        lvl: WARN
+        msg: "scheduler restart missed after restore action={action}"
+        vars:
+          action: {k: ch, v: ["restart_pending", "manual_restart_required"]}
+    beh:
+      n:
+        desc: Emits heartbeats; cron ticks are modeled as request-like flows.
+        emit:
+          - id: sched_heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Heartbeats may stop during the offline interval; 'scheduler not running' is suppressed until late failure.
+        emit:
+          - id: sched_heartbeat
+            per_min: 0.5
+            scope: per_host
+          - id: scheduler_not_running
+            per_min: 0.2
+            scope: per_host
+
+  - id: github_syncer
+    name: GitHub User Syncer
+    svc: github-syncer
+    hosts: [sync-1]
+    desc: >
+      Periodically syncs GitHub users and organizations into the platform database. This creates or updates user rows
+      even for existing customers. During the incident, sync attempts against emptied tables can recreate users with new
+      rows/IDs, contributing to later token/user mismatches after restore.
+    to:
+      - dst: github_api
+        proto: https
+        desc: Calls GitHub API to fetch user/org membership.
+      - dst: postgres_primary
+        proto: jdbc
+        desc: Upserts users and orgs into PostgreSQL.
+    logs:
+      sync_start:
+        desc: Start a sync cycle for a GitHub account.
+        lvl: INFO
+        msg: "sync start github_id={github_id} trace_id={trace_id}"
+        vars:
+          github_id: {k: i, v: [1, 400000000]}
+          trace_id: {k: hex, v: 32}
+      upsert_missing_user:
+        desc: Syncer created a user row because the expected user was missing (e.g., after truncation).
+        lvl: WARN
+        msg: "upsert missing user github_id={github_id} assigned_user_id={user_id} reason={reason} trace_id={trace_id}"
+        vars:
+          github_id: {k: i, v: [1, 400000000]}
+          user_id: {k: i, v: [1, 7000000]}
+          reason: {k: ch, v: ["user_row_missing", "org_row_missing", "db_empty"]}
+          trace_id: {k: hex, v: 32}
+      sync_complete:
+        desc: Sync cycle completed successfully.
+        lvl: INFO
+        msg: "sync complete github_id={github_id} upserts={upserts} trace_id={trace_id}"
+        vars:
+          github_id: {k: i, v: [1, 400000000]}
+          upserts: {k: i, v: [0, 5000]}
+          trace_id: {k: hex, v: 32}
+      sync_error:
+        desc: Sync cycle failed due to DB errors or API errors.
+        lvl: ERROR
+        msg: "sync error github_id={github_id} err={err} trace_id={trace_id}"
+        vars:
+          github_id: {k: i, v: [1, 400000000]}
+          err: {k: str, v: "err"}
+          trace_id: {k: hex, v: 32}
+      sync_heartbeat:
+        desc: Periodic process heartbeat.
+        lvl: DEBUG
+        msg: "heartbeat last_cycle_s={last_cycle_s}"
+        vars:
+          last_cycle_s: {k: i, v: [0, 3600]}
+    beh:
+      n:
+        desc: Emits a low-rate heartbeat; sync work is modeled as flows.
+        emit:
+          - id: sync_heartbeat
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Continues heartbeat; sync flows may be suppressed during the offline interval.
+        emit:
+          - id: sync_heartbeat
+            per_min: 0.5
+            scope: global
+
+  - id: github_api
+    name: GitHub API (external)
+    svc: null
+    hosts: []
+    desc: >
+      External GitHub API used for user/org sync and webhook delivery. It is not the root cause in this incident but
+      appears in sync flows to make user recreation behavior and timing diagnosable.
+    to:
+      - dst: postgres_primary
+        proto: https
+        desc: Logical hop representing the sync pipeline continuing from GitHub responses to DB writes (modeled for flow connectivity).
+    logs:
+      api_call_ok:
+        desc: Successful GitHub API request (sampled).
+        lvl: INFO
+        msg: "github api ok endpoint={endpoint} status={status} remaining={remaining} trace_id={trace_id}"
+        vars:
+          endpoint: {k: ch, v: ["/user", "/user/orgs", "/orgs/{org}/memberships/{user}", "/rate_limit"]}
+          status: {k: ch, v: [200, 304]}
+          remaining: {k: i, v: [0, 5000]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: No background emissions modeled for the external API.
+        emit: []
+      f:
+        desc: No background emissions modeled for the external API.
+        emit: []
+
+tracing:
+  on: true
+  origins: [edge_router, build_scheduler, job_queue]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic includes user logins and dashboard loads, GitHub webhooks that enqueue builds, periodic cron-triggered
+      builds, workers executing jobs, and periodic GitHub user sync cycles.
+    req:
+      - id: user_sign_in_success
+        desc: Browser login routed via web app; API authenticates and issues JWT; web app stores session.
+        rpm: 50.0
+        path: [edge_router, web_app, api_service, web_app]
+        emit:
+          - edge_router.request_received
+          - web_app.route_login
+          - api_service.login_ok
+          - api_service.jwt_issued
+          - web_app.session_established
+        latency_ms: [[0, 1], [2, 12], [30, 150], [1, 8], [10, 80]]
+        trace: true
+      - id: load_dashboard_success
+        desc: Web app renders dashboard by fetching profile data from API backed by PostgreSQL.
+        rpm: 150.0
+        path: [edge_router, web_app, api_service, postgres_primary, api_service, web_app]
+        emit:
+          - edge_router.request_received
+          - web_app.render_start
+          - api_service.profile_query
+          - postgres_primary.sql_exec
+          - api_service.profile_ok
+          - web_app.render_ok
+        latency_ms: [[0, 1], [3, 20], [10, 80], [8, 60], [5, 40], [20, 120]]
+        trace: true
+      - id: webhook_build_trigger_success
+        desc: GitHub webhook triggers a build; API records metadata in DB and enqueues a job in Redis.
+        rpm: 25.0
+        path: [edge_router, api_service, postgres_primary, api_service, job_queue]
+        emit:
+          - edge_router.request_received
+          - api_service.webhook_received
+          - postgres_primary.sql_exec
+          - api_service.build_enqueued
+          - job_queue.enqueue
+        latency_ms: [[0, 1], [5, 25], [15, 120], [5, 30], [2, 15]]
+        trace: true
+      - id: cron_trigger_enqueue
+        desc: Scheduler cron tick queries DB for scheduled builds and enqueues jobs.
+        rpm: 8.0
+        path: [build_scheduler, postgres_primary, build_scheduler, job_queue]
+        emit:
+          - build_scheduler.cron_trigger
+          - postgres_primary.sql_exec
+          - build_scheduler.cron_enqueued
+          - job_queue.enqueue
+        latency_ms: [[0, 1], [20, 250], [5, 30], [2, 15]]
+        trace: true
+      - id: worker_job_success
+        desc: Worker dequeues a job and successfully writes job state to PostgreSQL.
+        rpm: 35.0
+        path: [job_queue, worker_pool, postgres_primary, worker_pool]
+        emit:
+          - job_queue.dequeue
+          - worker_pool.job_start
+          - postgres_primary.sql_exec
+          - worker_pool.job_finish
+        latency_ms: [[0, 5], [5, 40], [50, 800], [120000, 600000]]
+        trace: true
+      - id: github_user_sync
+        desc: Syncer fetches from GitHub API and upserts users/orgs into PostgreSQL.
+        rpm: 5.0
+        path: [github_syncer, github_api, postgres_primary, github_syncer]
+        emit:
+          - github_syncer.sync_start
+          - github_api.api_call_ok
+          - postgres_primary.sql_exec
+          - github_syncer.sync_complete
+        latency_ms: [[0, 1], [40, 300], [20, 400], [5, 50]]
+        trace: false
+
+  f:
+    desc: >
+      Failure begins when PostgreSQL tables are truncated (emptied). Initially, apps keep serving traffic against the
+      mostly-empty DB: dashboard loads return empty profiles, and login/sync paths create new user records using
+      still-advanced sequences. Some write paths (e.g., build creation) fail due to missing referenced rows, causing
+      constraint violations. The platform is then taken offline for restore, causing edge 503s while PostgreSQL restore logs
+      appear. After restore, services return but some stored JWTs map to incorrect/restored users, producing user/token mismatches,
+      a build backlog, and missing scheduled (cron) builds due to the scheduler not being restarted.
+    req:
+      - id: user_sign_in_new_record
+        desc: Login during the empty-data window creates a new user record and issues a JWT referencing that new user_id.
+        rpm: 50.0
+        path: [edge_router, web_app, api_service, web_app]
+        emit:
+          - edge_router.request_received
+          - web_app.route_login
+          - api_service.user_created_after_truncate
+          - api_service.jwt_issued
+          - web_app.session_established
+        latency_ms: [[0, 1], [2, 12], [40, 250], [1, 10], [10, 100]]
+        trace: true
+      - id: load_dashboard_blank_profile
+        desc: Dashboard load during the empty-data window finds no profile rows and renders a blank user profile.
+        rpm: 150.0
+        path: [edge_router, web_app, api_service, postgres_primary, api_service, web_app]
+        emit:
+          - edge_router.request_received
+          - web_app.render_start
+          - api_service.profile_query
+          - postgres_primary.sql_exec
+          - api_service.profile_not_found
+          - web_app.render_blank_profile
+        latency_ms: [[0, 1], [3, 25], [10, 120], [5, 120], [2, 20], [10, 120]]
+        trace: true
+      - id: webhook_build_trigger_db_error
+        desc: Webhook received but build creation fails due to missing referenced rows after truncation (FK/uniqueness issues).
+        rpm: 25.0
+        path: [edge_router, api_service, postgres_primary, api_service]
+        emit:
+          - edge_router.request_received
+          - api_service.webhook_received
+          - postgres_primary.sql_error
+          - api_service.enqueue_failed_db
+        latency_ms: [[0, 1], [5, 30], [15, 250], [2, 60]]
+        trace: true
+      - id: cron_tick_zero_candidates
+        desc: Scheduler tick during the empty-data window runs but finds zero cron candidates to enqueue (tables empty).
+        rpm: 8.0
+        path: [build_scheduler, postgres_primary, build_scheduler]
+        emit:
+          - build_scheduler.cron_trigger
+          - postgres_primary.sql_exec
+          - build_scheduler.cron_scan_complete
+        latency_ms: [[0, 1], [20, 300], [2, 40]]
+        trace: true
+      - id: worker_job_db_error
+        desc: Worker dequeues job but fails when updating build state because the build row is missing (record-not-found behavior).
+        rpm: 35.0
+        path: [job_queue, worker_pool, postgres_primary, worker_pool]
+        emit:
+          - job_queue.dequeue
+          - worker_pool.job_start
+          - postgres_primary.sql_exec
+          - worker_pool.job_fail_db
+        latency_ms: [[0, 5], [5, 40], [50, 800], [200, 5000]]
+        trace: true
+      - id: api_offline_503
+        desc: After apps are taken offline for incident response/restore, edge returns 503 for incoming requests.
+        rpm: 200.0
+        path: [edge_router]
+        emit: [edge_router.upstream_unavailable]
+        latency_ms: [[0, 3]]
+        trace: true
+      - id: api_request_with_stale_token
+        desc: After restore, client presents a JWT issued during the empty-data window; API finds mismatch and forces logout.
+        rpm: 80.0
+        path: [edge_router, web_app, api_service, postgres_primary, api_service, web_app]
+        emit:
+          - edge_router.request_received
+          - web_app.render_start
+          - api_service.authn_from_jwt
+          - postgres_primary.sql_exec
+          - api_service.jwt_user_mismatch
+          - web_app.forced_logout
+        latency_ms: [[0, 1], [3, 25], [5, 80], [10, 250], [2, 60], [5, 120]]
+        trace: true
+      - id: webhook_build_trigger_success_degraded
+        desc: After restore, webhooks resume and builds are enqueued, but overall backlog keeps the system degraded.
+        rpm: 25.0
+        path: [edge_router, api_service, postgres_primary, api_service, job_queue]
+        emit:
+          - edge_router.request_received
+          - api_service.webhook_received
+          - postgres_primary.sql_exec
+          - api_service.build_enqueued
+          - job_queue.enqueue
+        latency_ms: [[0, 1], [5, 30], [25, 400], [10, 120], [2, 20]]
+        trace: true
+      - id: worker_job_slow_success
+        desc: During backlog processing after restore, workers complete jobs but with longer tail durations.
+        rpm: 40.0
+        path: [job_queue, worker_pool, postgres_primary, worker_pool]
+        emit:
+          - job_queue.dequeue
+          - worker_pool.job_start
+          - postgres_primary.sql_exec
+          - worker_pool.job_finish
+        latency_ms: [[0, 5], [5, 40], [80, 1500], [240000, 1200000]]
+        trace: true
+      - id: github_user_sync_recreate_users
+        desc: Syncer cycle during the empty-data window upserts users into emptied tables, recreating missing users.
+        rpm: 5.0
+        path: [github_syncer, github_api, postgres_primary, github_syncer]
+        emit:
+          - github_syncer.sync_start
+          - github_api.api_call_ok
+          - postgres_primary.sql_exec
+          - github_syncer.upsert_missing_user
+          - github_syncer.sync_complete
+        latency_ms: [[0, 1], [40, 300], [20, 450], [1, 20], [5, 80]]
+        trace: false
+      - id: github_user_sync_ok
+        desc: Syncer cycle after restore resumes normal upserts against restored data.
+        rpm: 5.0
+        path: [github_syncer, github_api, postgres_primary, github_syncer]
+        emit:
+          - github_syncer.sync_start
+          - github_api.api_call_ok
+          - postgres_primary.sql_exec
+          - github_syncer.sync_complete
+        latency_ms: [[0, 1], [40, 300], [30, 600], [5, 80]]
+        trace: false
+
+assumptions:
+  - "Architecture inferred from Travis CI patterns: edge router + web app + Rails API + PostgreSQL + Redis queue + scheduler + worker fleet + GitHub syncer; exact internal service boundaries were adapted for a compact causal graph."
+  - "To make request paths mechanically checkable while still emitting database logs mid-flow, some bidirectional/return-path network hops are modeled as 'logical response' edges (e.g., postgres_primary -> api_service, api_service -> web_app). This reflects response traffic on established connections rather than true request initiation by the downstream component."
+  - "TRUNCATE semantics were modeled as 'tables emptied but relations remain': most reads succeed and return zero rows (postgres_primary.sql_exec with low/zero rows), while some writes fail via realistic constraint violations (postgres_primary.sql_error with SQLSTATE 23503/23505)."
+  - "The postgres_primary.sql_exec template models state-dependent variability in result size by defining the {rows} domain only under state_vars (normal: broader; failure: near-zero), while other SQL fields keep a single shared domain."
+  - "Cron activity during the empty-data window is modeled as a successful scan with zero candidates (build_scheduler.cron_scan_complete), not as a query error; the scheduler 'not running' problem is modeled later as a separate steady-state symptom."
+  - "GitHub sync during the empty-data window is modeled as succeeding while recreating users: github_syncer.upsert_missing_user provides an explicit signal that upserts occurred due to missing rows; this is distinct from sync_error, which is reserved for true failures."
+  - "Timeline compressed to fit a 50-minute, two-phase scenario while preserving ordering: truncate executes -> apps briefly run against empty data -> apps taken offline -> restore -> service returns with token/user mismatch + backlog + scheduler not restarted."
+  - "Blank profiles modeled as web_app.render_blank_profile driven by api_service.profile_not_found and postgres_primary.sql_exec returning low/zero rows during the empty-data window."
+  - "Sequence behavior modeled via api_service.user_created_after_truncate including seq_last_value; PostgreSQL 'TRUNCATE does not reset sequences' is treated as external knowledge, not directly proven by logs alone."
+  - "Cron scheduler missed restart modeled as build_scheduler.scheduler_not_running plus api_service.scheduled_job_missed after restore; scheduler heartbeats are suppressed during the interval where the scheduler is not actually running."
+  - "JWT-subject variable naming was aligned across api_service.authn_from_jwt and api_service.jwt_user_mismatch (sub_user_id) so a single request can produce causally consistent log chains for a given token_id."
+  - "Estimated normal logs/min: background ~23.3/min plus flows ~1467/min => ~1490.3/min; over 25 min => ~37,258 lines."
+  - >
+    Failure volume breakdown (piecewise, with scenario suppression/multipliers; excludes one-shots unless noted):
+    25-35 (10 min): ~1469.8/min => ~14,698;
+    35-38 (3 min): ~522.7/min => ~1,568;
+    38-45 (7 min): ~530.7/min => ~3,715;
+    45-48 (3 min): ~1146.8/min => ~3,440;
+    48-50 (2 min): ~1070.4/min => ~2,141;
+    plus 14 one-shot lines => failure ~25,576 lines.
+  - "Estimated total logs: ~37,258 + ~25,576 ~= ~62,834 lines (within 20k..100k). Failure is noisy early due to blank-profile traffic and constraint/write failures; later it remains noisy due to token mismatch traffic and backlog-driven worker/queue warnings."
+  - "During the offline interval, app/scheduler background logs are suppressed via scenario rate multipliers to reflect processes being stopped; Redis/worker heartbeats continue to represent surviving infrastructure components."
+```

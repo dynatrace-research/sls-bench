@@ -1,0 +1,832 @@
+```yaml
+sys:
+  id: billing_inflight_balance_system
+  desc: >
+    A billing system calculates charges for billable usage events and maintains in-flight customer balances in Redis
+    for fast eligibility checks (e.g., auto-recharge). It also writes an authoritative double-bookkeeping ledger in a
+    relational database for reconciliation and recovery. An auto-recharge worker charges stored credit cards when
+    balances appear insufficient and then credits balances. The incident centers on a Redis master/replica disruption
+    followed by an incorrect Redis restart that wipes balance data and leaves the master in a read-only state.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: usage_ingest
+    name: Usage Ingest
+    svc: usage-ingest
+    hosts: [ingest-1, ingest-2]
+    desc: >
+      Receives billable usage events (voice/SMS) and forwards them to the billing API for pricing/balance application.
+    to:
+      - dst: billing_api
+        proto: https
+        desc: Sends billable usage events to the billing API.
+    logs:
+      billable_event:
+        desc: A billable usage event delivered for pricing and balance application.
+        lvl: INFO
+        msg: "billable event {event_id} account={acct} type={usage_type} units={units}"
+        vars:
+          event_id: {k: uuid, v: null}
+          acct: {k: hex, v: 8}
+          usage_type: {k: ch, v: [sms, voice]}
+          units: {k: i, v: [1, 5]}
+      ingest_backlog:
+        desc: Periodic ingest backlog metric.
+        lvl: INFO
+        msg: "ingest backlog queue_depth={depth} oldest_event_s={age_s}"
+        vars:
+          depth: {k: i, v: [0, 20000]}
+          age_s: {k: i, v: [0, 300]}
+    beh:
+      n:
+        desc: Ingest operates normally with small fluctuations in backlog.
+        emit:
+          - id: ingest_backlog
+            per_min: 1.0
+      f:
+        desc: Ingest continues to accept events; backlog may grow depending on billing availability.
+        emit:
+          - id: ingest_backlog
+            per_min: 1.0
+
+  - id: billing_api
+    name: Billing API
+    svc: billing-api
+    hosts: [bill-1, bill-2, bill-3, bill-4]
+    desc: >
+      Applies charges to in-flight balances in Redis and records authoritative entries in the ledger database.
+      Initiates auto-recharge when balances appear insufficient and can be taken offline to prevent further charging.
+    to:
+      - dst: redis_master
+        proto: tcp
+        desc: Reads/writes in-flight balances on the Redis master.
+      - dst: ledger_db
+        proto: jdbc
+        desc: Writes double-bookkeeping ledger records.
+      - dst: auto_recharge_worker
+        proto: kafka
+        desc: Enqueues auto-recharge jobs when balances appear insufficient.
+      - dst: payment_gateway
+        proto: https
+        desc: Charges customer credit cards for manual payments.
+    logs:
+      apply_charge_start:
+        desc: Start processing a billable usage event.
+        lvl: INFO
+        msg: "apply charge start event={event_id} account={acct} amount_cents={amount_cents}"
+        vars:
+          event_id: {k: uuid, v: null}
+          acct: {k: hex, v: 8}
+          amount_cents: {k: i, v: [1, 50]}
+      balance_update_ok:
+        desc: In-flight balance update succeeded.
+        lvl: INFO
+        msg: "inflight balance updated account={acct} delta_cents={delta_cents} new_balance_cents={new_balance_cents}"
+        vars:
+          acct: {k: hex, v: 8}
+          delta_cents: {k: i, v: [-5000, 5000]}
+          new_balance_cents: {k: i, v: [0, 20000]}
+      redis_get_timeout:
+        desc: Timeout reading balance from Redis during charge processing.
+        lvl: WARN
+        msg: "redis GET balance timeout account={acct} waited_ms={waited_ms}"
+        vars:
+          acct: {k: hex, v: 8}
+          waited_ms: {k: i, v: [100, 2000]}
+      balance_write_readonly:
+        desc: Failed to update balance because Redis is in READONLY mode.
+        lvl: ERROR
+        msg: "redis SET balance failed (READONLY) account={acct} delta_cents={delta_cents}"
+        vars:
+          acct: {k: hex, v: 8}
+          delta_cents: {k: i, v: [-5000, 5000]}
+      pricing_deferred_timeout:
+        desc: Pricing/billing work deferred because Redis operations timed out.
+        lvl: WARN
+        msg: "pricing deferred account={acct} reason=redis_timeout queued_event={event_id}"
+        vars:
+          acct: {k: hex, v: 8}
+          event_id: {k: uuid, v: null}
+      pricing_deferred_offline:
+        desc: Pricing/billing work deferred because billing is intentionally offline.
+        lvl: WARN
+        msg: "pricing deferred account={acct} reason=system_offline queued_event={event_id}"
+        vars:
+          acct: {k: hex, v: 8}
+          event_id: {k: uuid, v: null}
+      charge_applied:
+        desc: Charge completed end-to-end (including ledger write).
+        lvl: INFO
+        msg: "charge applied account={acct} ledger_txn={txn_id}"
+        vars:
+          acct: {k: hex, v: 8}
+          txn_id: {k: hex, v: 12}
+      recharge_requested_zero_balance:
+        desc: Auto-recharge requested because the in-flight balance appears wiped/zero.
+        lvl: INFO
+        msg: "auto-recharge requested account={acct} target_cents={target_cents} reason=zero_balance"
+        vars:
+          acct: {k: hex, v: 8}
+          target_cents: {k: i, v: [500, 5000]}
+      recharge_requested_balance_unwritable:
+        desc: Auto-recharge requested because balances cannot be safely written (dangerous failure mode).
+        lvl: INFO
+        msg: "auto-recharge requested account={acct} target_cents={target_cents} reason=balance_unwritable"
+        vars:
+          acct: {k: hex, v: 8}
+          target_cents: {k: i, v: [500, 5000]}
+      manual_payment_received:
+        desc: A customer initiated a manual credit-card payment.
+        lvl: INFO
+        msg: "manual payment received account={acct} payment_id={payment_id} amount_cents={amount_cents}"
+        vars:
+          acct: {k: hex, v: 8}
+          payment_id: {k: hex, v: 12}
+          amount_cents: {k: i, v: [500, 20000]}
+      payment_balance_update_failed:
+        desc: Payment succeeded upstream but could not be reflected in in-flight balance.
+        lvl: ERROR
+        msg: "payment posted but balance not updated account={acct} payment_id={payment_id} err={err}"
+        vars:
+          acct: {k: hex, v: 8}
+          payment_id: {k: hex, v: 12}
+          err: {k: ch, v: [readonly]}
+      account_suspended:
+        desc: Account suspended due to failed recharge attempts on a deactivated/declined card.
+        lvl: WARN
+        msg: "account suspended account={acct} reason={reason} payment_id={payment_id}"
+        vars:
+          acct: {k: hex, v: 8}
+          reason: {k: ch, v: [card_declined_after_retries]}
+          payment_id: {k: hex, v: 12}
+      pricing_lag_metric:
+        desc: Periodic metric for delayed pricing/backlog.
+        lvl: INFO
+        msg: "pricing lag seconds={lag_s} pending_events={pending}"
+        vars: {}
+        state_vars:
+          n:
+            lag_s: {k: i, v: [0, 30]}
+            pending: {k: i, v: [0, 5000]}
+          f:
+            lag_s: {k: i, v: [60, 1800]}
+            pending: {k: i, v: [5000, 50000]}
+      health_check:
+        desc: Periodic service health log.
+        lvl: INFO
+        msg: "health ok version={version} active_workers={workers}"
+        vars:
+          version: {k: ch, v: [1.18.0]}
+          workers: {k: i, v: [20, 80]}
+      billing_mode_changed:
+        desc: Operator action changing billing mode online/offline.
+        lvl: INFO
+        msg: "billing mode set to {mode} by={actor}"
+        vars:
+          mode: {k: ch, v: [online, offline]}
+          actor: {k: ch, v: [oncall]}
+    beh:
+      n:
+        desc: Normal operation with periodic health and low pricing lag.
+        emit:
+          - id: health_check
+            per_min: 2.0
+          - id: pricing_lag_metric
+            per_min: 1.0
+      f:
+        desc: During failure, health logs continue while pricing lag increases.
+        emit:
+          - id: health_check
+            per_min: 2.0
+          - id: pricing_lag_metric
+            per_min: 1.0
+
+  - id: auto_recharge_worker
+    name: Auto-Recharge Worker
+    svc: auto-recharge
+    hosts: [recharge-1, recharge-2]
+    desc: >
+      Processes auto-recharge jobs by charging the payment gateway and then asking the billing API to credit balances.
+    to:
+      - dst: payment_gateway
+        proto: https
+        desc: Charges customer credit cards.
+      - dst: billing_api
+        proto: https
+        desc: Posts credits to accounts after successful charges.
+    logs:
+      recharge_job_start:
+        desc: Start processing an auto-recharge job.
+        lvl: INFO
+        msg: "recharge job start account={acct} payment_id={payment_id} amount_cents={amount_cents}"
+        vars:
+          acct: {k: hex, v: 8}
+          payment_id: {k: hex, v: 12}
+          amount_cents: {k: i, v: [500, 5000]}
+      recharge_job_result_ok:
+        desc: Auto-recharge succeeded and balance crediting succeeded.
+        lvl: INFO
+        msg: "recharge job result account={acct} payment_id={payment_id} gateway_status=approved error=none"
+        vars:
+          acct: {k: hex, v: 8}
+          payment_id: {k: hex, v: 12}
+      recharge_job_result_balance_write_failed:
+        desc: Gateway approved but balance crediting failed (e.g., Redis READONLY).
+        lvl: INFO
+        msg: "recharge job result account={acct} payment_id={payment_id} gateway_status=approved error=balance_write_failed"
+        vars:
+          acct: {k: hex, v: 8}
+          payment_id: {k: hex, v: 12}
+      recharge_job_result_declined:
+        desc: Recharge failed due to a declined card.
+        lvl: INFO
+        msg: "recharge job result account={acct} payment_id={payment_id} gateway_status=declined error=card_declined"
+        vars:
+          acct: {k: hex, v: 8}
+          payment_id: {k: hex, v: 12}
+      worker_heartbeat:
+        desc: Periodic worker heartbeat.
+        lvl: INFO
+        msg: "worker heartbeat inflight_jobs={jobs}"
+        vars:
+          jobs: {k: i, v: [0, 500]}
+    beh:
+      n:
+        desc: Normal background heartbeat.
+        emit:
+          - id: worker_heartbeat
+            per_min: 1.0
+      f:
+        desc: Worker remains up; job volume depends on billing mode and balance behavior.
+        emit:
+          - id: worker_heartbeat
+            per_min: 1.0
+
+  - id: payment_gateway
+    name: Payment Gateway (External)
+    svc: null
+    hosts: [gateway]
+    desc: >
+      External credit-card processor. Approvals/declines are logged for correlation with auto-recharge anomalies.
+    to:
+      - dst: billing_api
+        proto: https
+        desc: Returns charge results to the billing API (modeled as response path).
+      - dst: auto_recharge_worker
+        proto: https
+        desc: Returns charge results to the auto-recharge worker (modeled as response path).
+    logs:
+      charge_request:
+        desc: A charge request sent to the gateway.
+        lvl: INFO
+        msg: "charge request payment_id={payment_id} account={acct} amount_cents={amount_cents} card_last4={last4}"
+        vars:
+          payment_id: {k: hex, v: 12}
+          acct: {k: hex, v: 8}
+          amount_cents: {k: i, v: [500, 20000]}
+          last4: {k: i, v: [1000, 9999]}
+      charge_response_approved:
+        desc: Gateway approved the charge request.
+        lvl: INFO
+        msg: "charge response payment_id={payment_id} status=approved auth_code={auth_code}"
+        vars:
+          payment_id: {k: hex, v: 12}
+          auth_code: {k: hex, v: 6}
+      charge_response_declined:
+        desc: Gateway declined the charge request.
+        lvl: INFO
+        msg: "charge response payment_id={payment_id} status=declined decline_code={decline_code}"
+        vars:
+          payment_id: {k: hex, v: 12}
+          decline_code: {k: ch, v: [do_not_honor, lost_card]}
+    beh:
+      n:
+        desc: No background emission modeled for the external gateway.
+        emit: []
+      f:
+        desc: No background emission modeled for the external gateway.
+        emit: []
+
+  - id: redis_master
+    name: Redis Master (In-flight balances)
+    svc: billing-redis
+    hosts: [redis-master-1]
+    desc: >
+      Single Redis master holding in-flight balances. Receives replication connections from replicas in other
+      data centers. Under heavy full-sync load, it times out clients; an incorrect restart can wipe data and
+      leave the node effectively read-only.
+    to:
+      - dst: redis_replicas
+        proto: tcp
+        desc: Serves replication streams to replicas.
+      - dst: billing_api
+        proto: tcp
+        desc: Serves client responses to the billing API (modeled as return path).
+    logs:
+      stats:
+        desc: Periodic master stats.
+        lvl: INFO
+        msg: "stats used_memory_mb={mem_mb} connected_slaves={slaves} ops_per_sec={ops}"
+        vars:
+          mem_mb: {k: i, v: [0, 12000]}
+          slaves: {k: i, v: [0, 3]}
+          ops: {k: i, v: [500, 12000]}
+      replica_sync_start:
+        desc: A replica begins full synchronization.
+        lvl: INFO
+        msg: "replica sync start replica={replica} runid={runid}"
+        vars:
+          replica: {k: ch, v: [redis-replica-1, redis-replica-2, redis-replica-3]}
+          runid: {k: hex, v: 40}
+      replica_sync_backlog:
+        desc: Master experiences backlog/cpu pressure while replicas sync.
+        lvl: WARN
+        msg: "replica sync backlog bytes={bytes} replicas_in_sync={replicas_in_sync} cpu_pct={cpu_pct}"
+        vars:
+          bytes: {k: i, v: [10000000, 400000000]}
+          replicas_in_sync: {k: i, v: [1, 3]}
+          cpu_pct: {k: i, v: [20, 100]}
+      command_timeout:
+        desc: Client commands timing out due to blocking/overload.
+        lvl: WARN
+        msg: "client timeout cmd={cmd} client={client} blocked_ms={blocked_ms}"
+        vars:
+          cmd: {k: ch, v: [GET, SET, MULTI, EXEC]}
+          client: {k: ch, v: [billing_api, replica]}
+          blocked_ms: {k: i, v: [50, 5000]}
+      restart:
+        desc: Redis process restart marker.
+        lvl: INFO
+        msg: "redis-server restarting pid={pid} config={config}"
+        vars:
+          pid: {k: i, v: [1000, 65000]}
+          config: {k: ch, v: [/etc/redis/redis-slave.conf]}
+      aof_open_failed:
+        desc: Redis fails to open an AOF during recovery.
+        lvl: ERROR
+        msg: "AOF open failed file={file} err={err}"
+        vars:
+          file: {k: ch, v: [/var/lib/redis/appendonly.aof]}
+          err: {k: ch, v: ["No such file or directory"]}
+      db_loaded:
+        desc: Redis reports dataset load from snapshot recovery (empty/near-empty dataset in this incident).
+        lvl: INFO
+        msg: "RDB loaded keys={keys} expires={expires} mem_mb={mem_mb}"
+        vars:
+          keys: {k: i, v: [0, 2000]}
+          expires: {k: i, v: [0, 100]}
+          mem_mb: {k: i, v: [0, 200]}
+      role_changed:
+        desc: Redis role change marker indicating a slave/readonly state.
+        lvl: WARN
+        msg: "role set to {role} master_host={master_host} master_port={master_port} readonly={readonly}"
+        vars:
+          role: {k: ch, v: [slave]}
+          master_host: {k: ch, v: [127.0.0.1]}
+          master_port: {k: i, v: [6379, 6379]}
+          readonly: {k: ch, v: [yes]}
+      role_status:
+        desc: Periodic role/readonly status confirmation (used to show persistent readonly mode after the bad restart).
+        lvl: INFO
+        msg: "role status role={role} readonly={readonly} master={master}"
+        vars:
+          role: {k: ch, v: [slave]}
+          readonly: {k: ch, v: [yes]}
+          master: {k: ch, v: ["127.0.0.1:6379"]}
+    beh:
+      n:
+        desc: Normal master operation with periodic stats and occasional minor timeouts.
+        emit:
+          - id: stats
+            per_min: 1.0
+          - id: command_timeout
+            per_min: 0.1
+      f:
+        desc: During failure, replication sync and timeouts increase; role_status is enabled only after the bad restart.
+        emit:
+          - id: stats
+            per_min: 1.0
+          - id: replica_sync_start
+            per_min: 0.2
+          - id: replica_sync_backlog
+            per_min: 0.3
+          - id: command_timeout
+            per_min: 0.3
+          - id: role_status
+            per_min: 2.0
+
+  - id: redis_replicas
+    name: Redis Replicas
+    svc: billing-redis
+    hosts: [redis-replica-1, redis-replica-2, redis-replica-3]
+    desc: >
+      Redis replicas in other data centers that replicate from the master. A network loss causes disconnects and
+      simultaneous full-sync requests that overload the master.
+    to:
+      - dst: redis_master
+        proto: tcp
+        desc: Connects to the master for replication.
+    logs:
+      link_down:
+        desc: Replica lost its connection to the master.
+        lvl: WARN
+        msg: "replica link down replica={replica} master={master} reason={reason}"
+        vars:
+          replica: {k: ch, v: [redis-replica-1, redis-replica-2, redis-replica-3]}
+          master: {k: ch, v: [redis-master-1]}
+          reason: {k: ch, v: [network_unreachable, connection_reset]}
+      fullsync_requested:
+        desc: Replica requests a full synchronization with the master.
+        lvl: INFO
+        msg: "replica requesting full resync replica={replica} offset={offset}"
+        vars:
+          replica: {k: ch, v: [redis-replica-1, redis-replica-2, redis-replica-3]}
+          offset: {k: i, v: [0, 999999999]}
+    beh:
+      n:
+        desc: Replicas are stable; disconnects are rare.
+        emit:
+          - id: link_down
+            per_min: 0.01
+      f:
+        desc: During network issues, replicas disconnect and request full resync in bursts.
+        emit:
+          - id: link_down
+            per_min: 0.2
+          - id: fullsync_requested
+            per_min: 0.2
+
+  - id: ledger_db
+    name: Ledger Database
+    svc: billing-ledger
+    hosts: [ledger-1, ledger-2]
+    desc: >
+      Authoritative relational store for double-bookkeeping of all billing ledger entries.
+      Used for balance restoration when Redis in-flight data is lost.
+    to:
+      - dst: billing_api
+        proto: jdbc
+        desc: Returns write results to the billing API (modeled as response path).
+    logs:
+      ledger_write_ok:
+        desc: Ledger write succeeded.
+        lvl: INFO
+        msg: "ledger write ok txn={txn_id} account={acct} amount_cents={amount_cents} source={source}"
+        vars:
+          txn_id: {k: hex, v: 12}
+          acct: {k: hex, v: 8}
+          amount_cents: {k: i, v: [-5000, 20000]}
+          source: {k: ch, v: [usage, auto_recharge, manual_payment]}
+      ledger_write_slow:
+        desc: Ledger write was slow (often due to upstream retry/backlog).
+        lvl: WARN
+        msg: "ledger write slow txn={txn_id} took_ms={took_ms} account={acct}"
+        vars:
+          txn_id: {k: hex, v: 12}
+          took_ms: {k: i, v: [200, 5000]}
+          acct: {k: hex, v: 8}
+      db_health:
+        desc: Periodic DB connection pool health.
+        lvl: INFO
+        msg: "db pool ok active_conns={active} waiters={waiters}"
+        vars:
+          active: {k: i, v: [1, 80]}
+          waiters: {k: i, v: [0, 30]}
+    beh:
+      n:
+        desc: Normal database health with rare slow writes.
+        emit:
+          - id: db_health
+            per_min: 0.5
+          - id: ledger_write_slow
+            per_min: 0.05
+      f:
+        desc: Database remains available; occasional slow writes occur due to upstream pressure.
+        emit:
+          - id: db_health
+            per_min: 0.5
+          - id: ledger_write_slow
+            per_min: 0.1
+
+  - id: billing_monitor
+    name: Billing Monitoring
+    svc: billing-monitor
+    hosts: [mon-1]
+    desc: >
+      Detects anomalies such as spikes in credit-card charges and account suspensions, and pages on-call engineers.
+      Also emits refund processing progress once refunds are underway.
+    to: []
+    logs:
+      monitor_tick:
+        desc: Periodic monitoring evaluation tick.
+        lvl: DEBUG
+        msg: "monitor tick checks={checks}"
+        vars:
+          checks: {k: i, v: [5, 30]}
+      anomaly_detected:
+        desc: Monitoring detected abnormal billing activity.
+        lvl: ERROR
+        msg: "billing anomaly detected metric={metric} value={value} threshold={threshold} window_min={window_min}"
+        vars:
+          metric: {k: ch, v: [charges_per_account, suspended_accounts]}
+          value: {k: i, v: [5, 500]}
+          threshold: {k: i, v: [3, 100]}
+          window_min: {k: i, v: [1, 10]}
+      alert_sent:
+        desc: On-call paging action.
+        lvl: CRITICAL
+        msg: "pager alert sent incident={incident} service={service} summary={summary}"
+        vars:
+          incident: {k: hex, v: 6}
+          service: {k: ch, v: [billing, redis]}
+          summary: {k: str, v: short_summary}
+      refund_job_started:
+        desc: Refund processing initiated for erroneous charges.
+        lvl: INFO
+        msg: "refund processing started batch={batch} count={count}"
+        vars:
+          batch: {k: hex, v: 8}
+          count: {k: i, v: [50, 5000]}
+      refund_progress:
+        desc: Periodic progress while refund processing is active.
+        lvl: INFO
+        msg: "refund progress batch={batch} processed={processed} remaining={remaining}"
+        vars:
+          batch: {k: hex, v: 8}
+          processed: {k: i, v: [0, 20000]}
+          remaining: {k: i, v: [0, 20000]}
+    beh:
+      n:
+        desc: Regular monitoring ticks.
+        emit:
+          - id: monitor_tick
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Regular monitoring ticks continue; refund progress appears after refund kickoff.
+        emit:
+          - id: monitor_tick
+            per_min: 1.0
+            scope: global
+          - id: refund_progress
+            per_min: 2.0
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal billing applies usage charges to Redis balances and records ledger entries. Auto-recharge is occasional,
+      and manual payments post successfully to both Redis in-flight balances and the ledger.
+    req:
+      - id: usage_billable_item_n
+        desc: Apply a billable usage event to in-flight balance and record it in the ledger.
+        rpm: 250.0
+        path: [usage_ingest, billing_api, redis_master, billing_api, ledger_db, billing_api]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.apply_charge_start
+          - billing_api.balance_update_ok
+          - ledger_db.ledger_write_ok
+          - billing_api.charge_applied
+        latency_ms: [[1, 4], [2, 8], [3, 15], [5, 25], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: customer_payment_n
+        desc: Manual customer credit-card payment that credits balance and writes a ledger entry.
+        rpm: 2.0
+        path: [billing_api, payment_gateway, billing_api, redis_master, billing_api, ledger_db, billing_api]
+        emit:
+          - billing_api.manual_payment_received
+          - payment_gateway.charge_request
+          - payment_gateway.charge_response_approved
+          - billing_api.balance_update_ok
+          - ledger_db.ledger_write_ok
+          - billing_api.charge_applied
+        latency_ms: [[2, 10], [20, 80], [50, 200], [5, 30], [10, 60], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: auto_recharge_charge_n
+        desc: Auto-recharge charges the card and then credits the in-flight balance and ledger.
+        rpm: 5.0
+        path: [auto_recharge_worker, payment_gateway, auto_recharge_worker, billing_api, redis_master, billing_api, ledger_db, billing_api, auto_recharge_worker]
+        emit:
+          - auto_recharge_worker.recharge_job_start
+          - payment_gateway.charge_request
+          - payment_gateway.charge_response_approved
+          - billing_api.balance_update_ok
+          - ledger_db.ledger_write_ok
+          - auto_recharge_worker.recharge_job_result_ok
+        latency_ms: [[2, 10], [20, 80], [50, 200], [5, 40], [10, 80], [2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      Failure begins with Redis replication instability and overload, then transitions to a bad Redis restart that
+      wipes in-flight balances and leaves Redis read-only. This causes balance updates to fail and triggers repeated
+      auto-recharge attempts only for the subset of accounts with auto-recharge enabled until billing is taken offline;
+      usage pricing is then deferred.
+    req:
+      - id: usage_billable_item_f_slow_ok
+        desc: Usage billing while Redis is overloaded but still writable (higher latency).
+        rpm: 240.0
+        path: [usage_ingest, billing_api, redis_master, billing_api, ledger_db, billing_api]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.apply_charge_start
+          - billing_api.balance_update_ok
+          - ledger_db.ledger_write_ok
+          - billing_api.charge_applied
+        latency_ms: [[1, 4], [5, 25], [15, 200], [15, 150], [5, 25]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: usage_billable_item_f_timeout
+        desc: Subset of usage events that time out on Redis reads and are deferred.
+        rpm: 10.0
+        path: [usage_ingest, billing_api]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.apply_charge_start
+          - billing_api.redis_get_timeout
+          - billing_api.pricing_deferred_timeout
+        latency_ms: [[1, 4], [5, 25], [200, 1200], [1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: usage_billable_item_f_readonly_no_recharge
+        desc: Usage billing after Redis restart leaves the node read-only; balance write fails but no auto-recharge is requested (accounts without auto-recharge enabled).
+        rpm: 245.0
+        path: [usage_ingest, billing_api, redis_master, billing_api, ledger_db]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.apply_charge_start
+          - billing_api.balance_write_readonly
+          - ledger_db.ledger_write_ok
+        latency_ms: [[1, 4], [3, 12], [3, 25], [10, 70]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: usage_billable_item_f_readonly_autorecharge
+        desc: Usage billing for auto-recharge-enabled accounts immediately after the wipe; balance appears zero and READONLY, triggering an auto-recharge request.
+        rpm: 5.0
+        path: [usage_ingest, billing_api, redis_master, billing_api, ledger_db, billing_api, auto_recharge_worker]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.apply_charge_start
+          - billing_api.balance_write_readonly
+          - ledger_db.ledger_write_ok
+          - billing_api.recharge_requested_zero_balance
+        latency_ms: [[1, 4], [3, 12], [3, 25], [10, 70], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: usage_billable_item_f_readonly_autorecharge_unwritable
+        desc: Usage billing after a ledger-based restore/re-enable; balances are present in the ledger but remain unwritable in Redis, and the unsafe auto-recharge logic triggers on balance write failure.
+        rpm: 5.0
+        path: [usage_ingest, billing_api, redis_master, billing_api, ledger_db, billing_api, auto_recharge_worker]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.apply_charge_start
+          - billing_api.balance_write_readonly
+          - ledger_db.ledger_write_ok
+          - billing_api.recharge_requested_balance_unwritable
+        latency_ms: [[1, 4], [3, 12], [3, 25], [10, 70], [2, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: usage_billable_item_f_offline
+        desc: Billing is offline; pricing is deferred for later computation.
+        rpm: 250.0
+        path: [usage_ingest, billing_api]
+        emit:
+          - usage_ingest.billable_event
+          - billing_api.pricing_deferred_offline
+        latency_ms: [[1, 4], [2, 10]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: customer_payment_f_readonly
+        desc: Manual payment succeeds at the gateway but cannot update in-flight balance due to Redis read-only.
+        rpm: 2.0
+        path: [billing_api, payment_gateway, billing_api, redis_master, billing_api, ledger_db]
+        emit:
+          - billing_api.manual_payment_received
+          - payment_gateway.charge_request
+          - payment_gateway.charge_response_approved
+          - billing_api.payment_balance_update_failed
+          - ledger_db.ledger_write_ok
+        latency_ms: [[2, 10], [20, 80], [50, 250], [3, 20], [10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: auto_recharge_charge_f_readonly
+        desc: Auto-recharge charges the card but crediting balance fails due to Redis read-only.
+        rpm: 5.0
+        path: [auto_recharge_worker, payment_gateway, auto_recharge_worker, billing_api, redis_master, billing_api, ledger_db, billing_api, auto_recharge_worker]
+        emit:
+          - auto_recharge_worker.recharge_job_start
+          - payment_gateway.charge_request
+          - payment_gateway.charge_response_approved
+          - billing_api.balance_write_readonly
+          - ledger_db.ledger_write_ok
+          - auto_recharge_worker.recharge_job_result_balance_write_failed
+        latency_ms: [[2, 10], [20, 80], [50, 250], [3, 25], [10, 80], [2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: auto_recharge_declined_suspend_f
+        desc: Some repeated recharge attempts hit a deactivated/declined card leading to account suspension.
+        rpm: 0.2
+        path: [auto_recharge_worker, payment_gateway, auto_recharge_worker, billing_api, auto_recharge_worker]
+        emit:
+          - auto_recharge_worker.recharge_job_start
+          - payment_gateway.charge_request
+          - payment_gateway.charge_response_declined
+          - billing_api.account_suspended
+          - auto_recharge_worker.recharge_job_result_declined
+        latency_ms: [[2, 10], [20, 80], [50, 250], [2, 20], [2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >-
+    The original multi-hour incident is compressed to a single 50-minute scenario while preserving causal order
+    (replica network loss to full-sync load to bad Redis restart to balances lost/read-only to auto-recharge spike
+    to billing taken offline to brief re-enable to recurrence and offline again).
+  - >-
+    Voice and SMS delivery are abstracted as a single high-rate usage_ingest→billing_api flow; communications delivery
+    is out of scope except for generating billing events.
+  - >-
+    Auto-recharge triggering is split into two explicit log/flow variants to keep the recurrence diagnostically consistent:
+    immediately after the wipe, recharge is requested with reason=zero_balance; after a ledger-based restore/re-enable,
+    recharge can reappear with reason=balance_unwritable (unsafe behavior when Redis is READONLY even if the ledger is correct).
+  - >-
+    Gateway and worker result logs are split into approved/declined variants to keep suspension signals consistent with
+    card declines and reduce semantic ambiguity in generated logs.
+  - >-
+    Traffic sizing uses ~250 rpm usage so that combined flow + background emissions produce ~55k logs over 50 minutes
+    (within the 20k-100k target).
+  - >-
+    Visibility anchors include replica link_down/fullsync (trigger), redis_master replica_sync_backlog/command_timeout
+    (overload), redis_master restart+aof_open_failed+role_changed/role_status (bad restart + persistent readonly),
+    billing_api balance_write_readonly with low-rate recharge_requested_* (customer-impacting path),
+    billing_monitor anomaly_detected/alert_sent (detection), and billing_mode_changed with pricing_deferred_offline
+    (mitigation).
+```

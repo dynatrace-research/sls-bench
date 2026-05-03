@@ -1,0 +1,218 @@
+```yaml
+scenario:
+  id: cassandra_scaleup_auto_bootstrap_false_incident
+  title: Cassandra scale-up caused missing rows and internal edge 404 routing failures
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system serves customer app login and balance reads via Cassandra, and routes internal tooling through an internal edge proxy that depends on configuration keys stored in Cassandra.
+    A planned Cassandra scale-up added new nodes with auto_bootstrap=false; the nodes unexpectedly became active for reads before data was present.
+    As token ownership shifted, some partition keys mapped to new nodes that returned empty results, making specific rows appear missing (not as Cassandra errors).
+    Impact included stale/incorrect balances, sporadic login failures, and internal tooling (COps chat/deploys) failing with 404 due to a missing internal network range config key.
+
+  trigger_desc: |
+    Operators start a Cassandra scale-up by adding six new nodes, expecting them to remain effectively inactive until data is streamed; auto_bootstrap=false causes them to become active immediately for assigned token ranges.
+
+  time:
+    total_minutes: 55
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 55}
+
+  phases:
+    n:
+      desc: |
+        Customer traffic (login and balance refresh) is handled successfully with quorum reads from existing Cassandra nodes.
+        Internal tooling (COps console and deployment tooling) reaches internal services through internal_edge, which consults config_service for the internal network range.
+        Metrics across services and Cassandra show low error rates and typical latencies.
+      flows: [app_login_ok_n, app_balance_ok_n, internal_tool_ok_n, card_auth_ok_n]
+      manifestation: [app_api.http_out_200, internal_edge.route_ok, internal_edge.edge_metrics, config_service.rpc_metrics]
+
+    f:
+      desc: |
+        After new Cassandra nodes are added, they join the ring and later assume responsibility for some token ranges.
+        Because they do not yet have streamed data, quorum reads for some partition keys return empty quickly (MISS/PARTIAL) rather than timeouts.
+        A key used by internal_edge (private_network_cidr) appears missing, causing internal_edge to return 404 for internal routes and breaking COps chat and deployments.
+        Investigation initially sees mostly normal Cassandra/config metrics, delaying focus on Cassandra until direct verification shows the row missing.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: cassandra_cluster
+          event: |
+            Scale-up begins and new Cassandra nodes join the cluster; early on, service and Cassandra metrics still look normal.
+          why: |
+            The cluster topology changes are observable via node join logs, but the missing-data symptom is not yet widespread in this window; client-visible metrics can remain normal because reads still complete quickly.
+            Incident-style edge 4xx metrics are explicitly suppressed until later, matching the delayed onset of observable 404 routing failures.
+          flows: [app_balance_ok_f, app_login_ok_f, internal_tool_ok_f, card_auth_ok_f]
+          rate_multipliers:
+            app_balance_stale_f: 0.0
+            app_login_fail_missing_f: 0.0
+            internal_tool_404_f: 0.0
+            card_auth_fail_bug_f: 0.0
+            internal_edge.edge_metrics_spike: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: cassandra_cluster.scale_up_start
+              count: 1
+              hosts: [cass-a1]
+            - ref: cassandra_cluster.node_joined
+              count: 6
+              hosts: [cass-n1, cass-n2, cass-n3, cass-n4, cass-n5, cass-n6]
+          manifestation: [cassandra_cluster.scale_up_start, cassandra_cluster.node_joined, internal_edge.edge_metrics, cassandra_cluster.metrics]
+
+        - order: 2
+          at_min: 29
+          component: cassandra_cluster
+          event: |
+            Token ownership shifts to include the new nodes as active replicas; internal edge begins returning 404s and customer app data reads become stale/partial, with sporadic login failures.
+          why: |
+            With multiple new nodes, quorum reads for some partition keys can be satisfied by responses that are empty (data not yet present on the active replicas), yielding fast MISS/PARTIAL outcomes instead of Cassandra errors.
+            Internal edge depends on a config key stored in Cassandra; when that row is affected, internal routing fails and manifests as HTTP 404.
+          flows: [app_balance_ok_f, app_balance_stale_f, app_login_ok_f, app_login_fail_missing_f, internal_tool_ok_f, internal_tool_404_f, card_auth_ok_f, card_auth_fail_bug_f]
+          rate_multipliers:
+            app_balance_ok_f: 0.8
+            app_balance_stale_f: 1.2
+            app_login_ok_f: 0.9
+            app_login_fail_missing_f: 1.5
+            internal_tool_ok_f: 0.5
+            internal_tool_404_f: 1.2
+            card_auth_ok_f: 0.95
+            card_auth_fail_bug_f: 2.0
+            internal_edge.edge_metrics: 0.0
+            internal_edge.edge_metrics_spike: 1.0
+          latency_multipliers:
+            app_balance_stale_f: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: cassandra_cluster.ownership_changed
+              count: 1
+              hosts: [cass-a2]
+            - ref: alerting.alert_fired
+              count: 2
+              hosts: [alert-1]
+          manifestation: [internal_edge.route_404, internal_edge.edge_metrics_spike, config_service.get_not_found_404, account_service.balance_read_partial, alerting.alert_fired]
+
+        - order: 3
+          at_min: 36
+          component: internal_tooling
+          event: |
+            Engineers probe config_service and observe 404 for a specific key; they bypass the service to query Cassandra directly and confirm the row is missing. Deployment tooling continues failing through internal edge, so a fallback deploy is used for the card fix.
+          why: |
+            Config service metrics can still look healthy because NOT_FOUND is not a 5xx error; targeted key probes reveal the discrepancy.
+            Internal edge 404s block standard deployment paths, so a fallback mechanism is used to deploy the card service fix and reduce card failures.
+          flows: [internal_tool_404_f, app_balance_ok_f, app_balance_stale_f, app_login_ok_f, app_login_fail_missing_f, card_auth_ok_f, card_auth_fail_bug_f]
+          rate_multipliers:
+            app_balance_ok_f: 0.7
+            app_balance_stale_f: 1.4
+            app_login_ok_f: 0.8
+            app_login_fail_missing_f: 1.8
+            internal_tool_ok_f: 0.4
+            internal_tool_404_f: 1.3
+            card_auth_ok_f: 1.0
+            card_auth_fail_bug_f: 0.6
+            internal_edge.edge_metrics: 0.0
+            internal_edge.edge_metrics_spike: 1.0
+          latency_multipliers:
+            internal_tool_404_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: internal_tooling.status_page_updated
+              count: 1
+              hosts: [ops-1]
+            - ref: internal_tooling.manual_cassandra_query
+              count: 1
+              hosts: [ops-1]
+            - ref: internal_tooling.fallback_deploy_used
+              count: 1
+              hosts: [ops-1]
+            - ref: mastercard_service.deploy_version
+              count: 1
+              hosts: [mc-1]
+          manifestation: [config_service.get_not_found_404, internal_tooling.manual_cassandra_query, internal_tooling.fallback_deploy_used, mastercard_service.deploy_version]
+
+        - order: 4
+          at_min: 43
+          component: cassandra_cluster
+          event: |
+            The team confirms new Cassandra nodes are serving reads while missing data; decommissioning of new nodes begins to shift ownership back to the original nodes.
+          why: |
+            Removing new nodes forces token ownership back to nodes that have the data, restoring reads for affected partition keys; this is operationally slow and proceeds node-by-node.
+          flows: [app_balance_ok_f, app_balance_stale_f, app_login_ok_f, app_login_fail_missing_f, internal_tool_404_f]
+          rate_multipliers:
+            app_balance_ok_f: 0.75
+            app_balance_stale_f: 1.3
+            app_login_ok_f: 0.8
+            app_login_fail_missing_f: 1.6
+            internal_tool_ok_f: 0.4
+            internal_tool_404_f: 1.2
+            internal_edge.edge_metrics: 0.0
+            internal_edge.edge_metrics_spike: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: cassandra_cluster.decommission_start
+              count: 1
+              hosts: [cass-n1]
+          manifestation: [cassandra_cluster.decommission_start, internal_edge.route_404, internal_edge.edge_metrics_spike, account_service.session_read_empty]
+
+        - order: 5
+          at_min: 52
+          component: cassandra_cluster
+          event: |
+            The first new Cassandra node is fully removed (after ~8–10 minutes); 404s drop noticeably and some internal tooling requests begin succeeding again, though customer data issues still persist.
+          why: |
+            With fewer active new replicas, fewer partition keys map to nodes without data; however other new nodes are still present, so missing-row reads remain for a subset of traffic.
+          flows: [internal_tool_ok_f, internal_tool_404_f, app_balance_ok_f, app_balance_stale_f, app_login_ok_f, app_login_fail_missing_f]
+          rate_multipliers:
+            app_balance_ok_f: 0.9
+            app_balance_stale_f: 0.6
+            app_login_ok_f: 1.0
+            app_login_fail_missing_f: 0.8
+            internal_tool_ok_f: 0.8
+            internal_tool_404_f: 0.4
+            internal_edge.edge_metrics: 0.0
+            internal_edge.edge_metrics_spike: 0.4
+          latency_multipliers:
+            internal_tool_ok_f: {p50: 0.9, p95: 0.9}
+          one_shots:
+            - ref: cassandra_cluster.decommission_complete
+              count: 1
+              hosts: [cass-n1]
+          manifestation: [cassandra_cluster.decommission_complete, internal_tooling.tool_ok, internal_edge.route_404, internal_edge.edge_metrics_spike]
+
+      steady:
+        - component: cassandra_cluster
+          condition: |
+            Some new Cassandra nodes remain active in the ring without having streamed the full dataset for their assigned token ranges, so some quorum reads return empty (MISS/PARTIAL) rather than timing out.
+          user_impact: |
+            A subset of app reads show stale/incorrect balances/transactions and some logins fail; internal systems relying on specific config keys intermittently break.
+          manifestation: [account_service.balance_read_partial, account_service.session_read_empty, cassandra_cluster.metrics]
+
+        - component: internal_edge
+          condition: |
+            internal_edge intermittently cannot validate internal traffic due to private_network_cidr being unreadable, returning 404 for internal routes; the 404 rate is reduced after the first node removal but remains present.
+          user_impact: |
+            COps chat and deployment operations are partially unavailable, slowing mitigation and customer support responses.
+          manifestation: [internal_edge.route_404, internal_edge.edge_metrics_spike, internal_tooling.tool_err_404]
+
+      feedback_loops:
+        - id: tooling_outage_slows_mitigation
+          desc: |
+            internal_edge 404s break standard deployment and COps workflows, reducing the team's ability to quickly ship fixes and coordinate response.
+
+      flows: [app_login_ok_f, app_login_fail_missing_f, app_balance_ok_f, app_balance_stale_f, internal_tool_ok_f, internal_tool_404_f, card_auth_ok_f, card_auth_fail_bug_f]
+      manifestation: [config_service.get_not_found_404, internal_edge.route_404, internal_edge.edge_metrics_spike, account_service.balance_read_partial]
+
+  assumptions:
+    - "Scenario minutes are relative; failure starts mid-scenario to keep a compact, analyzable log segment while preserving ordering of the real incident beats."
+    - "To avoid contradictory periodic edge 4xx reporting, the failure phase uses either internal_edge.edge_metrics (baseline view) or internal_edge.edge_metrics_spike (incident view) at a time: event 1 suppresses edge_metrics_spike; events 2-5 suppress edge_metrics."
+    - "Decommission timing is kept consistent with the modeled cassandra_cluster.decommission_complete duration_min=8..10 by placing decommission_complete at min 52 after decommission_start at min 43."
+    - "One-shot evidence logs are constrained to prevent contradictions: internal_tooling.manual_cassandra_query always emits result=MISSING; mastercard_service.deploy_version always emits version=2019.07.29.2 via=fallback_mechanism when referenced."
+    - "Piecewise failure breakdown (effective multipliers persist until overridden):"
+    - "  - min 25-29 (4 min): stale/login-fail/tool-404 flows suppressed; topology change visible; ≈4.4k flow logs."
+    - "  - min 29-36 (7 min): ownership shift activates missing-row symptoms and internal routing 404s; ≈9.6k flow logs."
+    - "  - min 36-43 (7 min): probing confirms missing key; fallback deploy reduces card failures; ≈9.3k flow logs + 4 one-shots."
+    - "  - min 43-52 (9 min): decommission in progress, still broadly broken; ≈12.1k flow logs + 1 one-shot."
+    - "  - min 52-55 (3 min): first node removed, partial improvement but still failing; ≈3.6k flow logs + 1 one-shot."
+    - "Normal phase (25 min) emits ≈31k flow logs; background metrics add ~700 logs across the full scenario (with edge_metrics_spike only after activation and edge_metrics suppressed thereafter); total expected logs ≈71k."
+    - "Most important failure signals are likely visible: internal_tool_404_f and internal_edge.route_404 occur at tens of rpm during peak impact, edge_metrics_spike is enabled only after onset, and account_service MISS/PARTIAL logs correlate with cass-n* replicas while cassandra metrics remain deceptively normal."
+```

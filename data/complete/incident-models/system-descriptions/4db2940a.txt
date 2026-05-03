@@ -1,0 +1,760 @@
+```yaml
+sys:
+  id: code_hosting_platform
+  desc: >
+    A Git-hosting and web application platform served through a load balancer to web and Git backends.
+    Repository operations depend on a fileserver HA pair for storage and on a datacenter network fabric
+    (access + aggregation switches) for connectivity. A network re-topology introduced a switch
+    misconfiguration and then exposed a vendor bug that caused traffic flooding and link saturation.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: edge-lb
+    hosts: [edge-1, edge-2]
+    desc: Terminates client connections and routes HTTP and Git traffic to backend pools.
+    to:
+      - dst: app_web
+        proto: https
+        desc: Forwards web/API requests to the application tier.
+      - dst: git_service
+        proto: tcp
+        desc: Forwards Git protocol traffic to the Git service pool.
+      - dst: net_monitor
+        proto: https
+        desc: Returns responses to synthetic probe clients operated by monitoring.
+    logs:
+      access_web_200:
+        desc: Successful web request access log.
+        lvl: INFO
+        msg: "web access {method} {route} status=200 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: str, v: "web_route"}
+          bytes_out: {k: i, v: [300, 2000000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [10, 600]}
+          f:
+            duration_ms: {k: i, v: [80, 8000]}
+      access_web_504:
+        desc: Web request timed out waiting for upstream.
+        lvl: WARN
+        msg: "web access {method} {route} status=504 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: str, v: "web_route"}
+          bytes_out: {k: i, v: [0, 5000]}
+          duration_ms: {k: i, v: [2000, 12000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+      access_web_503:
+        desc: Web request rejected due to no available upstreams.
+        lvl: ERROR
+        msg: "web access {method} {route} status=503 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: str, v: "web_route"}
+          bytes_out: {k: i, v: [0, 2000]}
+          duration_ms: {k: i, v: [10, 3000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+      access_git_200:
+        desc: Successful Git request access log.
+        lvl: INFO
+        msg: "git access {route} status=200 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          route: {k: str, v: "git_route"}
+          bytes_out: {k: i, v: [10000, 50000000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [80, 9000]}
+          f:
+            duration_ms: {k: i, v: [500, 25000]}
+      access_git_504:
+        desc: Git request timed out waiting for upstream.
+        lvl: WARN
+        msg: "git access {route} status=504 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          route: {k: str, v: "git_route"}
+          bytes_out: {k: i, v: [0, 8000]}
+          duration_ms: {k: i, v: [4000, 30000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+      access_git_503:
+        desc: Git request rejected due to no available upstreams.
+        lvl: ERROR
+        msg: "git access {route} status=503 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          route: {k: str, v: "git_route"}
+          bytes_out: {k: i, v: [0, 3000]}
+          duration_ms: {k: i, v: [10, 3000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+      access_git_500:
+        desc: Git request failed due to backend storage issue.
+        lvl: ERROR
+        msg: "git access {route} status=500 bytes={bytes_out} duration_ms={duration_ms} req_id={req_id} client_ip={client_ip}"
+        vars:
+          route: {k: str, v: "git_route"}
+          bytes_out: {k: i, v: [0, 5000]}
+          duration_ms: {k: i, v: [50, 10000]}
+          req_id: {k: hex, v: 16}
+          client_ip: {k: ip, v: null}
+      access_probe_200:
+        desc: Successful synthetic probe access log.
+        lvl: INFO
+        msg: "probe access {route} status=200 duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          route: {k: ch, v: [/ , /api/status]}
+          req_id: {k: hex, v: 16}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [5, 200]}
+          f:
+            duration_ms: {k: i, v: [50, 5000]}
+      access_probe_504:
+        desc: Synthetic probe timed out.
+        lvl: WARN
+        msg: "probe access {route} status=504 duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          route: {k: ch, v: [/ , /api/status]}
+          duration_ms: {k: i, v: [300, 15000]}
+          req_id: {k: hex, v: 16}
+      access_probe_503:
+        desc: Synthetic probe rejected due to no available upstreams.
+        lvl: ERROR
+        msg: "probe access {route} status=503 duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          route: {k: ch, v: [/ , /api/status]}
+          duration_ms: {k: i, v: [10, 4000]}
+          req_id: {k: hex, v: 16}
+    beh:
+      n:
+        desc: Access logging is modeled via request flows (no background emissions).
+        emit: []
+      f:
+        desc: Access logging is modeled via request flows (no background emissions).
+        emit: []
+
+  - id: app_web
+    name: Web/API Application
+    svc: app-web
+    hosts: [app-1, app-2]
+    desc: Handles web/API requests and performs internal dependency calls; sensitive to network latency.
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Returns responses back through the load balancer.
+    logs:
+      req_ok:
+        desc: Normal completed request.
+        lvl: INFO
+        msg: "handled {method} {route} status=200 duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: str, v: "web_route"}
+          duration_ms: {k: i, v: [5, 500]}
+          req_id: {k: hex, v: 16}
+      req_ok_slow:
+        desc: Completed request but slower than SLO.
+        lvl: WARN
+        msg: "handled {method} {route} status=200 slow duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: str, v: "web_route"}
+          duration_ms: {k: i, v: [200, 9000]}
+          req_id: {k: hex, v: 16}
+      req_failed_timeout:
+        desc: Request failed due to dependency/network timeouts during handling.
+        lvl: ERROR
+        msg: "request failed {method} {route} error=timeout dep={dep} timeout_ms={timeout_ms} req_id={req_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: str, v: "web_route"}
+          dep: {k: ch, v: [db, cache, fileserver]}
+          timeout_ms: {k: i, v: [500, 8000]}
+          req_id: {k: hex, v: 16}
+      threadpool_queue_warn:
+        desc: Periodic signal that request execution is backing up under latency.
+        lvl: WARN
+        msg: "threadpool queueing queue_depth={queue_depth} active_threads={active_threads}"
+        vars:
+          queue_depth: {k: i, v: [0, 300]}
+          active_threads: {k: i, v: [20, 200]}
+    beh:
+      n:
+        desc: Mild periodic queue depth warnings occur rarely.
+        emit:
+          - id: threadpool_queue_warn
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Elevated queueing during network-induced latency.
+        emit:
+          - id: threadpool_queue_warn
+            per_min: 0.4
+            scope: per_host
+
+  - id: git_service
+    name: Git Service
+    svc: git
+    hosts: [git-1, git-2]
+    desc: Serves Git clone/fetch by reading repository objects from backend storage.
+    to:
+      - dst: edge_lb
+        proto: tcp
+        desc: Sends Git responses back through the load balancer.
+      - dst: fileserver_cluster
+        proto: tcp
+        desc: Reads repository objects over the internal network.
+    logs:
+      clone_complete:
+        desc: Successful clone/fetch session completion.
+        lvl: INFO
+        msg: "git session complete repo={repo} pack_bytes={pack_bytes} duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          repo: {k: str, v: "owner/repo"}
+          pack_bytes: {k: i, v: [10000, 50000000]}
+          duration_ms: {k: i, v: [50, 12000]}
+          req_id: {k: hex, v: 16}
+      clone_slow:
+        desc: Successful clone/fetch but unusually slow due to network/storage slowness.
+        lvl: WARN
+        msg: "git session slow repo={repo} pack_bytes={pack_bytes} duration_ms={duration_ms} req_id={req_id}"
+        vars:
+          repo: {k: str, v: "owner/repo"}
+          pack_bytes: {k: i, v: [10000, 50000000]}
+          duration_ms: {k: i, v: [1000, 30000]}
+          req_id: {k: hex, v: 16}
+      clone_failed_timeout:
+        desc: Git operation timed out mid-session.
+        lvl: ERROR
+        msg: "git session failed repo={repo} error=timeout stage={stage} timeout_ms={timeout_ms} req_id={req_id}"
+        vars:
+          repo: {k: str, v: "owner/repo"}
+          stage: {k: ch, v: [negotiate, read_objects, pack]}
+          timeout_ms: {k: i, v: [2000, 30000]}
+          req_id: {k: hex, v: 16}
+      clone_failed_storage:
+        desc: Git operation failed due to repository storage errors.
+        lvl: ERROR
+        msg: "git session failed repo={repo} error=storage fileserver={fileserver} detail={detail} req_id={req_id}"
+        vars:
+          repo: {k: str, v: "owner/repo"}
+          fileserver: {k: ch, v: [fs-1, fs-2]}
+          detail: {k: ch, v: [stale_handle, io_error, not_primary]}
+          req_id: {k: hex, v: 16}
+    beh:
+      n:
+        desc: Git service emits logs only per request in this model.
+        emit: []
+      f:
+        desc: Git service emits logs only per request in this model.
+        emit: []
+
+  - id: fileserver_cluster
+    name: Fileserver HA Pair
+    svc: fileserver
+    hosts: [fs-1, fs-2]
+    desc: >
+      HA pair serving repository objects. Depends on reliable inter-node links to keep cluster state
+      consistent; network partitions can leave the pair degraded and cause a small percentage of repos
+      to error.
+    to:
+      - dst: git_service
+        proto: tcp
+        desc: Serves repository object reads for Git operations.
+    logs:
+      ha_heartbeat:
+        desc: Periodic HA heartbeat latency observation.
+        lvl: INFO
+        msg: "ha heartbeat peer={peer} role={role} latency_ms={latency_ms}"
+        vars:
+          peer: {k: ch, v: [fs-1, fs-2]}
+          role: {k: ch, v: [primary, secondary]}
+        state_vars:
+          n:
+            latency_ms: {k: i, v: [1, 50]}
+          f:
+            latency_ms: {k: i, v: [20, 2000]}
+      ha_peer_disconnected:
+        desc: HA peer link loss / cluster degradation indication.
+        lvl: ERROR
+        msg: "ha peer link down peer={peer} cluster_state={cluster_state}"
+        vars:
+          peer: {k: ch, v: [fs-1, fs-2]}
+          cluster_state: {k: ch, v: [degraded, split_brain_suspected, standby]}
+      node_fenced:
+        desc: Cluster fencing action taken after peer loss/quorum issues.
+        lvl: CRITICAL
+        msg: "fencing node={node} reason={reason}"
+        vars:
+          node: {k: ch, v: [fs-1, fs-2]}
+          reason: {k: ch, v: [heartbeat_timeout, quorum_loss]}
+      repo_io_error:
+        desc: Repository read errors observed on the fileserver (rare; impacts subset of repos).
+        lvl: ERROR
+        msg: "repo i/o error repo={repo} op={op} err={err}"
+        vars:
+          repo: {k: str, v: "owner/repo"}
+          op: {k: ch, v: [read_pack, stat_objects]}
+          err: {k: ch, v: [stale_handle, eio, etimedout]}
+    beh:
+      n:
+        desc: Heartbeats are steady; peer disconnects are not expected.
+        emit:
+          - id: ha_heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Heartbeats continue but may be slower; peer disconnects can occur under partitions.
+        emit:
+          - id: ha_heartbeat
+            per_min: 0.6
+            scope: per_host
+          - id: ha_peer_disconnected
+            per_min: 0.2
+            scope: per_host
+
+  - id: access_switch
+    name: Access Switch Pair (Cabinet)
+    svc: null
+    hosts: [asw-7a, asw-7b]
+    desc: Cabinet access switches connecting servers to the aggregation layer with redundant uplinks.
+    to:
+      - dst: aggregation_switch
+        proto: ethernet
+        desc: Redundant uplinks to aggregation switches.
+    logs:
+      uplink_crc_errors:
+        desc: Periodic summary of uplink errors/drops.
+        lvl: WARN
+        msg: "uplink errors cabinet={cabinet} port={port} crc_errors={crc_errors} drops={drops}"
+        vars:
+          cabinet: {k: ch, v: [cab-7]}
+          port: {k: ch, v: [xe-0/0/1, xe-0/0/2]}
+        state_vars:
+          n:
+            crc_errors: {k: i, v: [0, 50]}
+            drops: {k: i, v: [0, 200]}
+          f:
+            crc_errors: {k: i, v: [50, 5000]}
+            drops: {k: i, v: [200, 20000]}
+      watchdog_errdisable:
+        desc: Unsupported link watchdog trips and err-disables redundant uplinks.
+        lvl: ERROR
+        msg: "link watchdog triggered; errdisabling ports {port_a},{port_b} reason={reason}"
+        vars:
+          port_a: {k: ch, v: [xe-0/0/1, xe-0/0/2]}
+          port_b: {k: ch, v: [xe-0/0/1, xe-0/0/2]}
+          reason: {k: ch, v: [rx_mismatch, partial_failure_detected]}
+      stp_loop_guard:
+        desc: STP/loop-guard blocks a port after loop detection.
+        lvl: CRITICAL
+        msg: "stp loop guard: bridge loop detected; blocking port {port} vlan={vlan}"
+        vars:
+          port: {k: ch, v: [xe-0/0/1, xe-0/0/2]}
+          vlan: {k: i, v: [1, 4094]}
+      config_apply:
+        desc: Configuration change applied to address watchdog misconfiguration.
+        lvl: INFO
+        msg: "applied config change id={change_id} setting={setting} result={result}"
+        vars:
+          change_id: {k: hex, v: 8}
+          setting: {k: ch, v: [lacp_link_watchdog_disable]}
+          result: {k: ch, v: [ok, failed]}
+    beh:
+      n:
+        desc: Low steady noise of uplink warnings.
+        emit:
+          - id: uplink_crc_errors
+            per_min: 0.4
+            scope: per_host
+      f:
+        desc: Elevated uplink warnings; watchdog errdisable may occur depending on troubleshooting actions.
+        emit:
+          - id: uplink_crc_errors
+            per_min: 2.0
+            scope: per_host
+          - id: watchdog_errdisable
+            per_min: 0.3
+            scope: per_host
+
+  - id: aggregation_switch
+    name: Aggregation Switches
+    svc: null
+    hosts: [aggsw-1, aggsw-2]
+    desc: Aggregation layer; a vendor bug can prevent MAC learning and cause flooding of unknown-destination frames.
+    to:
+      - dst: access_switch
+        proto: ethernet
+        desc: Downlinks to access switches.
+    logs:
+      mac_table_stats:
+        desc: Periodic MAC/FDB table statistics.
+        lvl: INFO
+        msg: "fdb stats learned={learned} aged_out={aged_out} table_usage_pct={table_usage_pct}"
+        vars: {}
+        state_vars:
+          n:
+            learned: {k: i, v: [50000, 120000]}
+            aged_out: {k: i, v: [100, 3000]}
+            table_usage_pct: {k: i, v: [10, 60]}
+          f:
+            learned: {k: i, v: [10000, 70000]}
+            aged_out: {k: i, v: [500, 8000]}
+            table_usage_pct: {k: i, v: [20, 95]}
+      fdb_miss_flood:
+        desc: Unknown-destination frames are flooded due to missing MAC table entries.
+        lvl: WARN
+        msg: "fdb miss: flooding unknown dst_mac={dst_mac} pps={pps} rate_limited={rate_limited}"
+        vars:
+          dst_mac: {k: str, v: "mac"}
+          rate_limited: {k: ch, v: ["true", "false"]}
+        state_vars:
+          n:
+            pps: {k: i, v: [10, 2000]}
+          f:
+            pps: {k: i, v: [500, 100000]}
+      control_plane_cpu:
+        desc: Control-plane CPU elevated under flooding/stp activity.
+        lvl: WARN
+        msg: "control-plane cpu high cpu_pct={cpu_pct} cause={cause}"
+        vars:
+          cpu_pct: {k: i, v: [50, 99]}
+          cause: {k: ch, v: [l2_flood, stp_recalc]}
+    beh:
+      n:
+        desc: Normal periodic switch metrics with occasional low-rate misses.
+        emit:
+          - id: mac_table_stats
+            per_min: 1.0
+            scope: per_host
+          - id: fdb_miss_flood
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: MAC learning impairment increases flooding and switch stress.
+        emit:
+          - id: mac_table_stats
+            per_min: 1.5
+            scope: per_host
+          - id: fdb_miss_flood
+            per_min: 8.0
+            scope: per_host
+          - id: control_plane_cpu
+            per_min: 0.4
+            scope: per_host
+
+  - id: net_monitor
+    name: Network Monitoring and Synthetic Probes
+    svc: netmon
+    hosts: [netmon-1]
+    desc: Collects SNMP/ICMP telemetry and runs synthetic probes against the service.
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Runs synthetic HTTP probes via the edge.
+      - dst: access_switch
+        proto: snmp
+        desc: Polls access switches for link status and counters.
+      - dst: aggregation_switch
+        proto: snmp
+        desc: Polls aggregation switches for MAC table and utilization indicators.
+    logs:
+      uplink_utilization:
+        desc: Periodic aggregated access/aggregation uplink utilization summary.
+        lvl: INFO
+        msg: "uplinks util avg_pct={avg_pct} p95_pct={p95_pct} drops_per_s={drops_per_s}"
+        vars: {}
+        state_vars:
+          n:
+            avg_pct: {k: i, v: [10, 40]}
+            p95_pct: {k: i, v: [15, 60]}
+            drops_per_s: {k: i, v: [0, 50]}
+          f:
+            avg_pct: {k: i, v: [60, 95]}
+            p95_pct: {k: i, v: [80, 99]}
+            drops_per_s: {k: i, v: [50, 4000]}
+      alert_saturation:
+        desc: Alert emitted when uplinks are near saturation and drops rise.
+        lvl: WARN
+        msg: "ALERT saturation agg_access_links util_p95={util_p95} drops_per_s={drops_per_s}"
+        vars:
+          util_p95: {k: i, v: [80, 99]}
+          drops_per_s: {k: i, v: [200, 5000]}
+      poll_failed:
+        desc: Monitoring poll failures (device unreachable during outage/isolation).
+        lvl: ERROR
+        msg: "poll failed target={target} proto={proto} error={error}"
+        vars:
+          target: {k: ch, v: [asw-7a, asw-7b, aggsw-1, aggsw-2]}
+          proto: {k: ch, v: [snmp, icmp]}
+          error: {k: ch, v: [timeout, no_route]}
+      probe_ok:
+        desc: Synthetic probe success result.
+        lvl: INFO
+        msg: "synthetic probe ok path={path_name} status=200 latency_ms={latency_ms} req_id={req_id}"
+        vars:
+          path_name: {k: ch, v: [homepage, api_status]}
+          latency_ms: {k: i, v: [5, 300]}
+          req_id: {k: hex, v: 16}
+      probe_fail_504:
+        desc: Synthetic probe failure due to timeout.
+        lvl: ERROR
+        msg: "synthetic probe failed path={path_name} status=504 latency_ms={latency_ms} err={err} req_id={req_id}"
+        vars:
+          path_name: {k: ch, v: [homepage, api_status]}
+          latency_ms: {k: i, v: [300, 15000]}
+          err: {k: ch, v: [upstream_timeout, backend_slow]}
+          req_id: {k: hex, v: 16}
+      probe_fail_503:
+        desc: Synthetic probe failure due to no upstreams.
+        lvl: ERROR
+        msg: "synthetic probe failed path={path_name} status=503 latency_ms={latency_ms} err={err} req_id={req_id}"
+        vars:
+          path_name: {k: ch, v: [homepage, api_status]}
+          latency_ms: {k: i, v: [10, 4000]}
+          err: {k: ch, v: [no_upstreams, routing_blackhole]}
+          req_id: {k: hex, v: 16}
+      change_connect_uplink:
+        desc: "Operator action marker: connect/enable the final uplink during migration."
+        lvl: INFO
+        msg: "operator action connect uplink target={target} change_id={change_id}"
+        vars:
+          target: {k: ch, v: [asw-7a, asw-7b, aggsw-1, aggsw-2]}
+          change_id: {k: hex, v: 8}
+      change_shutdown_uplink:
+        desc: "Operator action marker: shut down one uplink for troubleshooting."
+        lvl: INFO
+        msg: "operator action shutdown uplink target={target} change_id={change_id}"
+        vars:
+          target: {k: ch, v: [asw-7a, asw-7b, aggsw-1, aggsw-2]}
+          change_id: {k: hex, v: 8}
+      change_remove_watchdog_setting:
+        desc: "Operator action marker: remove unsupported link watchdog setting."
+        lvl: INFO
+        msg: "operator action remove watchdog setting target={target} change_id={change_id}"
+        vars:
+          target: {k: ch, v: [asw-7a, asw-7b]}
+          change_id: {k: hex, v: 8}
+      change_enable_uplink:
+        desc: "Operator action marker: re-enable uplink(s) after configuration change."
+        lvl: INFO
+        msg: "operator action enable uplink target={target} change_id={change_id}"
+        vars:
+          target: {k: ch, v: [asw-7a, asw-7b, aggsw-1, aggsw-2]}
+          change_id: {k: hex, v: 8}
+    beh:
+      n:
+        desc: Normal telemetry with rare alerts or poll hiccups.
+        emit:
+          - id: uplink_utilization
+            per_min: 2.0
+            scope: global
+          - id: alert_saturation
+            per_min: 0.02
+            scope: global
+          - id: poll_failed
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Sustained high utilization with frequent saturation alerts; poll failures occur during cabinet isolation.
+        emit:
+          - id: uplink_utilization
+            per_min: 3.0
+            scope: global
+          - id: alert_saturation
+            per_min: 0.8
+            scope: global
+          - id: poll_failed
+            per_min: 0.05
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_lb, net_monitor]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user traffic consists of web requests and Git operations with low latency and high success rates.
+    req:
+      - id: web_page_view_ok
+        desc: Successful web/API request.
+        rpm: 400.0
+        path: [edge_lb, app_web, edge_lb]
+        emit: [app_web.req_ok, edge_lb.access_web_200]
+        latency_ms: [[15, 120], [20, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: git_clone_ok
+        desc: Successful Git clone/fetch.
+        rpm: 60.0
+        path: [edge_lb, git_service, fileserver_cluster, git_service, edge_lb]
+        emit: [git_service.clone_complete, edge_lb.access_git_200]
+        latency_ms: [[300, 4000], [350, 4500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: synthetic_probe_ok
+        desc: Monitoring synthetic probe succeeds.
+        rpm: 12.0
+        path: [net_monitor, edge_lb, app_web, edge_lb, net_monitor]
+        emit: [edge_lb.access_probe_200, net_monitor.probe_ok]
+        latency_ms: [[10, 120], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: After network changes, MAC learning impairment causes flooding and link saturation leading to sustained slowness and intermittent timeouts; troubleshooting can trigger a full cabinet isolation outage.
+    req:
+      - id: web_page_view_slow_ok
+        desc: Web request succeeds but is slow under saturated network links.
+        rpm: 240.0
+        path: [edge_lb, app_web, edge_lb]
+        emit: [app_web.req_ok_slow, edge_lb.access_web_200]
+        latency_ms: [[300, 2500], [350, 3000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: web_page_view_timeout_504
+        desc: Web request fails due to timeout.
+        rpm: 140.0
+        path: [edge_lb, app_web, edge_lb]
+        emit: [app_web.req_failed_timeout, edge_lb.access_web_504]
+        latency_ms: [[800, 6000], [1000, 12000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: web_page_view_hard_down_503
+        desc: During full outage, LB has no usable upstreams and returns 503.
+        rpm: 380.0
+        path: [edge_lb]
+        emit: [edge_lb.access_web_503]
+        latency_ms: [[50, 1500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: git_clone_slow_ok
+        desc: Git clone/fetch succeeds but is slow.
+        rpm: 40.0
+        path: [edge_lb, git_service, fileserver_cluster, git_service, edge_lb]
+        emit: [git_service.clone_slow, edge_lb.access_git_200]
+        latency_ms: [[1500, 12000], [1800, 14000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: git_clone_timeout_504
+        desc: Git clone/fetch fails due to timeout.
+        rpm: 20.0
+        path: [edge_lb, git_service, fileserver_cluster, git_service, edge_lb]
+        emit: [git_service.clone_failed_timeout, edge_lb.access_git_504]
+        latency_ms: [[3000, 20000], [4000, 30000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: git_clone_hard_down_503
+        desc: During full outage, LB has no usable Git upstreams and returns 503.
+        rpm: 55.0
+        path: [edge_lb]
+        emit: [edge_lb.access_git_503]
+        latency_ms: [[50, 1500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: git_clone_repo_unavailable_500
+        desc: Small subset of repos error due to fileserver HA degradation.
+        rpm: 1.5
+        path: [edge_lb, git_service, fileserver_cluster, git_service, edge_lb]
+        emit: [fileserver_cluster.repo_io_error, git_service.clone_failed_storage, edge_lb.access_git_500]
+        latency_ms: [[50, 1500], [200, 6000], [250, 8000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: synthetic_probe_ok_f
+        desc: Some probes still succeed during degraded service.
+        rpm: 2.0
+        path: [net_monitor, edge_lb, app_web, edge_lb, net_monitor]
+        emit: [edge_lb.access_probe_200, net_monitor.probe_ok]
+        latency_ms: [[50, 800], [20, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: synthetic_probe_timeout_504
+        desc: Probes fail with 504 under severe slowness.
+        rpm: 10.0
+        path: [net_monitor, edge_lb, app_web, edge_lb, net_monitor]
+        emit: [edge_lb.access_probe_504, net_monitor.probe_fail_504]
+        latency_ms: [[300, 12000], [500, 15000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: synthetic_probe_no_upstreams_503
+        desc: During hard downtime, probes fail with 503.
+        rpm: 12.0
+        path: [net_monitor, edge_lb, net_monitor]
+        emit: [edge_lb.access_probe_503, net_monitor.probe_fail_503]
+        latency_ms: [[20, 2000], [10, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - Component set is minimized to the user-visible surface (edge/app/git), storage HA pair, and network fabric (access/aggregation switches + monitoring).
+  - The modeled root cause is an aggregation-switch MAC learning impairment that increases unknown-destination flooding, saturating access↔aggregation links and raising latency/errors.
+  - A separate misconfiguration (unsupported link watchdog) can err-disable redundant uplinks during troubleshooting, producing a brief period of complete unavailability.
+  - Operator action markers were split into distinct log IDs (connect_uplink/shutdown_uplink/remove_watchdog_setting/enable_uplink) so one-shot emissions cannot contradict event narratives.
+  - Normal traffic is approximated at ~400 rpm web and ~60 rpm Git; failure traffic mixes slow successes and timeouts, with a distinct hard-down variant during the outage.
+  - Failure-state Git clone/fetch paths include the fileserver hop (even when fileserver does not emit a per-request log) to keep the coarse request route consistent with the modeled storage dependency and with normal operation.
+  - Fileserver HA degradation is modeled as a rare Git 500 error path (~1.5 rpm) plus HA peer-disconnect background logs to keep the side effect visible without inflating user impact.
+  - Estimated log volume for a 55-minute scenario is ~44k (mostly per-request access/app/git logs, plus hundreds of network telemetry logs), within the 20k..100k target.
+```

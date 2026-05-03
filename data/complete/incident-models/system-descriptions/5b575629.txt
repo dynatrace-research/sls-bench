@@ -1,0 +1,857 @@
+```yaml
+sys:
+  id: cloudflare_mcp_edge
+  desc: >
+    A representative model of Cloudflare edge traffic handling in Multi-Colo PoPs (MCP), where
+    HTTP requests are terminated at the edge, served from cache when possible, and otherwise
+    routed to internal compute clusters and/or customer origins. MCP uses a Clos-style internal
+    mesh with spine routers and a site-local routing layer to keep east-west traffic and origin
+    access resilient. The modeled incident is a BGP export-policy term reordering on MCP spines
+    that withdraws critical site-local prefixes, breaking internal forwarding and origin reachability
+    and leading to overload and widespread 5xx responses.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_proxy
+    name: Edge Proxy (HTTP reverse proxy)
+    svc: edge-proxy
+    hosts: [edge-mcp-01, edge-mcp-02, edge-mcp-03, edge-mcp-04, edge-mcp-05, edge-mcp-06]
+    desc: >
+      Terminates client HTTP/TLS, applies routing and cache policy, and returns responses.
+      For cache misses or dynamic traffic it talks to the cache/origin-fetcher path and the
+      internal load balancer. During failure it experiences upstream connectivity problems and
+      retries, producing elevated error responses and longer tail latencies.
+    to:
+      - dst: cache_cluster
+        proto: grpc
+        desc: Requests cache lookup and obtains cached bodies or miss decisions.
+      - dst: multimog_lb
+        proto: grpc
+        desc: Requests internal service routing to compute clusters for dynamic processing.
+    logs:
+      req_received:
+        desc: Client request accepted at the edge and assigned correlation IDs.
+        lvl: INFO
+        msg: "recv {method} {path} from {client_ip} ua={ua} req_id={req_id} trace_id={trace_id} colo={colo}"
+        vars:
+          method: {k: ch, v: [GET, POST, HEAD]}
+          path: {k: str, v: "url_path"}
+          client_ip: {k: ip, v: "0.0.0.0/0"}
+          ua: {k: str, v: "user_agent"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          colo: {k: ch, v: [ams07, atl01, iad03, ord02, fra02, lhr02, lax02, mad01, man01, mia01, mil01, bom01, ewr01, kix01, gru01, sjc01, sin01, syd01, nrt01]}
+      resp_sent:
+        desc: Final response sent to the client including cache outcome and timing.
+        lvl: INFO
+        msg: "sent {status_code} bytes={bytes} dur_ms={dur_ms} req_id={req_id} trace_id={trace_id} colo={colo} cache={cache_status}"
+        vars:
+          bytes: {k: i, v: [200, 500000]}
+          dur_ms: {k: i, v: [0, 60000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          colo: {k: ch, v: [ams07, atl01, iad03, ord02, fra02, lhr02, lax02, mad01, man01, mia01, mil01, bom01, ewr01, kix01, gru01, sjc01, sin01, syd01, nrt01]}
+          cache_status: {k: ch, v: [HIT, MISS, BYPASS]}
+        state_vars:
+          n:
+            status_code: {k: ch, v: [200, 206, 301, 302, 304, 404]}
+          f:
+            status_code: {k: ch, v: [200, 206, 301, 302, 304, 404, 500, 502, 503, 504, 520, 522, 523]}
+      upstream_error:
+        desc: Upstream/internal dependency error annotated for diagnostics.
+        lvl: ERROR
+        msg: "upstream error {err_type} detail={detail} req_id={req_id} trace_id={trace_id} colo={colo}"
+        vars:
+          err_type: {k: ch, v: [origin_timeout, origin_connect, lb_no_route, backend_overload]}
+          detail: {k: str, v: "err_detail"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          colo: {k: ch, v: [ams07, atl01, iad03, ord02, fra02, lhr02, lax02, mad01, man01, mia01, mil01, bom01, ewr01, kix01, gru01, sjc01, sin01, syd01, nrt01]}
+      retry_scheduled:
+        desc: Edge-layer retry scheduled for attempt 2+ after an upstream error.
+        lvl: WARN
+        msg: "retrying attempt={attempt} after_ms={backoff_ms} reason={reason} req_id={req_id} trace_id={trace_id}"
+        vars:
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [10, 1000]}
+          reason: {k: ch, v: [timeout, connect_error, route_unreachable, overload]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      edge_metrics:
+        desc: Periodic runtime metrics summary per instance.
+        lvl: INFO
+        msg: "metrics cpu_pct={cpu_pct} mem_pct={mem_pct} open_conns={open_conns}"
+        vars:
+          cpu_pct: {k: f, v: [1.0, 95.0]}
+          mem_pct: {k: f, v: [5.0, 98.0]}
+          open_conns: {k: i, v: [10, 200000]}
+      edge_conntrack_drops:
+        desc: Kernel/network drops observed by the proxy host.
+        lvl: WARN
+        msg: "conntrack drops={drops} reason={reason}"
+        vars:
+          drops: {k: i, v: [0, 20000]}
+          reason: {k: ch, v: [nf_conntrack_full, route_unreachable, backlog_overflow]}
+      edge_gc_pause:
+        desc: Application runtime GC pause report.
+        lvl: DEBUG
+        msg: "gc pause_ms={pause_ms} heap_mb={heap_mb}"
+        vars:
+          pause_ms: {k: f, v: [0.1, 500.0]}
+          heap_mb: {k: f, v: [50.0, 4000.0]}
+    beh:
+      n:
+        desc: >
+          Stable operation with low error rates; metrics and occasional GC pauses are logged.
+          Most requests complete quickly, with the majority served from cache.
+        emit:
+          - id: edge_metrics
+            per_min: 2.0
+            scope: per_host
+          - id: edge_gc_pause
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: >
+          Upstream connectivity issues trigger retries and elevated error responses; hosts also
+          report more network drops while still emitting periodic metrics.
+        emit:
+          - id: edge_metrics
+            per_min: 2.0
+            scope: per_host
+          - id: edge_conntrack_drops
+            per_min: 0.5
+            scope: per_host
+
+  - id: cache_cluster
+    name: Cache Cluster (edge cache)
+    svc: cache-cluster
+    hosts: [cache-mcp-01, cache-mcp-02, cache-mcp-03, cache-mcp-04]
+    desc: >
+      Provides cache lookup and storage for edge responses. On a cache miss it invokes the
+      origin fetcher. During the incident, cache nodes may lose reachability to peers and/or
+      upstream paths due to missing site-local routes, increasing misses and lookup failures.
+    to:
+      - dst: origin_fetcher
+        proto: grpc
+        desc: Requests origin fetch for cache misses and populates cache on success.
+      - dst: edge_proxy
+        proto: grpc
+        desc: Streams lookup results and bodies back to the edge proxy.
+    logs:
+      cache_hit:
+        desc: Cache lookup succeeded and a fresh object was found.
+        lvl: INFO
+        msg: "cache hit key={cache_key} ttl_s={ttl_s} req_id={req_id} trace_id={trace_id}"
+        vars:
+          cache_key: {k: hex, v: 16}
+          ttl_s: {k: i, v: [1, 86400]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      cache_miss:
+        desc: Cache lookup missed or object was bypassed/expired.
+        lvl: INFO
+        msg: "cache miss key={cache_key} reason={miss_reason} req_id={req_id} trace_id={trace_id}"
+        vars:
+          cache_key: {k: hex, v: 16}
+          miss_reason: {k: ch, v: [expired, not_found, bypass]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      cache_stats:
+        desc: Periodic cache performance counters.
+        lvl: INFO
+        msg: "stats hit_rate={hit_rate} items={items} evictions={evictions}"
+        vars:
+          hit_rate: {k: f, v: [0.0, 1.0]}
+          items: {k: i, v: [0, 50000000]}
+          evictions: {k: i, v: [0, 200000]}
+      cache_eviction:
+        desc: Eviction event due to memory pressure or TTL constraints.
+        lvl: DEBUG
+        msg: "evict key={cache_key} reason={reason} items={items}"
+        vars:
+          cache_key: {k: hex, v: 16}
+          reason: {k: ch, v: [lru, ttl_expired, size_limit]}
+          items: {k: i, v: [0, 50000000]}
+      peer_route_missing:
+        desc: Cache node cannot reach an expected peer over site-local networking.
+        lvl: WARN
+        msg: "peer route missing peer_ip={peer_ip} vrf={vrf} action={action}"
+        vars:
+          peer_ip: {k: ip, v: "10.0.0.0/8"}
+          vrf: {k: ch, v: [site-local, internal]}
+          action: {k: ch, v: [retry, fail_open, drop]}
+    beh:
+      n:
+        desc: Stable cache behavior with periodic stats and low-volume eviction logs.
+        emit:
+          - id: cache_stats
+            per_min: 1.5
+            scope: per_host
+          - id: cache_eviction
+            per_min: 0.3
+            scope: per_host
+      f:
+        desc: >
+          Cache still emits stats but also reports missing peer routes as the site-local mesh
+          becomes unreliable.
+        emit:
+          - id: cache_stats
+            per_min: 1.5
+            scope: per_host
+          - id: peer_route_missing
+            per_min: 1.0
+            scope: per_host
+
+  - id: origin_fetcher
+    name: Origin Fetcher
+    svc: origin-fetcher
+    hosts: [fetch-mcp-01, fetch-mcp-02, fetch-mcp-03]
+    desc: >
+      Performs outbound connections to customer origins for cache misses/dynamic content.
+      Normally fetches succeed quickly; during the incident it experiences connect failures
+      and long timeouts due to missing site-local routes and impaired egress paths from MCP.
+    to:
+      - dst: customer_origin
+        proto: https
+        desc: Connects to customer origin servers on the public Internet.
+      - dst: cache_cluster
+        proto: grpc
+        desc: Returns fetch results to cache for response assembly and caching.
+    logs:
+      fetch_start:
+        desc: Start of an origin fetch attempt.
+        lvl: INFO
+        msg: "origin fetch start host={origin_host} ip={origin_ip} req_id={req_id} trace_id={trace_id}"
+        vars:
+          origin_host: {k: str, v: "hostname"}
+          origin_ip: {k: ip, v: null}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      fetch_success:
+        desc: Successful origin fetch completed.
+        lvl: INFO
+        msg: "origin fetch ok status={origin_status} dur_ms={dur_ms} req_id={req_id} trace_id={trace_id}"
+        vars:
+          origin_status: {k: ch, v: [200, 204, 301, 302, 304, 404, 500]}
+          dur_ms: {k: i, v: [1, 20000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      fetch_timeout:
+        desc: Origin fetch timed out at a particular stage.
+        lvl: ERROR
+        msg: "origin fetch timeout stage={stage} dur_ms={dur_ms} req_id={req_id} trace_id={trace_id}"
+        vars:
+          stage: {k: ch, v: [connect, tls, first_byte]}
+          dur_ms: {k: i, v: [500, 60000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      fetch_connect_fail:
+        desc: Immediate origin connect failure (no route, refused, DNS, etc.).
+        lvl: ERROR
+        msg: "origin connect failed err={err} req_id={req_id} trace_id={trace_id}"
+        vars:
+          err: {k: ch, v: [no_route, network_unreachable, connection_refused, dns_nxdomain]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      fetcher_metrics:
+        desc: Periodic fetcher performance counters.
+        lvl: INFO
+        msg: "metrics qps={qps} inflight={inflight} err_rate={err_rate}"
+        vars:
+          qps: {k: f, v: [0.0, 2000.0]}
+          inflight: {k: i, v: [0, 20000]}
+          err_rate: {k: f, v: [0.0, 1.0]}
+      resolver_error:
+        desc: Resolver/egress helper reports upstream resolution/connectivity issues.
+        lvl: WARN
+        msg: "resolver error type={type} upstream={upstream} detail={detail}"
+        vars:
+          type: {k: ch, v: [timeout, servfail, network_unreachable]}
+          upstream: {k: ip, v: null}
+          detail: {k: str, v: "resolver_err"}
+    beh:
+      n:
+        desc: Low error rate; emits periodic metrics.
+        emit:
+          - id: fetcher_metrics
+            per_min: 0.8
+            scope: per_host
+      f:
+        desc: Elevated error rate and resolver issues; metrics continue.
+        emit:
+          - id: fetcher_metrics
+            per_min: 0.8
+            scope: per_host
+          - id: resolver_error
+            per_min: 0.4
+            scope: per_host
+
+  - id: multimog_lb
+    name: Multimog (internal load balancer)
+    svc: multimog
+    hosts: [mmog-mcp-01, mmog-mcp-02, mmog-mcp-03]
+    desc: >
+      Routes internal requests from the edge to compute clusters and services within MCP.
+      Relies on site-local routing/mesh to forward to the selected backend. During the incident,
+      missing site-local prefixes prevent forwarding, and uneven traffic distribution overloads
+      smaller clusters.
+    to:
+      - dst: compute_worker
+        proto: tcp
+        desc: Forwards requests to a chosen compute backend instance/cluster.
+      - dst: edge_proxy
+        proto: grpc
+        desc: Returns routing outcomes and error details back to edge.
+    logs:
+      route_request:
+        desc: Routing decision made for an incoming request.
+        lvl: DEBUG
+        msg: "route service={service} decision={decision} backend={backend} req_id={req_id} trace_id={trace_id}"
+        vars:
+          service: {k: ch, v: [http_app, workers, api]}
+          decision: {k: ch, v: [selected, fail_open, fail_closed]}
+          backend: {k: str, v: "cluster_id"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      forward_fail_no_route:
+        desc: Forwarding failed because the backend was unreachable in the site-local mesh.
+        lvl: ERROR
+        msg: "forward failed no route to backend={backend} prefix={prefix} req_id={req_id} trace_id={trace_id}"
+        vars:
+          backend: {k: str, v: "cluster_id"}
+          prefix: {k: str, v: "ip_prefix"}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      backend_overloaded:
+        desc: Backend signaled overload; requests are being rejected or queued excessively.
+        lvl: WARN
+        msg: "backend overload backend={backend} qdepth={qdepth} shedding={shedding} req_id={req_id} trace_id={trace_id}"
+        vars:
+          backend: {k: str, v: "cluster_id"}
+          qdepth: {k: i, v: [0, 20000]}
+          shedding: {k: ch, v: [true, false]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      mesh_route_missing:
+        desc: Background symptom that the site-local mesh lacks required routes.
+        lvl: WARN
+        msg: "mesh route missing dst={dst_ip} vrf={vrf} action={action}"
+        vars:
+          dst_ip: {k: ip, v: "10.0.0.0/8"}
+          vrf: {k: ch, v: [site-local, internal]}
+          action: {k: ch, v: [drop, reroute]}
+      lb_metrics:
+        desc: Periodic load balancer metrics per instance.
+        lvl: INFO
+        msg: "metrics routed={routed} failures={failures} p95_ms={p95_ms}"
+        vars:
+          routed: {k: i, v: [0, 500000]}
+          failures: {k: i, v: [0, 200000]}
+          p95_ms: {k: f, v: [0.1, 60000.0]}
+    beh:
+      n:
+        desc: Normal routing with periodic metrics.
+        emit:
+          - id: lb_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Mesh-route warnings increase while metrics continue.
+        emit:
+          - id: lb_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: mesh_route_missing
+            per_min: 2.0
+            scope: per_host
+
+  - id: compute_worker
+    name: Compute Worker (service runtime)
+    svc: compute-worker
+    hosts: [wrk-mcp-01, wrk-mcp-02, wrk-mcp-03, wrk-mcp-04]
+    desc: >
+      Executes dynamic request handling when routed by Multimog. Under normal conditions it
+      has sufficient headroom. During failure, uneven load distribution drives queue growth
+      and request rejection due to overload.
+    to:
+      - dst: multimog_lb
+        proto: tcp
+        desc: Returns responses and overload signals to the load balancer.
+    logs:
+      request_rejected_overload:
+        desc: Request rejected because the worker is overloaded.
+        lvl: ERROR
+        msg: "reject overload qdepth={qdepth} max={max_qdepth} req_id={req_id} trace_id={trace_id}"
+        vars:
+          qdepth: {k: i, v: [0, 20000]}
+          max_qdepth: {k: i, v: [100, 20000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      worker_shed_load:
+        desc: Background load shedding report.
+        lvl: WARN
+        msg: "shed load reason={reason} qdepth={qdepth} dropped={dropped}"
+        vars:
+          reason: {k: ch, v: [cpu_saturation, queue_limit, upstream_failures]}
+          qdepth: {k: i, v: [0, 20000]}
+          dropped: {k: i, v: [0, 200000]}
+      worker_metrics:
+        desc: Periodic worker metrics.
+        lvl: INFO
+        msg: "metrics cpu_pct={cpu_pct} qdepth={qdepth} active={active}"
+        vars:
+          cpu_pct: {k: f, v: [1.0, 99.0]}
+          qdepth: {k: i, v: [0, 20000]}
+          active: {k: i, v: [0, 20000]}
+    beh:
+      n:
+        desc: Low queue depth; emits periodic metrics.
+        emit:
+          - id: worker_metrics
+            per_min: 0.8
+            scope: per_host
+      f:
+        desc: Higher queue depth and shedding; continues metrics.
+        emit:
+          - id: worker_metrics
+            per_min: 0.8
+            scope: per_host
+          - id: worker_shed_load
+            per_min: 0.8
+            scope: per_host
+
+  - id: spine_router
+    name: MCP Spine Router (BGP + policy)
+    svc: mcp-spine
+    hosts: [spine-mcp-a, spine-mcp-b]
+    desc: >
+      Spine routers implement MCP routing and BGP export policy that governs which prefixes
+      are advertised/withdrawn. In the incident, a policy term reordering caused site-local
+      prefixes to be rejected by a catch-all reject term, triggering withdrawals and breaking
+      internal reachability and remote access. During failure, withdrawals and session flaps
+      become visible in router logs.
+    to:
+      - dst: upstream_peer
+        proto: bgp
+        desc: Exchanges routes with upstream transit/peer networks.
+    logs:
+      config_commit_applied:
+        desc: Configuration commit applied on a router (used as discrete operational marker).
+        lvl: INFO
+        msg: "commit applied commit_id={commit_id} cr_id={cr_id} target={target}"
+        vars:
+          commit_id: {k: hex, v: 8}
+          cr_id: {k: str, v: "CRQ-YYYYMMDD-####"}
+          target: {k: ch, v: [mcp_spines]}
+      policy_term_order_warning:
+        desc: Policy term order changed in a way that may alter match/accept behavior.
+        lvl: WARN
+        msg: "policy AGGREGATES-OUT term order changed moved_terms={moved_terms} now_after={now_after}"
+        vars:
+          moved_terms: {k: str, v: "term_list"}
+          now_after: {k: ch, v: [REJECT_THE_REST]}
+      prefix_withdrawn:
+        desc: Router withdrew a prefix from a peer due to policy evaluation.
+        lvl: ERROR
+        msg: "bgp withdrew prefix={prefix} peer={peer} reason={reason}"
+        vars:
+          prefix: {k: str, v: "ip_prefix"}
+          peer: {k: str, v: "asn_or_peer_name"}
+          reason: {k: ch, v: [policy_reject, term_reorder, manual_withdraw]}
+      bgp_session_flap:
+        desc: BGP session transitions with basic diagnostics.
+        lvl: WARN
+        msg: "bgp session {state} peer={peer} uptime_s={uptime_s} last_err={last_err}"
+        vars:
+          state: {k: ch, v: [down, up]}
+          peer: {k: str, v: "asn_or_peer_name"}
+          uptime_s: {k: i, v: [0, 86400]}
+          last_err: {k: str, v: "bgp_err"}
+      bgp_summary:
+        desc: Periodic BGP status summary.
+        lvl: INFO
+        msg: "bgp summary peers_up={peers_up} prefixes_adv={prefixes_adv}"
+        vars:
+          peers_up: {k: i, v: [0, 20]}
+        state_vars:
+          n:
+            prefixes_adv: {k: i, v: [3500, 5000]}
+          f:
+            prefixes_adv: {k: i, v: [0, 1500]}
+    beh:
+      n:
+        desc: Stable BGP with periodic summaries and rare session transitions.
+        emit:
+          - id: bgp_summary
+            per_min: 0.5
+            scope: per_host
+          - id: bgp_session_flap
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Elevated withdrawals and BGP instability as policy rejects site-local prefixes.
+        emit:
+          - id: bgp_summary
+            per_min: 0.5
+            scope: per_host
+          - id: prefix_withdrawn
+            per_min: 18.0
+            scope: per_host
+          - id: bgp_session_flap
+            per_min: 0.6
+            scope: per_host
+
+  - id: config_pusher
+    name: Network Config Pusher (automation)
+    svc: netcfg
+    hosts: [netcfg-01]
+    desc: >
+      Automation that rolls out network configuration/policy changes to routers. It logs
+      scheduler activity continuously and emits discrete logs when a rollout starts or is
+      modified during the incident.
+    to:
+      - dst: spine_router
+        proto: ssh
+        desc: Pushes configuration changes and triggers commits on spine routers.
+    logs:
+      scheduler_tick:
+        desc: Periodic scheduler/queue tick for rollout controller.
+        lvl: DEBUG
+        msg: "scheduler tick queued_jobs={queued_jobs} inflight={inflight}"
+        vars:
+          queued_jobs: {k: i, v: [0, 5000]}
+          inflight: {k: i, v: [0, 500]}
+      rollout_start:
+        desc: Rollout started (used as discrete operational marker).
+        lvl: INFO
+        msg: "start rollout cr_id={cr_id} fleet={fleet} version={version}"
+        vars:
+          cr_id: {k: str, v: "CRQ-YYYYMMDD-####"}
+          fleet: {k: ch, v: [legacy_pops, mcp_pops]}
+          version: {k: str, v: "git_sha"}
+      rollout_change:
+        desc: Rollout modified/aborted (used as discrete operational marker).
+        lvl: WARN
+        msg: "rollout change action={action} cr_id={cr_id} by={by}"
+        vars:
+          action: {k: ch, v: [pause, abort, resume]}
+          cr_id: {k: str, v: "CRQ-YYYYMMDD-####"}
+          by: {k: str, v: "username_or_bot"}
+    beh:
+      n:
+        desc: Scheduler ticks at low rate; no active rollout changes in the baseline window.
+        emit:
+          - id: scheduler_tick
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Scheduler continues; rollout changes happen as discrete events, not periodic.
+        emit:
+          - id: scheduler_tick
+            per_min: 0.2
+            scope: global
+
+  - id: noc_monitor
+    name: NOC Monitoring / Alerting
+    svc: noc-monitor
+    hosts: [noc-01, noc-02]
+    desc: >
+      Performs synthetic probes and evaluates alert rules for MCP service health.
+      During the incident probes fail and alert rules fire repeatedly as error rates
+      and reachability issues increase.
+    to:
+      - dst: edge_proxy
+        proto: https
+        desc: Performs HTTP probes against edge anycast VIPs for availability tracking.
+      - dst: spine_router
+        proto: tcp
+        desc: Performs router management reachability checks (ping/SSH/TCP probes).
+    logs:
+      http_probe_ok:
+        desc: Synthetic HTTP probe succeeded.
+        lvl: INFO
+        msg: "probe ok target={target} status={status} rtt_ms={rtt_ms}"
+        vars:
+          target: {k: str, v: "vip_or_url"}
+          status: {k: i, v: [200, 399]}
+          rtt_ms: {k: f, v: [1.0, 2000.0]}
+      http_probe_fail:
+        desc: Synthetic HTTP probe failed.
+        lvl: WARN
+        msg: "probe fail target={target} err={err} rtt_ms={rtt_ms}"
+        vars:
+          target: {k: str, v: "vip_or_url"}
+          err: {k: ch, v: [timeout, connection_refused, tls_error, no_route]}
+          rtt_ms: {k: f, v: [1.0, 10000.0]}
+      monitor_tick:
+        desc: Periodic monitoring loop tick.
+        lvl: DEBUG
+        msg: "tick checks={checks} queued_alerts={queued_alerts}"
+        vars:
+          checks: {k: i, v: [0, 50000]}
+          queued_alerts: {k: i, v: [0, 5000]}
+      alert_rule_fired:
+        desc: Alert rule fired based on aggregated probe/telemetry conditions.
+        lvl: CRITICAL
+        msg: "alert fired rule={rule} severity={severity} value={value}"
+        vars:
+          rule: {k: ch, v: [edge_5xx_rate, origin_timeout_rate, bgp_withdrawals, mesh_route_missing]}
+          severity: {k: ch, v: [page, ticket]}
+          value: {k: f, v: [0.0, 1.0]}
+      incident_declared:
+        desc: Incident declared (used as discrete operational marker).
+        lvl: CRITICAL
+        msg: "incident declared id={incident_id} commander={commander}"
+        vars:
+          incident_id: {k: str, v: "INC-YYYYMMDD-###"}
+          commander: {k: str, v: "username"}
+    beh:
+      n:
+        desc: Mostly quiet; emits monitoring ticks and low-frequency rule evaluations.
+        emit:
+          - id: monitor_tick
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Emits monitoring ticks and frequent alert firings as conditions breach thresholds.
+        emit:
+          - id: monitor_tick
+            per_min: 0.5
+            scope: per_host
+          - id: alert_rule_fired
+            per_min: 2.0
+            scope: per_host
+
+  - id: upstream_peer
+    name: Upstream Transit/Peer (external)
+    svc: null
+    hosts: []
+    desc: >
+      External BGP peers/transit providers connected to Cloudflare spines. Included to make
+      BGP topology explicit; the model treats peer-side logs as unavailable.
+    to:
+      - dst: spine_router
+        proto: bgp
+        desc: Receives advertisements/withdrawals from the spine routers.
+    logs:
+      peer_notice:
+        desc: Placeholder log template; not emitted in this model.
+        lvl: INFO
+        msg: "peer notice type={type} detail={detail}"
+        vars:
+          type: {k: ch, v: [route_update, keepalive, session_reset]}
+          detail: {k: str, v: "peer_detail"}
+    beh:
+      n: {desc: "External peer; no modeled periodic logs.", emit: []}
+      f: {desc: "External peer; no modeled periodic logs.", emit: []}
+
+  - id: customer_origin
+    name: Customer Origin (external)
+    svc: null
+    hosts: []
+    desc: >
+      Customer-managed origin servers on the public Internet. The model represents origin
+      reachability only via origin_fetcher logs; origin-side logs are not relied upon.
+    to:
+      - dst: origin_fetcher
+        proto: https
+        desc: Responds to origin fetcher requests (return path represented for flow traversal).
+    logs:
+      origin_access:
+        desc: Placeholder origin access log template; not emitted in this model.
+        lvl: INFO
+        msg: "origin access path={path} status={status} bytes={bytes}"
+        vars:
+          path: {k: str, v: "url_path"}
+          status: {k: i, v: [200, 599]}
+          bytes: {k: i, v: [0, 10000000]}
+    beh:
+      n: {desc: "External origin; no modeled periodic logs.", emit: []}
+      f: {desc: "External origin; no modeled periodic logs.", emit: []}
+
+tracing:
+  on: true
+  origins: [edge_proxy]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic mix: most requests are served from cache; cache misses go through the
+      origin fetcher to customer origins; monitoring probes confirm health. No retries are
+      modeled at the edge in the normal phase.
+    req:
+      - id: http_cache_hit
+        desc: Client HTTP request served from cache within the MCP PoP.
+        rpm: 280.0
+        path: [edge_proxy, cache_cluster, edge_proxy]
+        emit:
+          - edge_proxy.req_received
+          - cache_cluster.cache_hit
+          - edge_proxy.resp_sent
+        latency_ms:
+          - [0, 0]
+          - [2, 8]
+          - [1, 5]
+        trace: true
+      - id: http_cache_miss_origin_ok
+        desc: Cache miss triggers origin fetch and returns successfully.
+        rpm: 120.0
+        path: [edge_proxy, cache_cluster, origin_fetcher, customer_origin, origin_fetcher, cache_cluster, edge_proxy]
+        emit:
+          - edge_proxy.req_received
+          - cache_cluster.cache_miss
+          - origin_fetcher.fetch_start
+          - origin_fetcher.fetch_success
+          - edge_proxy.resp_sent
+        latency_ms:
+          - [0, 0]
+          - [3, 12]
+          - [1, 4]
+          - [45, 220]
+          - [2, 15]
+        trace: true
+      - id: edge_healthcheck_ok
+        desc: Synthetic HTTP probe to edge VIP succeeds.
+        rpm: 30.0
+        path: [noc_monitor, edge_proxy]
+        emit: [noc_monitor.http_probe_ok]
+        latency_ms: [[5, 50]]
+        trace: false
+
+  f:
+    desc: >
+      After site-local prefixes are withdrawn, internal forwarding and origin reachability degrade.
+      The edge performs retries on failures, amplifying load and log volume. Some cache hits still
+      succeed, but misses and dynamic traffic increasingly fail via timeouts or no-route errors.
+    req:
+      - id: http_cache_hit_degraded
+        desc: Remaining cache hits that still succeed despite internal instability.
+        rpm: 60.0
+        path: [edge_proxy, cache_cluster, edge_proxy]
+        emit:
+          - edge_proxy.req_received
+          - cache_cluster.cache_hit
+          - edge_proxy.resp_sent
+        latency_ms:
+          - [0, 0]
+          - [4, 40]
+          - [2, 20]
+        trace: true
+
+      - id: http_origin_timeout
+        desc: Cache miss where origin fetch fails (timeouts / no route) and edge returns 52x/5xx.
+        rpm: 60.0
+        path: [edge_proxy, cache_cluster, origin_fetcher, cache_cluster, edge_proxy]
+        emit:
+          - edge_proxy.req_received
+          - cache_cluster.cache_miss
+          - origin_fetcher.fetch_start
+          - origin_fetcher.fetch_timeout
+          - edge_proxy.upstream_error
+          - edge_proxy.resp_sent
+        latency_ms:
+          - [0, 0]
+          - [6, 60]
+          - [2, 10]
+          - [3000, 20000]
+          - [1, 5]
+          - [1, 10]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.3
+          emit_per_retry: [edge_proxy.retry_scheduled]
+          backoff_ms:
+            - [50, 150]
+            - [150, 400]
+        trace: true
+
+      - id: http_internal_lb_fail
+        desc: Dynamic request routed via Multimog fails immediately with no-route to backend.
+        rpm: 30.0
+        path: [edge_proxy, multimog_lb, edge_proxy]
+        emit:
+          - edge_proxy.req_received
+          - multimog_lb.forward_fail_no_route
+          - edge_proxy.upstream_error
+          - edge_proxy.resp_sent
+        latency_ms:
+          - [0, 0]
+          - [20, 250]
+          - [1, 6]
+          - [1, 10]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.1
+          emit_per_retry: [edge_proxy.retry_scheduled]
+          backoff_ms:
+            - [40, 120]
+            - [120, 350]
+        trace: true
+
+      - id: http_compute_overloaded_503
+        desc: Multimog reaches a backend, but the selected small cluster rejects due to overload.
+        rpm: 20.0
+        path: [edge_proxy, multimog_lb, compute_worker, multimog_lb, edge_proxy]
+        emit:
+          - edge_proxy.req_received
+          - multimog_lb.route_request
+          - compute_worker.request_rejected_overload
+          - edge_proxy.upstream_error
+          - edge_proxy.resp_sent
+        latency_ms:
+          - [0, 0]
+          - [10, 80]
+          - [50, 800]
+          - [1, 6]
+          - [1, 10]
+        retry:
+          max_attempts: 2
+          expected_attempts: 2.0
+          emit_per_retry: [edge_proxy.retry_scheduled]
+          backoff_ms:
+            - [30, 120]
+        trace: true
+
+      - id: edge_healthcheck_fail
+        desc: Synthetic HTTP probe to edge VIP fails during the incident.
+        rpm: 30.0
+        path: [noc_monitor, edge_proxy]
+        emit: [noc_monitor.http_probe_fail]
+        latency_ms: [[20, 2000]]
+        trace: false
+
+assumptions:
+  - >
+    The model represents a "typical" MCP PoP behavior rather than all 19 affected data centers individually;
+    the {colo} field spans the 19 MCP locations named in the post-mortem, and host lists represent a small
+    fleet whose logs approximate aggregate behavior.
+  - >
+    Internet anycast routing effects are simplified: the failure is modeled primarily as internal reachability
+    loss (site-local prefix withdrawals) causing origin fetch and internal load balancing failures, rather than
+    complete absence of inbound traffic. Failure-phase request rpm is lower than normal to reflect partial
+    traffic shedding/rerouting, while retries amplify backend load and logs.
+  - >
+    Retry behavior is modeled at the edge layer (edge_proxy.retry_scheduled) to capture retry amplification
+    dynamics without simulating separate client-side retries; this matches the incident’s "retry/overload"
+    reinforcement pattern.
+  - >
+    Estimated normal-phase volume (20 min): background ~31.7 logs/min; flows ~1470 logs/min; total ~1502 logs/min;
+    normal total ~30,040 lines.
+  - >
+    Failure-phase baseline (20 min) before event multipliers: background ~87.4 logs/min; flows ~1621 logs/min
+    (includes retry amplification via expected_attempts); total ~1708 logs/min.
+  - >
+    Failure-phase piecewise estimate using scenario multipliers:
+    interval [20,24): ~1403 logs/min * 4 = ~5,614;
+    interval [24,30): ~2100 logs/min * 6 = ~12,598;
+    interval [30,35): ~1690 logs/min * 5 = ~8,451;
+    interval [35,40): ~2305 logs/min * 5 = ~11,526;
+    plus ~10-30 one-shot lines; failure total ~38,200 lines.
+  - >
+    Estimated total logs over the full scenario: ~30,040 (normal) + ~38,200 (failure) + one-shots ~= ~68k,
+    within the required 20k..100k range. The failure phase is noisier mainly due to retries and elevated
+    routing/withdrawal warnings.
+```

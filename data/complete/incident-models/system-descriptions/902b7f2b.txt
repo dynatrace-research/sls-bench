@@ -1,0 +1,476 @@
+```yaml
+sys:
+  id: appnexus_impbus_ad_serving
+  desc: >
+    A simplified ad-serving platform where an edge gateway receives direct tag requests and exchange auction
+    requests, forwards them to an impression bus (impbus) that runs auctions, and returns the response.
+    A data distribution pipeline publishes internal DB deltas and snapshots to impbus and also runs a validation
+    tier intended to catch bad data/config before wide rollout. This incident models a latent impbus memory
+    reclamation bug triggered by a rare delete delta that passes validation (no waiting window) and then crashes
+    impbus nodes nearly simultaneously, initially halting ad serving and later restoring direct traffic first.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: internal_db
+    name: Internal Database
+    svc: internal-db
+    hosts: [db-1]
+    desc: Source of configuration/data used by impbus; changes are turned into deltas and snapshots.
+    to:
+      - dst: data_distributor
+        proto: jdbc
+        desc: Data distributor reads committed changes and snapshot sources.
+    logs:
+      commit_change:
+        desc: A data change is committed that will later be published as a delta.
+        lvl: INFO
+        msg: "committed data change change_id={change_id} table={table} op={op}"
+        vars:
+          change_id: {k: hex, v: 12}
+          table: {k: ch, v: [rare_object_table]}
+          op: {k: ch, v: [DELETE]}
+    beh:
+      n: {desc: No notable periodic logs modeled., emit: []}
+      f: {desc: No notable periodic logs modeled., emit: []}
+
+  - id: data_distributor
+    name: Data Distributor
+    svc: data-dist
+    hosts: [dd-1]
+    desc: Publishes deltas and produces per-DC snapshots used to restore impbus to a known-good data state.
+    to:
+      - dst: validation_engine
+        proto: https
+        desc: Sends candidate deltas for validation before production rollout.
+      - dst: impbus
+        proto: tcp
+        desc: Pushes approved deltas and snapshots to impbus nodes.
+    logs:
+      delta_publish:
+        desc: A delta is published for validation and rollout.
+        lvl: INFO
+        msg: "delta published change_id={change_id} kind={kind} items={items}"
+        vars:
+          change_id: {k: hex, v: 12}
+          kind: {k: ch, v: [object_delete]}
+          items: {k: i, v: [1, 5]}
+      snapshot_progress:
+        desc: Progress message while building a new snapshot for a data center.
+        lvl: INFO
+        msg: "snapshot build dc={dc} pct={pct}"
+        vars:
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+          pct: {k: i, v: [0, 100]}
+      snapshot_ready_ams1:
+        desc: Snapshot build completed and is ready to load in AMS1.
+        lvl: INFO
+        msg: "snapshot ready dc=AMS1 snapshot_id={snapshot_id} duration_s={dur_s}"
+        vars:
+          snapshot_id: {k: hex, v: 10}
+          dur_s: {k: i, v: [300, 3600]}
+    beh:
+      n:
+        desc: Periodic snapshot building noise.
+        emit:
+          - id: snapshot_progress
+            per_min: 0.05
+            scope: global
+      f:
+        desc: Snapshot building is used during recovery; rate is controlled by scenario multipliers.
+        emit:
+          - id: snapshot_progress
+            per_min: 0.10
+            scope: global
+
+  - id: validation_engine
+    name: Validation Engine (Canary)
+    svc: validation-eng
+    hosts: [val-1]
+    desc: Applies candidate deltas; in this incident it approves a change without waiting for deferred effects.
+    to:
+      - dst: data_distributor
+        proto: https
+        desc: Reports acceptance/failure back to the distributor.
+    logs:
+      candidate_pass:
+        desc: Candidate delta is accepted for rollout.
+        lvl: INFO
+        msg: "validation passed change_id={change_id} checks={checks} wait_window_s={wait_s}"
+        vars:
+          change_id: {k: hex, v: 12}
+          checks: {k: ch, v: [schema_ok, invariants_ok]}
+          wait_s: {k: i, v: [0, 0]}
+      val_crash:
+        desc: Validator process crashes later due to deferred side effects.
+        lvl: ERROR
+        msg: "validation crashed reason={reason} change_id={change_id} pid={pid}"
+        vars:
+          reason: {k: ch, v: ["malloc(): double free or corruption", SIGABRT, segfault]}
+          change_id: {k: hex, v: 12}
+          pid: {k: i, v: [1000, 9999]}
+    beh:
+      n: {desc: No periodic logs modeled., emit: []}
+      f:
+        desc: Rare but important corroborating signal; activated by scenario multipliers.
+        emit:
+          - id: val_crash
+            per_min: 0.02
+            scope: global
+
+  - id: ad_gateway
+    name: Ad Gateway (Edge)
+    svc: ad-gateway
+    hosts: [gw-ams1, gw-iad1, gw-sjc1, gw-fra1, gw-sin1, gw-syd1]
+    desc: HTTP entry point for direct tag traffic and exchange auction traffic; forwards to impbus and returns responses.
+    to:
+      - dst: impbus
+        proto: http
+        desc: Forwards requests to the local impbus pool.
+    logs:
+      req_direct:
+        desc: Direct tag request received.
+        lvl: INFO
+        msg: "direct req {method} {route} req_id={req_id} dc={dc}"
+        vars:
+          method: {k: ch, v: [GET]}
+          route: {k: ch, v: [/tag]}
+          req_id: {k: uuid, v: null}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      req_exchange:
+        desc: Exchange auction request received.
+        lvl: INFO
+        msg: "exchange req {method} {route} req_id={req_id} dc={dc}"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: [/auction]}
+          req_id: {k: uuid, v: null}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      upstream_connect_fail:
+        desc: Upstream impbus connection failed.
+        lvl: WARN
+        msg: "upstream impbus {err} req_id={req_id} dc={dc}"
+        vars:
+          err: {k: ch, v: ["connection refused", timeout, "no healthy upstream"]}
+          req_id: {k: uuid, v: null}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      resp_200:
+        desc: Successful HTTP response.
+        lvl: INFO
+        msg: "resp 200 bytes={bytes} dur_ms={dur_ms} req_id={req_id} dc={dc}"
+        vars:
+          bytes: {k: i, v: [200, 25000]}
+          dur_ms: {k: i, v: [1, 300]}
+          req_id: {k: uuid, v: null}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      resp_503:
+        desc: Error HTTP response when no impbus capacity is available.
+        lvl: INFO
+        msg: "resp 503 bytes={bytes} dur_ms={dur_ms} req_id={req_id} dc={dc}"
+        vars:
+          bytes: {k: i, v: [0, 600]}
+          dur_ms: {k: i, v: [5, 10000]}
+          req_id: {k: uuid, v: null}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      pool_health:
+        desc: Periodic pool health summary for impbus backends.
+        lvl: INFO
+        msg: "impbus_pool healthy={healthy} unhealthy={unhealthy} dc={dc}"
+        vars:
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+        state_vars:
+          n:
+            healthy: {k: i, v: [6, 8]}
+            unhealthy: {k: i, v: [0, 1]}
+          f:
+            healthy: {k: i, v: [0, 6]}
+            unhealthy: {k: i, v: [0, 8]}
+    beh:
+      n:
+        desc: Emits periodic backend pool health.
+        emit:
+          - id: pool_health
+            per_min: 0.20
+      f:
+        desc: Pool health continues but reflects backend crashes and partial restoration.
+        emit:
+          - id: pool_health
+            per_min: 0.20
+
+  - id: impbus
+    name: Impression Bus (Impbus)
+    svc: impbus
+    hosts: [imp-ams1, imp-iad1, imp-sjc1, imp-fra1, imp-sin1, imp-syd1]
+    desc: Runs auctions and serves creatives; applies deltas/snapshots to an in-memory data model.
+    to:
+      - dst: ad_gateway
+        proto: http
+        desc: Returns auction outcomes/responses back to the gateway.
+    logs:
+      auction_direct_ok:
+        desc: Direct request successfully served by impbus.
+        lvl: INFO
+        msg: "served direct ad req_id={req_id} creative={creative} price_cpm={price} dur_ms={dur_ms} dc={dc}"
+        vars:
+          req_id: {k: uuid, v: null}
+          creative: {k: hex, v: 8}
+          price: {k: f, v: [0.05, 12.0]}
+          dur_ms: {k: i, v: [1, 250]}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      auction_exchange_ok:
+        desc: Exchange auction successfully processed by impbus.
+        lvl: INFO
+        msg: "processed exchange auction req_id={req_id} bid={bid} dur_ms={dur_ms} dc={dc}"
+        vars:
+          req_id: {k: uuid, v: null}
+          bid: {k: ch, v: [bid, no_bid]}
+          dur_ms: {k: i, v: [1, 280]}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      delta_applied:
+        desc: A delta is applied and deferred reclamation is scheduled.
+        lvl: INFO
+        msg: "delta applied change_id={change_id} op={op} obj={obj} retire_after_ms={retire_ms} dc={dc}"
+        vars:
+          change_id: {k: hex, v: 12}
+          op: {k: ch, v: [delete]}
+          obj: {k: ch, v: [rare_object]}
+          retire_ms: {k: i, v: [60000, 240000]}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+      snapshot_loaded_ams1:
+        desc: A known-good snapshot is loaded to restore service in AMS1.
+        lvl: INFO
+        msg: "snapshot loaded snapshot_id={snapshot_id} dc=AMS1 age_s={age_s}"
+        vars:
+          snapshot_id: {k: hex, v: 10}
+          age_s: {k: i, v: [0, 7200]}
+      crash:
+        desc: Process crash observed (often near-simultaneous across nodes).
+        lvl: ERROR
+        msg: "impbus crashed signal={signal} reason={reason} dc={dc} pid={pid}"
+        vars:
+          signal: {k: ch, v: [SIGABRT, SIGSEGV]}
+          reason: {k: ch, v: ["malloc(): double free or corruption", segfault, "heap corruption detected"]}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+          pid: {k: i, v: [1000, 9999]}
+      crash_wave:
+        desc: A one-time initial crash wave marker used to show near-simultaneous global failure onset.
+        lvl: ERROR
+        msg: "impbus fatal crash (wave=initial) signal={signal} reason={reason} dc={dc} pid={pid}"
+        vars:
+          signal: {k: ch, v: [SIGABRT, SIGSEGV]}
+          reason: {k: ch, v: ["malloc(): double free or corruption", segfault, "heap corruption detected"]}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+          pid: {k: i, v: [1000, 9999]}
+      restart:
+        desc: Supervisor restarts impbus after a crash.
+        lvl: WARN
+        msg: "impbus restarting backoff_ms={backoff} dc={dc}"
+        vars:
+          backoff: {k: i, v: [200, 5000]}
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+    beh:
+      n: {desc: No periodic logs modeled., emit: []}
+      f:
+        desc: Crash-loop logs during the incident; rate is controlled by scenario multipliers.
+        emit:
+          - id: crash
+            per_min: 0.05
+          - id: restart
+            per_min: 0.05
+
+  - id: deploy_orchestrator
+    name: Deployment Orchestrator
+    svc: deploy
+    hosts: [deploy-1]
+    desc: Deploys new impbus builds to data centers; in this incident it becomes a bottleneck during a global deploy attempt.
+    to:
+      - dst: impbus
+        proto: ssh
+        desc: Pushes binaries/restarts services on impbus hosts.
+    logs:
+      deploy_start:
+        desc: Deployment started (initial attempt is simultaneous).
+        lvl: INFO
+        msg: "deploy start version={version} scope={scope} mode={mode}"
+        vars:
+          version: {k: ch, v: [impbus_2013_09_17_1]}
+          scope: {k: ch, v: [global]}
+          mode: {k: ch, v: [simultaneous]}
+      queue_sat:
+        desc: Deployment queue saturation warning.
+        lvl: WARN
+        msg: "deploy queue saturated pending={pending} workers={workers} mode={mode}"
+        vars:
+          pending: {k: i, v: [50, 5000]}
+          workers: {k: i, v: [5, 200]}
+          mode: {k: ch, v: [simultaneous, rolling]}
+      rolling_switch:
+        desc: Orchestrator switches to rolling mode to reduce load.
+        lvl: INFO
+        msg: "deploy switching to rolling batch_size={batch} interval_s={interval_s}"
+        vars:
+          batch: {k: i, v: [10, 200]}
+          interval_s: {k: i, v: [30, 600]}
+      deploy_complete:
+        desc: Deployment completes for the targeted scope.
+        lvl: INFO
+        msg: "deploy complete version={version} scope={scope} succeeded={succeeded} duration_min={dur_min}"
+        vars:
+          version: {k: ch, v: [impbus_2013_09_17_1]}
+          scope: {k: ch, v: [global]}
+          succeeded: {k: ch, v: [true]}
+          dur_min: {k: i, v: [1, 90]}
+    beh:
+      n: {desc: No periodic logs modeled., emit: []}
+      f:
+        desc: Queue saturation is visible during recovery; activated by scenario multipliers.
+        emit:
+          - id: queue_sat
+            per_min: 0.05
+            scope: global
+
+  - id: monitor
+    name: Monitoring / Alerting
+    svc: monitor
+    hosts: [mon-1]
+    desc: Observes error rates and backend health and emits alerts during outages and partial recovery.
+    to:
+      - dst: ad_gateway
+        proto: https
+        desc: Pulls error-rate and pool-health signals.
+      - dst: impbus
+        proto: https
+        desc: Pulls availability signals from impbus supervisors.
+    logs:
+      alert_down:
+        desc: Alert when impbus availability is low and error rate spikes.
+        lvl: CRITICAL
+        msg: "ALERT impbus down dc={dc} healthy={healthy} total={total} err_rate={err_rate}"
+        vars:
+          dc: {k: ch, v: [AMS1, IAD1, SJC1, FRA1, SIN1, SYD1]}
+          healthy: {k: i, v: [0, 3]}
+          total: {k: i, v: [6, 8]}
+          err_rate: {k: f, v: [0.30, 1.00]}
+      alert_partial:
+        desc: Alert indicating partial recovery (first observed in AMS1 during this incident).
+        lvl: WARN
+        msg: "ALERT partial recovery dc={dc} direct_success_rate={rate}"
+        vars:
+          dc: {k: ch, v: [AMS1]}
+          rate: {k: f, v: [0.10, 0.95]}
+      supply_ramp:
+        desc: Operator-visible marker that exchange supply traffic is being gradually re-enabled.
+        lvl: INFO
+        msg: "supply ramp started target_exchange_pct={pct} reason={reason}"
+        vars:
+          pct: {k: i, v: [10, 100]}
+          reason: {k: ch, v: [stability_check, capacity_ramp]}
+    beh:
+      n: {desc: No periodic logs modeled., emit: []}
+      f:
+        desc: Emits alerts during the outage and partial restoration.
+        emit:
+          - id: alert_down
+            per_min: 0.20
+            scope: global
+          - id: alert_partial
+            per_min: 0.05
+            scope: global
+
+tracing:
+  on: true
+  origins: [ad_gateway]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Direct tag requests and exchange auction requests are processed successfully by impbus.
+    req:
+      - id: direct_ad_serving_ok
+        desc: A direct tag request is auctioned and served successfully.
+        rpm: 160
+        path: [ad_gateway, impbus, ad_gateway]
+        emit: [ad_gateway.req_direct, impbus.auction_direct_ok, ad_gateway.resp_200]
+        latency_ms: [[0, 0], [8, 30], [3, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: exchange_auction_ok
+        desc: An exchange auction request is processed successfully.
+        rpm: 240
+        path: [ad_gateway, impbus, ad_gateway]
+        emit: [ad_gateway.req_exchange, impbus.auction_exchange_ok, ad_gateway.resp_200]
+        latency_ms: [[0, 0], [10, 40], [3, 12]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: Traffic continues to arrive, but impbus crashes cause widespread upstream failures and 503 responses; recovery prioritizes direct traffic.
+    req:
+      - id: direct_ad_serving_ok_f
+        desc: Direct traffic that succeeds on whatever healthy impbus capacity exists at the moment.
+        rpm: 155
+        path: [ad_gateway, impbus, ad_gateway]
+        emit: [ad_gateway.req_direct, impbus.auction_direct_ok, ad_gateway.resp_200]
+        latency_ms: [[0, 0], [12, 60], [4, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: direct_ad_serving_503
+        desc: Direct traffic failing due to no impbus capacity.
+        rpm: 5
+        path: [ad_gateway, impbus, ad_gateway]
+        emit: [ad_gateway.req_direct, ad_gateway.upstream_connect_fail, ad_gateway.resp_503]
+        latency_ms: [[0, 0], [60, 900], [3, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: exchange_auction_ok_f
+        desc: Exchange traffic that succeeds on whatever healthy impbus capacity exists at the moment.
+        rpm: 230
+        path: [ad_gateway, impbus, ad_gateway]
+        emit: [ad_gateway.req_exchange, impbus.auction_exchange_ok, ad_gateway.resp_200]
+        latency_ms: [[0, 0], [14, 70], [4, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: exchange_auction_503
+        desc: Exchange traffic failing due to impbus unavailability (missed auctions).
+        rpm: 10
+        path: [ad_gateway, impbus, ad_gateway]
+        emit: [ad_gateway.req_exchange, ad_gateway.upstream_connect_fail, ad_gateway.resp_503]
+        latency_ms: [[0, 0], [60, 1000], [3, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "Host counts are heavily downscaled: one impbus host and one gateway host represent each of six data centers; real fleet size is not modeled."
+  - "Direct vs exchange traffic is represented by separate request logs and separate flow families to keep prioritization visible during recovery."
+  - "The latent bug is modeled via a rare delete delta that schedules deferred reclamation; the scenario compresses the delay so the crash wave appears at failure onset."
+  - "Validation is modeled as accepting the change with wait_window_s=0 and only crashing later, matching the 'eligible for distribution without waiting' condition."
+  - "The near-simultaneous global crash at onset is represented by a dedicated one-shot log (impbus.crash_wave) while ongoing crash-loop behavior uses background crash/restart logs."
+  - "Failure 503 response duration domain is widened (resp_503.dur_ms up to 10s) to accommodate modeled p95 latency multipliers during the outage."
+  - "Partial-recovery alerting is bound to dc=AMS1 to keep the 'AMS1 restores first' storyline stable in generated logs."
+  - "deploy_orchestrator.deploy_complete.duration_min is allowed to be as low as 1 minute to remain consistent with the compressed scenario timeline."
+  - "Volume estimate: normal phase ~400 rpm * 3 logs/request ≈ 1200 logs/min; with similar failure traffic plus a few background/one-shot markers, total scenario is targeted around ~60k logs (within 20k–100k)."
+```

@@ -1,0 +1,311 @@
+```yaml
+scenario:
+  id: buildkite_outage_aug_2016_compressed
+  title: Dashboard outage from DB saturation + unhealthy replacement instances (with late recovery actions)
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally serves dashboard requests through an ELB to Rails app instances backed by PostgreSQL via PgBouncer, while a separate Agent API continues polling for jobs.
+    Under US-peak traffic after an RDS downgrade and pooling changes, PostgreSQL saturates and DB pings time out, causing the DB-dependent /healthcheck endpoint to return 500.
+    The dashboard ELB drains targets and returns widespread 503s, while Auto Scaling fails to restore capacity because new instances cannot fetch the deployed revision from the same down site and run an old health check referencing a decommissioned shard.
+    Late in the incident operators upgrade RDS, roll out a fixed AMI bootstrap path, and roll back pooling topology, restoring most health checks and reducing 503s, but latency and intermittent errors remain elevated by scenario end.
+
+  trigger_desc: |
+    Increased US-peak traffic hits soon after an RDS instance downgrade and a switch to a centralized PgBouncer.
+    PostgreSQL saturates CPU and begins timing out connections, causing the dashboard health check endpoint to return HTTP 500.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Dashboard traffic and ELB health checks are served normally. PgBouncer shows low waiting counts and near-zero wait time.
+        PostgreSQL metrics show moderate CPU and stable connections. Agent API polling continues at a steady rate.
+      flows: [dashboard_login, dashboard_view_build_log, dashboard_elb_healthcheck, agent_job_poll]
+      manifestation:
+        - postgres_rds.rds_metrics
+        - pgbouncer_central.pool_stats
+        - dashboard_elb.hc_result_ok
+        - monitoring.probe_result
+
+    f:
+      desc: |
+        PostgreSQL becomes saturated and begins timing out connections. The dashboard /healthcheck endpoint returns 500 because DB pings fail,
+        and the dashboard ELB drains targets, resulting in widespread 503s for login, docs, and build log viewing.
+        Auto Scaling launches replacements, but bootstrap depends on fetching the currently deployed revision from the same site; when that fails,
+        instances run a baked revision whose health check references a removed DB shard and never become healthy.
+        Operators mitigate by borrowing capacity and locking desired counts, then later upgrade the database and roll out a fixed AMI/bootstrap approach,
+        reducing errors but leaving elevated latency and intermittent failures by the end of the modeled window.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: postgres_rds
+          event: |
+            PostgreSQL saturation begins causing connection timeouts; dashboard health checks start failing and the ELB begins returning 503 due to draining targets.
+          why: |
+            The ELB health check endpoint depends on DB connectivity; when DB pings time out, the app returns 500 and the ELB marks instances unhealthy.
+            This is directly observable via failing /healthcheck logs and elevated RDS metrics; the underlying cause is the downgraded DB capacity under peak load.
+          flows:
+            - dashboard_elb_healthcheck_fail_db
+            - dashboard_login_503
+            - dashboard_view_build_log_503
+            - agent_job_poll
+          rate_multipliers:
+            dashboard_login_slow: 0.0
+            dashboard_elb_healthcheck_fail_old_shard: 0.0
+            dashboard_elb_healthcheck_ok: 0.0
+            autoscaling.userdata_fetch_rev_failed: 0.0
+            autoscaling.launch_failed_rate_limit: 0.0
+            postgres_rds.rds_metrics_recovered: 0.0
+            pgbouncer_central.pool_stats_recovered: 0.0
+          latency_multipliers:
+            dashboard_elb_healthcheck_fail_db: {p50: 1.2, p95: 1.2}
+            agent_job_poll: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: monitoring.pagerduty_incident
+              count: 1
+              hosts: [monitor-1]
+          manifestation:
+            - postgres_rds.rds_metrics
+            - dashboard_app.healthcheck_db_timeout
+            - dashboard_elb.req_no_healthy
+            - monitoring.pagerduty_incident
+
+        - order: 2
+          at_min: 32
+          component: autoscaling
+          event: |
+            Auto Scaling replacement attempts accelerate; new instances fail to bootstrap because the deploy revision endpoint is unreachable,
+            and a growing fraction of health checks fail due to an old shard reference.
+          why: |
+            Instance bootstrap tries to fetch the latest deployed revision from https://buildkite.com/_secret/version; with the dashboard down,
+            the fetch fails and the instance runs the baked revision. That older code performs a health check against shard one, which has been removed,
+            causing persistent 500s and churn. Bootstrap failures are directly observable; the shard mismatch is inferred from the shard=one health check errors.
+          flows:
+            - dashboard_elb_healthcheck_fail_old_shard
+            - dashboard_elb_healthcheck_fail_db
+          rate_multipliers:
+            dashboard_elb_healthcheck_fail_db: 0.6
+            dashboard_elb_healthcheck_fail_old_shard: 0.4
+            dashboard_elb_healthcheck_ok: 0.0
+            autoscaling.instance_launch: 15.0
+            autoscaling.instance_terminate: 15.0
+            autoscaling.userdata_fetch_rev_failed: 15.0
+          latency_multipliers:
+            dashboard_elb_healthcheck_fail_old_shard: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - autoscaling.userdata_fetch_rev_failed
+            - autoscaling.instance_terminate
+            - dashboard_app.healthcheck_old_shard_error
+
+        - order: 3
+          at_min: 40
+          component: autoscaling
+          event: |
+            Operators mitigate by locking desired capacity and registering borrowed instances to the dashboard ELB; some health checks begin returning 200,
+            allowing partial service, but many requests still fail and successful requests are slow.
+          why: |
+            Locking desired count reduces churn and EC2 API pressure, while borrowed instances provide a small stable pool of targets that can pass health checks
+            (at least intermittently) even while DB pressure remains. This is directly observable via ASG action logs and a mix of 200/500 health check results.
+          flows:
+            - dashboard_elb_healthcheck_ok
+            - dashboard_elb_healthcheck_fail_db
+            - dashboard_elb_healthcheck_fail_old_shard
+            - dashboard_login_slow
+            - dashboard_login_503
+            - dashboard_view_build_log_503
+          rate_multipliers:
+            dashboard_login_503: 0.6
+            dashboard_view_build_log_503: 0.7
+            dashboard_login_slow: 1.0
+            dashboard_elb_healthcheck_fail_db: 0.5
+            dashboard_elb_healthcheck_fail_old_shard: 0.3
+            dashboard_elb_healthcheck_ok: 0.2
+            autoscaling.instance_launch: 2.0
+            autoscaling.instance_terminate: 2.0
+            autoscaling.userdata_fetch_rev_failed: 2.0
+          latency_multipliers:
+            dashboard_login_slow: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: autoscaling.desired_capacity_set
+              count: 1
+              hosts: [asg-dashboard]
+            - ref: autoscaling.register_instance_to_elb
+              count: 2
+              hosts: [asg-dashboard]
+          manifestation:
+            - autoscaling.register_instance_to_elb
+            - dashboard_elb.hc_result_ok
+            - dashboard_app.req_completed_ok
+
+        - order: 4
+          at_min: 46
+          component: autoscaling
+          event: |
+            Continued churn culminates in EC2 request limits: launch attempts are rejected, so successful instance launches drop sharply and bootstrap-related failures largely subside.
+          why: |
+            After many launch/terminate cycles, EC2 API throttling begins returning RequestLimitExceeded. This is directly observable via EC2 API error logs.
+            Because far fewer instances successfully launch, far fewer user-data bootstraps run, so revision-fetch failures become uncommon relative to the rate-limit errors.
+          flows:
+            - dashboard_elb_healthcheck_fail_db
+            - dashboard_login_503
+          rate_multipliers:
+            autoscaling.launch_failed_rate_limit: 20.0
+            autoscaling.instance_launch: 0.2
+            autoscaling.instance_terminate: 0.3
+            autoscaling.userdata_fetch_rev_failed: 0.2
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - autoscaling.launch_failed_rate_limit
+            - autoscaling.instance_launch
+
+        - order: 5
+          at_min: 48
+          component: postgres_rds
+          event: |
+            Operators apply the key recovery actions: upgrade the RDS instance type, roll out a new AMI that no longer depends on the dashboard for revision discovery,
+            and roll back pooling topology; health checks become mostly 200 and 503s drop sharply, though latency remains above normal.
+          why: |
+            Increasing DB capacity reduces connection timeouts and query latency; fixing bootstrap removes the circular dependency where new instances need the down site to deploy,
+            eliminating the old-shard health check failures. Rolling back pooling reduces waiting pressure. The actions are directly observable via one-shot change markers and a shift
+            toward recovered metrics and successful health checks; the precise internal AWS console/IAM mechanics are external and not modeled.
+          flows:
+            - dashboard_elb_healthcheck_ok
+            - dashboard_elb_healthcheck_fail_db
+            - dashboard_login_slow
+            - dashboard_login_503
+            - dashboard_view_build_log_503
+          rate_multipliers:
+            dashboard_elb_healthcheck_ok: 0.9
+            dashboard_elb_healthcheck_fail_db: 0.1
+            dashboard_elb_healthcheck_fail_old_shard: 0.0
+            dashboard_login_503: 0.1
+            dashboard_view_build_log_503: 0.1
+            dashboard_login_slow: 3.0
+            postgres_rds.rds_metrics: 0.0
+            postgres_rds.rds_metrics_recovered: 1.0
+            postgres_rds.connection_timeout: 0.2
+            postgres_rds.slow_query: 0.2
+            pgbouncer_central.pool_stats: 0.0
+            pgbouncer_central.pool_stats_recovered: 1.0
+            pgbouncer_central.server_connect_failed: 0.2
+            autoscaling.userdata_fetch_rev_failed: 0.1
+            autoscaling.instance_launch: 0.5
+            autoscaling.instance_terminate: 0.5
+            autoscaling.launch_failed_rate_limit: 0.2
+          latency_multipliers:
+            dashboard_login_slow: {p50: 0.7, p95: 0.6}
+            agent_job_poll: {p50: 0.95, p95: 0.95}
+          one_shots:
+            - ref: postgres_rds.modify_instance
+              count: 1
+              hosts: [rds-primary]
+            - ref: autoscaling.ami_rollout_started
+              count: 1
+              hosts: [asg-dashboard]
+            - ref: pgbouncer_central.config_change
+              count: 1
+              hosts: [pgb-1]
+          manifestation:
+            - postgres_rds.modify_instance
+            - autoscaling.ami_rollout_started
+            - postgres_rds.rds_metrics_recovered
+            - dashboard_elb.hc_result_ok
+
+      steady:
+        - component: postgres_rds
+          condition: |
+            After the instance upgrade, the database runs at moderately high but no longer maxed CPU, with fewer connection timeouts and fewer slow queries than earlier.
+          user_impact: |
+            Dashboard requests that reach the app complete more reliably, but end-to-end latency remains elevated compared to normal.
+          manifestation:
+            - postgres_rds.rds_metrics_recovered
+            - postgres_rds.connection_timeout
+            - postgres_rds.slow_query
+
+        - component: dashboard_elb
+          condition: |
+            The dashboard ELB has mostly healthy targets again; health checks are predominantly 200 with occasional 500, and a small tail of user requests still see 503.
+          user_impact: |
+            Most users can reach the site again, but intermittent login/build-log/docs failures persist and some pages are slow.
+          manifestation:
+            - dashboard_elb.hc_result_ok
+            - dashboard_elb.hc_result_500
+            - dashboard_elb.req_no_healthy
+
+        - component: autoscaling
+          condition: |
+            Replacement instances are less likely to fail bootstrap; churn and EC2 request-limit errors are reduced but not fully eliminated within the modeled window.
+          user_impact: |
+            Capacity is easier to stabilize than during the peak of the incident, but scaling actions may still be unreliable.
+          manifestation:
+            - autoscaling.userdata_fetch_rev_failed
+            - autoscaling.launch_failed_rate_limit
+            - autoscaling.instance_launch
+
+        - component: agent_api
+          condition: |
+            Agent API continues serving job polls with mild latency/retry increases throughout.
+          user_impact: |
+            Builds can continue running even while the dashboard is degraded.
+          manifestation:
+            - agent_api.agent_req
+            - agent_api.agent_retry
+
+      feedback_loops:
+        - id: healthcheck_capacity_collapse
+          desc: |
+            DB saturation causes health check 500s, which causes the ELB to drain targets, which concentrates load on fewer instances and sustains DB pressure.
+
+        - id: asg_churn_to_ec2_limits
+          desc: |
+            Unhealthy replacements repeatedly launch and terminate, increasing EC2 API usage until request limits are hit, preventing recovery via scaling.
+
+      flows:
+        - dashboard_elb_healthcheck_fail_db
+        - dashboard_elb_healthcheck_fail_old_shard
+        - dashboard_elb_healthcheck_ok
+        - dashboard_login_503
+        - dashboard_view_build_log_503
+        - dashboard_login_slow
+        - agent_job_poll
+      manifestation:
+        - dashboard_app.healthcheck_db_timeout
+        - dashboard_app.healthcheck_old_shard_error
+        - dashboard_elb.hc_result_ok
+        - dashboard_elb.req_no_healthy
+        - postgres_rds.rds_metrics
+        - postgres_rds.rds_metrics_recovered
+        - pgbouncer_central.pool_stats
+        - pgbouncer_central.pool_stats_recovered
+        - autoscaling.userdata_fetch_rev_failed
+        - autoscaling.launch_failed_rate_limit
+        - monitoring.pagerduty_incident
+
+  assumptions:
+    - >
+      The real outage lasted several hours; this scenario compresses it to 25 minutes of failure while keeping the same ordering:
+      DB saturation → health check failures → dashboard drained → replacement bootstrap regression → churn → EC2 request limits → upgrade + AMI rollout + pooling rollback.
+    - >
+      Failure-phase piecewise expectations (rough):
+      minutes 25-32 (7m): ~685 logs/min (503s + DB-failing health checks + agent polling/retries + DB/PgBouncer metrics); recovered metrics suppressed.
+      minutes 32-40 (8m): ~700 logs/min with elevated ASG churn and health checks shifting partly to shard-one failures (split via rate multipliers).
+      minutes 40-46 (6m): ~650 logs/min with a small fraction of health checks succeeding (enabling some successful-but-slow logins) and reduced ASG churn; mitigation one-shots at minute 40.
+      minutes 46-48 (2m): ~650 logs/min with RequestLimitExceeded errors visible (~1/min expected) while successful launches and bootstrap-failure logs drop proportionally.
+      minutes 48-50 (2m): ~640 logs/min with mostly-OK health checks, fewer 503s, higher successful login volume, and recovered DB/PgBouncer metric profiles enabled.
+    - >
+      One-shots: minute 25 opens PagerDuty incident; minute 40 locks desired capacity and registers two borrowed instances; minute 48 records RDS instance modification,
+      AMI rollout start (bootstrap fix), and pooling rollback marker.
+    - >
+      Total log volume estimate: normal phase ~24k logs; failure phase ~17k logs; total ~41k logs (within 20k..100k).
+      Key diagnostics are likely-visible due to steady 30s ELB health checks (dozens per interval), high-rate 503s early, elevated ASG churn mid-incident,
+      RequestLimitExceeded errors after minute 46, and the minute-48 one-shot recovery markers plus the switched-over recovered metric logs for RDS and PgBouncer.
+```

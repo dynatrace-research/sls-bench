@@ -1,0 +1,323 @@
+```yaml
+sys:
+  id: duo1_authentication_platform
+  desc: >
+    A deployment of the Duo authentication service that handles inbound authentication checks from customer
+    applications. Requests enter through an edge proxy and are served by an authentication API tier that
+    relies on a shared relational database. Under sustained load, application threads can queue while waiting
+    for a database connection, increasing end-to-end latency and causing intermittent timeouts.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_proxy
+    name: Edge Proxy
+    svc: duo-edge
+    hosts: [edge-1, edge-2]
+    desc: >
+      Public entrypoint for customer authentication checks. Forwards requests to the authentication API and
+      returns responses to clients. Operators can enable request limiting at this layer.
+    to:
+      - dst: auth_api
+        proto: https
+        desc: Routes /auth/v2/check requests to the authentication API tier.
+    logs:
+      access_ok:
+        desc: Successful client response for an authentication check.
+        lvl: INFO
+        msg: "{method} {route} status={status} dur_ms={dur_ms} req_id={req_id} upstream=auth_api"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: [/auth/v2/check]}
+          status: {k: i, v: [200, 200]}
+          dur_ms: {k: i, v: [20, 3000]}
+          req_id: {k: hex, v: 16}
+      access_504:
+        desc: Client-visible timeout when the upstream does not complete in time.
+        lvl: WARN
+        msg: "{method} {route} status=504 dur_ms={dur_ms} req_id={req_id} upstream=auth_api err=upstream_timeout"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: [/auth/v2/check]}
+          dur_ms: {k: i, v: [2500, 9000]}
+          req_id: {k: hex, v: 16}
+      access_429:
+        desc: Client-visible rejection when upstream begins proactively rejecting due to internal queue cap.
+        lvl: WARN
+        msg: "{method} {route} status=429 dur_ms={dur_ms} req_id={req_id} upstream=auth_api err=too_many_requests"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: [/auth/v2/check]}
+          dur_ms: {k: i, v: [5, 80]}
+          req_id: {k: hex, v: 16}
+      rate_limit_enabled:
+        desc: Operator action marker enabling request limiting at the edge.
+        lvl: INFO
+        msg: "enabled request limiting: max_rpm={max_rpm} scope=duo1"
+        vars:
+          max_rpm: {k: i, v: [400, 900]}
+      proxy_worker_stats:
+        desc: Periodic proxy resource snapshot.
+        lvl: DEBUG
+        msg: "metric proxy: active_conns={active_conns} queued={queued} cpu_pct={cpu_pct}"
+        vars:
+          active_conns: {k: i, v: [50, 800]}
+          queued: {k: i, v: [0, 3000]}
+          cpu_pct: {k: i, v: [5, 95]}
+    beh:
+      n:
+        desc: Light periodic proxy stats during healthy operation.
+        emit:
+          - id: proxy_worker_stats
+            per_min: 0.5
+      f:
+        desc: Similar periodic proxy stats; values may be higher due to slower upstream responses.
+        emit:
+          - id: proxy_worker_stats
+            per_min: 0.5
+
+  - id: auth_api
+    name: Core Authentication API
+    svc: duo-auth
+    hosts: [auth-1, auth-2, auth-3, auth-4]
+    desc: >
+      Handles authentication checks and consults the database for user/device/factor data. Under load, threads
+      can queue while waiting for a database connection from a pool, increasing request duration and causing
+      timeouts. Mitigations include flushing the wait queue and enforcing a maximum queue size.
+    to:
+      - dst: auth_db
+        proto: jdbc
+        desc: Reads and writes authentication-related records.
+      - dst: edge_proxy
+        proto: https
+        desc: Returns HTTP responses to the edge proxy.
+    logs:
+      db_acquire_wait_warn:
+        desc: Per-request warning indicating long wait for a DB connection and queued pressure.
+        lvl: WARN
+        msg: "db connection wait high: waited_ms={waited_ms} queue_depth={queue_depth} req_id={req_id}"
+        vars:
+          waited_ms: {k: i, v: [200, 6000]}
+          queue_depth: {k: i, v: [50, 9000]}
+          req_id: {k: hex, v: 16}
+      auth_ok:
+        desc: Authentication check completed successfully (allow/deny decision returned).
+        lvl: INFO
+        msg: "auth completed: result={result} dur_ms={dur_ms} req_id={req_id} user={user_id}"
+        vars:
+          result: {k: ch, v: [allow, deny]}
+          dur_ms: {k: i, v: [30, 7000]}
+          req_id: {k: hex, v: 16}
+          user_id: {k: uuid, v: null}
+      auth_timeout:
+        desc: Authentication check failed due to timing out while acquiring a DB connection.
+        lvl: ERROR
+        msg: "auth failed: error=db_acquire_timeout waited_ms={waited_ms} dur_ms={dur_ms} req_id={req_id}"
+        vars:
+          waited_ms: {k: i, v: [2000, 9000]}
+          dur_ms: {k: i, v: [2500, 9500]}
+          req_id: {k: hex, v: 16}
+      auth_rejected_queue_full:
+        desc: Authentication check proactively rejected because the DB-wait queue hit its maximum.
+        lvl: WARN
+        msg: "auth rejected: reason=queue_full queue_depth={queue_depth} max_queue={max_queue} req_id={req_id}"
+        vars:
+          queue_depth: {k: i, v: [500, 9000]}
+          max_queue: {k: i, v: [2000, 2000]}
+          req_id: {k: hex, v: 16}
+      queue_depth_metric:
+        desc: Periodic snapshot of the internal DB-wait queue depth and DB wait pressure.
+        lvl: INFO
+        msg: "metric db_wait_queue: depth={queue_depth} inflight={inflight} p95_db_wait_ms={p95_wait_ms}"
+        vars: {}
+        state_vars:
+          n:
+            queue_depth: {k: i, v: [0, 40]}
+            inflight: {k: i, v: [10, 120]}
+            p95_wait_ms: {k: i, v: [1, 30]}
+          f:
+            queue_depth: {k: i, v: [300, 9000]}
+            inflight: {k: i, v: [80, 600]}
+            p95_wait_ms: {k: i, v: [200, 7000]}
+      db_pool_metric:
+        desc: Periodic snapshot of DB connection pool usage and waiter count.
+        lvl: INFO
+        msg: "metric db_pool: in_use={in_use} max={max} waiters={waiters}"
+        vars:
+          max: {k: i, v: [200, 200]}
+        state_vars:
+          n:
+            in_use: {k: i, v: [20, 120]}
+            waiters: {k: i, v: [0, 10]}
+          f:
+            in_use: {k: i, v: [150, 200]}
+            waiters: {k: i, v: [50, 1500]}
+      queue_flushed:
+        desc: Operator action marker flushing accumulated DB-wait queue on an application server.
+        lvl: INFO
+        msg: "flushed pending db-wait queue: dropped={dropped} reason={reason}"
+        vars:
+          dropped: {k: i, v: [500, 6000]}
+          reason: {k: ch, v: [manual_mitigation]}
+      queue_limit_enabled:
+        desc: Operator action marker enabling a max queue limit to reject overflow instead of queuing.
+        lvl: INFO
+        msg: "set db-wait queue max={max_queue} action=reject_overflow"
+        vars:
+          max_queue: {k: i, v: [2000, 2000]}
+    beh:
+      n:
+        desc: Regular metrics show low queue depth and minimal DB connection waiting.
+        emit:
+          - id: queue_depth_metric
+            per_min: 1.0
+          - id: db_pool_metric
+            per_min: 1.0
+      f:
+        desc: Regular metrics show elevated queue depth and high DB pool usage under capacity stress.
+        emit:
+          - id: queue_depth_metric
+            per_min: 1.0
+          - id: db_pool_metric
+            per_min: 1.0
+
+  - id: auth_db
+    name: Authentication Database
+    svc: duo-mysql
+    hosts: [db-1, db-2]
+    desc: >
+      Relational database tier backing the authentication API. When flooded by queued application work, it can
+      remain at high connection utilization and exhibit slower queries, prolonging request completion.
+    to:
+      - dst: auth_api
+        proto: tcp
+        desc: Replies to the authentication API over established DB connections (modeled return hop).
+    logs:
+      db_conn_stats:
+        desc: Periodic snapshot of DB connection/utilization health.
+        lvl: INFO
+        msg: "metric db: active_conns={active} max_conns={max} threads_running={threads} qps={qps}"
+        vars:
+          max: {k: i, v: [1000, 1000]}
+        state_vars:
+          n:
+            active: {k: i, v: [150, 450]}
+            threads: {k: i, v: [10, 80]}
+            qps: {k: i, v: [300, 1200]}
+          f:
+            active: {k: i, v: [600, 980]}
+            threads: {k: i, v: [80, 300]}
+            qps: {k: i, v: [600, 2200]}
+      slow_query_sample:
+        desc: Sampled slow query log.
+        lvl: WARN
+        msg: "slow query sample: dur_ms={dur_ms} rows={rows} query={query}"
+        vars:
+          dur_ms: {k: i, v: [200, 7000]}
+          rows: {k: i, v: [1, 8000]}
+          query: {k: ch, v: ["SELECT user_factors", "SELECT device_tokens", "UPDATE auth_sessions"]}
+    beh:
+      n:
+        desc: DB emits connection stats every minute and rare slow query samples.
+        emit:
+          - id: db_conn_stats
+            per_min: 1.0
+          - id: slow_query_sample
+            per_min: 0.05
+      f:
+        desc: Under failure load, connection stats remain high and slow query samples are more frequent.
+        emit:
+          - id: db_conn_stats
+            per_min: 1.0
+          - id: slow_query_sample
+            per_min: 0.5
+
+tracing:
+  on: true
+  origins: [edge_proxy]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal traffic consists of authentication checks that complete quickly with minimal DB waiting.
+    req:
+      - id: auth_check_normal
+        desc: Typical authentication check completing successfully.
+        rpm: 550.0
+        path: [edge_proxy, auth_api, auth_db, auth_api, edge_proxy]
+        emit: [auth_api.auth_ok, edge_proxy.access_ok]
+        latency_ms: [[60, 180], [65, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: During capacity stress, many requests queue for DB connections, raising latency and causing timeouts.
+    req:
+      - id: auth_check_ok_queued
+        desc: Authentication succeeds but experiences long DB connection wait and queuing.
+        rpm: 560.0
+        path: [edge_proxy, auth_api, auth_db, auth_api, edge_proxy]
+        emit: [auth_api.db_acquire_wait_warn, auth_api.auth_ok, edge_proxy.access_ok]
+        latency_ms: [[400, 1500], [450, 2200], [480, 2300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: auth_check_ok_fast
+        desc: Authentication succeeds without significant DB waiting (appears after backlog relief).
+        rpm: 200.0
+        path: [edge_proxy, auth_api, auth_db, auth_api, edge_proxy]
+        emit: [auth_api.auth_ok, edge_proxy.access_ok]
+        latency_ms: [[90, 250], [100, 280]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: auth_check_timeout
+        desc: Authentication request times out while waiting for a DB connection.
+        rpm: 140.0
+        path: [edge_proxy, auth_api, auth_db, auth_api, edge_proxy]
+        emit: [auth_api.auth_timeout, edge_proxy.access_504]
+        latency_ms: [[3000, 6500], [3000, 6800]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: auth_check_rejected_queue_full
+        desc: Authentication request is rejected due to internal queue cap (better than indefinite queuing).
+        rpm: 120.0
+        path: [edge_proxy, auth_api, auth_db, auth_api, edge_proxy]
+        emit: [auth_api.auth_rejected_queue_full, edge_proxy.access_429]
+        latency_ms: [[5, 15], [10, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    Names are genericized to three core components (edge proxy, auth API, DB) to preserve the incident’s causal core:
+    DB-connection wait queuing and its mitigation.
+  - |
+    "Request limiting was ineffective" is modeled as reduced inbound request rate at the edge while the auth API continues
+    to show heavy DB-wait queuing and timeouts until queues are flushed.
+  - |
+    Push/SMS/phone delivery impacts are not separately modeled; the incident is represented via the shared authentication
+    path whose degradation explains customer-visible latency/timeouts.
+  - |
+    Normal-phase log volume estimate: ~550 rpm * 2 logs/request + ~12 background logs/min ≈ ~1100 logs/min.
+  - |
+    Total scenario log volume estimate (with failure multipliers in the scenario): ~77k logs (in the required 20k–100k range),
+    dominated by per-request access/result logs plus per-minute metrics.
+```

@@ -1,0 +1,217 @@
+```yaml
+scenario:
+  id: cloudbleed_style_edge_html_leak
+  title: Dual-parser HTML filter chain enables rare memory leakage until global kills applied
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The edge proxies customer HTML and applies HTML rewriting features via NGINX filter modules.
+    A feature migration enables a dual-parser chain (legacy Ragel parser + new streaming parser) that subtly changes NGINX buffering, activating a latent pointer bug in the legacy parser for rare malformed-EOF HTML.
+    An external security report triggers incident response, targeted probes reproduce leakage, and successive global kills remove the vulnerable feature paths.
+    The scenario ends with leakage mitigated but with features disabled and ongoing cache-purge coordination.
+
+  trigger_desc: |
+    A deployment changes Email Obfuscation to run through a dual HTML-parser filter chain, which marks the last data buffer differently and causes malformed-EOF HTML to execute an error path that can step a pointer past the buffer end.
+
+  time:
+    total_minutes: 56
+    phases:
+      n: {start_min: 0, end_min: 28}
+      f: {start_min: 28, end_min: 56}
+
+  phases:
+    n:
+      desc: |
+        The edge handles steady client GET traffic, fetches HTML from origins, and logs access.
+        Some origin HTML is malformed near EOF, producing occasional parse warnings, but the legacy parser's bug
+        does not lead to memory leakage under the normal buffer-chaining behavior.
+      flows: [n_client_get_html_ok, n_client_get_html_malformed]
+      manifestation: [edge_nginx.access_ok, edge_nginx.worker_stats, edge_nginx.html_parse_warn]
+
+    f:
+      desc: |
+        After the Email Obfuscation migration introduces a dual-parser filter chain, a latent pointer bug in the legacy
+        Ragel-based parser can overrun an HTML buffer in rare malformed-EOF cases, potentially appending unintended
+        memory bytes into a response body. Responders receive an external report, reproduce via targeted probes, then
+        apply global kills to disable implicated features and finally deploy a patch adding the missing kill switch.
+        Incident status updates and cache purge coordination continue while features remain disabled.
+
+      events:
+        - order: 1
+          at_min: 28
+          component: feature_flag_service
+          event: |
+            Email Obfuscation is deployed in a mode that uses a dual HTML parser chain on edge responses, making the latent
+            malformed-EOF pointer bug exploitable and enabling rare response-body leakage.
+          why: |
+            With dual-chain buffering, the last data buffer is treated as EOF by the legacy parser; on malformed attributes at
+            buffer end, an error transition can advance a pointer past the buffer boundary and continue parsing into adjacent memory.
+            The symptom is too rare to reliably observe in ambient traffic, and responders have not started probes yet.
+          flows: [f_client_get_html_ok, f_client_get_html_malformed, f_client_get_html_email_leak_rare]
+          rate_multipliers:
+            f_probe_detect_leak: 0.0
+            f_probe_confirm_clean: 0.0
+            secops.incident_status: 0.0
+          latency_multipliers:
+            f_client_get_html_ok: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: feature_flag_service.deploy_email_migration
+              count: 1
+              hosts: [control-01]
+          manifestation: [feature_flag_service.deploy_email_migration, edge_nginx.html_parse_warn]
+
+        - order: 2
+          at_min: 32
+          component: secops
+          event: |
+            An external security report is received, an incident is declared, and responders begin running a known malformed test URI
+            to reproduce the issue.
+          why: |
+            The real-world symptom (corrupted pages / leaked memory fragments) is too rare to observe reliably in ambient traffic,
+            so responders use a targeted malformed-EOF probe to deterministically exercise the vulnerable HTML parsing path.
+          flows: [f_probe_detect_leak]
+          rate_multipliers:
+            f_probe_detect_leak: 1.0
+            secops.incident_status: 1.0
+          latency_multipliers:
+            f_probe_detect_leak: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: secops.report_received
+              count: 1
+              hosts: [secops-01]
+            - ref: secops.incident_declared
+              count: 1
+              hosts: [secops-01]
+          manifestation: [secops.report_received, synthetic_monitor.probe_leak_detected, edge_nginx.html_buffer_overread_email]
+
+        - order: 3
+          at_min: 33
+          component: feature_flag_service
+          event: |
+            The global kill for Email Obfuscation is set to disabled and propagates to the edge fleet, removing the main vulnerable
+            feature path and causing the targeted probe to stop detecting leakage.
+          why: |
+            Email Obfuscation was the highest-coverage feature exercising the dual-chain path; disabling it removes most opportunities
+            for the legacy parser bug to be reached at EOF. Residual risk may remain through other features still using cf-html plus legacy parsing.
+          flows: [f_probe_confirm_clean, f_client_get_html_ahr_leak_rare, f_client_get_html_sse_leak_rare]
+          rate_multipliers:
+            f_client_get_html_email_leak_rare: 0.0
+            f_probe_detect_leak: 0.0
+            f_probe_confirm_clean: 1.0
+          latency_multipliers:
+            f_probe_confirm_clean: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: feature_flag_service.kill_set_email_obfuscation
+              count: 1
+              hosts: [control-01]
+            - ref: feature_flag_service.kill_propagated_email_obfuscation
+              count: 1
+              hosts: [control-02]
+          manifestation: [feature_flag_service.kill_set_email_obfuscation, synthetic_monitor.probe_ok, edge_nginx.access_ok]
+
+        - order: 4
+          at_min: 44
+          component: feature_flag_service
+          event: |
+            The global kill for Automatic HTTPS Rewrites is disabled worldwide, further reducing remaining vulnerable paths.
+          why: |
+            Automatic HTTPS Rewrites can still exercise cf-html in combination with legacy parsing behavior; disabling it removes
+            another path that could expose the pointer bug under rare malformed-EOF conditions.
+          flows: [f_client_get_html_sse_leak_rare, f_probe_confirm_clean]
+          rate_multipliers:
+            f_client_get_html_ahr_leak_rare: 0.0
+          latency_multipliers:
+            f_client_get_html_ok: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: feature_flag_service.kill_set_auto_https_rewrites
+              count: 1
+              hosts: [control-01]
+            - ref: feature_flag_service.kill_propagated_auto_https_rewrites
+              count: 1
+              hosts: [control-02]
+          manifestation: [feature_flag_service.kill_set_auto_https_rewrites, synthetic_monitor.probe_ok]
+
+        - order: 5
+          at_min: 52
+          component: feature_flag_service
+          event: |
+            A patch is deployed adding a global kill for Server-Side Excludes, and the feature is disabled as a final safety measure,
+            while secops begins coordinated search-cache purges for known leaked URLs.
+          why: |
+            Server-Side Excludes is an older feature without a prior global kill; adding one enables rapid fleet-wide mitigation even for
+            the small subset of traffic where it runs. Cache purges address secondary impact of leaked pages being stored by search engines
+            (external to edge request logs, recorded here as operational actions).
+          flows: [f_probe_confirm_clean]
+          rate_multipliers:
+            f_client_get_html_sse_leak_rare: 0.0
+          latency_multipliers:
+            f_probe_confirm_clean: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: feature_flag_service.deploy_add_sse_kill
+              count: 1
+              hosts: [control-01]
+            - ref: feature_flag_service.kill_set_server_side_excludes
+              count: 1
+              hosts: [control-01]
+            - ref: feature_flag_service.kill_propagated_server_side_excludes
+              count: 1
+              hosts: [control-02]
+            - ref: secops.cache_purge_requested
+              count: 2
+              hosts: [secops-01]
+          manifestation: [feature_flag_service.deploy_add_sse_kill, feature_flag_service.kill_set_server_side_excludes, secops.cache_purge_requested]
+
+      steady:
+        - component: edge_nginx
+          condition: |
+            The vulnerable HTML rewriting feature paths are disabled via global kills, and targeted probes consistently return clean HTML;
+            normal client traffic continues without leakage indicators.
+          user_impact: |
+            Some HTML rewriting functionality is temporarily unavailable (features disabled), but core content delivery remains operational.
+          manifestation: [synthetic_monitor.probe_ok, edge_nginx.access_ok, edge_nginx.worker_stats]
+
+        - component: secops
+          condition: |
+            Incident response continues with coordination to remove previously cached leaked responses from search engines.
+          user_impact: |
+            Residual exposure risk decreases as cached copies are purged; operational teams remain engaged.
+          manifestation: [secops.incident_status]
+
+      feedback_loops:
+        - id: cache_amplification
+          desc: |
+            Even when leakage is extremely rare, a single leaked response can be replicated by crawler caching,
+            increasing exposure until purge requests succeed. This loop affects impact severity more than live error rate.
+
+      flows:
+        - f_client_get_html_ok
+        - f_client_get_html_malformed
+        - f_client_get_html_email_leak_rare
+        - f_client_get_html_ahr_leak_rare
+        - f_client_get_html_sse_leak_rare
+        - f_probe_detect_leak
+        - f_probe_confirm_clean
+      manifestation:
+        - edge_nginx.html_buffer_overread_email
+        - synthetic_monitor.probe_leak_detected
+        - feature_flag_service.kill_set_email_obfuscation
+        - feature_flag_service.kill_propagated_email_obfuscation
+        - synthetic_monitor.probe_ok
+        - secops.incident_status
+
+  assumptions:
+    - "System-model alignment: edge_nginx.worker_stats.req_s is now consistent with modeled traffic magnitude (~400 rpm overall), so periodic telemetry will not contradict request-flow volumes."
+    - "Repair per verifier feedback: edge_nginx.access_ok is feature/chain-agnostic, so it cannot contradict mitigation states after kill switches; feature identity appears only in dedicated leak logs and control-plane one-shots."
+    - "The multi-day real-world exposure window is compressed: normal represents pre-migration behavior; failure begins at the migration that enables dual-chain buffering."
+    - "Leak frequency in ambient traffic remains extremely rare via very low leak-flow RPMs; diagnosis is made visible via targeted probe flows that responders run only after the external report."
+    - |-
+      Piecewise failure breakdown (approx):
+      - min 28-32 (4 min): client traffic at 400 rpm (~1.6k req, ~4.8k logs across 3 emits), probes suppressed; secops incident_status suppressed.
+      - min 32-33 (1 min): f_probe_detect_leak at 2 rpm (~2 req, ~12 logs across 6 emits) produces visible leak detection; secops incident_status enabled (~0-1 logs).
+      - min 33-56 (23 min): f_probe_confirm_clean at 1 rpm (~23 req, ~115 logs across 5 emits) shows clean responses; email leak path disabled.
+      - one-shots: deploy_email_migration (1), report_received (1), incident_declared (1), email kill set+prop (2), AHR kill set+prop (2), SSE deploy+kill set+prop (3), cache_purge_requested (2).
+    - "Normal-phase volume estimate: ≈33.6k request-flow logs plus ≈112 edge worker_stats logs."
+    - "Total volume estimate: ≈67k–70k logs (dominant access/origin logs plus small probes, worker_stats, and low-rate cp/secops background), within the 20k–100k target."
+    - "Key visible diagnostics: probe_leak_detected appears only between the report and the Email Obfuscation kill; kill propagation one-shots mark mitigation boundaries; probes and access logs show clean steady-state afterward."
+```

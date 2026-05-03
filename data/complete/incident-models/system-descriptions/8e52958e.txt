@@ -1,0 +1,489 @@
+```yaml
+sys:
+  id: code_hosting_web_platform
+  desc: >
+    A web platform for hosting Git repositories and collaboration features.
+    User traffic is terminated at HAProxy load balancers and forwarded to web application servers.
+    Web application servers depend on Redis clusters for shared caching/session coordination.
+    During the modeled incident, a facility power event rebooted a large slice of servers, taking Redis and other internal systems offline and leading to widespread HTTP 503 responses.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: haproxy
+    hosts: [lb-1, lb-2]
+    desc: >
+      Terminates inbound HTTPS and forwards requests to the web application backend pool.
+      Emits access logs and backend connection error logs when the pool is unhealthy.
+    to:
+      - dst: web_app
+        proto: https
+        desc: Forwards requests to web application servers in the backend pool.
+      - dst: ddos_shield
+        proto: tcp
+        desc: Optional upstream mitigation layer used during suspected volumetric attacks.
+    logs:
+      req_received:
+        desc: Request received at the edge; a trace id is assigned here when tracing is on.
+        lvl: INFO
+        msg: "req_in {method} {uri} src={client_ip} trace_id={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/", "/login", "/octo/hello", "/octo/hello/pull/1", "/api/v3/repos", "/octo/hello.git/info/refs"]}
+          client_ip: {k: ip, v: "203.0.113.0/24"}
+          trace_id: {k: hex, v: 32}
+      backend_conn_fail:
+        desc: HAProxy could not connect to a chosen backend server.
+        lvl: WARN
+        msg: "backend_connect_fail backend={backend} err={err} trace_id={trace_id}"
+        vars:
+          backend: {k: ch, v: [app-1, app-2, app-3, app-4, app-5, app-6]}
+          err: {k: ch, v: [connection_refused, timeout, no_route]}
+          trace_id: {k: hex, v: 32}
+      http_access_ok:
+        desc: Access log for a successful (HTTP 200) response.
+        lvl: INFO
+        msg: "resp 200 bytes={bytes} dur_ms={dur_ms} backend={backend} trace_id={trace_id}"
+        vars:
+          bytes: {k: i, v: [800, 200000]}
+          dur_ms: {k: i, v: [20, 600]}
+          backend: {k: ch, v: [app-1, app-2, app-3, app-4, app-5, app-6]}
+          trace_id: {k: hex, v: 32}
+      http_access_503:
+        desc: Access log for an HTTP 503 response (either backend connect failure or upstream 503).
+        lvl: WARN
+        msg: "resp 503 bytes={bytes} dur_ms={dur_ms} reason={reason} trace_id={trace_id}"
+        vars:
+          bytes: {k: i, v: [400, 8000]}
+          dur_ms: {k: i, v: [10, 4000]}
+          reason: {k: ch, v: [backend_connect_fail, upstream_503]}
+          trace_id: {k: hex, v: 32}
+      pool_state:
+        desc: Periodic summary of backend pool health.
+        lvl: INFO
+        msg: "backend_pool pool={pool} up={up} down={down}"
+        vars:
+          pool: {k: ch, v: [web_app_pool]}
+        state_vars:
+          n:
+            up: {k: i, v: [4, 6]}
+            down: {k: i, v: [0, 2]}
+          f:
+            up: {k: i, v: [0, 2]}
+            down: {k: i, v: [4, 6]}
+    beh:
+      n:
+        desc: Periodic pool-health logs during normal operation.
+        emit:
+          - id: pool_state
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Pool-health logs become more frequent during the outage.
+        emit:
+          - id: pool_state
+            per_min: 1.0
+            scope: per_host
+
+  - id: web_app
+    name: Web Application Servers
+    svc: web-app
+    hosts: [app-1, app-2, app-3, app-4, app-5, app-6]
+    desc: >
+      Serves web/API requests and depends on Redis for cache/session primitives.
+      During the incident, many processes cannot start because Redis is down (hard boot-path dependency),
+      and some requests that reach running processes fail with 503 due to Redis connection failures.
+    to:
+      - dst: redis_cluster
+        proto: tcp
+        desc: Uses Redis for shared cache/session and coordination primitives.
+      - dst: edge_lb
+        proto: https
+        desc: Returns responses back through the load balancer (logical return hop for request flows).
+    logs:
+      req_completed_ok:
+        desc: Application completed a request successfully.
+        lvl: INFO
+        msg: "app_resp status=200 route={route} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          route: {k: ch, v: [home, login, repo, pull_request, api_repos, git_info_refs]}
+          dur_ms: {k: i, v: [10, 500]}
+          trace_id: {k: hex, v: 32}
+      redis_conn_error:
+        desc: Redis connectivity error observed while handling a request.
+        lvl: ERROR
+        msg: "redis_error cluster={cluster} err={err} timeout_ms={timeout_ms} trace_id={trace_id}"
+        vars:
+          cluster: {k: ch, v: [cache-main]}
+          err: {k: ch, v: [connection_refused, timeout, cluster_down]}
+          timeout_ms: {k: i, v: [100, 2000]}
+          trace_id: {k: hex, v: 32}
+      req_completed_503:
+        desc: Application completed a request with HTTP 503 due to backend dependency failure.
+        lvl: ERROR
+        msg: "app_resp status=503 err={err} dur_ms={dur_ms} trace_id={trace_id}"
+        vars:
+          err: {k: ch, v: [redis_unavailable, dependency_timeout, circuit_open]}
+          dur_ms: {k: i, v: [50, 3000]}
+          trace_id: {k: hex, v: 32}
+      healthcheck:
+        desc: Periodic health indicator from the running app process.
+        lvl: INFO
+        msg: "health ok version={version}"
+        vars:
+          version: {k: ch, v: ["2016.01.28"]}
+      boot_start:
+        desc: Process supervisor starting the application after a reboot.
+        lvl: INFO
+        msg: "boot starting web-app version={version}"
+        vars:
+          version: {k: ch, v: ["2016.01.28"]}
+      boot_fail_redis:
+        desc: Process start aborted because Redis is not reachable (hard dependency in boot path).
+        lvl: ERROR
+        msg: "boot failed: redis_required cluster={cluster} err={err}"
+        vars:
+          cluster: {k: ch, v: [cache-main]}
+          err: {k: ch, v: [cluster_down, timeout]}
+    beh:
+      n:
+        desc: Low-rate health logs when the service is operating normally.
+        emit:
+          - id: healthcheck
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: During the outage, app processes repeatedly attempt to boot but fail when Redis is down.
+        emit:
+          - id: healthcheck
+            per_min: 0.1
+            scope: per_host
+          - id: boot_start
+            per_min: 0.4
+            scope: per_host
+          - id: boot_fail_redis
+            per_min: 0.4
+            scope: per_host
+
+  - id: redis_cluster
+    name: Redis Cluster
+    svc: redis
+    hosts: [redis-1, redis-2, redis-3, redis-4, redis-5, redis-6]
+    desc: >
+      Provides caching/session primitives for the web application.
+      During the incident, multiple Redis nodes reboot or become unreachable, leaving the cluster unhealthy.
+    to: []
+    logs:
+      cluster_state:
+        desc: Periodic cluster health snapshot.
+        lvl: INFO
+        msg: "cluster {cluster} state={state} masters_up={masters_up}/{masters_total}"
+        vars:
+          cluster: {k: ch, v: [cache-main]}
+          masters_total: {k: i, v: [3, 3]}
+        state_vars:
+          n:
+            state: {k: ch, v: [ok]}
+            masters_up: {k: i, v: [3, 3]}
+          f:
+            state: {k: ch, v: [down, degraded]}
+            masters_up: {k: i, v: [0, 1]}
+      node_unreachable:
+        desc: A node/member is not reachable from the cluster viewpoint.
+        lvl: WARN
+        msg: "node_unreachable node={node} last_seen_s={last_seen_s}"
+        vars:
+          node: {k: ch, v: [redis-1, redis-2, redis-3, redis-4, redis-5, redis-6]}
+          last_seen_s: {k: i, v: [5, 900]}
+    beh:
+      n:
+        desc: Cluster health logs in normal operation.
+        emit:
+          - id: cluster_state
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: During the outage, health snapshots continue and unreachable-member warnings increase.
+        emit:
+          - id: cluster_state
+            per_min: 0.7
+            scope: per_host
+          - id: node_unreachable
+            per_min: 0.6
+            scope: per_host
+
+  - id: chatops
+    name: ChatOps / Incident Automation
+    svc: chatops
+    hosts: [chat-1, chat-2]
+    desc: >
+      Internal automation used for coordination and status updates.
+      Some instances reboot during the power event, delaying early communication (status page updates).
+    to: []
+    logs:
+      heartbeat:
+        desc: Periodic heartbeat indicating the bot is responsive.
+        lvl: INFO
+        msg: "chatops heartbeat leader={leader}"
+        vars:
+          leader: {k: ch, v: [chat-1, chat-2]}
+      command_fail:
+        desc: A ChatOps command could not be executed due to unavailable internal dependencies.
+        lvl: WARN
+        msg: "chatops cmd_failed cmd={cmd} err={err}"
+        vars:
+          cmd: {k: ch, v: [set_status_red, page_oncall, restart_service]}
+          err: {k: ch, v: [host_unreachable, dependency_down, timeout]}
+      status_post_red:
+        desc: Status page update posted indicating the incident is in a red (outage) state.
+        lvl: INFO
+        msg: "status_posted status=red summary={summary}"
+        vars:
+          summary: {k: ch, v: ["investigating connectivity", "service outage - recovery in progress"]}
+    beh:
+      n:
+        desc: ChatOps is normally healthy and emits heartbeats.
+        emit:
+          - id: heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the outage, ChatOps is partially degraded; command failures are common.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+          - id: command_fail
+            per_min: 0.6
+            scope: per_host
+
+  - id: infra_monitor
+    name: Infrastructure Monitoring
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Monitors facility and host health, emitting alerts about reboots and network anomalies.
+      Provides early visibility into the power-related reboot storm and later perceived connection spikes.
+    to: []
+    logs:
+      power_glitch:
+        desc: One-time critical alert for a facility power distribution disruption.
+        lvl: CRITICAL
+        msg: "facility power event affected_pct={affected_pct} rebooted_hosts~={rebooted_hosts}"
+        vars:
+          affected_pct: {k: i, v: [20, 35]}
+          rebooted_hosts: {k: i, v: [200, 2000]}
+      alert_page:
+        desc: Alerting system pages on-call responders.
+        lvl: INFO
+        msg: "paged oncall team={team} incident_id={incident_id}"
+        vars:
+          team: {k: ch, v: [ops, web, storage]}
+          incident_id: {k: uuid, v: null}
+      host_reboot_alert:
+        desc: Alert that a host has rebooted (uptime resets).
+        lvl: WARN
+        msg: "host_reboot host={host} hw_class={hw_class} uptime_s={uptime_s}"
+        vars:
+          host: {k: ch, v: [app-1, app-2, app-3, app-4, app-5, app-6, redis-1, redis-2, redis-3, redis-4, redis-5, redis-6, chat-1, chat-2]}
+          hw_class: {k: ch, v: [class_a, class_b]}
+          uptime_s: {k: i, v: [30, 1800]}
+      conn_spike:
+        desc: Observed spike in inbound connection attempts (later investigated as possible DDoS).
+        lvl: WARN
+        msg: "inbound_conn_spike src={src} cps={cps}"
+        vars:
+          src: {k: ch, v: [mixed_internet, single_asn]}
+          cps: {k: i, v: [5000, 80000]}
+    beh:
+      n:
+        desc: Low background alert noise in normal operations.
+        emit:
+          - id: host_reboot_alert
+            per_min: 0.05
+            scope: global
+          - id: conn_spike
+            per_min: 0.02
+            scope: global
+      f:
+        desc: During the outage, reboot alerts are frequent; connection spikes may be observed and investigated.
+        emit:
+          - id: host_reboot_alert
+            per_min: 2.0
+            scope: global
+          - id: conn_spike
+            per_min: 1.0
+            scope: global
+
+  - id: ddos_shield
+    name: DDoS Mitigation Gateway
+    svc: ddos-mitigation
+    hosts: [waf-1, waf-2]
+    desc: >
+      Mitigation layer that can be enabled quickly during suspected attacks.
+      Not the root cause in this incident, but it is activated during early investigation.
+    to: []
+    logs:
+      mitigation_enabled:
+        desc: One-time log indicating mitigation is enabled.
+        lvl: INFO
+        msg: "mitigation enabled profile={profile}"
+        vars:
+          profile: {k: ch, v: [standard]}
+      mitigation_stats:
+        desc: Periodic mitigation statistics during operation.
+        lvl: INFO
+        msg: "mitigation stats cps_in={cps_in} drop_pct={drop_pct}"
+        vars:
+          cps_in: {k: i, v: [1000, 90000]}
+          drop_pct: {k: i, v: [0, 60]}
+    beh:
+      n:
+        desc: Low-rate stats in normal conditions.
+        emit:
+          - id: mitigation_stats
+            per_min: 0.1
+            scope: per_host
+      f:
+        desc: Stats are available during the incident but are suppressed until mitigation is enabled.
+        emit:
+          - id: mitigation_stats
+            per_min: 0.5
+            scope: per_host
+
+  - id: fleet_manager
+    name: Fleet Provisioning / Recovery Tooling
+    svc: fleet
+    hosts: [fleet-1, fleet-2]
+    desc: >
+      Used to provision/rebuild hosts and orchestrate recovery actions.
+      During the incident, provisioning is slowed by internal dependencies being on rebooted hardware,
+      and some hosts show boot failures where drives are not detected until cold power-cycled.
+    to:
+      - dst: web_app
+        proto: ssh
+        desc: Used to restart or replace application servers.
+      - dst: redis_cluster
+        proto: ssh
+        desc: Used to rebuild Redis nodes on alternate hardware.
+    logs:
+      provision_blocked:
+        desc: Provisioning or rebuild action delayed due to unavailable dependency.
+        lvl: WARN
+        msg: "provisioning delayed dependency={dep} err={err}"
+        vars:
+          dep: {k: ch, v: [pxe, inventory_db, config_repo]}
+          err: {k: ch, v: [unreachable, timeout]}
+      oob_boot_error:
+        desc: Out-of-band console indicates a boot-time hardware/firmware issue.
+        lvl: ERROR
+        msg: "oob_boot_error host={host} hw_class={hw_class} boot_error={boot_error}"
+        vars:
+          host: {k: ch, v: [app-2, app-3, redis-2, redis-4]}
+          hw_class: {k: ch, v: [class_a]}
+          boot_error: {k: ch, v: [no_boot_disk, raid_controller_missing]}
+      cold_power_cycle:
+        desc: One-time action marker for draining flea power / cold power cycle request.
+        lvl: INFO
+        msg: "cold_power_cycle requested host={host} action={action}"
+        vars:
+          host: {k: ch, v: [app-2, app-3, redis-2, redis-4]}
+          action: {k: ch, v: [drain_flea_power]}
+      redis_rebuild_start:
+        desc: One-time action marker for rebuilding the Redis cluster on alternate hardware.
+        lvl: INFO
+        msg: "redis_rebuild start cluster={cluster} target_hw={target_hw}"
+        vars:
+          cluster: {k: ch, v: [cache-main]}
+          target_hw: {k: ch, v: [standby_pool]}
+    beh:
+      n:
+        desc: Occasional provisioning delays in normal operation.
+        emit:
+          - id: provision_blocked
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Recovery work and blocked provisioning are common once recovery pivots to rebuilds.
+        emit:
+          - id: provision_blocked
+            per_min: 0.6
+            scope: per_host
+          - id: oob_boot_error
+            per_min: 0.3
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [edge_lb]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal web traffic successfully reaches the application tier and returns HTTP 200.
+    req:
+      - id: web_request_ok
+        desc: Standard web/API request path with a healthy backend pool.
+        rpm: 320.0
+        path: [edge_lb, web_app, edge_lb]
+        emit: [edge_lb.req_received, web_app.req_completed_ok, edge_lb.http_access_ok]
+        latency_ms: [[1, 4], [20, 180], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+  f:
+    desc: >
+      During the incident, large parts of the backend are unavailable.
+      Requests either fail at the load balancer due to backend connection failures or reach the app and fail due to Redis being down.
+    req:
+      - id: web_request_503_backend_down
+        desc: HAProxy cannot connect to backends (pool mostly down); returns 503.
+        rpm: 220.0
+        path: [edge_lb]
+        emit: [edge_lb.req_received, edge_lb.backend_conn_fail, edge_lb.http_access_503]
+        latency_ms: [[1, 4], [20, 250], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+      - id: web_request_503_redis
+        desc: Request reaches an app process but fails because Redis is unavailable (upstream 503).
+        rpm: 120.0
+        path: [edge_lb, web_app, edge_lb]
+        emit: [edge_lb.req_received, web_app.redis_conn_error, web_app.req_completed_503, edge_lb.http_access_503]
+        latency_ms: [[1, 4], [40, 800], [30, 1200], [1, 4]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - |
+    The real incident lasted ~2h6m; this model compresses it to a shorter window while preserving the causal chain
+    (power event -> reboots -> Redis down -> app boot dependency -> widespread 503).
+  - |
+    HAProxy backend connection retries are not modeled because the schema emits `emit` per attempt; keeping retries would make
+    per-request completion logs (access logs) repeat. The incident remains diagnosable via backend_conn_fail and 503 access logs.
+  - |
+    Redis is modeled as a single logical cluster (cache-main) with periodic health logs and unreachable-node warnings;
+    per-command Redis logs are omitted to avoid unrealistic volume.
+  - |
+    The main user-visible symptom (HTTP 503) is represented by HAProxy access logs and app-level 503 logs; the unicorn error page is implied by status=503.
+  - |
+    Normal-phase log volume estimate: ~19.2k flow logs (320 rpm * 3 logs * 20 min) plus ~150 background logs.
+  - |
+    Total scenario log volume estimate: ~45k–55k logs (flow-dominant; no retry amplification), staying within the 20k–100k target.
+  - |
+    Key diagnostic anchors intended to be visible: infra_monitor.power_glitch (one-shot), infra_monitor.host_reboot_alert (rate),
+    redis_cluster.cluster_state/node_unreachable (rate), web_app.boot_fail_redis (rate), edge_lb.http_access_503 + backend_conn_fail (high-rate),
+    and fleet_manager.oob_boot_error/cold_power_cycle markers during recovery pivot.
+```

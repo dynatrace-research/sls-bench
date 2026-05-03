@@ -1,0 +1,236 @@
+```yaml
+scenario:
+  id: alert_2791_widespread_outage_compressed
+  title: Widespread outage from Multipass Redis retry storm; core recovery followed by 2FA SMS throttling
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally processes merchant logins and payment charges through Multipass authentication backed by Redis.
+    At incident start, Multipass enters a high-retry/no-backoff Redis optimistic-transaction loop that overloads Redis and drives auth timeouts,
+    cascading into 503s for login and payments and synthetic monitors reporting the API as down.
+    A later Multipass deploy caps retries and adds backoff, restoring core traffic, but the post-outage login surge overwhelms SMS capacity,
+    leaving 2FA code delivery unreliable at the end of the scenario.
+
+  trigger_desc: |
+    A one-datacenter rollout of the adjacent Roster identity service coincides with Multipass switching into an incident mode where
+    Redis optimistic-transaction retries amplify load (high retry bound, minimal backoff), rapidly saturating Redis and causing timeouts.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Traffic is steady and mostly healthy. Merchants can log in and run charges; Redis has low slowlog volume.
+        The external synthetic monitor is green and upstream 5xx rates are near zero.
+      flows: [payment_charge_ok, merchant_login_ok_no2fa, merchant_login_2fa_ok]
+      manifestation:
+        - synthetic_monitor.check_ok
+        - api_gateway.upstream_5xx_metric
+        - multipass_redis.info_stats
+        - multipass_auth.timeout_metric
+        - multipass_auth.redis_ops_metric
+
+    f:
+      desc: |
+        Multipass becomes overloaded by Redis transaction retries without meaningful backoff, saturating Redis and driving timeouts.
+        Product endpoints (payments and login) fail primarily with 503s due to upstream auth timeouts. After a deploy that caps retries
+        and introduces backoff, core traffic recovers and external checks go green again. However, the rush of post-outage logins
+        triggers SMS vendor throttling, causing 2FA code delivery failures that persist through the end.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: roster_identity
+          event: |
+            A one-DC Roster deploy starts; immediately after, Multipass enters a Redis retry-storm mode. Redis slowlogs and CPU saturation
+            warnings appear frequently and login/charge requests begin failing with 503s; the external synthetic monitor starts failing.
+          why: |
+            Increased contention plus a high-retry/no-backoff optimistic transaction loop amplifies Redis load, pushing Redis latency/CPU up.
+            This is directly observable via Redis slowlog/CPU logs and Multipass high-mode metrics, and indirectly via gateway 503s and synthetic failures.
+          flows:
+            - payment_charge_timeout
+            - merchant_login_timeout
+          rate_multipliers:
+            payment_charge_ok_after_fix: 0.0
+            merchant_login_ok_after_fix: 0.0
+            merchant_login_2fa_sms_throttled: 0.0
+            sms_gateway.vendor_throttle_metric: 0.0
+            synthetic_monitor.check_ok: 0.0
+            api_gateway.upstream_5xx_metric: 0.0
+            api_gateway.upstream_5xx_metric_high: 1.0
+            multipass_auth.timeout_metric: 0.0
+            multipass_auth.timeout_metric_high: 1.0
+            multipass_auth.redis_ops_metric: 0.0
+            multipass_auth.redis_ops_metric_high: 1.0
+          latency_multipliers:
+            payment_charge_timeout: {p50: 1.0, p95: 1.0}
+            merchant_login_timeout: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: roster_identity.deploy_started
+              count: 1
+              hosts: [roster-wc-1]
+            - ref: synthetic_monitor.alert_opened
+              count: 1
+              hosts: [extmon-1]
+          manifestation:
+            - multipass_auth.timeout_metric_high
+            - multipass_redis.slowlog_entry
+            - multipass_redis.cpu_saturation_warn
+            - synthetic_monitor.check_fail
+
+        - order: 2
+          at_min: 32
+          component: multipass_auth
+          event: |
+            Engineers roll back the Roster change and restart Multipass, but the outage persists; Redis MONITOR is attached to aid diagnosis.
+          why: |
+            Rolling back the adjacent deploy does not unwind the retry-driven overload, and restarting does not remove the underlying retry behavior.
+            Attaching MONITOR is an operator action to identify hot operations and confirm Redis saturation (directly observable).
+          flows:
+            - payment_charge_timeout
+            - merchant_login_timeout
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: roster_identity.rollback_completed
+              count: 1
+              hosts: [roster-wc-1]
+            - ref: multipass_auth.restart
+              count: 1
+              hosts: [mp-wc-1]
+            - ref: multipass_redis.monitor_attached
+              count: 1
+              hosts: [redis-1]
+          manifestation:
+            - roster_identity.rollback_completed
+            - multipass_auth.restart
+            - multipass_redis.monitor_attached
+            - api_gateway.gw_resp_charge_503
+
+        - order: 3
+          at_min: 45
+          component: multipass_auth
+          event: |
+            Multipass deploys a fix that caps Redis transaction retries and adds backoff. Core endpoints (charges and non-2FA logins) largely recover,
+            synthetic checks flip back to OK, and Redis slowlog/CPU warnings drop sharply as the retry amplification is removed.
+          why: |
+            Reducing retry amplification relieves Redis CPU and latency, reducing auth timeouts and allowing dependent services to complete requests.
+            Recovery is visible via high-mode Multipass metrics disappearing, fewer Redis slowlogs/CPU warnings, gateway 200s returning, and synthetic checks turning green.
+          flows:
+            - payment_charge_ok_after_fix
+            - merchant_login_ok_after_fix
+          rate_multipliers:
+            payment_charge_timeout: 0.2
+            merchant_login_timeout: 0.2
+            payment_charge_ok_after_fix: 1.0
+            merchant_login_ok_after_fix: 1.2
+            synthetic_monitor.check_fail: 0.0
+            synthetic_monitor.check_ok: 1.0
+            multipass_auth.timeout_metric_high: 0.0
+            multipass_auth.timeout_metric: 1.0
+            multipass_auth.redis_ops_metric_high: 0.0
+            multipass_auth.redis_ops_metric: 1.0
+            multipass_auth.redis_txn_retry: 0.1
+            multipass_redis.slowlog_entry: 0.2
+            multipass_redis.cpu_saturation_warn: 0.2
+            api_gateway.upstream_5xx_metric_high: 0.0
+            api_gateway.upstream_5xx_metric: 1.0
+          latency_multipliers:
+            payment_charge_ok_after_fix: {p50: 1.0, p95: 1.0}
+            merchant_login_ok_after_fix: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: multipass_auth.deploy_fix
+              count: 1
+              hosts: [mp-wc-1]
+          manifestation:
+            - multipass_auth.deploy_fix
+            - synthetic_monitor.check_ok
+            - api_gateway.gw_resp_charge_200
+            - multipass_auth.timeout_metric
+
+        - order: 4
+          at_min: 52
+          component: sms_gateway
+          event: |
+            After core recovery, a surge of logins increases 2FA SMS send volume; the SMS vendor begins throttling requests, causing 2FA delivery failures.
+            Engineers start expanding the outbound SMS number pool, but throttling remains present by the end.
+          why: |
+            SMS throughput is limited by vendor and phone-number pool capacity. Increased post-outage login attempts concentrate SMS sends, producing 429s and
+            queue buildup (directly observable via SMS throttling metrics and per-request throttled logs).
+          flows:
+            - merchant_login_2fa_sms_throttled
+          rate_multipliers:
+            merchant_login_2fa_sms_throttled: 1.0
+            sms_gateway.vendor_throttle_metric: 1.0
+          latency_multipliers:
+            merchant_login_2fa_sms_throttled: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: sms_gateway.pool_add_numbers
+              count: 1
+              hosts: [sms-1]
+          manifestation:
+            - sms_gateway.vendor_throttle_metric
+            - sms_gateway.sms_send_throttled
+            - product_api.login_fail_2fa_delivery
+            - api_gateway.gw_resp_login_503
+
+      steady:
+        - component: sms_gateway
+          condition: |
+            SMS vendor throttling continues and internal queue depth remains elevated; 2FA login attempts intermittently fail.
+          user_impact: |
+            Merchants with 2FA enabled may not receive codes promptly (or at all), preventing successful login despite core services being mostly restored.
+          manifestation:
+            - sms_gateway.vendor_throttle_metric
+            - sms_gateway.sms_send_throttled
+
+        - component: multipass_auth
+          condition: |
+            Core authentication is mostly restored after the retry/backoff fix, but a small fraction of auth timeouts persists under residual load.
+          user_impact: |
+            Most payments and non-2FA logins succeed, but some requests still see transient 503s.
+          manifestation:
+            - multipass_auth.auth_timeout
+            - api_gateway.gw_resp_charge_503
+
+      feedback_loops:
+        - id: redis_retry_storm
+          desc: |
+            Redis optimistic-transaction conflicts cause immediate retries; with high retry bounds and minimal backoff, retries multiply load on Redis.
+            Increased Redis latency further increases timeouts/conflicts, generating more retries and sustaining the overload until retry behavior is changed.
+
+      flows:
+        - payment_charge_timeout
+        - merchant_login_timeout
+        - payment_charge_ok_after_fix
+        - merchant_login_ok_after_fix
+        - merchant_login_2fa_sms_throttled
+      manifestation:
+        - multipass_auth.timeout_metric_high
+        - multipass_redis.slowlog_entry
+        - synthetic_monitor.check_fail
+        - sms_gateway.vendor_throttle_metric
+
+  assumptions:
+    - >-
+      The original incident lasted hours; this scenario compresses it to 60 minutes while keeping the key causal beats and observable signals.
+    - >-
+      Failure-phase piecewise breakdown (rough effective volumes): minutes 25–45 core outage ~850–950 logs/min (timeout flows + retry-storm background logs);
+      minutes 45–52 core recovery ~1200–1300 logs/min (successful flows return, retry-storm signals drop); minutes 52–60 core mostly healthy but 2FA throttling
+      adds ~120 logs/min plus SMS metrics (total ~1300–1400 logs/min).
+    - >-
+      One-shot counts: Roster deploy start (1), external alert opened (1), rollback complete (1), Multipass restart (1), Redis MONITOR attached (1),
+      Multipass fix deploy (1), SMS pool add numbers (1).
+    - >-
+      Visibility rationale: outage onset is visible via Multipass high-mode metrics plus Redis slowlog/CPU warnings and synthetic check_fail; recovery is
+      visible via deploy_fix, metrics switching back to low mode, and check_ok flipping back; the remaining degraded state is visible via sms_send_throttled
+      plus vendor_throttle_metric.
+    - >-
+      Expected total log count across the 60-minute scenario is ~60k–75k under the scenario controls, and remains <100k under conservative estimation,
+      satisfying the 20k–100k target.
+```

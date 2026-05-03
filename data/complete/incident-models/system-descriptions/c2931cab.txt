@@ -1,0 +1,819 @@
+```yaml
+sys:
+  id: reddit_coordination_outage
+  desc: >
+    A large-scale social and API platform served by an edge load balancer and an application cluster backed by
+    a cache tier and a relational database. Cluster membership and health are tracked in ZooKeeper, which is
+    consulted by an internal autoscaler to decide when to terminate or create instances. During a ZooKeeper
+    infrastructure migration, configuration management unexpectedly re-enabled the autoscaler, causing it to
+    act on partially migrated state and terminate most app and cache nodes, leading to full outage followed by
+    prolonged degradation from cold caches and database overload.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: edge-lb
+    hosts: [edge-01, edge-02, edge-03, edge-04]
+    desc: >
+      Terminates TLS, routes requests to the application cluster, and emits access and upstream error logs.
+      In normal operation it routes to healthy app backends and returns fast 2xx responses. In failure it
+      frequently cannot find healthy backends (after mass terminations) or experiences upstream timeouts due
+      to database overload, and it can serve a "down mode" response when enabled by operations.
+    to:
+      - dst: app_cluster
+        proto: https
+        desc: Forwards end-user HTTP requests to application instances.
+      - dst: monitoring
+        proto: https
+        desc: Exposes metrics endpoints scraped by monitoring.
+    logs:
+      hc_ok:
+        desc: Periodic healthcheck result summary emitted by each edge instance.
+        lvl: INFO
+        msg: "healthcheck ok target={target} rtt_ms={rtt_ms}"
+        vars:
+          target: {k: ch, v: ["app_cluster", "cache_cluster", "db_cluster"]}
+        state_vars:
+          n:
+            rtt_ms: {k: i, v: [1, 50]}
+          f:
+            rtt_ms: {k: i, v: [1, 500]}
+      access_log:
+        desc: Access log for completed requests at the edge.
+        lvl: INFO
+        msg: "req completed req_id={req_id} trace_id={trace_id} method={method} path={path} status={status} upstream={upstream} upstream_ms={upstream_ms} bytes_out={bytes_out}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          method: {k: ch, v: ["GET", "POST"]}
+          path: {k: str, v: "http_path"}
+          upstream: {k: ch, v: ["app_cluster", "down_mode", "none"]}
+          upstream_ms: {k: i, v: [0, 10000]}
+          bytes_out: {k: i, v: [200, 500000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 204, 304]}
+          f:
+            status: {k: ch, v: [200, 429, 503, 504]}
+      upstream_error:
+        desc: Edge routing/upstream failure log (no healthy upstream, connect failure, or timeout).
+        lvl: ERROR
+        msg: "upstream error req_id={req_id} trace_id={trace_id} upstream={upstream} error={error} detail={detail}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          upstream: {k: ch, v: ["app_cluster", "none"]}
+          detail: {k: str, v: "err_detail"}
+        state_vars:
+          n:
+            error: {k: ch, v: ["upstream_reset", "connect_timeout"]}
+          f:
+            error: {k: ch, v: ["no_healthy_upstream", "connect_timeout", "upstream_timeout", "down_mode"]}
+      retry_scheduled:
+        desc: Edge-side retry scheduling log for clients/gateways that automatically retry.
+        lvl: WARN
+        msg: "retrying req_id={req_id} trace_id={trace_id} attempt={attempt} reason={reason} backoff_ms={backoff_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          attempt: {k: i, v: [2, 3]}
+          reason: {k: ch, v: ["503", "connect_error", "timeout"]}
+          backoff_ms: {k: i, v: [50, 2000]}
+      down_mode_served:
+        desc: Edge served a down-mode response without proxying to app backends.
+        lvl: WARN
+        msg: "served down mode req_id={req_id} trace_id={trace_id} path={path} status={status} reason={reason}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          path: {k: str, v: "http_path"}
+          reason: {k: ch, v: ["maintenance", "restore_in_progress"]}
+        state_vars:
+          n:
+            status: {k: ch, v: [200]}
+          f:
+            status: {k: ch, v: [200, 503]}
+    beh:
+      n:
+        desc: Routes traffic normally and emits periodic healthcheck logs.
+        emit:
+          - id: hc_ok
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Still emits healthchecks, but observed RTTs are higher and more variable during outage/degradation.
+        emit:
+          - id: hc_ok
+            per_min: 1.0
+            scope: per_host
+
+  - id: app_cluster
+    name: Application Cluster
+    svc: app-cluster
+    hosts: [app-01, app-02, app-03, app-04, app-05, app-06]
+    desc: >
+      Serves Reddit web and API requests and uses the cache tier to reduce database load. In normal operation
+      most reads are satisfied from cache and DB queries are quick. In failure, many instances may be terminated,
+      and after restoration the caches are cold leading to cache misses, increased DB load, elevated latency, and
+      request timeouts.
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Returns responses back through the edge/load balancer.
+      - dst: cache_cluster
+        proto: redis
+        desc: Reads/writes cached objects for hot pages and API responses.
+      - dst: db_cluster
+        proto: jdbc
+        desc: Executes transactional and read queries for uncached data.
+      - dst: monitoring
+        proto: https
+        desc: Exposes application metrics and health endpoints.
+    logs:
+      req_start:
+        desc: Marks the start of request handling on an app instance.
+        lvl: INFO
+        msg: "request start req_id={req_id} trace_id={trace_id} route={route} user_id={user_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          route: {k: ch, v: ["/", "/r/{sub}/hot", "/api/v1/me", "/api/v1/subreddit/{sub}/hot"]}
+          user_id: {k: i, v: [1, 50000000]}
+      db_query:
+        desc: App-side log for a DB query completion (used for latency attribution).
+        lvl: INFO
+        msg: "db query req_id={req_id} trace_id={trace_id} db_host={db_host} sql_hash={sql_hash} duration_ms={duration_ms} rows={rows}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          db_host: {k: ch, v: ["db-01", "db-02", "db-03"]}
+          sql_hash: {k: hex, v: 16}
+          rows: {k: i, v: [0, 500]}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [1, 200]}
+          f:
+            duration_ms: {k: i, v: [10, 4000]}
+      req_end:
+        desc: Marks the end of request handling on an app instance.
+        lvl: INFO
+        msg: "request end req_id={req_id} trace_id={trace_id} status={status} latency_ms={latency_ms} cache={cache}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 304]}
+            latency_ms: {k: i, v: [5, 400]}
+            cache: {k: ch, v: ["hit", "hit_stale", "miss"]}
+          f:
+            status: {k: ch, v: [200, 304, 500, 504]}
+            latency_ms: {k: i, v: [20, 10000]}
+            cache: {k: ch, v: ["hit", "hit_stale", "miss", "miss_cold"]}
+      db_timeout:
+        desc: App timed out waiting on the database.
+        lvl: ERROR
+        msg: "db timeout req_id={req_id} trace_id={trace_id} db_host={db_host} timeout_ms={timeout_ms} waited_ms={waited_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+          db_host: {k: ch, v: ["db-01", "db-02", "db-03"]}
+          timeout_ms: {k: i, v: [500, 3000]}
+        state_vars:
+          n:
+            waited_ms: {k: i, v: [100, 2000]}
+          f:
+            waited_ms: {k: i, v: [500, 15000]}
+      gc_pause_warn:
+        desc: JVM/GC pause warning emitted periodically when pauses exceed a threshold.
+        lvl: WARN
+        msg: "gc pause duration_ms={duration_ms} heap_mb={heap_mb}"
+        vars:
+          heap_mb: {k: i, v: [512, 8192]}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [50, 500]}
+          f:
+            duration_ms: {k: i, v: [100, 3000]}
+    beh:
+      n:
+        desc: Healthy app instances with low GC pressure; request work is primarily cache-backed.
+        emit:
+          - id: gc_pause_warn
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: During outage many instances may be absent; after restoration, higher work and queuing increase GC pauses.
+        emit:
+          - id: gc_pause_warn
+            per_min: 0.4
+            scope: per_host
+
+  - id: cache_cluster
+    name: Cache Cluster (Redis/Memcache)
+    svc: cache-cluster
+    hosts: [cache-01, cache-02, cache-03]
+    desc: >
+      Caches hot content and API responses to shield the database from read load. In normal operation the keyspace
+      is large and hit rate high. In failure, many cache nodes may be terminated and replaced, and after restoration
+      the cache is cold, so keyspace and hit rate are low while warmup proceeds.
+    to:
+      - dst: app_cluster
+        proto: redis
+        desc: Serves cache reads/writes initiated by application instances.
+      - dst: monitoring
+        proto: https
+        desc: Exposes cache metrics scraped by monitoring.
+    logs:
+      redis_stats:
+        desc: Periodic cache node stats snapshot.
+        lvl: INFO
+        msg: "redis stats node={node} connected_clients={clients} used_memory_mb={mem_mb} key_count={key_count} hit_rate={hit_rate}"
+        vars:
+          node: {k: ch, v: ["cache-01", "cache-02", "cache-03"]}
+          clients: {k: i, v: [10, 50000]}
+          mem_mb: {k: i, v: [256, 65536]}
+        state_vars:
+          n:
+            key_count: {k: i, v: [1000000, 50000000]}
+            hit_rate: {k: f, v: [0.80, 0.99]}
+          f:
+            key_count: {k: i, v: [0, 5000000]}
+            hit_rate: {k: f, v: [0.00, 0.70]}
+      warmup_tick:
+        desc: Periodic warmup progress report after cache replacements.
+        lvl: INFO
+        msg: "cache warmup loaded_keys={loaded_keys} load_rate_keys_s={rate_keys_s} miss_rate={miss_rate}"
+        vars:
+          rate_keys_s: {k: i, v: [0, 200000]}
+        state_vars:
+          n:
+            loaded_keys: {k: i, v: [1000000, 50000000]}
+            miss_rate: {k: f, v: [0.01, 0.20]}
+          f:
+            loaded_keys: {k: i, v: [0, 10000000]}
+            miss_rate: {k: f, v: [0.20, 1.00]}
+    beh:
+      n:
+        desc: Stable cache fleet emitting periodic stats; warmup progress is not meaningful in steady state.
+        emit:
+          - id: redis_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: After termination/replacement, stats show reduced keyspace and warmup logs persist while caches refill.
+        emit:
+          - id: redis_stats
+            per_min: 1.0
+            scope: per_host
+          - id: warmup_tick
+            per_min: 2.0
+            scope: per_host
+
+  - id: db_cluster
+    name: Database Cluster
+    svc: db-cluster
+    hosts: [db-01, db-02, db-03]
+    desc: >
+      Primary relational store for content, sessions, and API data. In normal operation query latency is low and
+      connection pools are not heavily contended. In failure, cold caches shift read load to the database, causing
+      connection pool waits and slow queries, which surface as timeouts and 5xx at the edge.
+    to:
+      - dst: app_cluster
+        proto: jdbc
+        desc: Returns query results to the application cluster.
+      - dst: monitoring
+        proto: https
+        desc: Exposes DB metrics and exporter endpoints.
+    logs:
+      db_metrics:
+        desc: Periodic DB host metrics snapshot.
+        lvl: INFO
+        msg: "db metrics host={host} connections={connections} qps={qps} cpu_pct={cpu_pct}"
+        vars:
+          host: {k: ch, v: ["db-01", "db-02", "db-03"]}
+          connections: {k: i, v: [50, 2000]}
+          qps: {k: i, v: [100, 20000]}
+          cpu_pct: {k: i, v: [1, 100]}
+      conn_pool_waiting:
+        desc: Connection pool contention marker exported by DB middleware/driver.
+        lvl: ERROR
+        msg: "connection pool waiting host={host} waiting={waiting} max={max} wait_ms_p95={wait_ms_p95}"
+        vars:
+          host: {k: ch, v: ["db-01", "db-02", "db-03"]}
+          max: {k: i, v: [200, 3000]}
+        state_vars:
+          n:
+            waiting: {k: i, v: [0, 50]}
+            wait_ms_p95: {k: i, v: [0, 200]}
+          f:
+            waiting: {k: i, v: [10, 2000]}
+            wait_ms_p95: {k: i, v: [50, 15000]}
+      slow_query_warn:
+        desc: Slow query warning emitted when query duration exceeds threshold.
+        lvl: WARN
+        msg: "slow query host={host} duration_ms={duration_ms} normalized_sql={normalized_sql}"
+        vars:
+          host: {k: ch, v: ["db-01", "db-02", "db-03"]}
+          normalized_sql: {k: str, v: "sql"}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [200, 1500]}
+          f:
+            duration_ms: {k: i, v: [500, 20000]}
+    beh:
+      n:
+        desc: Emits steady metrics and occasional slow-query warnings.
+        emit:
+          - id: db_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: slow_query_warn
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Under cold-cache load, connection waits and slow queries are more frequent.
+        emit:
+          - id: db_metrics
+            per_min: 1.0
+            scope: per_host
+          - id: conn_pool_waiting
+            per_min: 3.0
+            scope: per_host
+          - id: slow_query_warn
+            per_min: 1.0
+            scope: per_host
+
+  - id: zookeeper
+    name: ZooKeeper Cluster
+    svc: zookeeper
+    hosts: [zk-01, zk-02, zk-03]
+    desc: >
+      Coordination system maintaining membership/health records used by the autoscaler. In normal operation the
+      quorum is stable and snapshots are consistent. During migration, the cluster may present partially migrated
+      data, leading clients to observe incomplete membership information.
+    to:
+      - dst: autoscaler
+        proto: tcp
+        desc: Returns snapshot responses to autoscaler clients (modeled as response hop).
+      - dst: monitoring
+        proto: https
+        desc: Exposes ZooKeeper metrics and health endpoints.
+    logs:
+      quorum_status:
+        desc: Periodic ZooKeeper quorum status.
+        lvl: INFO
+        msg: "zk quorum status node={node} role={role} zxid={zxid} peers_up={peers_up}"
+        vars:
+          node: {k: ch, v: ["zk-01", "zk-02", "zk-03"]}
+          role: {k: ch, v: ["leader", "follower"]}
+          zxid: {k: hex, v: 8}
+          peers_up: {k: i, v: [1, 3]}
+      migration_stage:
+        desc: Migration progress marker for moving ZooKeeper to new infrastructure.
+        lvl: WARN
+        msg: "zk migration stage={stage} progress_pct={progress_pct} source_cluster={source} dest_cluster={dest}"
+        vars:
+          stage: {k: ch, v: ["prep", "snapshot_copy", "cutover_partial", "cutover", "verify"]}
+          progress_pct: {k: i, v: [0, 100]}
+          source: {k: ch, v: ["zk-legacy"]}
+          dest: {k: ch, v: ["zk-modern"]}
+      read_snapshot:
+        desc: Autoscaler read a consistent membership snapshot from ZooKeeper.
+        lvl: INFO
+        msg: "snapshot read client={client} servers_seen={servers_seen} version={version}"
+        vars:
+          client: {k: ch, v: ["autoscaler"]}
+          version: {k: i, v: [1, 1000000]}
+        state_vars:
+          n:
+            servers_seen: {k: i, v: [200, 5000]}
+          f:
+            servers_seen: {k: i, v: [0, 5000]}
+      read_inconsistent:
+        desc: Autoscaler read an inconsistent/partial snapshot from ZooKeeper during migration.
+        lvl: ERROR
+        msg: "inconsistent snapshot client={client} servers_seen={servers_seen} missing_azs={missing_azs} version={version}"
+        vars:
+          client: {k: ch, v: ["autoscaler"]}
+          missing_azs: {k: ch, v: ["1", "2", "3"]}
+          version: {k: i, v: [1, 1000000]}
+        state_vars:
+          n:
+            servers_seen: {k: i, v: [200, 5000]}
+          f:
+            servers_seen: {k: i, v: [0, 2000]}
+    beh:
+      n:
+        desc: Stable quorum with routine status logs; migration markers are mostly quiet.
+        emit:
+          - id: quorum_status
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: During migration, additional migration-stage markers appear alongside routine quorum status.
+        emit:
+          - id: quorum_status
+            per_min: 0.5
+            scope: per_host
+          - id: migration_stage
+            per_min: 0.2
+            scope: per_host
+
+  - id: autoscaler
+    name: Autoscaler
+    svc: autoscaler
+    hosts: [as-01, as-02]
+    desc: >
+      Periodically reconciles desired capacity with observed membership in ZooKeeper and calls cloud APIs to
+      terminate or create instances. In normal operation it performs small, bounded adjustments. In failure, if
+      enabled during a migration, it can misinterpret partially migrated ZooKeeper data and issue aggressive,
+      unsafe termination actions.
+    to:
+      - dst: zookeeper
+        proto: tcp
+        desc: Reads membership/health information from ZooKeeper.
+      - dst: cloud_api
+        proto: https
+        desc: Issues instance lifecycle calls such as TerminateInstances.
+      - dst: monitoring
+        proto: https
+        desc: Exposes autoscaler reconciliation metrics.
+    logs:
+      reconcile_tick:
+        desc: Periodic autoscaler scheduler tick.
+        lvl: INFO
+        msg: "reconcile tick enabled={enabled} last_run_age_s={age_s}"
+        vars:
+          enabled: {k: ch, v: ["true", "false"]}
+          age_s: {k: i, v: [0, 600]}
+      reconcile_start:
+        desc: Start of a reconciliation run.
+        lvl: INFO
+        msg: "reconcile start run_id={run_id} reason={reason}"
+        vars:
+          run_id: {k: uuid, v: null}
+          reason: {k: ch, v: ["periodic", "startup", "manual"]}
+      reconcile_done:
+        desc: End of a successful reconciliation run.
+        lvl: INFO
+        msg: "reconcile done run_id={run_id} desired={desired} current={current} actions={actions} duration_ms={duration_ms}"
+        vars:
+          run_id: {k: uuid, v: null}
+          desired: {k: i, v: [50, 2000]}
+          current: {k: i, v: [0, 2000]}
+          actions: {k: i, v: [0, 500]}
+        state_vars:
+          n:
+            duration_ms: {k: i, v: [50, 2000]}
+          f:
+            duration_ms: {k: i, v: [100, 10000]}
+      scale_decision_bad:
+        desc: Unsafe scaling decision taken based on partial snapshot (guardrails missing or bypassed).
+        lvl: CRITICAL
+        msg: "unsafe scale decision run_id={run_id} snapshot_servers_seen={servers_seen} terminate_count={terminate_count} guardrails={guardrails}"
+        vars:
+          run_id: {k: uuid, v: null}
+          servers_seen: {k: i, v: [0, 5000]}
+          terminate_count: {k: i, v: [1, 2000]}
+          guardrails: {k: ch, v: ["none", "partial"]}
+      enabled_state_change:
+        desc: Autoscaler enabled/disabled state change (operational event).
+        lvl: WARN
+        msg: "autoscaler enabled state changed enabled={enabled} actor={actor} reason={reason}"
+        vars:
+          enabled: {k: ch, v: ["true", "false"]}
+          actor: {k: ch, v: ["operator", "pkg_manager", "sre_bot"]}
+          reason: {k: str, v: "reason"}
+      bulk_termination_summary:
+        desc: Summary of a bulk termination burst.
+        lvl: CRITICAL
+        msg: "bulk termination issued count={count} duration_s={duration_s} reason={reason} run_id={run_id}"
+        vars:
+          count: {k: i, v: [10, 1000]}
+          duration_s: {k: i, v: [1, 60]}
+          reason: {k: ch, v: ["bad_zk_snapshot", "operator"]}
+          run_id: {k: uuid, v: null}
+    beh:
+      n:
+        desc: Runs periodic reconciliation and emits scheduler ticks at a steady cadence.
+        emit:
+          - id: reconcile_tick
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Scheduler continues; depending on enablement and errors, reconcile cadence can increase.
+        emit:
+          - id: reconcile_tick
+            per_min: 2.0
+            scope: per_host
+
+  - id: pkg_manager
+    name: Package/Config Management
+    svc: pkg-manager
+    hosts: [pkg-01, pkg-02]
+    desc: >
+      Configuration enforcement system that detects drift from desired state and applies changes.
+      In this incident it reverted a manual disable of the autoscaler, re-enabling it unexpectedly.
+    to:
+      - dst: autoscaler
+        proto: ssh
+        desc: Applies configuration changes and restarts/services state on autoscaler hosts.
+      - dst: monitoring
+        proto: https
+        desc: Exposes enforcement and drift metrics.
+    logs:
+      drift_scan:
+        desc: Periodic drift detection scan summary.
+        lvl: INFO
+        msg: "drift scan component={component} drift_found={drift_found} changes={changes}"
+        vars:
+          component: {k: ch, v: ["autoscaler", "zookeeper"]}
+          drift_found: {k: ch, v: ["true", "false"]}
+          changes: {k: i, v: [0, 50]}
+      config_revert:
+        desc: Drift remediation applied reverting a manual change.
+        lvl: WARN
+        msg: "config reverted by package manager component={component} from={from_state} to={to_state} ticket={ticket}"
+        vars:
+          component: {k: ch, v: ["autoscaler"]}
+          from_state: {k: ch, v: ["disabled", "enabled"]}
+          to_state: {k: ch, v: ["disabled", "enabled"]}
+          ticket: {k: str, v: "ticket"}
+    beh:
+      n:
+        desc: Periodically scans for drift and usually finds none.
+        emit:
+          - id: drift_scan
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Scans continue during incident; remediation events are modeled as one-shots in the scenario.
+        emit:
+          - id: drift_scan
+            per_min: 0.5
+            scope: per_host
+
+  - id: cloud_api
+    name: Cloud Provider API (EC2)
+    svc: cloud-api
+    hosts: [awsapi-01, awsapi-02]
+    desc: >
+      External cloud control-plane API used to terminate instances. It emits aggregate call metrics continuously,
+      and bulk termination requests appear as discrete operational events in the incident timeline.
+    to:
+      - dst: monitoring
+        proto: https
+        desc: Exposes API call metrics to monitoring.
+    logs:
+      api_request_metrics:
+        desc: Periodic aggregate metrics for cloud API calls.
+        lvl: INFO
+        msg: "aws api metrics api={api} success={success} throttle={throttle} latency_ms_p95={latency_ms_p95}"
+        vars:
+          api: {k: ch, v: ["TerminateInstances", "DescribeInstances"]}
+          success: {k: i, v: [0, 5000]}
+          throttle: {k: i, v: [0, 5000]}
+        state_vars:
+          n:
+            latency_ms_p95: {k: i, v: [20, 400]}
+          f:
+            latency_ms_p95: {k: i, v: [20, 2000]}
+      terminate_instances_batch:
+        desc: Bulk terminate instances request log.
+        lvl: CRITICAL
+        msg: "TerminateInstances batch request batch_id={batch_id} instance_count={instance_count} caller={caller} http_status={http_status}"
+        vars:
+          batch_id: {k: hex, v: 12}
+          instance_count: {k: i, v: [1, 1000]}
+          caller: {k: ch, v: ["autoscaler"]}
+        state_vars:
+          n:
+            http_status: {k: ch, v: ["200"]}
+          f:
+            http_status: {k: ch, v: ["200", "429", "500"]}
+    beh:
+      n:
+        desc: Emits periodic call metrics for normal control-plane activity.
+        emit:
+          - id: api_request_metrics
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Emits periodic call metrics with higher tail latencies during incident activity.
+        emit:
+          - id: api_request_metrics
+            per_min: 1.0
+            scope: per_host
+
+  - id: monitoring
+    name: Monitoring/Alerting
+    svc: monitoring
+    hosts: [mon-01, mon-02]
+    desc: >
+      Scrapes metrics and generates alerts. In normal conditions it emits scrape logs at a steady cadence.
+      During the incident it fires availability and error-rate alerts, modeled as discrete one-shot log bursts.
+    to: []
+    logs:
+      scrape_success:
+        desc: Successful Prometheus scrape log.
+        lvl: DEBUG
+        msg: "prom scrape ok job={job} targets={targets}"
+        vars:
+          job: {k: ch, v: ["edge_lb", "app_cluster", "cache_cluster", "db_cluster", "zookeeper", "autoscaler", "pkg_manager", "cloud_api"]}
+          targets: {k: i, v: [1, 200]}
+      alert_firing:
+        desc: Alert firing notification.
+        lvl: CRITICAL
+        msg: "ALERT firing name={name} severity={severity} value={value} summary={summary}"
+        vars:
+          name: {k: ch, v: ["site_unreachable", "5xx_spike", "db_latency_high"]}
+          severity: {k: ch, v: ["page", "ticket"]}
+          value: {k: f, v: [0.0, 100.0]}
+          summary: {k: str, v: "alert_summary"}
+    beh:
+      n:
+        desc: Continuous metric scraping at a stable rate; alerts are rare.
+        emit:
+          - id: scrape_success
+            per_min: 6.0
+            scope: global
+      f:
+        desc: Scraping continues; alerts are emitted as scenario one-shots.
+        emit:
+          - id: scrape_success
+            per_min: 6.0
+            scope: global
+
+  - id: ops_console
+    name: Operations Console / Feature Flag Controller
+    svc: ops-console
+    hosts: [ops-01]
+    desc: >
+      Operational control surface used to toggle site-wide "down mode" and record operator actions. In normal
+      operation it emits low-rate audit logs. During incident response it records a down-mode toggle event.
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Pushes/updates edge configuration/flags such as down mode.
+      - dst: monitoring
+        proto: https
+        desc: Exposes operational action metrics.
+    logs:
+      audit_log:
+        desc: Low-rate operations audit log.
+        lvl: INFO
+        msg: "ops audit action={action} actor={actor} target={target}"
+        vars:
+          action: {k: ch, v: ["view_dashboard", "ack_alert", "toggle_down_mode"]}
+          actor: {k: ch, v: ["oncall", "sre_bot"]}
+          target: {k: ch, v: ["edge_lb", "autoscaler", "zookeeper", "cache_cluster", "db_cluster"]}
+      down_mode_enabled:
+        desc: Down mode toggled on/off by an operator.
+        lvl: WARN
+        msg: "down mode set enabled={enabled} actor={actor} reason={reason}"
+        vars:
+          enabled: {k: ch, v: ["true", "false"]}
+          actor: {k: ch, v: ["oncall", "sre"]}
+          reason: {k: str, v: "reason"}
+    beh:
+      n:
+        desc: Occasional audit actions; no down-mode toggles.
+        emit:
+          - id: audit_log
+            per_min: 0.1
+            scope: global
+      f:
+        desc: Audit continues; down-mode toggle is modeled as a scenario one-shot.
+        emit:
+          - id: audit_log
+            per_min: 0.1
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_lb]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal user traffic is served by app instances behind the edge; most requests are satisfied via cache with
+      occasional DB access. The autoscaler periodically reconciles membership using ZooKeeper.
+    req:
+      - id: web_page_ok
+        desc: Browser loads a Reddit page successfully (cache-backed most of the time).
+        rpm: 180.0
+        path: [edge_lb, app_cluster, cache_cluster, app_cluster, edge_lb]
+        emit: [app_cluster.req_start, app_cluster.req_end, edge_lb.access_log]
+        latency_ms: [[0, 1], [20, 120], [1, 8]]
+        trace: true
+      - id: api_get_ok
+        desc: Third-party/app client performs a successful API GET for user/session or listing data.
+        rpm: 120.0
+        path: [edge_lb, app_cluster, cache_cluster, app_cluster, edge_lb]
+        emit: [app_cluster.req_start, app_cluster.req_end, edge_lb.access_log]
+        latency_ms: [[0, 1], [15, 100], [1, 8]]
+        trace: true
+      - id: autoscaler_reconcile_ok
+        desc: Periodic autoscaler reconciliation using a consistent ZooKeeper snapshot.
+        rpm: 1.0
+        path: [autoscaler, zookeeper, autoscaler]
+        emit: [autoscaler.reconcile_start, zookeeper.read_snapshot, autoscaler.reconcile_done]
+        latency_ms: [[0, 1], [50, 150], [5, 30]]
+        trace: false
+
+  f:
+    desc: >
+      Failure begins when autoscaler is unexpectedly enabled during a partial ZooKeeper migration. Initially some
+      user requests still succeed, but shortly after, bulk instance terminations remove most app and cache capacity,
+      producing widespread 503s and retries at the edge. After capacity is restored, caches are cold and the database
+      becomes overloaded, leading to slow responses and intermittent timeouts (504) that persist through the end.
+    req:
+      - id: web_page_503_no_backends
+        desc: Browser request fails immediately because the edge has no healthy app backends.
+        rpm: 180.0
+        path: [edge_lb]
+        emit: [edge_lb.upstream_error, edge_lb.access_log]
+        latency_ms: [[2, 30], [0, 2]]
+        trace: true
+      - id: api_get_503_retrying
+        desc: API request fails with 503 and the client/gateway retries automatically.
+        rpm: 120.0
+        path: [edge_lb]
+        emit: [edge_lb.upstream_error, edge_lb.access_log]
+        latency_ms: [[2, 40], [0, 2]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.3
+          emit_per_retry: [edge_lb.retry_scheduled]
+          backoff_ms: [[200, 500], [500, 1500]]
+        trace: true
+      - id: web_page_down_mode
+        desc: Browser request is served a down-mode page by the edge to reduce backend load.
+        rpm: 60.0
+        path: [edge_lb]
+        emit: [edge_lb.down_mode_served, edge_lb.access_log]
+        latency_ms: [[0, 2], [0, 2]]
+        trace: true
+      - id: api_down_mode
+        desc: API request receives a down-mode response while restoration is in progress.
+        rpm: 40.0
+        path: [edge_lb]
+        emit: [edge_lb.down_mode_served, edge_lb.access_log]
+        latency_ms: [[0, 2], [0, 2]]
+        trace: true
+      - id: web_page_slow_ok
+        desc: Browser request succeeds but is slow due to cache misses and increased DB work.
+        rpm: 110.0
+        path: [edge_lb, app_cluster, cache_cluster, app_cluster, db_cluster, app_cluster, edge_lb]
+        emit: [app_cluster.req_start, app_cluster.db_query, app_cluster.req_end, edge_lb.access_log]
+        latency_ms: [[0, 1], [40, 250], [10, 150], [1, 10]]
+        trace: true
+      - id: api_get_slow_ok
+        desc: API request succeeds but is slow due to cold caches and elevated DB latency.
+        rpm: 70.0
+        path: [edge_lb, app_cluster, cache_cluster, app_cluster, db_cluster, app_cluster, edge_lb]
+        emit: [app_cluster.req_start, app_cluster.db_query, app_cluster.req_end, edge_lb.access_log]
+        latency_ms: [[0, 1], [30, 220], [10, 140], [1, 10]]
+        trace: true
+      - id: web_page_db_timeout
+        desc: Browser request times out in the app/DB layer and surfaces as a gateway timeout at the edge.
+        rpm: 50.0
+        path: [edge_lb, app_cluster, cache_cluster, app_cluster, db_cluster, app_cluster, edge_lb]
+        emit: [app_cluster.req_start, app_cluster.db_timeout, edge_lb.upstream_error, edge_lb.access_log]
+        latency_ms: [[0, 1], [800, 5000], [5, 50], [0, 2]]
+        trace: true
+      - id: api_db_timeout
+        desc: API request times out; client retries once, increasing load during degradation.
+        rpm: 30.0
+        path: [edge_lb, app_cluster, cache_cluster, app_cluster, db_cluster, app_cluster, edge_lb]
+        emit: [app_cluster.req_start, app_cluster.db_timeout, edge_lb.upstream_error, edge_lb.access_log]
+        latency_ms: [[0, 1], [700, 4000], [5, 60], [0, 2]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.6
+          emit_per_retry: [edge_lb.retry_scheduled]
+          backoff_ms: [[300, 800]]
+        trace: true
+      - id: autoscaler_reconcile_bad
+        desc: Autoscaler reconciliation run during migration reads inconsistent ZooKeeper data and decides unsafe terminations.
+        rpm: 2.0
+        path: [autoscaler, zookeeper, autoscaler]
+        emit: [autoscaler.reconcile_start, zookeeper.read_inconsistent, autoscaler.scale_decision_bad]
+        latency_ms: [[0, 1], [80, 300], [5, 80]]
+        trace: false
+
+assumptions:
+  - "The real incident lasted ~3 hours with recovery; for the required two-phase (normal→failure, no recovery) structure, the timeline is compressed to 48 minutes and ends while the service is still degraded (cold-cache/DB pressure persists)."
+  - "Application servers and API are modeled as a single app_cluster because the post-mortem states the same servers serve website and API; separate flows represent web vs API traffic patterns."
+  - "Cache-to-DB access is modeled as app_cluster consulting cache_cluster and then (on miss) querying db_cluster; failure-state slow/timeout flow paths include an explicit return from cache_cluster to app_cluster before the db_cluster hop."
+  - "ZooKeeper is modeled as the membership source for autoscaler decisions; the 'partially migrated data' manifests as zookeeper.read_inconsistent with low servers_seen and missing_azs."
+  - "Mass termination in ~16 seconds is represented with scenario one-shots (autoscaler.bulk_termination_summary and cloud_api.terminate_instances_batch) rather than a high per-minute rate."
+  - "Client retry behavior is approximated at the edge layer using flow retries for API requests; web traffic is modeled mostly without retries to keep behavior distinct and diagnosable."
+  - "Estimated normal logs/min: ~927 (flows: ~903; background: ~24). Normal duration 24 min ⇒ ~22,248 logs."
+  - "Estimated failure logs (piecewise, before one-shots): I1 1m≈754; I2 5m≈5,485; I3 8m≈3,808; I4 4m≈3,306; I5 4m≈6,431; I6 2m≈2,583 ⇒ ~22,367 logs. One-shots add ~8 logs (counts chosen in scenario)."
+  - "Estimated total logs ≈ 22,248 + 22,375 ≈ 44,600, fitting the 20k–100k target; failure is noisier due to retries and elevated DB/cold-cache symptoms even while down-mode reduces some traffic."
+```

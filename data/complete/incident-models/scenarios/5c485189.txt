@@ -1,0 +1,179 @@
+```yaml
+scenario:
+  id: dns_resolver_stall_spike_outage
+  title: Traffic spike triggers DNS connect stalls and widespread 504s
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The hosted package repository normally serves package metadata and artifacts through a load balancer and a small frontend tier.
+    A scheduled automation wave causes an extreme traffic spike (~6x baseline), and frontends begin stalling on connect() to the
+    datacenter DNS resolver, tying up workers and producing many 503/504 responses. External monitoring detects the outage and pages
+    on-call; operator actions confirm the DNS-connect stall, but the incident ends while the service is still degraded.
+
+  trigger_desc: |
+    A periodic config-management/automation job across many clients starts simultaneously and generates a synchronized surge of package
+    repository requests well above typical spikes.
+
+  time:
+    total_minutes: 24
+    phases:
+      n: {start_min: 0, end_min: 12}
+      f: {start_min: 12, end_min: 24}
+
+  phases:
+    n:
+      desc: |
+        Baseline traffic is steady and served successfully. Load balancer stats show low queueing and near-zero 5xx counts.
+        Frontend metrics show low inflight load and fast DNS lookups, and external monitoring checks succeed.
+      flows: [fetch_package_n, monitor_check_n]
+      manifestation: [edge_lb.access_2xx, edge_lb.lb_stats, app_frontend.app_metrics, external_monitor.check_ok]
+
+    f:
+      desc: |
+        At failure start, a synchronized automation spike increases request volume dramatically. As the spike continues, the
+        datacenter DNS resolver becomes slow/erratic, and frontend workers spend significant time blocked waiting on DNS connect()
+        and lookups. The load balancer increasingly returns 504/503 while frontend inflight load and DNS timeout rates climb.
+
+      events:
+        - order: 1
+          at_min: 12
+          component: edge_lb
+          event: |
+            A scheduled client automation wave hits and request volume jumps to ~6x baseline; backend queueing begins and some requests
+            start timing out, triggering external monitoring failures and paging.
+          why: |
+            The frontends handle far more concurrent requests, increasing dependency calls including DNS. Early in the spike,
+            contention and dependency latency start pushing responses over timeouts (directly observable via LB 5xx and monitor failures).
+          flows: [fetch_package_ok_f, fetch_package_fail_f, monitor_check_f]
+          rate_multipliers:
+            fetch_package_ok_f: 1.0
+            fetch_package_fail_f: 1.0
+            monitor_check_f: 1.0
+            app_frontend.dns_timeout: 1.0
+          latency_multipliers:
+            fetch_package_ok_f: {p50: 1.2, p95: 1.4}
+            fetch_package_fail_f: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: external_monitor.page_sent
+              count: 1
+              hosts: [mon-1]
+          manifestation: [external_monitor.page_sent, edge_lb.lb_stats, edge_lb.access_5xx, app_frontend.app_metrics]
+
+        - order: 2
+          at_min: 15
+          component: dns_resolver
+          event: |
+            Resolver performance degrades under the spike: DNS response times and TCP connection errors increase, and frontend DNS timeout
+            warnings become more frequent. The successful share of requests drops while 503/504 responses rise.
+          why: |
+            With many frontend workers attempting DNS connections/queries concurrently, the shared resolver becomes a bottleneck and may
+            shed load or slow down, causing connect()/lookup stalls. This is observable indirectly (frontend DNS warnings/metrics) and
+            corroborated by resolver stats; the exact rate-limiting policy is external to the app.
+          flows: [fetch_package_ok_f, fetch_package_fail_f]
+          rate_multipliers:
+            fetch_package_ok_f: 0.5
+            fetch_package_fail_f: 1.5
+            app_frontend.dns_timeout: 2.0
+          latency_multipliers:
+            fetch_package_ok_f: {p50: 1.5, p95: 2.0}
+            fetch_package_fail_f: {p50: 1.2, p95: 1.3}
+          one_shots: []
+          manifestation: [app_frontend.dns_timeout, app_frontend.app_metrics, dns_resolver.dns_stats, edge_lb.access_5xx]
+
+        - order: 3
+          at_min: 18
+          component: oncall_ops
+          event: |
+            On-call increases load balancer weight and shifts capacity toward the frontend tier, but the new frontend remains oddly low
+            on CPU; a sampled process shows it blocked in connect() to the DNS resolver.
+          why: |
+            Adding/weighting frontend capacity does not help when the shared DNS resolver is the bottleneck: more workers still stall on
+            the same dependency. The strace sample provides direct evidence of connect() blocking, while LB 5xx and frontend metrics remain elevated.
+          flows: [fetch_package_ok_f, fetch_package_fail_f]
+          rate_multipliers: {}
+          latency_multipliers: {}
+          one_shots:
+            - ref: oncall_ops.lb_weight_change
+              count: 1
+              hosts: [ops-1]
+            - ref: oncall_ops.shift_capacity
+              count: 1
+              hosts: [ops-1]
+            - ref: oncall_ops.strace_sample
+              count: 1
+              hosts: [ops-1]
+          manifestation: [oncall_ops.strace_sample, app_frontend.dns_timeout, edge_lb.access_5xx]
+
+        - order: 4
+          at_min: 21
+          component: edge_lb
+          event: |
+            As the spike persists, request queueing worsens and timeouts dominate; most client requests are now served as 504/503.
+          why: |
+            Frontend workers are increasingly consumed by blocked DNS connect/lookups, reducing effective throughput. More requests exceed
+            upstream timeouts and fail at the load balancer (directly observable via LB access 5xx and increasing DNS timeout warnings).
+          flows: [fetch_package_ok_f, fetch_package_fail_f, monitor_check_f]
+          rate_multipliers:
+            fetch_package_ok_f: 0.2
+            fetch_package_fail_f: 1.8
+            app_frontend.dns_timeout: 2.5
+          latency_multipliers:
+            fetch_package_ok_f: {p50: 2.0, p95: 3.0}
+            fetch_package_fail_f: {p50: 1.5, p95: 1.8}
+          one_shots: []
+          manifestation: [edge_lb.lb_stats, edge_lb.access_5xx, app_frontend.app_metrics, external_monitor.check_fail]
+
+      steady:
+        - component: app_frontend
+          condition: |
+            Frontend workers remain saturated with high inflight counts; DNS connect/lookup latency and timeouts stay elevated, keeping
+            throughput low even with additional instances present.
+          user_impact: |
+            Most users experience repository unavailability (timeouts or 503/504) during the spike window.
+          manifestation: [app_frontend.app_metrics, app_frontend.dns_timeout]
+        - component: edge_lb
+          condition: |
+            The load balancer continues to return a high fraction of 504/503 due to slow/unresponsive upstreams; backend queue remains high.
+          user_impact: |
+            Client requests frequently fail fast with 503 or time out to 504; automation may retry and amplify load.
+          manifestation: [edge_lb.access_5xx, edge_lb.lb_stats]
+        - component: external_monitor
+          condition: |
+            External checks continue to fail intermittently and report high latency.
+          user_impact: |
+            Monitoring shows sustained outage conditions; on-call remains engaged.
+          manifestation: [external_monitor.check_fail]
+
+      feedback_loops:
+        - id: automation_retry_amplification
+          desc: |
+            Clients performing automation often retry failed package fetches. During the spike this increases concurrent request volume,
+            further stressing frontends and the shared DNS resolver, which in turn increases timeouts and prompts more retries.
+
+      flows: [fetch_package_ok_f, fetch_package_fail_f, monitor_check_f]
+      manifestation: [edge_lb.access_5xx, edge_lb.lb_stats, app_frontend.dns_timeout, app_frontend.app_metrics, dns_resolver.dns_stats, external_monitor.check_fail]
+
+  assumptions:
+    - >
+      This scenario models one of the repeated spike-driven outages specifically in the "add capacity but still down" era, where the
+      observed bottleneck is DNS connectivity (connect() stalls) rather than a load balancer max-connection cap.
+    - >
+      Failure-phase piecewise breakdown (12 minutes total):
+      minutes 12-15: fetch ok 2400 rpm, fetch fail 2400 rpm, dns_timeout ~90/min total, steady stats/metrics (~110/min).
+      minutes 15-18: ok multiplier 0.5 (1200 rpm), fail multiplier 1.5 (3600 rpm), dns_timeout multiplier 2.0 (~180/min total).
+      minutes 18-21: rates as above, plus 3 ops one-shots at minute 18.
+      minutes 21-24: ok multiplier 0.2 (480 rpm), fail multiplier 1.8 (4320 rpm), dns_timeout multiplier 2.5 (~225/min total).
+    - >
+      Consistency note: app_frontend.app_metrics.dns_timeouts_1m is intended to be on the same order as emitted WARNs
+      app_frontend.dns_timeout per host (rolling 1-minute count), with normal kept near-zero and failure elevated.
+    - >
+      Visibility rationale: LB access 5xx dominates during failure (tens of thousands of logs), edge_lb.lb_stats cleanly separates
+      normal (near-zero 5xx/queue) from failure (elevated), app_frontend.app_metrics emits every 10s per host, and app_frontend.dns_timeout
+      is frequent during the spike; together they make the DNS stall progression and impact obvious.
+    - >
+      Domain alignment note: edge_lb.access_5xx rt_ms/upstream_ms domains are sized to accommodate the largest modeled failure
+      latency hint after multipliers (up to ~18000ms implied p95).
+    - >
+      Estimated total logs: ~69k (normal ~9.9k; failure ~59k including ops one-shots), within the 20k–100k target.
+```

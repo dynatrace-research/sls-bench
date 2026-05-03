@@ -1,0 +1,563 @@
+```yaml
+sys:
+  id: cdn_edge_transit_failover
+  desc: >
+    A CDN edge service proxies end-user HTTP requests and fetches content from customer origin servers on cache misses.
+    Edge egress traffic exits the PoP via multiple transit providers; when a provider path is lossy, TCP retransmissions and
+    connection timeouts can prevent the edge from reaching origins, producing HTTP 522 errors. Network monitoring runs
+    active probes to detect packet loss, and operators can manually drain/disable a transit provider to reroute traffic.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_proxy
+    name: Edge reverse proxy
+    svc: edge-proxy
+    hosts: [edge-ams-1, edge-ams-2, edge-fra-1]
+    desc: >
+      Terminates client connections, serves cached content, and fetches from origins on cache misses.
+      Emits per-request access logs and origin connection error logs.
+
+    to:
+      - dst: egress_router
+        proto: tcp
+        desc: Sends origin-bound traffic to the local egress router for upstream transit.
+
+    logs:
+      access_hit_200:
+        desc: Cache-hit access log for successful responses.
+        lvl: INFO
+        msg: "req {req_id} pop={pop} {method} {host}{uri} -> 200 hit dur={dur_ms}ms bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          method: {k: ch, v: [GET, HEAD]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          uri: {k: ch, v: [/, /login, /api/v1/items, /static/app.js]}
+          dur_ms: {k: i, v: [5, 80]}
+          bytes: {k: i, v: [200, 90000]}
+
+      origin_fetch_start:
+        desc: Start of an origin connection attempt (generic, provider chosen by egress).
+        lvl: DEBUG
+        msg: "origin connect start pop={pop} host={host} provider={provider} origin_ip={origin_ip} timeout={timeout_ms}ms"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          provider: {k: ch, v: [telia, cogent, level3]}
+          origin_ip: {k: ip, v: null}
+          timeout_ms: {k: i, v: [2000, 7000]}
+
+      access_miss_200:
+        desc: Cache-miss access log for successful responses (generic provider).
+        lvl: INFO
+        msg: "req {req_id} pop={pop} {method} {host}{uri} -> 200 miss provider={provider} dur={dur_ms}ms bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          method: {k: ch, v: [GET, HEAD]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          uri: {k: ch, v: [/, /login, /api/v1/items, /static/app.js]}
+          provider: {k: ch, v: [telia, cogent, level3]}
+          dur_ms: {k: i, v: [60, 3500]}
+          bytes: {k: i, v: [200, 90000]}
+
+      origin_fetch_start_telia:
+        desc: Start of an origin connection attempt routed via Telia.
+        lvl: DEBUG
+        msg: "origin connect start pop={pop} host={host} provider=telia origin_ip={origin_ip} timeout={timeout_ms}ms"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          origin_ip: {k: ip, v: null}
+          timeout_ms: {k: i, v: [2000, 7000]}
+
+      access_miss_200_telia:
+        desc: Cache-miss success routed via Telia.
+        lvl: INFO
+        msg: "req {req_id} pop={pop} {method} {host}{uri} -> 200 miss provider=telia dur={dur_ms}ms bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          method: {k: ch, v: [GET, HEAD]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          uri: {k: ch, v: [/, /login, /api/v1/items, /static/app.js]}
+          dur_ms: {k: i, v: [120, 8000]}
+          bytes: {k: i, v: [200, 90000]}
+
+      origin_fetch_start_alt:
+        desc: Start of an origin connection attempt routed via a non-Telia transit provider.
+        lvl: DEBUG
+        msg: "origin connect start pop={pop} host={host} provider={provider} origin_ip={origin_ip} timeout={timeout_ms}ms"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          provider: {k: ch, v: [cogent, level3]}
+          origin_ip: {k: ip, v: null}
+          timeout_ms: {k: i, v: [2000, 7000]}
+
+      access_miss_200_alt:
+        desc: Cache-miss success routed via a non-Telia transit provider.
+        lvl: INFO
+        msg: "req {req_id} pop={pop} {method} {host}{uri} -> 200 miss provider={provider} dur={dur_ms}ms bytes={bytes}"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          method: {k: ch, v: [GET, HEAD]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          uri: {k: ch, v: [/, /login, /api/v1/items, /static/app.js]}
+          provider: {k: ch, v: [cogent, level3]}
+          dur_ms: {k: i, v: [120, 9000]}
+          bytes: {k: i, v: [200, 90000]}
+
+      origin_connect_timeout_telia:
+        desc: Origin connection timed out while routed via Telia.
+        lvl: ERROR
+        msg: "origin connect timeout pop={pop} host={host} provider=telia waited={waited_ms}ms"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          waited_ms: {k: i, v: [2000, 12000]}
+
+      access_522_telia:
+        desc: Client-facing 522 response due to inability to reach origin via Telia.
+        lvl: INFO
+        msg: "req {req_id} pop={pop} {method} {host}{uri} -> 522 origin_unreachable provider=telia dur={dur_ms}ms"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          method: {k: ch, v: [GET, HEAD]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          uri: {k: ch, v: [/, /login, /api/v1/items, /static/app.js]}
+          dur_ms: {k: i, v: [3000, 15000]}
+
+      origin_connect_timeout_alt:
+        desc: Origin connection timed out while routed via a non-Telia provider (e.g., congestion after reroute).
+        lvl: ERROR
+        msg: "origin connect timeout pop={pop} host={host} provider={provider} waited={waited_ms}ms"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          provider: {k: ch, v: [cogent, level3]}
+          waited_ms: {k: i, v: [2000, 12000]}
+
+      access_522_alt:
+        desc: Client-facing 522 response after traffic is shifted to non-Telia providers.
+        lvl: INFO
+        msg: "req {req_id} pop={pop} {method} {host}{uri} -> 522 origin_unreachable provider={provider} dur={dur_ms}ms"
+        vars:
+          req_id: {k: uuid, v: null}
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          method: {k: ch, v: [GET, HEAD]}
+          host: {k: ch, v: [app1.example, app2.example, api.example]}
+          uri: {k: ch, v: [/, /login, /api/v1/items, /static/app.js]}
+          provider: {k: ch, v: [cogent, level3]}
+          dur_ms: {k: i, v: [3000, 15000]}
+
+      cache_metrics:
+        desc: Periodic cache health/throughput summary per edge host.
+        lvl: INFO
+        msg: "cache stats pop={pop} hit_rate={hit_rate}% evictions={evictions} fill_q={fill_q}"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          hit_rate: {k: i, v: [60, 98]}
+          evictions: {k: i, v: [0, 250]}
+          fill_q: {k: i, v: [0, 80]}
+
+      egress_queue_high:
+        desc: Edge-local egress queueing observed when shifted traffic congests remaining providers.
+        lvl: WARN
+        msg: "egress queueing pop={pop} queue_depth={queue_depth} p95_wait_ms={p95_wait_ms}"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          queue_depth: {k: i, v: [50, 4000]}
+          p95_wait_ms: {k: i, v: [20, 1200]}
+
+    beh:
+      n:
+        desc: Low-noise periodic cache summaries on each edge.
+        emit:
+          - id: cache_metrics
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Cache summaries continue; after reroute, some edges observe egress queueing due to shifted load.
+        emit:
+          - id: cache_metrics
+            per_min: 0.5
+            scope: per_host
+          - id: egress_queue_high
+            per_min: 4.0
+            scope: per_host
+
+  - id: egress_router
+    name: PoP egress router
+    svc: egress-router
+    hosts: [rtr-ams-1, rtr-ams-2]
+    desc: >
+      Maintains upstream transit sessions and forwards origin-bound traffic to transit providers.
+      Operators can administratively disable Telia ports and update egress policy to shift traffic.
+
+    to:
+      - dst: edge_proxy
+        proto: tcp
+        desc: Carries traffic from edge hosts toward upstream providers (modeled as a local adjacency).
+      - dst: net_monitor
+        proto: icmp
+        desc: Responds to probing/measurement traffic used for path quality detection.
+      - dst: traffic_engineering
+        proto: netconf
+        desc: Receives operator-driven configuration/policy updates.
+
+    logs:
+      iface_counters:
+        desc: Periodic egress interface counters for non-Telia providers (used after mitigation).
+        lvl: INFO
+        msg: "egress counters iface={iface} provider={provider} tx_mbps={tx_mbps} drops={drops}"
+        vars:
+          iface: {k: ch, v: [ae2]}
+          provider: {k: ch, v: [cogent, level3]}
+        state_vars:
+          n:
+            tx_mbps: {k: i, v: [1, 12]}
+            drops: {k: i, v: [0, 10]}
+          f:
+            tx_mbps: {k: i, v: [3, 25]}
+            drops: {k: i, v: [0, 40]}
+
+      iface_counters_telia:
+        desc: Periodic egress interface counters for Telia, including drops during the loss event.
+        lvl: INFO
+        msg: "egress counters iface={iface} provider=telia tx_mbps={tx_mbps} drops={drops}"
+        vars:
+          iface: {k: ch, v: [ae1]}
+        state_vars:
+          n:
+            tx_mbps: {k: i, v: [1, 12]}
+            drops: {k: i, v: [0, 10]}
+          f:
+            tx_mbps: {k: i, v: [2, 20]}
+            drops: {k: i, v: [300, 5000]}
+
+      admin_down_telia:
+        desc: Administrative shutdown of Telia egress port(s).
+        lvl: INFO
+        msg: "admin down: provider=telia iface={iface} reason={reason}"
+        vars:
+          iface: {k: ch, v: [ae1]}
+          reason: {k: ch, v: [high_packet_loss]}
+
+      policy_update:
+        desc: Egress policy update to prefer alternate providers over Telia.
+        lvl: INFO
+        msg: "egress policy updated: prefer={prefer} avoid=telia"
+        vars:
+          prefer: {k: ch, v: [cogent, level3]}
+
+    beh:
+      n:
+        desc: Routers emit periodic counters for each upstream; drops are typically near zero.
+        emit:
+          - id: iface_counters
+            per_min: 1.0
+            scope: per_host
+          - id: iface_counters_telia
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Periodic counters continue; Telia shows elevated drops until the port is taken down.
+        emit:
+          - id: iface_counters
+            per_min: 1.0
+            scope: per_host
+          - id: iface_counters_telia
+            per_min: 1.0
+            scope: per_host
+
+  - id: net_monitor
+    name: Network path monitor
+    svc: net-monitor
+    hosts: [netmon-1]
+    desc: >
+      Runs active probes to measure packet loss/latency to common destinations per transit provider,
+      and raises an alarm when a provider shows sustained high loss.
+
+    to:
+      - dst: egress_router
+        proto: icmp
+        desc: Probes traverse the same egress/transit paths used for origin traffic.
+
+    logs:
+      probe_ok:
+        desc: Routine probe result showing low loss on non-Telia providers.
+        lvl: INFO
+        msg: "probe provider={provider} dst={dst} loss={loss_pct}% rtt={rtt_ms}ms"
+        vars:
+          provider: {k: ch, v: [cogent, level3]}
+          dst: {k: ch, v: [8.8.8.8, 1.1.1.1, 93.184.216.34]}
+          loss_pct: {k: f, v: [0.0, 2.0]}
+          rtt_ms: {k: i, v: [10, 180]}
+
+      probe_ok_telia:
+        desc: Routine probe result showing low loss on Telia (normal baseline only).
+        lvl: INFO
+        msg: "probe provider=telia dst={dst} loss={loss_pct}% rtt={rtt_ms}ms"
+        vars:
+          dst: {k: ch, v: [8.8.8.8, 1.1.1.1, 93.184.216.34]}
+          loss_pct: {k: f, v: [0.0, 2.0]}
+          rtt_ms: {k: i, v: [10, 180]}
+
+      probe_high_loss_telia:
+        desc: Probe result indicating high loss on Telia.
+        lvl: WARN
+        msg: "probe high loss provider=telia dst={dst} loss={loss_pct}% rtt={rtt_ms}ms"
+        vars:
+          dst: {k: ch, v: [8.8.8.8, 1.1.1.1, 93.184.216.34]}
+          loss_pct: {k: f, v: [20.0, 85.0]}
+          rtt_ms: {k: i, v: [40, 350]}
+
+      packet_loss_alarm:
+        desc: Alarm raised when Telia loss is detected across multiple probe targets.
+        lvl: CRITICAL
+        msg: "alarm: high packet loss provider=telia pop={pop} loss={loss_pct}%"
+        vars:
+          pop: {k: ch, v: [ams, fra, lhr, iad]}
+          loss_pct: {k: f, v: [30.0, 85.0]}
+
+    beh:
+      n:
+        desc: Continuous low-loss probe results across providers.
+        emit:
+          - id: probe_ok
+            per_min: 8.0
+            scope: global
+          - id: probe_ok_telia
+            per_min: 4.0
+            scope: global
+      f:
+        desc: During the incident, Telia probes show high loss until mitigation takes Telia out of service.
+        emit:
+          - id: probe_ok
+            per_min: 6.0
+            scope: global
+          - id: probe_high_loss_telia
+            per_min: 12.0
+            scope: global
+
+  - id: traffic_engineering
+    name: NOC traffic engineering tool
+    svc: noc-te
+    hosts: [noc-1]
+    desc: >
+      Used by on-call engineers to apply manual mitigations (drain/disable provider ports, change egress preference).
+      Emits runbook action markers and a low-rate heartbeat.
+
+    to:
+      - dst: egress_router
+        proto: netconf
+        desc: Pushes operator-approved configuration changes to routers.
+
+    logs:
+      noc_heartbeat:
+        desc: Periodic liveness marker.
+        lvl: DEBUG
+        msg: "noc-te heartbeat leader={leader}"
+        vars:
+          leader: {k: ch, v: [noc-1]}
+
+      mitigation_command:
+        desc: Operator initiates the runbook to drain/disable Telia.
+        lvl: INFO
+        msg: "runbook execute action={action} provider=telia requested_by={user}"
+        vars:
+          action: {k: ch, v: [drain_ports, disable_bgp_sessions]}
+          user: {k: ch, v: [oncall1, oncall2]}
+
+    beh:
+      n:
+        desc: Heartbeat logs at low rate.
+        emit:
+          - id: noc_heartbeat
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Heartbeat continues during incident.
+        emit:
+          - id: noc_heartbeat
+            per_min: 0.2
+            scope: per_host
+
+  - id: analytics
+    name: Error-rate aggregator
+    svc: analytics
+    hosts: [analytics-1]
+    desc: >
+      Aggregates edge outcomes and periodically emits a summary focused on HTTP 522 rates
+      to support incident detection and scoping.
+
+    to:
+      - dst: edge_proxy
+        proto: logpipe
+        desc: Consumes edge logs/metrics for aggregation.
+
+    logs:
+      http_522_summary_normal:
+        desc: Normal baseline of 522 errors (near-zero).
+        lvl: INFO
+        msg: "http error summary status=522 count={count} pct={pct}% scope=global"
+        vars:
+          count: {k: i, v: [0, 3]}
+          pct: {k: f, v: [0.0, 0.1]}
+
+      http_522_summary_high:
+        desc: Elevated 522 errors during Telia loss period (aligned to modeled flow volumes).
+        lvl: INFO
+        msg: "http error summary status=522 count={count} pct={pct}% scope=global"
+        vars:
+          count: {k: i, v: [30, 80]}
+          pct: {k: f, v: [5.0, 15.0]}
+
+      http_522_summary_reduced:
+        desc: Reduced-but-still-elevated 522 errors after traffic is shifted away from Telia (aligned to modeled flow volumes).
+        lvl: INFO
+        msg: "http error summary status=522 count={count} pct={pct}% scope=global"
+        vars:
+          count: {k: i, v: [5, 20]}
+          pct: {k: f, v: [1.0, 5.0]}
+
+    beh:
+      n:
+        desc: Emits a low 522 baseline summary.
+        emit:
+          - id: http_522_summary_normal
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During incident, summaries switch from high to reduced after mitigation.
+        emit:
+          - id: http_522_summary_high
+            per_min: 1.0
+            scope: global
+          - id: http_522_summary_reduced
+            per_min: 1.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [edge_proxy]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic consists of mostly cache hits and a smaller fraction of cache misses that fetch from origins via transit.
+      Origin reachability is generally good, with rare 522s not modeled as a dominant normal behavior.
+    req:
+      - id: http_cache_hit
+        desc: Client request served from cache at the edge.
+        rpm: 350.0
+        path: [edge_proxy]
+        emit: [edge_proxy.access_hit_200]
+        latency_ms: [[5, 35]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: http_cache_miss_ok
+        desc: Cache miss triggers an origin fetch and returns 200.
+        rpm: 150.0
+        path: [edge_proxy, egress_router]
+        emit: [edge_proxy.origin_fetch_start, edge_proxy.access_miss_200]
+        latency_ms: [[1, 10], [80, 2200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      During failure, Telia transit experiences heavy packet loss, causing some origin connections to time out (522).
+      A manual mitigation later drains/disables Telia and shifts traffic to alternate providers, reducing loss but leaving
+      some residual 522s and increased queueing/latency due to shifted load.
+    req:
+      - id: http_cache_hit_f
+        desc: Cache hits continue to succeed; overall request volume may drop slightly as users experience failures.
+        rpm: 330.0
+        path: [edge_proxy]
+        emit: [edge_proxy.access_hit_200]
+        latency_ms: [[5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: http_cache_miss_ok_telia
+        desc: Cache miss succeeds while routed via Telia despite degraded path quality.
+        rpm: 90.0
+        path: [edge_proxy, egress_router]
+        emit: [edge_proxy.origin_fetch_start_telia, edge_proxy.access_miss_200_telia]
+        latency_ms: [[1, 20], [150, 7000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_cache_miss_ok_alt
+        desc: Cache miss succeeds via alternate providers (used partially early, and heavily after mitigation).
+        rpm: 30.0
+        path: [edge_proxy, egress_router]
+        emit: [edge_proxy.origin_fetch_start_alt, edge_proxy.access_miss_200_alt]
+        latency_ms: [[1, 20], [180, 8000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_cache_miss_522_telia
+        desc: Cache miss fails with 522 due to origin connection timeout while routed via Telia.
+        rpm: 50.0
+        path: [edge_proxy, egress_router]
+        emit: [edge_proxy.origin_fetch_start_telia, edge_proxy.origin_connect_timeout_telia, edge_proxy.access_522_telia]
+        latency_ms: [[1, 20], [2500, 12000], [1, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: http_cache_miss_522_alt
+        desc: Residual 522 failures after reroute, attributed to alternate-provider congestion/timeout rather than Telia loss.
+        rpm: 5.0
+        path: [edge_proxy, egress_router]
+        emit: [edge_proxy.origin_fetch_start_alt, edge_proxy.origin_connect_timeout_alt, edge_proxy.access_522_alt]
+        latency_ms: [[1, 20], [2500, 12000], [1, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "The modeled incident focuses on the Jun 20 event (massive packet loss on Telia and manual drain shortly after)."
+  - "The system is simplified to a single representative PoP/cluster with a few edge hosts; the same patterns apply globally in the real incident."
+  - "TCP retransmissions are represented via increased request/connection durations and timeouts rather than explicit retry logs."
+  - "Router tx_mbps domains are scaled to the modeled traffic slice implied by the flow rpms and per-request byte ranges (not a full multi-Gbps PoP)."
+  - "To prevent post-mitigation contradictions, 'probe_ok' and 'iface_counters' are modeled as non-Telia-only signals; Telia-specific signals use separate log IDs (probe_high_loss_telia / iface_counters_telia) that can be suppressed after the drain."
+  - "Analytics 522 summaries are modeled as aggregations over the same modeled traffic slice; count/pct domains are aligned to the 522-producing flow rpms and total request volume."
+  - "Normal-phase expected volume is about 650 logs per minute from request flows plus about 18 to 20 logs per minute background (probes, router counters, cache stats, and summaries)."
+  - "Total scenario volume estimate is about 33k logs over 50 minutes (within the 20k to 100k target)."
+  - "Key diagnostic visibility comes from net_monitor.probe_high_loss_telia (frequent pre-mitigation then stops), analytics 522 summaries (1 per minute), edge 522 access logs (dozens per minute pre-mitigation), and router Telia counters (drops) disappearing after the drain via event control."
+```

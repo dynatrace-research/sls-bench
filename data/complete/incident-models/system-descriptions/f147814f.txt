@@ -1,0 +1,565 @@
+```yaml
+sys:
+  id: browser_testing_platform_2014
+  desc: >
+    A web-based cross-browser testing platform runs on AWS and stores account/session metadata in an RDS database.
+    Users interact with the service through HTTPS endpoints (login/dashboard/session start).
+    The incident centers on an inactive legacy prototype EC2 host that remained reachable and unpatched against Shellshock,
+    exposing embedded AWS credentials that enabled AWS API abuse and access to a database backup.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: web_frontend
+    name: Public Web Frontend
+    svc: web-frontend
+    hosts: [web-1, web-2, web-3]
+    desc: >
+      Handles user HTTPS requests for login/dashboard/session operations and talks to the primary database.
+      Emits access/response logs and occasional security pattern blocks.
+    to:
+      - dst: rds_database
+        proto: jdbc
+        desc: Reads/writes account and session metadata in the primary database.
+    logs:
+      http_req:
+        desc: Request received at the edge/app layer.
+        lvl: INFO
+        msg: "req {method} {route} rid={rid} ip={ip} ua={ua}"
+        vars:
+          method: {k: ch, v: [GET, POST]}
+          route: {k: ch, v: [/login, /dashboard, /sessions]}
+          rid: {k: hex, v: 16}
+          ip: {k: ip, v: null}
+          ua: {k: ch, v: [Chrome, Firefox, Safari, CI]}
+      auth_ok:
+        desc: Authentication/authorization completed.
+        lvl: DEBUG
+        msg: "auth ok uid={uid} rid={rid}"
+        vars:
+          uid: {k: i, v: [1000, 50000]}
+          rid: {k: hex, v: 16}
+      http_resp_ok:
+        desc: Successful response sent.
+        lvl: INFO
+        msg: "resp {status} bytes={bytes} dur_ms={dur_ms} rid={rid}"
+        vars:
+          status: {k: ch, v: [200, 302, 304]}
+          bytes: {k: i, v: [500, 60000]}
+          rid: {k: hex, v: 16}
+        state_vars:
+          n:
+            dur_ms: {k: i, v: [30, 900]}
+          f:
+            dur_ms: {k: i, v: [30, 30000]}
+      http_resp_err:
+        desc: Server error response sent (typically after DB wait/timeout).
+        lvl: ERROR
+        msg: "resp 500 err={err} dur_ms={dur_ms} rid={rid}"
+        vars:
+          err: {k: ch, v: [db_timeout, internal_error]}
+          dur_ms: {k: i, v: [2000, 45000]}
+          rid: {k: hex, v: 16}
+      http_resp_maint:
+        desc: Maintenance-mode response sent.
+        lvl: WARN
+        msg: "resp 503 maintenance dur_ms={dur_ms} rid={rid}"
+        vars:
+          dur_ms: {k: i, v: [5, 120]}
+          rid: {k: hex, v: 16}
+      shellshock_block:
+        desc: Request blocked by security pattern matching (patched production servers).
+        lvl: WARN
+        msg: "blocked request pattern=shellshock ip={ip} rid={rid}"
+        vars:
+          ip: {k: ip, v: null}
+          rid: {k: hex, v: 16}
+      maintenance_enabled:
+        desc: Operator action marker enabling maintenance mode.
+        lvl: INFO
+        msg: "maintenance mode enabled reason={reason} actor={actor}"
+        vars:
+          reason: {k: ch, v: [security_investigation]}
+          actor: {k: ch, v: [oncall]}
+      web_health_ok:
+        desc: Periodic health marker during normal serving.
+        lvl: INFO
+        msg: "health ok active_conns={conns} cpu_pct={cpu_pct}"
+        vars:
+          conns: {k: i, v: [20, 600]}
+          cpu_pct: {k: i, v: [5, 85]}
+      web_health_degraded:
+        desc: Periodic health marker when DB contention impacts request handling.
+        lvl: WARN
+        msg: "health degraded active_conns={conns} cpu_pct={cpu_pct}"
+        vars:
+          conns: {k: i, v: [200, 1200]}
+          cpu_pct: {k: i, v: [40, 98]}
+    beh:
+      n:
+        desc: Normal serving with periodic health logs.
+        emit:
+          - id: web_health_ok
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: During the incident, health can shift to degraded when DB locks cause request backpressure.
+        emit:
+          - id: web_health_ok
+            per_min: 1.0
+            scope: per_host
+          - id: web_health_degraded
+            per_min: 0.5
+            scope: per_host
+
+  - id: legacy_prototype_host
+    name: Legacy Prototype Host
+    svc: legacy-proto
+    hosts: [proto-1]
+    desc: >
+      Inactive legacy EC2 instance left running and unpatched. It is exploited via Shellshock and contains
+      embedded AWS credentials used to perform AWS API actions and access backups.
+    to:
+      - dst: aws_cloudtrail
+        proto: https
+        desc: AWS API calls are recorded as CloudTrail events.
+      - dst: rds_database
+        proto: jdbc
+        desc: Uses obtained DB credentials to connect from an unrecognized IP.
+      - dst: email_service
+        proto: https
+        desc: Uses SES credentials to send bulk email.
+    logs:
+      proto_http_cgi:
+        desc: CGI request to legacy host (entry point for Shellshock exploit).
+        lvl: INFO
+        msg: "cgi req {path} ip={ip} ua={ua} rid={rid}"
+        vars:
+          path: {k: ch, v: [/cgi-bin/status, /cgi-bin/diag]}
+          ip: {k: ip, v: null}
+          ua: {k: ch, v: [curl, python-requests, unknown]}
+          rid: {k: hex, v: 16}
+      shellshock_exec:
+        desc: Shellshock-like command execution observed by bash/CGI environment.
+        lvl: ERROR
+        msg: "bash imported function executed via {path}; cmd={cmd} rid={rid}"
+        vars:
+          path: {k: ch, v: [/cgi-bin/status, /cgi-bin/diag]}
+          cmd: {k: str, v: "short shell command fragment"}
+          rid: {k: hex, v: 16}
+      aws_cli_invoke:
+        desc: Local marker of AWS CLI usage from the host.
+        lvl: INFO
+        msg: "awscli service={service} op={op} region={region} rid={rid}"
+        vars:
+          service: {k: ch, v: [iam, ec2, ses, rds]}
+          op: {k: ch, v: [create, modify, list, send]}
+          region: {k: ch, v: [us-east-1]}
+          rid: {k: hex, v: 16}
+      ssh_login:
+        desc: SSH login observed (not always present for the exploit path).
+        lvl: INFO
+        msg: "ssh login user={user} ip={ip} auth={auth}"
+        vars:
+          user: {k: ch, v: [ec2-user, ubuntu, root]}
+          ip: {k: ip, v: null}
+          auth: {k: ch, v: [key, password]}
+    beh:
+      n:
+        desc: Host is mostly idle during normal operations.
+        emit: []
+      f:
+        desc: No periodic emissions; activity appears through attack-driven request flows.
+        emit: []
+
+  - id: rds_database
+    name: Primary RDS Database
+    svc: rds-primary
+    hosts: [rds-primary]
+    desc: >
+      Stores user account records and session metadata. During the incident, bulk reads and lock contention
+      generate slow-query and lock-wait evidence.
+    to:
+      - dst: web_frontend
+        proto: tcp
+        desc: Returns query results and errors back to the web tier (modeled as a return edge for flow traversability).
+    logs:
+      db_checkpoint:
+        desc: Periodic database checkpoint/maintenance marker.
+        lvl: INFO
+        msg: "checkpoint complete flushed_mb={mb}"
+        vars:
+          mb: {k: i, v: [50, 800]}
+      db_conn:
+        desc: Connection accepted (shows client IP and role).
+        lvl: INFO
+        msg: "conn from {src_ip} user={db_user} app={app} conn_id={conn_id}"
+        vars:
+          src_ip: {k: ip, v: null}
+          db_user: {k: ch, v: [app_user, readonly, admin]}
+          app: {k: ch, v: [web, unknown]}
+          conn_id: {k: hex, v: 12}
+      db_long_query:
+        desc: Slow query log entry (duration above threshold).
+        lvl: WARN
+        msg: "slow query sql={sql_tag} table={table} dur_ms={dur_ms} rows={rows}"
+        vars:
+          sql_tag: {k: ch, v: [select_users_export, select_sessions, update_session]}
+          table: {k: ch, v: [users, sessions]}
+          dur_ms: {k: i, v: [500, 25000]}
+          rows: {k: i, v: [10, 200000]}
+      db_lock_wait:
+        desc: Lock wait timeout on a table (contention symptom).
+        lvl: ERROR
+        msg: "lock wait timeout table={table} waited_ms={waited_ms} blocker_conn={blocker}"
+        vars:
+          table: {k: ch, v: [users]}
+          waited_ms: {k: i, v: [5000, 30000]}
+          blocker: {k: hex, v: 12}
+      db_audit_copy:
+        desc: Heuristic audit marker for bulk reads.
+        lvl: WARN
+        msg: "bulk read detected table={table} rows_est={rows_est} src_ip={src_ip}"
+        vars:
+          table: {k: ch, v: [users]}
+          rows_est: {k: i, v: [1000, 200000]}
+          src_ip: {k: ip, v: null}
+    beh:
+      n:
+        desc: Normal operations with periodic checkpoint logs.
+        emit:
+          - id: db_checkpoint
+            per_min: 0.5
+            scope: global
+      f:
+        desc: Same baseline checkpointing during the incident.
+        emit:
+          - id: db_checkpoint
+            per_min: 0.5
+            scope: global
+
+  - id: aws_cloudtrail
+    name: AWS CloudTrail Audit Log
+    svc: cloudtrail
+    hosts: [cloudtrail]
+    desc: >
+      Records AWS control-plane actions. During the incident it captures attacker API activity and
+      later operator containment actions (revoking ingress, terminating instances, deleting keys).
+    to: []
+    logs:
+      ct_event:
+        desc: Generic CloudTrail event emitted per AWS API call.
+        lvl: INFO
+        msg: "CloudTrail event={event} actor={actor} src_ip={src_ip} resource={resource}"
+        vars:
+          event: {k: ch, v: [CreateUser, CreateAccessKey, RunInstances, AttachVolume, AuthorizeSecurityGroupIngress, DescribeSnapshots]}
+          actor: {k: ch, v: [root, attacker-iam]}
+          src_ip: {k: ip, v: null}
+          resource: {k: str, v: "arn-or-resource-id"}
+      ct_ops_revoke_sg:
+        desc: Operator containment action revoking DB security group ingress.
+        lvl: INFO
+        msg: "CloudTrail event=RevokeSecurityGroupIngress sg={sg} cidr={cidr} actor={actor}"
+        vars:
+          sg: {k: ch, v: [db-sg]}
+          cidr: {k: ch, v: ["203.0.113.55/32", "198.51.100.77/32"]}
+          actor: {k: ch, v: [oncall]}
+      ct_ops_terminate_instance:
+        desc: Operator containment action terminating the attacker instance.
+        lvl: INFO
+        msg: "CloudTrail event=TerminateInstances instance_id={instance_id} actor={actor}"
+        vars:
+          instance_id: {k: str, v: "i-[0-9a-f]{8,17}"}
+          actor: {k: ch, v: [oncall]}
+      ct_ops_delete_keys:
+        desc: Operator action deleting/revoking access keys.
+        lvl: INFO
+        msg: "CloudTrail event=DeleteAccessKey principal={principal} actor={actor}"
+        vars:
+          principal: {k: ch, v: [root, app-keys]}
+          actor: {k: ch, v: [security]}
+    beh:
+      n:
+        desc: CloudTrail entries in this model are driven by request flows, not background emission.
+        emit: []
+      f:
+        desc: CloudTrail entries in this model are driven by request flows, not background emission.
+        emit: []
+
+  - id: monitoring
+    name: Monitoring & Alerting
+    svc: monitoring
+    hosts: [mon-1]
+    desc: >
+      Polls DB metrics and raises alerts when lock waits or suspicious client IPs are observed.
+      Provides operator acknowledgement markers.
+    to:
+      - dst: rds_database
+        proto: tcp
+        desc: Collects database metrics and health indicators.
+      - dst: web_frontend
+        proto: https
+        desc: Polls service health endpoints.
+    logs:
+      metric_db_lockwait:
+        desc: Periodic metric sample for DB lock wait.
+        lvl: INFO
+        msg: "metric db.lock_wait_ms={lock_wait_ms} db={db}"
+        vars:
+          lock_wait_ms: {k: i, v: [0, 30000]}
+          db: {k: ch, v: [rds-primary]}
+      alert_db_lock:
+        desc: Alert raised when lock waits exceed threshold.
+        lvl: CRITICAL
+        msg: "ALERT db lock wait high table={table} lock_wait_ms={lock_wait_ms}"
+        vars:
+          table: {k: ch, v: [users]}
+          lock_wait_ms: {k: i, v: [5000, 30000]}
+      alert_unrecognized_db_ip:
+        desc: Alert raised on unexpected DB client IPs.
+        lvl: WARN
+        msg: "ALERT unrecognized db client ip={ip}"
+        vars:
+          ip: {k: ip, v: null}
+      pagerduty_ack:
+        desc: Operator acknowledgement marker.
+        lvl: INFO
+        msg: "incident {incident} acknowledged by {actor}"
+        vars:
+          incident: {k: ch, v: [DB_LOCK]}
+          actor: {k: ch, v: [oncall]}
+    beh:
+      n:
+        desc: Regular metric sampling; alerts are absent under normal conditions.
+        emit:
+          - id: metric_db_lockwait
+            per_min: 1.0
+            scope: global
+          - id: alert_db_lock
+            per_min: 0.0
+            scope: global
+          - id: alert_unrecognized_db_ip
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Metric sampling continues; alerts are enabled by incident conditions and event-time multipliers.
+        emit:
+          - id: metric_db_lockwait
+            per_min: 1.0
+            scope: global
+          - id: alert_db_lock
+            per_min: 0.2
+            scope: global
+          - id: alert_unrecognized_db_ip
+            per_min: 0.05
+            scope: global
+
+  - id: email_service
+    name: SES Outbound Email
+    svc: ses
+    hosts: [ses]
+    desc: >
+      Sends outbound email. During the incident, attacker-used SES credentials are used to send a misleading
+      message to a small subset of registered users.
+    to: []
+    logs:
+      ses_send_batch:
+        desc: Batch email send request accepted.
+        lvl: INFO
+        msg: "send batch campaign={campaign} recipients={rcpt} src={src} msg_id={msg_id}"
+        vars:
+          campaign: {k: ch, v: [account_notice]}
+          rcpt: {k: i, v: [500, 1500]}
+          src: {k: ch, v: [no-reply@service.test]}
+          msg_id: {k: uuid, v: null}
+      ses_send_reject:
+        desc: Batch email send rejected (not the primary incident path).
+        lvl: WARN
+        msg: "send rejected reason={reason} src_ip={src_ip}"
+        vars:
+          reason: {k: ch, v: [throttled, invalid_credentials]}
+          src_ip: {k: ip, v: null}
+    beh:
+      n:
+        desc: Email logs are modeled via request flows.
+        emit: []
+      f:
+        desc: Email logs are modeled via request flows.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal user traffic to the web frontend with occasional blocked exploit probes.
+    req:
+      - id: user_dashboard_ok
+        desc: Typical authenticated dashboard/session navigation.
+        rpm: 450.0
+        path: [web_frontend, rds_database, web_frontend]
+        emit:
+          - web_frontend.http_req
+          - web_frontend.auth_ok
+          - web_frontend.http_resp_ok
+        latency_ms: [[1, 5], [5, 25], [40, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: shellshock_probe_prod
+        desc: External Shellshock probes against patched production web servers (blocked).
+        rpm: 2.0
+        path: [web_frontend]
+        emit: [web_frontend.shellshock_block]
+        latency_ms: [[2, 15]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Incident period where attacker activity and DB lock contention degrade the service and later force maintenance mode.
+    req:
+      - id: user_dashboard_ok_f
+        desc: User traffic continues initially before DB contention impacts performance.
+        rpm: 420.0
+        path: [web_frontend, rds_database, web_frontend]
+        emit:
+          - web_frontend.http_req
+          - web_frontend.auth_ok
+          - web_frontend.http_resp_ok
+        latency_ms: [[1, 5], [5, 25], [50, 300]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: user_dashboard_slow_ok
+        desc: Successful requests that become slow due to DB contention.
+        rpm: 320.0
+        path: [web_frontend, rds_database, web_frontend]
+        emit:
+          - web_frontend.http_req
+          - web_frontend.auth_ok
+          - rds_database.db_long_query
+          - web_frontend.http_resp_ok
+        latency_ms: [[1, 5], [8, 40], [800, 8000], [30, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: user_dashboard_500
+        desc: Requests that fail due to lock wait timeouts.
+        rpm: 80.0
+        path: [web_frontend, rds_database, web_frontend]
+        emit:
+          - web_frontend.http_req
+          - web_frontend.auth_ok
+          - rds_database.db_lock_wait
+          - web_frontend.http_resp_err
+        latency_ms: [[1, 5], [8, 40], [5000, 30000], [5, 30]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: user_request_maintenance
+        desc: User requests served during operator-enabled maintenance window.
+        rpm: 250.0
+        path: [web_frontend]
+        emit:
+          - web_frontend.http_req
+          - web_frontend.http_resp_maint
+        latency_ms: [[1, 4], [5, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: attacker_shellshock_proto
+        desc: Shellshock exploitation attempts against the unpatched legacy prototype host.
+        rpm: 4.0
+        path: [legacy_prototype_host]
+        emit:
+          - legacy_prototype_host.proto_http_cgi
+          - legacy_prototype_host.shellshock_exec
+        latency_ms: [[2, 15], [1, 8]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: attacker_aws_api_abuse
+        desc: AWS control-plane actions executed using stolen credentials (visible in CloudTrail).
+        rpm: 12.0
+        path: [legacy_prototype_host, aws_cloudtrail]
+        emit:
+          - legacy_prototype_host.aws_cli_invoke
+          - aws_cloudtrail.ct_event
+        latency_ms: [[5, 30], [10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: attacker_db_export
+        desc: Bulk read/export against the users table using credentials obtained from a mounted backup.
+        rpm: 1.0
+        path: [legacy_prototype_host, rds_database]
+        emit:
+          - legacy_prototype_host.aws_cli_invoke
+          - rds_database.db_conn
+          - rds_database.db_audit_copy
+          - rds_database.db_long_query
+        latency_ms: [[5, 25], [5, 30], [10, 80], [2000, 25000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: attacker_ses_send
+        desc: Bulk outbound email sent via SES credentials from within the compromised account.
+        rpm: 1.0
+        path: [legacy_prototype_host, email_service]
+        emit:
+          - legacy_prototype_host.aws_cli_invoke
+          - email_service.ses_send_batch
+        latency_ms: [[5, 25], [30, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - |
+    Names and exact AWS resources are genericized; CloudTrail is modeled as a log-producing component rather than an AWS subsystem.
+  - |
+    The “mount backup disk to obtain DB password” step is represented by the attacker_db_export flow beginning once AWS abuse is underway.
+  - |
+    SES emailing is modeled as a small number of batch sends (500–1500 recipients per batch) to represent ~5,000 recipients without inflating per-recipient logs.
+  - |
+    web_frontend.http_resp_ok.dur_ms is state-scoped: normal responses stay sub-second while failure-state responses can reflect multi-second DB contention.
+  - |
+    web_frontend.http_resp_err.dur_ms is widened to cover end-to-end request durations that include DB lock waits up to ~30s (and overhead), avoiding impossible timing vs rds_database.db_lock_wait.waited_ms.
+  - |
+    Normal-phase log rate estimate: ~450 rpm * 3 logs/request ≈ 1350 logs/min, plus small background health/metrics.
+  - |
+    End-to-end scenario log volume estimate: ~43k logs (within 20k–100k), driven primarily by normal and degraded web request logging, with attacker and alert logs as diagnostic anchors.
+```

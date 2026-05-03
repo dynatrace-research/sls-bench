@@ -1,0 +1,538 @@
+```yaml
+sys:
+  id: gce_external_connectivity
+  desc: >
+    A cloud compute platform exposes VM, VPN, and L3 load balancer endpoints on public IP blocks.
+    Those IP blocks are announced to the internet via BGP from multiple edge sites for performance and redundancy.
+    A network configuration manager generates and rolls out BGP announcement configuration to the edge fabric using
+    canary and progressive rollout safeguards. External reachability is primarily observed via active probes and BGP
+    coverage metrics rather than VM-side logs.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: netcfg_mgr
+    name: Network Config Manager
+    svc: netcfg-mgr
+    hosts: [netcfg-1, netcfg-2]
+    desc: >
+      Validates and rolls out route/BGP configuration for GCE-related IP blocks to the edge fabric.
+      Implements a canary check and progressive rollout, and can also push rollback configs.
+    to:
+      - dst: edge_bgp_fabric
+        proto: grpc
+        desc: Pushes rendered BGP announcement configuration to the edge routing fabric.
+    logs:
+      cfg_change_requested:
+        desc: Operator submits a network configuration change for rollout.
+        lvl: INFO
+        msg: "config change requested cfg={cfg} change_id={change_id} actor={actor}"
+        vars:
+          cfg: {k: ch, v: [cfg-20160411-1450, cfg-rollback-20160411-1909]}
+          change_id: {k: hex, v: 16}
+          actor: {k: ch, v: [netops, sre_oncall]}
+      cfg_validation_inconsistency:
+        desc: Validator detects inconsistent inputs while processing a change.
+        lvl: WARN
+        msg: "validation inconsistency change_id={change_id} detail={detail}"
+        vars:
+          change_id: {k: hex, v: 16}
+          detail: {k: ch, v: [ip_block_list_mismatch, stale_secondary_file, render_inputs_out_of_sync]}
+      canary_failed:
+        desc: Canary site verification reports the candidate config is unsafe.
+        lvl: ERROR
+        msg: "canary verification failed cfg={cfg} canary_site={site} reason={reason}"
+        vars:
+          cfg: {k: ch, v: [cfg-20160411-1450]}
+          site: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          reason: {k: ch, v: [no_prefixes_advertised, external_probe_failed, bgp_withdraw_detected]}
+      rollout_continues:
+        desc: Rollout controller starts/continues progressive rollout based on its current canary state.
+        lvl: ERROR
+        msg: "rollout controller continuing cfg={cfg} change_id={change_id} canary_state={canary_state}"
+        vars:
+          cfg: {k: ch, v: [cfg-20160411-1450]}
+          change_id: {k: hex, v: 16}
+          canary_state: {k: ch, v: [pending, assumed_pass, unknown]}
+      push_site:
+        desc: Begins pushing a config to a specific edge site.
+        lvl: INFO
+        msg: "push start cfg={cfg} site={site} push_id={push_id}"
+        vars:
+          cfg: {k: ch, v: [cfg-20160411-1450, cfg-rollback-20160411-1909]}
+          site: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          push_id: {k: hex, v: 12}
+      push_site_done:
+        desc: Completes pushing a config to a site.
+        lvl: INFO
+        msg: "push done cfg={cfg} site={site} push_id={push_id} result={result} dur_ms={dur_ms}"
+        vars:
+          cfg: {k: ch, v: [cfg-20160411-1450, cfg-rollback-20160411-1909]}
+          site: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          push_id: {k: hex, v: 12}
+          result: {k: ch, v: [ok, partial]}
+          dur_ms: {k: i, v: [150, 1800]}
+      rollback_started:
+        desc: An operational rollback is initiated to restore the prior announcement set.
+        lvl: WARN
+        msg: "rollback initiated target_cfg={cfg} ticket={ticket}"
+        vars:
+          cfg: {k: ch, v: [cfg-rollback-20160411-1909]}
+          ticket: {k: str, v: "INC[0-9]{6}"}
+      mgr_heartbeat:
+        desc: Periodic health/loop heartbeat from the config manager.
+        lvl: DEBUG
+        msg: "heartbeat loop_lag_ms={loop_lag_ms}"
+        vars:
+          loop_lag_ms: {k: i, v: [0, 120]}
+    beh:
+      n:
+        desc: Normal config manager operation with low-noise periodic heartbeat.
+        emit:
+          - id: mgr_heartbeat
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Under incident conditions, the manager continues operating and emitting heartbeat.
+        emit:
+          - id: mgr_heartbeat
+            per_min: 0.8
+            scope: per_host
+
+  - id: edge_bgp_fabric
+    name: Edge BGP Announcement Fabric
+    svc: edge-bgp
+    hosts: [edge-bgp-ctl]
+    desc: >
+      Represents the distributed edge sites that announce GCE-related IP blocks to the internet via BGP.
+      Applies configuration updates from the config manager and exposes global announcement coverage summaries.
+    to:
+      - dst: netcfg_mgr
+        proto: grpc
+        desc: Sends apply acknowledgements/telemetry back to the config manager control plane.
+    logs:
+      apply_bad_config:
+        desc: A site applies a rendered config that contains no GCE-related prefixes.
+        lvl: WARN
+        msg: "applied config cfg={cfg} site={site} gce_prefixes={gce_prefixes} vpn_prefixes={vpn_prefixes}"
+        vars:
+          cfg: {k: ch, v: [cfg-20160411-1450]}
+          site: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          gce_prefixes: {k: i, v: [0, 0]}
+          vpn_prefixes: {k: i, v: [0, 0]}
+      apply_safe_config:
+        desc: A site applies a config that restores GCE/VPN prefixes.
+        lvl: INFO
+        msg: "applied config cfg={cfg} site={site} gce_prefixes={gce_prefixes} vpn_prefixes={vpn_prefixes}"
+        vars:
+          cfg: {k: ch, v: [cfg-rollback-20160411-1909]}
+          site: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          gce_prefixes: {k: i, v: [96, 110]}
+          vpn_prefixes: {k: i, v: [14, 22]}
+      bgp_announce_ok:
+        desc: Periodic global summary showing healthy multi-site announcements.
+        lvl: INFO
+        msg: "bgp announcements healthy sites_advertising={sites} gce_prefixes={gce_prefixes} vpn_prefixes={vpn_prefixes}"
+        vars:
+          sites: {k: i, v: [18, 18]}
+          gce_prefixes: {k: i, v: [100, 110]}
+          vpn_prefixes: {k: i, v: [16, 20]}
+      bgp_announce_degraded:
+        desc: Periodic global summary showing reduced multi-site announcement coverage.
+        lvl: WARN
+        msg: "bgp announcements degraded sites_advertising={sites} gce_prefixes={gce_prefixes} vpn_prefixes={vpn_prefixes}"
+        vars:
+          sites: {k: i, v: [1, 10]}
+          gce_prefixes: {k: i, v: [1, 110]}
+          vpn_prefixes: {k: i, v: [0, 20]}
+      bgp_announce_zero:
+        desc: Periodic global summary showing no announcements for GCE/VPN prefixes.
+        lvl: ERROR
+        msg: "bgp announcements missing sites_advertising={sites} gce_prefixes={gce_prefixes} vpn_prefixes={vpn_prefixes}"
+        vars:
+          sites: {k: i, v: [0, 0]}
+          gce_prefixes: {k: i, v: [0, 0]}
+          vpn_prefixes: {k: i, v: [0, 0]}
+      bgp_announce_restored:
+        desc: Periodic global summary indicating announcements have returned after rollback.
+        lvl: INFO
+        msg: "bgp announcements restored sites_advertising={sites} gce_prefixes={gce_prefixes} vpn_prefixes={vpn_prefixes}"
+        vars:
+          sites: {k: i, v: [18, 18]}
+          gce_prefixes: {k: i, v: [100, 110]}
+          vpn_prefixes: {k: i, v: [16, 20]}
+    beh:
+      n:
+        desc: Healthy state with stable announcement coverage.
+        emit:
+          - id: bgp_announce_ok
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During the incident, coverage can degrade, drop to zero, and then be restored by rollback.
+        emit:
+          - id: bgp_announce_degraded
+            per_min: 1.2
+            scope: global
+          - id: bgp_announce_zero
+            per_min: 1.2
+            scope: global
+          - id: bgp_announce_restored
+            per_min: 1.0
+            scope: global
+
+  - id: netmon
+    name: Network Monitoring / Prober
+    svc: netmon
+    hosts: [netmon-1, netmon-2, netmon-3]
+    desc: >
+      Actively probes external connectivity to representative GCE VM IPs and VPN gateways from multiple POPs.
+      Emits alert logs when latency increases, VPN reachability drops, or inbound loss is detected.
+    to:
+      - dst: edge_bgp_fabric
+        proto: https
+        desc: Sends external reachability probes that depend on correct BGP announcements.
+      - dst: vpn_gateway
+        proto: udp
+        desc: Sends periodic VPN reachability/keepalive probes (modeled as IKE/DPD).
+    logs:
+      probe_ok:
+        desc: External probe succeeds.
+        lvl: INFO
+        msg: "external probe ok target_ip={target_ip} pop={pop} rtt_ms={rtt_ms}"
+        vars:
+          target_ip: {k: ip, v: "35.235.0.0/16"}
+          pop: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          rtt_ms: {k: i, v: [20, 2500]}
+      probe_timeout:
+        desc: External probe fails (no route / dropped packets / timeout).
+        lvl: ERROR
+        msg: "external probe failed target_ip={target_ip} pop={pop} err={err} waited_ms={waited_ms}"
+        vars:
+          target_ip: {k: ip, v: "35.235.0.0/16"}
+          pop: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          err: {k: ch, v: [timeout, no_reply, tcp_syn_dropped]}
+          waited_ms: {k: i, v: [800, 3500]}
+      probe_retry:
+        desc: Retry marker for an external probe attempt.
+        lvl: WARN
+        msg: "retrying external probe target_ip={target_ip} pop={pop} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          target_ip: {k: ip, v: "35.235.0.0/16"}
+          pop: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [150, 1200]}
+      vpn_probe_retry:
+        desc: Retry marker for a VPN reachability probe attempt.
+        lvl: WARN
+        msg: "retrying vpn probe region={region} tunnel_id={tunnel_id} attempt={attempt} backoff_ms={backoff_ms}"
+        vars:
+          region: {k: ch, v: [asia-east1]}
+          tunnel_id: {k: uuid, v: null}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [200, 1500]}
+      probe_summary:
+        desc: Periodic summary of probe success and latency.
+        lvl: INFO
+        msg: "probe summary window_s={window_s} success_pct={success_pct} rtt_p95_ms={rtt_p95_ms}"
+        vars:
+          window_s: {k: i, v: [60, 60]}
+          success_pct: {k: i, v: [0, 100]}
+          rtt_p95_ms: {k: i, v: [30, 3000]}
+      alert_latency_anomaly:
+        desc: Alert that external latency is anomalously high.
+        lvl: WARN
+        msg: "ALERT external latency elevated pop={pop} rtt_p95_ms={rtt_p95_ms}"
+        vars:
+          pop: {k: ch, v: [sfo, iad, lhr, sin, syd, gru]}
+          rtt_p95_ms: {k: i, v: [400, 3000]}
+      alert_vpn_unreachable:
+        desc: Alert that VPN reachability has dropped (earlier than general GCE).
+        lvl: ERROR
+        msg: "ALERT vpn unreachable region={region} fail_rate_pct={fail_rate_pct}"
+        vars:
+          region: {k: ch, v: [asia-east1]}
+          fail_rate_pct: {k: i, v: [40, 100]}
+      alert_inbound_loss:
+        desc: Alert that inbound internet traffic to GCE endpoints is largely lost.
+        lvl: CRITICAL
+        msg: "ALERT inbound internet traffic loss observed loss_pct={loss_pct}"
+        vars:
+          loss_pct: {k: i, v: [80, 100]}
+    beh:
+      n:
+        desc: Normal monitoring emits periodic probe summaries.
+        emit:
+          - id: probe_summary
+            per_min: 1.0
+            scope: global
+      f:
+        desc: During the incident, alert streams can activate in addition to summaries.
+        emit:
+          - id: probe_summary
+            per_min: 1.0
+            scope: global
+          - id: alert_latency_anomaly
+            per_min: 0.6
+            scope: global
+          - id: alert_vpn_unreachable
+            per_min: 0.7
+            scope: global
+          - id: alert_inbound_loss
+            per_min: 1.8
+            scope: global
+
+  - id: vpn_gateway
+    name: Cloud VPN Gateway
+    svc: cloud-vpn
+    hosts: [vpn-asia-east1-1, vpn-asia-east1-2]
+    desc: >
+      Terminates customer VPN tunnels on public endpoints that rely on the same external routing announcements.
+      Emits keepalive success/failure signals that correlate with external reachability.
+    to:
+      - dst: edge_bgp_fabric
+        proto: tcp
+        desc: Depends on edge routing announcements for inbound reachability of VPN public endpoints.
+    logs:
+      ike_keepalive_ok:
+        desc: VPN keepalive succeeds.
+        lvl: INFO
+        msg: "ike keepalive ok region={region} tunnel_id={tunnel_id} rtt_ms={rtt_ms}"
+        vars:
+          region: {k: ch, v: [asia-east1]}
+          tunnel_id: {k: uuid, v: null}
+          rtt_ms: {k: i, v: [30, 2500]}
+      ike_keepalive_fail:
+        desc: VPN keepalive fails due to inbound path loss or packet drops.
+        lvl: ERROR
+        msg: "ike keepalive failed region={region} tunnel_id={tunnel_id} err={err} waited_ms={waited_ms}"
+        vars:
+          region: {k: ch, v: [asia-east1]}
+          tunnel_id: {k: uuid, v: null}
+          err: {k: ch, v: [no_response, peer_unreachable, packet_loss]}
+          waited_ms: {k: i, v: [800, 3500]}
+      vpn_sa_metric:
+        desc: Periodic metric of active security associations.
+        lvl: INFO
+        msg: "vpn metric region={region} active_sas={active_sas}"
+        vars:
+          region: {k: ch, v: [asia-east1]}
+          active_sas: {k: i, v: [500, 5000]}
+    beh:
+      n:
+        desc: Normal operation emits low-rate aggregate VPN metrics.
+        emit:
+          - id: vpn_sa_metric
+            per_min: 0.5
+            scope: per_host
+      f:
+        desc: Under incident conditions, metrics continue but may show lower counts.
+        emit:
+          - id: vpn_sa_metric
+            per_min: 0.8
+            scope: per_host
+
+  - id: sre_ops
+    name: SRE Operations Console
+    svc: sre-ops
+    hosts: [sre-console]
+    desc: >
+      Represents oncall actions and incident control-plane markers (paging, rollback approval, and change freeze).
+      Emits sparse operational/audit logs.
+    to:
+      - dst: netcfg_mgr
+        proto: grpc
+        desc: Issues rollback and change-freeze actions through the configuration manager.
+    logs:
+      pager_triggered:
+        desc: Pager fired for oncall based on monitoring alert.
+        lvl: WARN
+        msg: "page triggered service={service} reason={reason}"
+        vars:
+          service: {k: ch, v: [gce-network, cloud-vpn]}
+          reason: {k: ch, v: [vpn_unreachable, external_latency_anomaly, inbound_loss]}
+      rollback_approved:
+        desc: SRE authorizes rollback of the most recent network config.
+        lvl: WARN
+        msg: "rollback approved cfg={cfg} by={actor}"
+        vars:
+          cfg: {k: ch, v: [cfg-rollback-20160411-1909]}
+          actor: {k: ch, v: [sre_oncall]}
+      change_freeze_enabled:
+        desc: Network configuration changes are frozen after rollback initiation.
+        lvl: INFO
+        msg: "network config freeze enabled ticket={ticket}"
+        vars:
+          ticket: {k: str, v: "INC[0-9]{6}"}
+      change_freeze_status:
+        desc: Periodic status signal that the network configuration freeze remains enabled.
+        lvl: INFO
+        msg: "network config freeze status enabled={enabled} ticket={ticket}"
+        vars:
+          enabled: {k: ch, v: ["true"]}
+          ticket: {k: str, v: "INC[0-9]{6}"}
+      ops_audit:
+        desc: Low-rate audit heartbeat from ops tooling.
+        lvl: DEBUG
+        msg: "ops audit heartbeat queue_depth={queue_depth}"
+        vars:
+          queue_depth: {k: i, v: [0, 20]}
+    beh:
+      n:
+        desc: Mostly quiet; occasional audit heartbeat.
+        emit:
+          - id: ops_audit
+            per_min: 0.1
+            scope: global
+          - id: change_freeze_status
+            per_min: 0.0
+            scope: global
+      f:
+        desc: During incident response the console is slightly noisier but still low-rate.
+        emit:
+          - id: ops_audit
+            per_min: 0.2
+            scope: global
+          - id: change_freeze_status
+            per_min: 0.4
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal operation consists of successful external probes to representative public endpoints, stable BGP coverage
+      metrics, and successful VPN keepalives.
+    req:
+      - id: gce_external_probe_ok_n
+        desc: Netmon external probe to a representative GCE public VM IP succeeds.
+        rpm: 420.0
+        path: [netmon, edge_bgp_fabric]
+        emit: [netmon.probe_ok]
+        latency_ms: [[40, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: vpn_keepalive_ok_n
+        desc: Netmon-originated VPN keepalive succeeds for asia-east1 endpoints.
+        rpm: 120.0
+        path: [netmon, vpn_gateway]
+        emit: [vpn_gateway.ike_keepalive_ok]
+        latency_ms: [[60, 220]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: >
+      During failure, the edge announcement set degrades then can drop to zero, causing probe timeouts and VPN failures.
+      SREs roll back the config to restore announcements; the service can recover while incident response remains active.
+    req:
+      - id: gce_external_probe_ok_f
+        desc: External probe still succeeds when at least some edge sites advertise GCE prefixes.
+        rpm: 350.0
+        path: [netmon, edge_bgp_fabric]
+        emit: [netmon.probe_ok]
+        latency_ms: [[80, 280]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: gce_external_probe_timeout_f
+        desc: External probe times out due to missing or incorrect routing for GCE IP blocks.
+        rpm: 60.0
+        path: [netmon, edge_bgp_fabric]
+        emit: [netmon.probe_timeout]
+        latency_ms: [[900, 2400]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.5
+          emit_per_retry: [netmon.probe_retry]
+          backoff_ms: [[250, 900], [450, 1300]]
+        trace: false
+      - id: vpn_keepalive_ok_f
+        desc: VPN keepalive succeeds while sufficient VPN announcements remain (or after rollback restores them).
+        rpm: 90.0
+        path: [netmon, vpn_gateway]
+        emit: [vpn_gateway.ike_keepalive_ok]
+        latency_ms: [[90, 350]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: vpn_keepalive_fail_f
+        desc: VPN keepalive fails due to degraded or missing inbound reachability.
+        rpm: 30.0
+        path: [netmon, vpn_gateway]
+        emit: [vpn_gateway.ike_keepalive_fail]
+        latency_ms: [[900, 2400]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.0
+          emit_per_retry: [netmon.vpn_probe_retry]
+          backoff_ms: [[300, 1100], [500, 1500]]
+        trace: false
+      - id: netcfg_push_bad_f
+        desc: Config manager progressively pushes the bad config (missing all prefixes) to edge sites.
+        rpm: 8.0
+        path: [netcfg_mgr, edge_bgp_fabric, netcfg_mgr]
+        emit: [netcfg_mgr.push_site, edge_bgp_fabric.apply_bad_config, netcfg_mgr.push_site_done]
+        latency_ms: [[80, 250], [30, 120], [120, 700]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+      - id: netcfg_push_rollback_f
+        desc: Config manager pushes rollback config to restore prefixes to sites.
+        rpm: 6.0
+        path: [netcfg_mgr, edge_bgp_fabric, netcfg_mgr]
+        emit: [netcfg_mgr.push_site, edge_bgp_fabric.apply_safe_config, netcfg_mgr.push_site_done]
+        latency_ms: [[80, 250], [30, 120], [120, 700]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    The model focuses on external reachability and BGP announcement coverage; customer VM-side logs are not modeled because
+    inbound traffic loss produces little/no VM-local telemetry.
+  - >
+    The edge fabric is represented by a single control-plane emitter for global BGP coverage summaries plus per-site apply
+    logs (site is a field), rather than modeling dozens of edge routers explicitly.
+  - >
+    The netcfg push flows include a return hop to netcfg_mgr (push completion), so edge_bgp_fabric includes a modeled telemetry/ack edge
+    back to netcfg_mgr for path connectivity.
+  - >
+    The rollout controller does not explicitly log that it is ignoring a failing canary; instead, the bug is inferred from the
+    close timing of netcfg_mgr.canary_failed followed by netcfg_mgr.rollout_continues and subsequent edge withdrawals.
+  - >
+    The real incident included an earlier asia-east1 VPN failure and a long investigation window; this model compresses those precursors
+    but preserves the key beats: bad rendered config, canary failure not stopping rollout, progressive withdrawal, full inbound loss,
+    and restoration by rollback while incident response continues (change freeze/monitoring).
+  - >
+    Added a low-rate failure-state background log (sre_ops.change_freeze_status) to make the "freeze remains enabled" end-state observable
+    beyond the one-shot freeze-enablement marker.
+  - >
+    Volume estimate (60 minutes): normal ~16k request logs + low background; failure ~33k-36k request+retry logs + alerts and
+    coverage metrics; total ~49k-53k logs, within the 20k-100k target and with high-signal anchors (coverage zero, probe timeouts,
+    inbound-loss alerts, rollback markers, restored coverage).
+```

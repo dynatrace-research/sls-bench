@@ -1,0 +1,180 @@
+```yaml
+scenario:
+  id: smars_powerpeg_deploy_mismatch
+  title: SMARS deployment mismatch triggers runaway Power Peg routing during market open
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    A broker order gateway routes parent orders to a SMARS engine cluster which slices and submits child orders to exchanges.
+    One SMARS engine is left on a stale release; when the market opens and RLP-flagged orders arrive, that engine activates legacy Power Peg behavior and emits runaway child orders.
+    Operators initially miss diagnostic emails and then roll back/uninstall the working release, which spreads the legacy behavior across engines and spikes execution volume and exposure.
+    The incident ends with order routing disabled (outage) and risk exposure still elevated, rather than a clean recovery.
+
+  trigger_desc: |
+    At market open, incoming RLP-eligible parent orders begin flowing at full rate. A subset of orders is routed to the one stale SMARS engine,
+    where a repurposed flag activates legacy Power Peg routing without the intended cumulative tracking, causing runaway child order submission.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        Pre-open processing runs normally at moderate load. Parent orders are accepted and acknowledged, with routine per-minute execution summaries.
+        Automated diagnostic emails with subject "SMARS diag: Power Peg disabled" are emitted frequently but are not treated as alerts.
+        A low-rate deployment audit periodically reports one stale SMARS host (7 updated, 1 stale), but no operational action is taken.
+      flows: [flow_parent_order_rlp]
+      manifestation:
+        - broker_gateway.parent_order_resp_ok
+        - exchange_gateway.exec_summary_minute
+        - email_notifier.smars_diag_email
+        - config_auditor.deploy_audit_partial
+
+    f:
+      desc: |
+        When full market traffic begins, some orders hit the stale SMARS engine and activate Power Peg behavior, producing runaway child order volume.
+        Exchange execution summaries climb rapidly and venue backpressure starts to appear. Operators attempt countermeasures in-flight and initiate a rollback/uninstall
+        that spreads the legacy behavior across engines, further spiking execution volume and triggering risk limit breaches. Finally, routing is disabled to stop new order flow,
+        leaving the system in an outage state with elevated exposure still visible in risk snapshots.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: broker_gateway
+          event: |
+            Market-open order flow starts; a subset of parent orders routes to the one stale SMARS engine and Power Peg warnings begin appearing.
+            Execution volume rises, but routing remains enabled.
+          why: |
+            The stale engine still contains legacy Power Peg code and responds to a repurposed activation flag; the runaway behavior is directly observable
+            via smars_router.powerpeg_warn and elevated exchange summaries. The earlier diagnostic emails exist but are not operationally acted upon.
+          flows: [flow_parent_order_rlp_ok, flow_parent_order_powerpeg]
+          rate_multipliers:
+            flow_parent_order_rejected: 0.0
+            flow_parent_order_powerpeg_widespread: 0.0
+            exchange_gateway.exec_summary_spike: 0.0
+            risk_monitor.limit_breach: 0.0
+            config_auditor.deploy_audit_rollback: 0.0
+          latency_multipliers:
+            flow_parent_order_rlp_ok: {p50: 1.2, p95: 1.5}
+            flow_parent_order_powerpeg: {p50: 1.2, p95: 1.6}
+          one_shots:
+            - ref: ops_console.triage_note
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - smars_router.powerpeg_warn
+            - exchange_gateway.exec_summary_minute
+            - email_notifier.smars_diag_email
+            - config_auditor.deploy_audit_partial
+
+        - order: 2
+          at_min: 30
+          component: ops_console
+          event: |
+            Operators initiate a rollback/uninstall of the new SMARS release while the market is live.
+            Power Peg-affected routing spreads across engines and exchange spike markers and backpressure become common.
+          why: |
+            The response action removes the working release from correctly deployed servers, increasing the population effectively running legacy behavior.
+            This is reflected by a switch in deployment audit logs and by Power Peg warnings now originating from multiple engine IDs (directly observable).
+          flows: [flow_parent_order_powerpeg_widespread]
+          rate_multipliers:
+            flow_parent_order_powerpeg: 0.0
+            flow_parent_order_powerpeg_widespread: 8.0
+            flow_parent_order_rlp_ok: 0.0
+            exchange_gateway.exec_summary_spike: 1.0
+            exchange_gateway.throttling_warn: 2.5
+            risk_monitor.limit_breach: 1.0
+            config_auditor.deploy_audit_partial: 0.0
+            config_auditor.deploy_audit_rollback: 1.0
+          latency_multipliers:
+            flow_parent_order_powerpeg_widespread: {p50: 2.5, p95: 3.5}
+          one_shots:
+            - ref: ops_console.rollback_initiated
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - ops_console.rollback_initiated
+            - config_auditor.deploy_audit_rollback
+            - smars_router.powerpeg_warn_legacy
+            - exchange_gateway.exec_summary_spike
+            - risk_monitor.limit_breach
+
+        - order: 3
+          at_min: 55
+          component: ops_console
+          event: |
+            With exposure and venue backpressure still high, operators disable order routing at the broker gateway to stop new order flow.
+            New parent orders are rejected; exchange spike markers subside but elevated exposure remains.
+          why: |
+            There is no automated kill-switch in the modeled system; the stop is achieved via an operational disable at the entry point.
+            The change is observable through broker rejections and reduced spike-only exchange markers, while risk snapshots remain elevated.
+          flows: [flow_parent_order_rejected]
+          rate_multipliers:
+            flow_parent_order_powerpeg: 0.0
+            flow_parent_order_powerpeg_widespread: 0.0
+            flow_parent_order_rlp_ok: 0.0
+            flow_parent_order_rejected: 1.0
+            exchange_gateway.exec_summary_spike: 0.0
+            exchange_gateway.throttling_warn: 0.5
+            email_notifier.smars_diag_email: 0.2
+          latency_multipliers:
+            flow_parent_order_rejected: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: ops_console.disable_routing
+              count: 1
+              hosts: [ops-01]
+          manifestation:
+            - ops_console.disable_routing
+            - broker_gateway.parent_order_resp_err
+            - exchange_gateway.throttling_warn
+            - risk_monitor.exposure_snapshot
+
+      steady:
+        - component: broker_gateway
+          condition: |
+            Order routing remains disabled at the gateway; incoming parent orders are rejected.
+          user_impact: |
+            Broker-dealers cannot route orders through this system; order submissions receive immediate 503/429-style failures.
+          manifestation: [broker_gateway.parent_order_resp_err]
+
+        - component: risk_monitor
+          condition: |
+            Exposure remains elevated and requires manual unwinding; risk snapshots continue to show large net positions.
+          user_impact: |
+            The firm is exposed to large market risk and loss; downstream risk processes operate in degraded emergency mode.
+          manifestation: [risk_monitor.exposure_snapshot, risk_monitor.limit_breach]
+
+        - component: config_auditor
+          condition: |
+            Deployment audit reflects the post-rollback state (all SMARS hosts effectively stale/legacy).
+          user_impact: |
+            Operators lack confidence in running the router; remediation requires coordinated redeploy and verification.
+          manifestation: [config_auditor.deploy_audit_rollback]
+
+      feedback_loops:
+        - id: runaway_orders_amplify_backpressure
+          desc: |
+            Power Peg runaway routing increases exchange submissions, which increases venue backpressure and gateway retries.
+            Retries and delays add load at the broker gateway and SMARS, sustaining high traffic and worsening exposure until routing is manually disabled.
+
+      flows: [flow_parent_order_rlp_ok, flow_parent_order_powerpeg, flow_parent_order_powerpeg_widespread, flow_parent_order_rejected]
+      manifestation:
+        - smars_router.powerpeg_warn
+        - smars_router.powerpeg_warn_legacy
+        - exchange_gateway.exec_summary_spike
+        - risk_monitor.limit_breach
+        - broker_gateway.parent_order_resp_err
+        - config_auditor.deploy_audit_rollback
+
+  assumptions:
+    - "Time is compressed: the normal phase represents the pre-open period with diagnostic emails, and the 40-minute failure phase represents the roughly 45-minute market-open window described in the post-mortem."
+    - "The rollback/uninstall spreading the legacy behavior is modeled by switching from flow_parent_order_powerpeg (engine fixed to 8) to flow_parent_order_powerpeg_widespread (engine varies 1–8) at minute 30, aligned with deploy_audit_rollback."
+    - "Failure-phase piecewise breakdown (rough): 20–30 (10 min) baseline failure rates (rlp_ok=130 rpm, powerpeg=12 rpm, widespread suppressed, rejected suppressed) at ~860–900 logs/min including backgrounds; 30–55 (25 min) rollback amplification (rlp_ok suppressed, powerpeg suppressed, widespread=12 rpm × 8, exec_summary_spike enabled, throttling amplified, limit_breach enabled, deploy_audit_rollback enabled) at ~580–650 logs/min; 55–60 (5 min) routing disabled (rlp_ok/powerpeg/widespread suppressed, rejected enabled) at ~300–330 logs/min."
+    - "One-shots are one triage_note at minute 20, one rollback_initiated at minute 30, and one disable_routing at minute 55."
+    - "Estimated total log count is ~42k–47k logs (within 20k–100k), dominated by per-parent-order flow logs plus per-minute exchange/SMARS/risk summaries."
+    - "Visibility is ensured because pre-rollback Power Peg activation produces repeated smars_router.powerpeg_warn (engine=8) and minute_stats; the rollback event produces deploy_audit_rollback plus smars_router.powerpeg_warn_legacy with varied engine IDs; risk_monitor.limit_breach and exchange_gateway.exec_summary_spike corroborate impact; broker_gateway.parent_order_resp_err marks the final outage state."
+```

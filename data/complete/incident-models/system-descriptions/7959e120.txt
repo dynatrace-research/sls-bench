@@ -1,0 +1,991 @@
+```yaml
+sys:
+  id: slack_like_collaboration_stack
+  desc: >
+    A collaboration SaaS serves HTTPS API requests via an edge load balancer to an autoscaled Apache web tier, which calls
+    an internal messages backend. The web tier scales based on CPU and Apache worker utilization; new instances must be
+    configured by a provision-service before entering service. Operators rely on an internal dashboard/alerting UI and an
+    external synthetic monitor. In this incident, inter-VPC network packet loss raises latency/timeouts, saturates web workers,
+    and a failed scale-up occurs due to provision-service resource limits.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_lb
+    name: Edge Load Balancer
+    svc: edge-lb
+    hosts: [lb-a, lb-b]
+    desc: >
+      Terminates client HTTPS and forwards requests to the web tier. Performs health checks and may enter panic mode
+      when many targets fail checks. Health-check summaries are split into "small target set" and "large target set"
+      variants so the scenario can model a later rise in registered targets during scale-out.
+    to:
+      - dst: web_tier
+        proto: https
+        desc: Forwards client API requests to Apache on the web tier.
+      - dst: external_monitor
+        proto: https
+        desc: Returns synthetic-check responses to the external monitor client.
+    logs:
+      access_message_200:
+        desc: Final access log for message send requests that succeed.
+        lvl: INFO
+        msg: "access route=/api/messages.send status=200 dur_ms={dur_ms} target=web-{slot} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [10, 9000]}
+          slot: {k: i, v: [1, 200]}
+          trace_id: {k: hex, v: 32}
+      access_message_503:
+        desc: Final access log for message send requests that return 503.
+        lvl: WARN
+        msg: "access route=/api/messages.send status=503 dur_ms={dur_ms} target=web-{slot} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [50, 12000]}
+          slot: {k: i, v: [1, 200]}
+          trace_id: {k: hex, v: 32}
+      access_ping_200:
+        desc: Final access log for ping requests that succeed.
+        lvl: INFO
+        msg: "access route=/api/ping status=200 dur_ms={dur_ms} target=web-{slot}"
+        vars:
+          dur_ms: {k: i, v: [2, 3000]}
+          slot: {k: i, v: [1, 200]}
+      access_ping_503:
+        desc: Final access log for ping requests that return 503.
+        lvl: WARN
+        msg: "access route=/api/ping status=503 dur_ms={dur_ms} target=web-{slot}"
+        vars:
+          dur_ms: {k: i, v: [50, 9000]}
+          slot: {k: i, v: [1, 200]}
+      healthcheck_summary_small:
+        desc: Periodic summary of target health check results for a smaller registered target set.
+        lvl: INFO
+        msg: "healthchecks targets={targets} failing={failing}"
+        vars: {}
+        state_vars:
+          n:
+            targets: {k: i, v: [40, 70]}
+            failing: {k: i, v: [0, 4]}
+          f:
+            targets: {k: i, v: [40, 90]}
+            failing: {k: i, v: [0, 25]}
+      healthcheck_summary_large:
+        desc: Periodic summary of target health check results for a larger registered target set (after scale-out/registration).
+        lvl: INFO
+        msg: "healthchecks targets={targets} failing={failing}"
+        vars: {}
+        state_vars:
+          n:
+            targets: {k: i, v: [40, 70]}
+            failing: {k: i, v: [0, 4]}
+          f:
+            targets: {k: i, v: [100, 160]}
+            failing: {k: i, v: [10, 120]}
+      panic_mode_enabled:
+        desc: Marker that the balancer has enabled panic mode due to high health check failure rates.
+        lvl: WARN
+        msg: "panic_mode enabled reason=healthcheck_failures threshold_pct={threshold_pct}"
+        vars:
+          threshold_pct: {k: i, v: [50, 80]}
+    beh:
+      n:
+        desc: Regular health checks report mostly healthy targets.
+        emit:
+          - id: healthcheck_summary_small
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Health checks often fail due to network issues and saturated targets; the target-set size varies over time.
+        emit:
+          - id: healthcheck_summary_small
+            per_min: 1.0
+            scope: per_host
+          - id: healthcheck_summary_large
+            per_min: 1.0
+            scope: per_host
+
+  - id: web_tier
+    name: Web Tier (Apache)
+    svc: web-tier
+    hosts:
+      - web-1
+      - web-2
+      - web-3
+      - web-4
+      - web-5
+      - web-6
+      - web-7
+      - web-8
+      - web-9
+      - web-10
+      - web-11
+      - web-12
+      - web-13
+      - web-14
+      - web-15
+      - web-16
+      - web-17
+      - web-18
+      - web-19
+      - web-20
+      - web-21
+      - web-22
+      - web-23
+      - web-24
+      - web-25
+      - web-26
+      - web-27
+      - web-28
+      - web-29
+      - web-30
+      - web-31
+      - web-32
+      - web-33
+      - web-34
+      - web-35
+      - web-36
+      - web-37
+      - web-38
+      - web-39
+      - web-40
+      - web-41
+      - web-42
+      - web-43
+      - web-44
+      - web-45
+      - web-46
+      - web-47
+      - web-48
+      - web-49
+      - web-50
+      - web-51
+      - web-52
+      - web-53
+      - web-54
+      - web-55
+      - web-56
+      - web-57
+      - web-58
+      - web-59
+      - web-60
+      - web-61
+      - web-62
+      - web-63
+      - web-64
+      - web-65
+      - web-66
+      - web-67
+      - web-68
+      - web-69
+      - web-70
+      - web-71
+      - web-72
+      - web-73
+      - web-74
+      - web-75
+      - web-76
+      - web-77
+      - web-78
+      - web-79
+      - web-80
+      - web-81
+      - web-82
+      - web-83
+      - web-84
+      - web-85
+      - web-86
+      - web-87
+      - web-88
+      - web-89
+      - web-90
+      - web-91
+      - web-92
+      - web-93
+      - web-94
+      - web-95
+      - web-96
+      - web-97
+      - web-98
+      - web-99
+      - web-100
+      - web-101
+      - web-102
+      - web-103
+      - web-104
+      - web-105
+      - web-106
+      - web-107
+      - web-108
+      - web-109
+      - web-110
+      - web-111
+      - web-112
+      - web-113
+      - web-114
+      - web-115
+      - web-116
+      - web-117
+      - web-118
+      - web-119
+      - web-120
+      - web-121
+      - web-122
+      - web-123
+      - web-124
+      - web-125
+      - web-126
+      - web-127
+      - web-128
+      - web-129
+      - web-130
+      - web-131
+      - web-132
+      - web-133
+      - web-134
+      - web-135
+      - web-136
+      - web-137
+      - web-138
+      - web-139
+      - web-140
+      - web-141
+      - web-142
+      - web-143
+      - web-144
+      - web-145
+      - web-146
+      - web-147
+      - web-148
+      - web-149
+      - web-150
+      - web-151
+      - web-152
+      - web-153
+      - web-154
+      - web-155
+      - web-156
+      - web-157
+      - web-158
+      - web-159
+      - web-160
+      - web-161
+      - web-162
+      - web-163
+      - web-164
+      - web-165
+      - web-166
+      - web-167
+      - web-168
+      - web-169
+      - web-170
+      - web-171
+      - web-172
+      - web-173
+      - web-174
+      - web-175
+      - web-176
+      - web-177
+      - web-178
+      - web-179
+      - web-180
+      - web-181
+      - web-182
+      - web-183
+      - web-184
+      - web-185
+      - web-186
+      - web-187
+      - web-188
+      - web-189
+      - web-190
+      - web-191
+      - web-192
+      - web-193
+      - web-194
+      - web-195
+      - web-196
+      - web-197
+      - web-198
+      - web-199
+      - web-200
+    desc: >
+      Terminates application requests and calls internal backends to send messages. Under network degradation, backend
+      calls become slow or time out, consuming Apache worker threads and causing saturation. Fleet-level snapshots of worker
+      utilization are emitted as background telemetry (modeled as global to match scaled traffic volumes).
+    to:
+      - dst: backend_api
+        proto: grpc
+        desc: Calls internal backend APIs for message send operations.
+      - dst: edge_lb
+        proto: https
+        desc: Returns responses back through the load balancer.
+    logs:
+      msg_send_start:
+        desc: Start of a message send request on the web tier.
+        lvl: INFO
+        msg: "recv route=/api/messages.send req_id={req_id} trace={trace_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      msg_send_backend_call:
+        desc: Web tier initiates a backend RPC for message send.
+        lvl: INFO
+        msg: "backend_call backend=messages op=CreateMessage timeout_ms={timeout_ms} trace={trace_id}"
+        vars:
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            timeout_ms: {k: i, v: [1500, 2000]}
+          f:
+            timeout_ms: {k: i, v: [1500, 8000]}
+      msg_send_backend_timeout:
+        desc: Backend call did not complete before timeout.
+        lvl: ERROR
+        msg: "backend_timeout backend=messages op=CreateMessage waited_ms={waited_ms} err={err} trace={trace_id}"
+        vars:
+          waited_ms: {k: i, v: [1500, 8200]}
+          err: {k: ch, v: [deadline_exceeded, connect_timeout]}
+          trace_id: {k: hex, v: 32}
+      msg_send_respond_200:
+        desc: Web tier responds successfully to client.
+        lvl: INFO
+        msg: "respond status=200 dur_ms={dur_ms} bytes={bytes} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [10, 9000]}
+          bytes: {k: i, v: [200, 8000]}
+          trace_id: {k: hex, v: 32}
+      msg_send_respond_503:
+        desc: Web tier returns a service-unavailable response.
+        lvl: WARN
+        msg: "respond status=503 dur_ms={dur_ms} err={err} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [50, 12000]}
+          err: {k: ch, v: [upstream_timeout, overload]}
+          trace_id: {k: hex, v: 32}
+      ping_start:
+        desc: Start of a lightweight ping request.
+        lvl: DEBUG
+        msg: "recv route=/api/ping req_id={req_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+      ping_respond_200:
+        desc: Ping response from the web tier.
+        lvl: DEBUG
+        msg: "respond route=/api/ping status=200 dur_ms={dur_ms}"
+        vars:
+          dur_ms: {k: i, v: [1, 2000]}
+      ping_respond_503:
+        desc: Ping fails on the web tier (e.g., overload) and returns 503.
+        lvl: DEBUG
+        msg: "respond route=/api/ping status=503 dur_ms={dur_ms} err={err}"
+        vars:
+          dur_ms: {k: i, v: [20, 9000]}
+          err: {k: ch, v: [overload, upstream_unreachable]}
+      apache_status:
+        desc: Fleet-level Apache worker snapshot (aggregated telemetry for the whole web tier).
+        lvl: INFO
+        msg: "apache_status busy={busy} idle={idle} cpu_pct={cpu_pct} queue={queue}"
+        vars: {}
+        state_vars:
+          n:
+            busy: {k: i, v: [10, 90]}
+            idle: {k: i, v: [120, 320]}
+            cpu_pct: {k: f, v: [15.0, 60.0]}
+            queue: {k: i, v: [0, 30]}
+          f:
+            busy: {k: i, v: [60, 256]}
+            idle: {k: i, v: [0, 260]}
+            cpu_pct: {k: f, v: [5.0, 55.0]}
+            queue: {k: i, v: [0, 400]}
+      worker_queue_high:
+        desc: Warning emitted when fleet-level queueing indicates worker saturation.
+        lvl: WARN
+        msg: "worker_saturation queue={queue} est_wait_ms={est_wait_ms}"
+        vars:
+          queue: {k: i, v: [80, 500]}
+          est_wait_ms: {k: i, v: [200, 7000]}
+    beh:
+      n:
+        desc: Mostly healthy worker availability and moderate CPU (telemetry modeled as a global fleet snapshot).
+        emit:
+          - id: apache_status
+            per_min: 1.0
+            scope: global
+          - id: worker_queue_high
+            per_min: 0.08
+            scope: global
+      f:
+        desc: Workers can saturate due to slow/timeouting backend calls (telemetry modeled as a global fleet snapshot).
+        emit:
+          - id: apache_status
+            per_min: 1.0
+            scope: global
+          - id: worker_queue_high
+            per_min: 1.0
+            scope: global
+
+  - id: backend_api
+    name: Backend API (Messages)
+    svc: messages-backend
+    hosts: [be-1, be-2]
+    desc: >
+      Backend service handling message creation. During the incident it is often reachable but end-to-end latency rises
+      because the network drops packets and connections stall.
+    to:
+      - dst: web_tier
+        proto: grpc
+        desc: Returns RPC responses to the web tier.
+    logs:
+      msg_send_rpc_recv:
+        desc: Backend receives message send RPC.
+        lvl: INFO
+        msg: "rpc_recv op=CreateMessage from=web-tier trace={trace_id}"
+        vars:
+          trace_id: {k: hex, v: 32}
+      msg_send_rpc_ok:
+        desc: Backend completes message send RPC successfully.
+        lvl: INFO
+        msg: "rpc_ok op=CreateMessage dur_ms={dur_ms} trace={trace_id}"
+        vars:
+          dur_ms: {k: i, v: [5, 6000]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n: {desc: No significant background logging required., emit: []}
+      f: {desc: No significant background logging required., emit: []}
+
+  - id: autoscaler
+    name: Web Tier Autoscaler
+    svc: autoscaler
+    hosts: [asctl-1]
+    desc: >
+      Evaluates CPU and Apache worker utilization to decide scaling actions. Can terminate instances during downscale
+      and requests new instances to be provisioned during scale-up.
+    to:
+      - dst: provision_service
+        proto: grpc
+        desc: Requests provisioning/configuration of newly launched web instances.
+    logs:
+      scale_eval:
+        desc: Periodic autoscaling evaluation snapshot.
+        lvl: INFO
+        msg: "eval asg=web-asg cpu_pct={cpu_pct} worker_util={worker_util} current={current} desired={desired}"
+        vars: {}
+        state_vars:
+          n:
+            cpu_pct: {k: f, v: [20.0, 55.0]}
+            worker_util: {k: f, v: [0.25, 0.75]}
+            current: {k: i, v: [40, 60]}
+            desired: {k: i, v: [40, 65]}
+          f:
+            cpu_pct: {k: f, v: [5.0, 35.0]}
+            worker_util: {k: f, v: [0.75, 1.20]}
+            current: {k: i, v: [30, 160]}
+            desired: {k: i, v: [60, 160]}
+      asg_limit:
+        desc: Autoscaler cannot increase desired capacity due to configured ASG max.
+        lvl: WARN
+        msg: "asg_limit_reached asg=web-asg desired={desired} max={max}"
+        vars:
+          desired: {k: i, v: [120, 160]}
+          max: {k: i, v: [120, 120]}
+      scale_out_request:
+        desc: Autoscaler requests provisioning for a new web instance.
+        lvl: INFO
+        msg: "scale_out_request asg=web-asg instance_id=i-{iid}"
+        vars:
+          iid: {k: hex, v: 8}
+      instance_terminated:
+        desc: Marker for an instance terminated during automated downscale/unhealthy replacement.
+        lvl: WARN
+        msg: "terminate instance_id=i-{iid} reason={reason} active_ssh={active_ssh}"
+        vars:
+          iid: {k: hex, v: 8}
+          reason: {k: ch, v: [cpu_low, unhealthy, scale_in_policy]}
+          active_ssh: {k: i, v: [0, 5]}
+      downscaling_disabled:
+        desc: Operator disables automated downscaling to preserve capacity and avoid losing investigative sessions.
+        lvl: INFO
+        msg: "policy_change asg=web-asg downscaling=disabled requested_by={actor}"
+        vars:
+          actor: {k: ch, v: [incident_commander, oncall_infra, oncall_web]}
+      asg_max_increased:
+        desc: Operator raises ASG max to allow more capacity.
+        lvl: INFO
+        msg: "config_change asg=web-asg max_increased old_max={old_max} new_max={new_max}"
+        vars:
+          old_max: {k: i, v: [120, 120]}
+          new_max: {k: i, v: [140, 180]}
+    beh:
+      n:
+        desc: Regular evaluation; limit warnings are absent.
+        emit:
+          - id: scale_eval
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Evaluation continues; limit warnings occur during aggressive scale-up and ASG headroom exhaustion.
+        emit:
+          - id: scale_eval
+            per_min: 1.0
+            scope: global
+          - id: asg_limit
+            per_min: 0.3
+            scope: global
+
+  - id: provision_service
+    name: Provision Service
+    svc: provision-service
+    hosts: [prov-1, prov-2]
+    desc: >
+      Configures and validates newly launched instances so they can join the web tier. Under extreme concurrent
+      provisioning and degraded network/API latency, it can exhaust local resources (e.g., open files) and hit AWS API
+      quota/throttling, preventing new capacity from coming online.
+    to:
+      - dst: web_tier
+        proto: tcp
+        desc: Pushes configuration and runs basic readiness checks on new web instances.
+    logs:
+      provision_begin:
+        desc: Start provisioning a new web instance.
+        lvl: INFO
+        msg: "provision_start instance_id=i-{iid} role=web"
+        vars:
+          iid: {k: hex, v: 8}
+      provision_ok:
+        desc: Provisioning succeeded and instance is ready to serve.
+        lvl: INFO
+        msg: "provision_ok instance_id=i-{iid} dur_s={dur_s}"
+        vars:
+          iid: {k: hex, v: 8}
+          dur_s: {k: i, v: [20, 900]}
+      provision_fail_emfile:
+        desc: Provisioning failed due to open file descriptor exhaustion (at the then-current FD limit).
+        lvl: ERROR
+        msg: "provision_fail instance_id=i-{iid} err=EMFILE open_files={open_files} limit=8192"
+        vars:
+          iid: {k: hex, v: 8}
+          open_files: {k: i, v: [8192, 8192]}
+      provision_fail_quota:
+        desc: Provisioning hit AWS API throttling/quota.
+        lvl: ERROR
+        msg: "aws_api_error instance_id=i-{iid} api={api} code=Throttling retries={retries}"
+        vars:
+          iid: {k: hex, v: 8}
+          api: {k: ch, v: [RunInstances, DescribeInstances, CreateTags]}
+          retries: {k: i, v: [0, 6]}
+      pool_metrics_8192:
+        desc: Provision-service worker pool and resource snapshot while the process limit is 8192 open files.
+        lvl: INFO
+        msg: "pool active={active} queued={queued} open_files={open_files} limit=8192"
+        vars: {}
+        state_vars:
+          n:
+            active: {k: i, v: [5, 40]}
+            queued: {k: i, v: [0, 80]}
+            open_files: {k: i, v: [400, 1800]}
+          f:
+            active: {k: i, v: [20, 160]}
+            queued: {k: i, v: [0, 2600]}
+            open_files: {k: i, v: [800, 8192]}
+      pool_metrics_16384:
+        desc: Provision-service worker pool and resource snapshot after the process limit is raised to 16384 open files.
+        lvl: INFO
+        msg: "pool active={active} queued={queued} open_files={open_files} limit=16384"
+        vars:
+          active: {k: i, v: [10, 140]}
+          queued: {k: i, v: [0, 1800]}
+          open_files: {k: i, v: [800, 16384]}
+      pool_overload_8192:
+        desc: Snapshot emitted when provisioning backlog is high and the FD limit is the pre-fix value.
+        lvl: WARN
+        msg: "pool_overload active={active} queued={queued} open_files={open_files} limit=8192"
+        vars:
+          active: {k: i, v: [50, 160]}
+          queued: {k: i, v: [300, 2600]}
+          open_files: {k: i, v: [7600, 8192]}
+      pool_overload_16384:
+        desc: Snapshot emitted when provisioning backlog is high after increasing the FD limit.
+        lvl: WARN
+        msg: "pool_overload active={active} queued={queued} open_files={open_files} limit=16384"
+        vars:
+          active: {k: i, v: [40, 140]}
+          queued: {k: i, v: [200, 1800]}
+          open_files: {k: i, v: [12000, 16384]}
+      fd_exhaustion_8192:
+        desc: Background errors when the process is near the pre-fix FD limit.
+        lvl: ERROR
+        msg: "resource_pressure kind=open_files open_files={open_files} limit=8192"
+        vars:
+          open_files: {k: i, v: [7800, 8192]}
+      fd_exhaustion_16384:
+        desc: Background errors when the process is near the post-fix FD limit.
+        lvl: ERROR
+        msg: "resource_pressure kind=open_files open_files={open_files} limit=16384"
+        vars:
+          open_files: {k: i, v: [15000, 16384]}
+      restarted:
+        desc: Operator restarts provision-service with adjusted limits.
+        lvl: INFO
+        msg: "restart completed ulimit_nofile={ulimit_nofile}"
+        vars:
+          ulimit_nofile: {k: i, v: [16384, 16384]}
+    beh:
+      n:
+        desc: Small steady provisioning background activity.
+        emit:
+          - id: pool_metrics_8192
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: >
+          Provision-service emits pool metrics; overload/FD pressure logs are event-controlled during scale bursts.
+          The active pool metric reflects the current FD limit (pre-fix vs post-fix) and is event-controlled.
+        emit:
+          - id: pool_metrics_8192
+            per_min: 1.0
+            scope: per_host
+          - id: pool_metrics_16384
+            per_min: 1.0
+            scope: per_host
+          - id: pool_overload_8192
+            per_min: 1.0
+            scope: per_host
+          - id: fd_exhaustion_8192
+            per_min: 0.4
+            scope: per_host
+          - id: pool_overload_16384
+            per_min: 0.7
+            scope: per_host
+          - id: fd_exhaustion_16384
+            per_min: 0.2
+            scope: per_host
+
+  - id: monitoring_ui
+    name: Dashboard & Alerting UI
+    svc: monitoring-ui
+    hosts: [mon-1, mon-2]
+    desc: >
+      Internal dashboarding and alerting UI used by operators. During this incident its backend dependency becomes slow
+      or unreachable across degraded network links, making dashboards unavailable during critical troubleshooting.
+    to: []
+    logs:
+      ui_health:
+        desc: Periodic heartbeat of the UI process.
+        lvl: INFO
+        msg: "ui_health ok=true build={build}"
+        vars:
+          build: {k: ch, v: [2021.01.04-1, 2021.01.04-2]}
+      db_timeout:
+        desc: UI cannot reach its backend store (simulated as a DB connection timeout).
+        lvl: ERROR
+        msg: "backend_unreachable upstream=db waited_ms={waited_ms} err=timeout"
+        vars:
+          waited_ms: {k: i, v: [500, 15000]}
+      ui_request_ok:
+        desc: Operator dashboard request succeeded.
+        lvl: INFO
+        msg: "http_request path=/dashboards/overview status=200 dur_ms={dur_ms}"
+        vars:
+          dur_ms: {k: i, v: [20, 2000]}
+      ui_request_fail:
+        desc: Operator dashboard request failed.
+        lvl: ERROR
+        msg: "http_request path=/dashboards/overview status=502 dur_ms={dur_ms} err={err}"
+        vars:
+          dur_ms: {k: i, v: [200, 15000]}
+          err: {k: ch, v: [upstream_timeout, connection_reset]}
+    beh:
+      n:
+        desc: UI is healthy; no backend connectivity errors.
+        emit:
+          - id: ui_health
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: UI stays up but frequently times out to its backend dependency.
+        emit:
+          - id: ui_health
+            per_min: 1.0
+            scope: per_host
+          - id: db_timeout
+            per_min: 1.5
+            scope: per_host
+
+  - id: network_fabric
+    name: Inter-VPC Network Fabric (TGW)
+    svc: aws-tgw
+    hosts: [tgw-1]
+    desc: >
+      Represents the inter-VPC transit gateway layer used by multiple services. It emits aggregate telemetry indicating
+      packet drops and RTT increases when saturated.
+    to: []
+    logs:
+      tgw_stats:
+        desc: Periodic transit-gateway traffic and loss telemetry.
+        lvl: INFO
+        msg: "tgw_stats tgw_id={tgw_id} pps={pps} drop_pct={drop_pct} rtt_ms={rtt_ms}"
+        vars:
+          tgw_id: {k: ch, v: [tgw-main]}
+        state_vars:
+          n:
+            pps: {k: i, v: [500, 3000]}
+            drop_pct: {k: f, v: [0.0, 0.2]}
+            rtt_ms: {k: i, v: [2, 8]}
+          f:
+            pps: {k: i, v: [4000, 30000]}
+            drop_pct: {k: f, v: [1.0, 8.0]}
+            rtt_ms: {k: i, v: [20, 220]}
+      packet_drop_alert:
+        desc: Warning signal when drop rate is high.
+        lvl: WARN
+        msg: "packet_drops elevated drop_pct={drop_pct} pps={pps}"
+        vars:
+          drop_pct: {k: f, v: [1.0, 10.0]}
+          pps: {k: i, v: [4000, 40000]}
+    beh:
+      n:
+        desc: Packet drops are negligible.
+        emit:
+          - id: tgw_stats
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Packet drops and RTT are elevated and persist.
+        emit:
+          - id: tgw_stats
+            per_min: 1.0
+            scope: global
+          - id: packet_drop_alert
+            per_min: 0.8
+            scope: global
+
+  - id: external_monitor
+    name: External Synthetic Monitor
+    svc: ext-monitor
+    hosts: [extmon-1]
+    desc: >
+      Third-party availability monitor that periodically checks a ping endpoint and pages when error rates rise.
+    to:
+      - dst: edge_lb
+        proto: https
+        desc: Runs synthetic ping checks against the public edge.
+    logs:
+      ping_check_ok:
+        desc: Synthetic check succeeded.
+        lvl: INFO
+        msg: "synthetic_check name=ping status=200 dur_ms={dur_ms}"
+        vars:
+          dur_ms: {k: i, v: [10, 2500]}
+      ping_check_fail:
+        desc: Synthetic check failed and records observed error rate.
+        lvl: WARN
+        msg: "synthetic_check name=ping status=503 dur_ms={dur_ms} err_rate={err_rate}"
+        vars:
+          dur_ms: {k: i, v: [50, 8000]}
+          err_rate: {k: f, v: [0.01, 0.80]}
+      page_sent:
+        desc: Page triggered due to elevated error rates.
+        lvl: CRITICAL
+        msg: "page_sent monitor=ping reason=error_rate_high observed_err_rate={err_rate}"
+        vars:
+          err_rate: {k: f, v: [0.05, 0.80]}
+    beh:
+      n: {desc: No background logs; checks are modeled as flows., emit: []}
+      f: {desc: No background logs; checks are modeled as flows., emit: []}
+
+tracing:
+  on: true
+  origins: [web_tier, monitoring_ui]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic is dominated by message sends through the web tier to the backend API, plus periodic synthetic ping
+      checks and occasional operator dashboard use. Provisioning runs at a low rate for routine scaling/rolls.
+    req:
+      - id: message_send_normal
+        desc: Successful message send under healthy network conditions.
+        rpm: 220.0
+        path: [edge_lb, web_tier, backend_api, web_tier, edge_lb]
+        emit:
+          - web_tier.msg_send_start
+          - web_tier.msg_send_backend_call
+          - backend_api.msg_send_rpc_recv
+          - backend_api.msg_send_rpc_ok
+          - web_tier.msg_send_respond_200
+          - edge_lb.access_message_200
+        latency_ms: [[2, 5], [5, 15], [8, 25], [20, 80], [2, 6], [1, 3]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: synthetic_ping_ok
+        desc: External monitor ping check succeeds.
+        rpm: 15.0
+        path: [external_monitor, edge_lb, web_tier, edge_lb, external_monitor]
+        emit:
+          - web_tier.ping_start
+          - web_tier.ping_respond_200
+          - edge_lb.access_ping_200
+          - external_monitor.ping_check_ok
+        latency_ms: [[1, 3], [1, 8], [1, 5], [5, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: view_dashboard_ok
+        desc: Operator views the monitoring dashboard successfully.
+        rpm: 3.0
+        path: [monitoring_ui]
+        emit: [monitoring_ui.ui_request_ok]
+        latency_ms: [[40, 400]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: provision_web_instance_ok
+        desc: Autoscaler requests provisioning and it completes successfully.
+        rpm: 2.0
+        path: [autoscaler, provision_service]
+        emit:
+          - autoscaler.scale_out_request
+          - provision_service.provision_begin
+          - provision_service.provision_ok
+        latency_ms: [[5, 20], [20, 80], [30000, 70000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      Under network packet loss and elevated RTT, backend calls stall and time out, saturating Apache workers and causing
+      503s. Autoscaling reacts with both scale-in and aggressive scale-out, but provisioning struggles under concurrency
+      and degraded network/API performance, delaying capacity increases.
+    req:
+      - id: message_send_success
+        desc: Message send succeeds but with elevated latency.
+        rpm: 180.0
+        path: [edge_lb, web_tier, backend_api, web_tier, edge_lb]
+        emit:
+          - web_tier.msg_send_start
+          - web_tier.msg_send_backend_call
+          - backend_api.msg_send_rpc_recv
+          - backend_api.msg_send_rpc_ok
+          - web_tier.msg_send_respond_200
+          - edge_lb.access_message_200
+        latency_ms: [[3, 10], [15, 80], [20, 120], [60, 600], [5, 20], [2, 8]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: message_send_fail_timeout
+        desc: Message send fails due to backend call timeouts under packet loss or saturation.
+        rpm: 40.0
+        path: [edge_lb, web_tier, backend_api, web_tier, edge_lb]
+        emit:
+          - web_tier.msg_send_start
+          - web_tier.msg_send_backend_call
+          - web_tier.msg_send_backend_timeout
+          - web_tier.msg_send_respond_503
+          - edge_lb.access_message_503
+        latency_ms: [[3, 12], [30, 180], [1800, 8200], [5, 20], [2, 10]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: synthetic_ping_fail
+        desc: External monitor ping check fails because the web tier returns 503 under degradation.
+        rpm: 12.0
+        path: [external_monitor, edge_lb, web_tier, edge_lb, external_monitor]
+        emit:
+          - web_tier.ping_start
+          - web_tier.ping_respond_503
+          - edge_lb.access_ping_503
+          - external_monitor.ping_check_fail
+        latency_ms: [[1, 5], [10, 200], [1, 10], [10, 60]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: synthetic_ping_ok_small
+        desc: Some synthetic ping checks still succeed during partial degradation.
+        rpm: 3.0
+        path: [external_monitor, edge_lb, web_tier, edge_lb, external_monitor]
+        emit:
+          - web_tier.ping_start
+          - web_tier.ping_respond_200
+          - edge_lb.access_ping_200
+          - external_monitor.ping_check_ok
+        latency_ms: [[1, 5], [2, 40], [1, 10], [10, 80]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: view_dashboard_fail
+        desc: Operator dashboard access fails because the UI cannot reach its backend dependency reliably.
+        rpm: 3.0
+        path: [monitoring_ui]
+        emit: [monitoring_ui.ui_request_fail]
+        latency_ms: [[200, 15000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: provision_web_instance_ok
+        desc: Provisioning succeeds but is slower under degraded conditions.
+        rpm: 2.0
+        path: [autoscaler, provision_service]
+        emit:
+          - autoscaler.scale_out_request
+          - provision_service.provision_begin
+          - provision_service.provision_ok
+        latency_ms: [[10, 60], [50, 250], [80000, 300000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: provision_web_instance_fail_emfile
+        desc: Provisioning fails due to open file limit exhaustion.
+        rpm: 5.0
+        path: [autoscaler, provision_service]
+        emit:
+          - autoscaler.scale_out_request
+          - provision_service.provision_begin
+          - provision_service.provision_fail_emfile
+        latency_ms: [[10, 60], [100, 800], [10, 50]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: provision_web_instance_fail_quota
+        desc: Provisioning fails due to AWS API throttling/quota under concurrent scale-up.
+        rpm: 3.0
+        path: [autoscaler, provision_service]
+        emit:
+          - autoscaler.scale_out_request
+          - provision_service.provision_begin
+          - provision_service.provision_fail_quota
+        latency_ms: [[10, 60], [100, 1200], [10, 80]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - |-
+    Names and topology are simplified from the real incident: one web tier, one messages backend, an autoscaler, a provision service,
+    an internal monitoring UI, an external monitor, and a TGW-like network fabric component for observability.
+  - |-
+    The causal core preserved is: TGW saturation -> packet loss/RTT -> backend-call latency/timeouts -> Apache worker saturation -> increased 503s;
+    autoscaling then drives a large scale-up that overloads provision-service (EMFILE + AWS throttling), delaying capacity recovery.
+  - |-
+    To keep traffic volumes and total log volume realistic while still modeling worker saturation, web_tier.apache_status and web_tier.worker_queue_high
+    are treated as fleet-level aggregated telemetry (scope=global) rather than per-host snapshots.
+  - |-
+    TGW packet-per-second telemetry ranges are scaled down to match the modeled request rates (the PPS field represents only this incident-specific system slice,
+    not Slack's entire real-world fleet).
+  - |-
+    edge_lb healthcheck summaries are split into small/large target-set log IDs so the scenario can model a later rise in registered targets during scale-out
+    without forcing high target counts at failure onset.
+  - |-
+    Failure severity is time-varying and is primarily expressed via scenario event multipliers (early creeping errors, then a mini-peak spike, then ASG max hit,
+    then partial mitigation). Failure-state value domains for web/apache and LB healthchecks are broad enough to represent both mild early degradation and later saturation.
+  - |-
+    Web-tier backend RPC timeout behavior is modeled as state-dependent: normal uses a ~1.5–2s deadline, while failure can extend up to ~8s under severe
+    packet loss/connection stalls, keeping backend_call timeout_ms consistent with backend_timeout waited_ms and timeout-related flow latency hints.
+  - |-
+    Fleet size/counts are intentionally scaled down while keeping the same qualitative scaling dynamics and bottlenecks; the model retains up to 200 web host identities
+    so LB target counts, autoscaler current/desired, and access-log target slots remain internally consistent.
+  - |-
+    Provision-service pool metrics are split by FD limit (pool_metrics_8192 vs pool_metrics_16384) so event-controlled limit changes can be represented
+    without generating impossible combinations (e.g., open_files > 8192 before the restart) and without contradicting overload/FD-pressure logs.
+  - |-
+    Synthetic ping failures are modeled as web-tier 503 responses (web_tier.ping_respond_503) preceding the edge access log, avoiding an implausible LB-only 503
+    chronology while keeping the same overall monitoring semantics.
+  - |-
+    Normal-phase volume estimate (20 min): ~27k–30k total logs (dominated by message_send_normal; background telemetry is intentionally modest).
+  - |-
+    Total scenario log estimate after rate tuning and failure multipliers: ~60k–80k logs, within the 20k–100k target.
+  - |-
+    Diagnostic visibility anchors expected to appear: network_fabric.packet_drop_alert + tgw_stats; web_tier.worker_queue_high + msg_send_backend_timeout;
+    edge_lb.healthcheck_summary_* + a one-shot panic_mode_enabled; provision_service.pool_overload_8192/fd_exhaustion_8192 plus provision_fail_emfile/provision_fail_quota;
+    autoscaler.asg_limit and instance_terminated; monitoring_ui.db_timeout/ui_request_fail; and external_monitor.page_sent.
+```

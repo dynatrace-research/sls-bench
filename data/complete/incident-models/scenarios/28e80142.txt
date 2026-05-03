@@ -1,0 +1,175 @@
+```yaml
+scenario:
+  id: beagle_slo_crashloop_due_to_topic_typo
+  title: Beagle crash-loop and SLO processing delay after mis-typed Kafka topic in runbook
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    Retriever continuously publishes mutation events to Kafka and Beagle consumes them to compute SLO points.
+    During a retriever scale-up, operators apply an SLO definition referencing a Kafka topic, but the topic name
+    contains an underscore instead of a hyphen. Beagle repeatedly fails to start consuming that non-existent topic,
+    crash-loops, and SLO processing falls behind, leading to customer-visible SLO data delay.
+
+  trigger_desc: |
+    An operator applies a runbook step that inserts/updates a Beagle SLO definition using the mis-typed topic
+    "honeycomb-prod.retriever_mutation" (underscore), while producers use "honeycomb-prod.retriever-mutation" (hyphen).
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 18}
+      f: {start_min: 18, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Steady ingest and SLO processing. Retriever publishes to the correct Kafka mutation topic and Beagle keeps up.
+        Beagle lag metrics remain low and there are only occasional consumer rebalances.
+      flows: [publish_retriever_mutation, beagle_process_slo_batch]
+      manifestation: [retriever.mutation_publish_ok, beagle.batch_processed, beagle.lag_metric, alerting.notifier_ok]
+
+    f:
+      desc: |
+        A runbook introduces an SLO definition pointing to a mis-typed Kafka topic. Beagle repeatedly fails to consume
+        that topic and enters a restart loop; normal batch processing stops and lag cannot be reliably reported
+        from Beagle while it is not stably running. Operators attempt to mitigate by scaling/changing Beagle, which
+        increases consumer-group churn but does not resolve the underlying topic mismatch. After the typo is found and
+        corrected, Beagle resumes batch processing but remains significantly lagged and continues draining backlog
+        slowly through the end of the scenario.
+
+      events:
+        - order: 1
+          at_min: 18
+          component: ops_tool
+          event: |
+            During retriever scale-up, an SLO definition is applied with a mis-typed topic string. Beagle begins failing
+            to start its consumer and enters a restart loop; alerts begin firing.
+          why: |
+            Beagle reads SLO topic definitions from the SLO database; the mis-typed topic does not exist in Kafka, so
+            consumer startup fails with UnknownTopicOrPartition and Beagle exits. This is directly observable via the
+            ops_tool apply log plus Beagle's unknown-topic and restart/exit logs; the causal link requires knowing that
+            Beagle uses those SLO definitions to subscribe.
+          flows: [publish_retriever_mutation, beagle_consume_unknown_topic]
+          rate_multipliers:
+            beagle_process_slo_batch: 0.0
+            beagle_consume_unknown_topic: 1.0
+            beagle.process_start: 4.0
+            beagle.lag_metric: 0.0
+            alerting.alert_fired: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tool.scale_retriever
+              count: 1
+              hosts: [ops-1]
+            - ref: ops_tool.apply_slo_def_wrong
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_tool.apply_slo_def_wrong
+            - beagle.consumer_error_unknown_topic
+            - beagle.panic_exit
+            - beagle.process_start
+            - alerting.alert_fired
+
+        - order: 2
+          at_min: 26
+          component: ops_tool
+          event: |
+            Operators attempt to mitigate by scaling/changing Beagle, causing more consumer group churn and more frequent
+            restarts, but consumption still fails due to the same topic mismatch.
+          why: |
+            Changing Beagle's runtime characteristics (replicas/workers) triggers consumer rebalances and restarts, but
+            does not fix the invalid topic configuration. This is observable via increased rebalance and process_start
+            logs plus continued UnknownTopicOrPartition errors; lag logs remain absent while Beagle is crash-looping.
+          flows: [beagle_consume_unknown_topic]
+          rate_multipliers:
+            beagle_consume_unknown_topic: 2.0
+            beagle.process_start: 8.0
+            beagle.consumer_rebalance: 6.0
+            beagle.lag_metric: 0.0
+            alerting.alert_fired: 1.5
+          latency_multipliers: {}
+          one_shots:
+            - ref: ops_tool.scale_beagle
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_tool.scale_beagle
+            - beagle.consumer_rebalance
+            - beagle.consumer_error_unknown_topic
+            - beagle.process_start
+            - alerting.alert_fired
+
+        - order: 3
+          at_min: 34
+          component: ops_tool
+          event: |
+            The topic typo is identified and the SLO definition is corrected to the hyphenated topic. Beagle stops
+            emitting unknown-topic errors and resumes batch processing, but remains behind and drains lag slowly.
+          why: |
+            With the correct topic configured, Beagle can successfully subscribe and process batches again. The end of
+            UnknownTopicOrPartition errors is directly observable; persistent lag is observable via lag_metric and the
+            high-lag values in batch_processed.
+          flows: [beagle_process_slo_batch]
+          rate_multipliers:
+            beagle_consume_unknown_topic: 0.0
+            beagle_process_slo_batch: 1.0
+            beagle.process_start: 0.1
+            beagle.consumer_rebalance: 2.0
+            beagle.lag_metric: 1.0
+            alerting.alert_fired: 1.0
+          latency_multipliers:
+            beagle_process_slo_batch: {p50: 1.1, p95: 1.2}
+          one_shots:
+            - ref: ops_tool.apply_slo_def_correct
+              count: 1
+              hosts: [ops-1]
+          manifestation:
+            - ops_tool.apply_slo_def_correct
+            - beagle.batch_processed
+            - beagle.lag_metric
+            - alerting.alert_fired
+
+      steady:
+        - component: beagle
+          condition: |
+            Beagle is processing again but is substantially behind; p95 consumer lag remains in the minutes range
+            through the end of the scenario. Rebalances occur occasionally while backlog drains.
+          user_impact: |
+            SLO-derived data (dashboards/alerts depending on SLO processing) is delayed and appears stale; some customers
+            see several minutes (or more) of delay in SLO computations.
+          manifestation: [beagle.lag_metric, beagle.batch_processed, alerting.alert_fired]
+
+      feedback_loops:
+        - id: crashloop_blocks_catchup
+          desc: |
+            While Beagle is crash-looping, offsets do not advance, so lag grows. Larger lag increases operational pressure
+            and prompts scaling/restarts that can further increase rebalances, slowing stabilization even after fixes.
+
+      flows: [publish_retriever_mutation, beagle_consume_unknown_topic, beagle_process_slo_batch]
+      manifestation:
+        - ops_tool.apply_slo_def_wrong
+        - ops_tool.apply_slo_def_correct
+        - beagle.consumer_error_unknown_topic
+        - beagle.panic_exit
+        - beagle.process_start
+        - beagle.lag_metric
+        - alerting.alert_fired
+
+  assumptions:
+    - "Timeline is compressed into a 40-minute window: 18 minutes normal, then a 22-minute failure that ends while still lagged (no full recovery modeled)."
+    - |
+      Failure-phase piecewise behavior and approximate effective rates (order-of-magnitude, after multipliers):
+      - min 18-26 (8 min): beagle_process_slo_batch suppressed (0.0); beagle_consume_unknown_topic at 1.0x (30 rpm => ~60 logs/min);
+        beagle.process_start at 4.0x (7.5/min => ~30 logs/min); beagle.lag_metric suppressed (0.0); alerts active.
+        Effective logs/min ≈ ~2.1k (dominated by retriever publishes).
+      - min 26-34 (8 min): unknown-topic attempts increase to 2.0x (60 rpm => ~120 logs/min); beagle.process_start increases to 8.0x (~60 logs/min);
+        rebalances increase; beagle.lag_metric remains suppressed (0.0). Effective logs/min ≈ ~2.2k.
+      - min 34-40 (6 min): unknown-topic flow suppressed (0.0); beagle_process_slo_batch resumes at 1.0x (30 rpm => ~90 logs/min) with high lag;
+        beagle.lag_metric resumes (1.0x); restarts drop sharply (process_start 0.1x => <1/min). Effective logs/min ≈ ~2.1k.
+    - "One-shots per event: event1 has 2 (scale_retriever, apply_slo_def_wrong); event2 has 1 (scale_beagle); event3 has 1 (apply_slo_def_correct)."
+    - "Backlog plausibility: crash-looping prevents offset advancement for ~16 minutes (min 18-34), building a backlog of ~32k mutation events at 2000/min; post-fix processing is modeled to catch up only modestly faster than production, so minutes of lag persist through min 40."
+    - "Volume estimate: normal ~40k logs (18 min * ~2247 logs/min) + failure ~46k–50k logs (22 min at ~2.1k–2.2k logs/min depending on interval) ≈ ~86k–90k total, within the 20k–100k target."
+    - "Crash-loop visibility is ensured by aligned beagle.process_start (~30/min then ~60/min) plus beagle_consume_unknown_topic errors/exits at the same order; lag visibility resumes after the fix via beagle.lag_metric and high-lag beagle.batch_processed."
+```

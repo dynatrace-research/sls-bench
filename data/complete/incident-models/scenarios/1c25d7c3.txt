@@ -1,0 +1,288 @@
+```yaml
+scenario:
+  id: api_dashboard_availability_2020_11_02_compact
+  title: Partial switch failure triggers etcd churn, DB promotion, and auth DB overload
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The control plane serves an API and dashboard that depend on an auth service and an HA auth database coordinated via etcd.
+    A rack switch enters a partial failure mode, causing selective packet loss that triggers etcd RAFT election churn and temporary write blocking.
+    The DB cluster manager misinterprets coordination signals, promotes a primary, and (due to a defect) begins a full replica rebuild, leaving the primary without replicas and overloaded.
+    API success rate drops to ~75% at times and the dashboard becomes extremely slow when reads are temporarily routed to the DR replica; the scenario ends before replicas are rebuilt.
+
+  trigger_desc: |
+    A top-of-rack switch enters a partial failure state where some packets are not forwarded even though link aggregation stays up, creating inconsistent connectivity between one etcd member and the leader.
+
+  time:
+    total_minutes: 48
+    phases:
+      n: {start_min: 0, end_min: 24}
+      f: {start_min: 24, end_min: 48}
+
+  phases:
+    n:
+      desc: |
+        API and dashboard traffic authenticate using the primary auth database in region A.
+        Etcd leadership is stable and the DB cluster manager performs no failovers or rebuilds.
+        Redis session latency remains low and steady.
+        Occasional API auth failures trigger gateway auth retries before returning a 503.
+      flows:
+        - api_primary_ok_n
+        - api_ingress_503_n
+        - api_auth_primary_fail_n
+        - dash_primary_ok_n
+        - dash_primary_504_n
+      manifestation:
+        - etcd_cluster.raft_leader_heartbeat
+        - auth_db_primary.db_health
+        - api_gateway.api_resp_200
+        - api_gateway.api_retry
+        - dashboard_web.page_resp_200
+        - redis_cache.redis_latency
+
+    f:
+      desc: |
+        A partial rack switch fault causes inconsistent packet delivery that is hard for connected servers to interpret as a clean failure.
+        Etcd enters disruptive election churn and briefly blocks writes; the DB cluster manager promotes a primary and starts a replica rebuild due to a defect.
+        With replicas offline, the auth DB primary becomes saturated, producing API auth timeouts and dashboard timeouts; operators then divert authentication reads to the DR replica to improve API availability.
+        Cross-region reads dramatically worsen dashboard latency until routing is narrowed to API-only, leaving the system still degraded at the scenario end.
+
+      events:
+        - order: 1
+          at_min: 24
+          component: rack_switch
+          event: |
+            The rack switch begins intermittently dropping packets while remaining partially reachable; monitoring starts reporting significant ping loss.
+          why: |
+            The partial failure does not cleanly drop links, so link aggregation stays up while the forwarding plane omits some traffic; this is directly observable only via monitoring and downstream symptoms.
+          flows:
+            - api_primary_ok_f
+            - dash_primary_ok_f
+          rate_multipliers:
+            rack_switch.switch_ping_loss: 1.0
+            etcd_cluster.raft_election_started: 0.0
+            etcd_cluster.raft_write_blocked: 0.0
+            db_cluster_mgr.replica_rebuild_progress: 0.0
+            auth_db_primary.db_overload: 0.0
+            api_ingress_503_primary_f: 0.0
+            api_auth_primary_fail_f: 0.0
+            dash_primary_504_f: 0.0
+            api_dr_ok_f: 0.0
+            api_ingress_503_dr_f: 0.0
+            api_auth_dr_fail_f: 0.0
+            dash_dr_ok_f: 0.0
+            dash_dr_504_f: 0.0
+          latency_multipliers: {}
+          one_shots: []
+          manifestation:
+            - rack_switch.switch_ping_loss
+            - etcd_cluster.raft_leader_heartbeat
+
+        - order: 2
+          at_min: 26
+          component: etcd_cluster
+          event: |
+            Etcd begins repeated leader elections and blocks writes; heartbeats stop during the leader-gap interval. The DB cluster manager cannot confirm a healthy primary and triggers an automatic promotion, starting a full replica rebuild.
+          why: |
+            Inconsistent connectivity (omission/partial fault) gives members conflicting views, causing RAFT elections and a leader gap; without stable etcd writes, the cluster manager's coordination degrades and failover logic triggers.
+            Etcd churn is directly observable; the exact network asymmetry is only partially observable from service logs.
+          flows:
+            - api_primary_ok_f
+            - api_ingress_503_primary_f
+            - api_auth_primary_fail_f
+            - dash_primary_ok_f
+            - dash_primary_504_f
+          rate_multipliers:
+            etcd_cluster.raft_leader_heartbeat: 0.0
+            etcd_cluster.raft_election_started: 1.0
+            etcd_cluster.raft_write_blocked: 1.0
+            db_cluster_mgr.replica_rebuild_progress: 1.0
+            auth_db_primary.db_overload: 1.0
+            api_primary_ok_f: 0.67
+            api_ingress_503_primary_f: 14.0
+            api_auth_primary_fail_f: 14.0
+            dash_primary_ok_f: 0.76
+            dash_primary_504_f: 15.0
+          latency_multipliers:
+            api_primary_ok_f: {p50: 1.5, p95: 3.0}
+            api_ingress_503_primary_f: {p50: 1.8, p95: 2.5}
+            dash_primary_ok_f: {p50: 4.0, p95: 8.0}
+            dash_primary_504_f: {p50: 1.3, p95: 1.3}
+          one_shots:
+            - ref: db_cluster_mgr.promote_primary
+              count: 1
+              hosts: [dbmgr-a1]
+            - ref: db_cluster_mgr.replica_rebuild_started
+              count: 1
+              hosts: [dbmgr-a1]
+          manifestation:
+            - etcd_cluster.raft_election_started
+            - etcd_cluster.raft_write_blocked
+            - db_cluster_mgr.promote_primary
+            - auth_db_primary.db_overload
+            - api_gateway.api_resp_503
+
+        - order: 3
+          at_min: 30
+          component: rack_switch
+          event: |
+            The rack switch recovers and monitoring stops reporting loss; etcd regains a stable leader (heartbeats resume) and write blocking ceases, but the database replica rebuild remains in progress.
+          why: |
+            Once packet delivery normalizes, RAFT members can communicate consistently and elections stop; the DB promotion/rebuild side effects persist and remain the dominant source of user impact.
+            Switch recovery and etcd stabilization are directly observable; the remaining DB rebuild is directly observable via cluster manager progress logs.
+          flows:
+            - api_primary_ok_f
+            - api_ingress_503_primary_f
+            - api_auth_primary_fail_f
+            - dash_primary_ok_f
+            - dash_primary_504_f
+          rate_multipliers:
+            rack_switch.switch_ping_loss: 0.0
+            etcd_cluster.raft_election_started: 0.0
+            etcd_cluster.raft_write_blocked: 0.0
+            etcd_cluster.raft_leader_heartbeat: 1.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: rack_switch.switch_recovered
+              count: 1
+              hosts: [sw-r12a]
+            - ref: etcd_cluster.raft_leader_stable
+              count: 1
+              hosts: [etcd-3]
+          manifestation:
+            - rack_switch.switch_recovered
+            - etcd_cluster.raft_leader_stable
+            - db_cluster_mgr.replica_rebuild_progress
+            - auth_db_primary.db_overload
+
+        - order: 4
+          at_min: 34
+          component: db_cluster_mgr
+          event: |
+            Operators throttle non-critical work and enable cross-region read routing to the DR replica for all authentication reads, substantially improving API success rate but making dashboard requests extremely slow.
+          why: |
+            Reducing background pressure helps the saturated primary, while shifting reads to the DR replica reduces primary load; however, dashboard session/auth paths are latency-sensitive and cross-region DB reads add significant RTT, amplifying perceived slowness.
+            The operational actions are directly observable; the resulting shift is visible in auth logs showing db=dr_replica and in dashboard latency.
+          flows:
+            - api_dr_ok_f
+            - api_ingress_503_dr_f
+            - api_auth_dr_fail_f
+            - dash_dr_ok_f
+            - dash_dr_504_f
+          rate_multipliers:
+            auth_db_primary.db_overload: 0.4
+            api_primary_ok_f: 0.0
+            api_ingress_503_primary_f: 0.0
+            api_auth_primary_fail_f: 0.0
+            api_dr_ok_f: 0.95
+            api_ingress_503_dr_f: 1.2
+            api_auth_dr_fail_f: 1.2
+            dash_primary_ok_f: 0.0
+            dash_primary_504_f: 0.0
+            dash_dr_ok_f: 0.95
+            dash_dr_504_f: 3.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: db_cluster_mgr.noncritical_work_throttled
+              count: 1
+              hosts: [dbmgr-a2]
+            - ref: db_cluster_mgr.read_routing_enabled_all
+              count: 1
+              hosts: [dbmgr-a2]
+          manifestation:
+            - db_cluster_mgr.read_routing_enabled_all
+            - auth_service.auth_ok_dr
+            - api_gateway.api_resp_200
+            - dashboard_web.page_resp_200
+
+        - order: 5
+          at_min: 40
+          component: db_cluster_mgr
+          event: |
+            Read routing is narrowed to API-only: API traffic continues using the DR replica, while dashboard auth reads are forced back to the primary, reducing dashboard latency relative to the cross-region interval but leaving it degraded by primary load.
+          why: |
+            Dashboard sessions are latency-sensitive and effectively local-stateful; removing cross-region DB reads reduces end-user wait time.
+            This is directly observable as a shift from auth_ok_dr back to auth_ok_primary for dashboard flows and fewer long-running dashboard requests than during the all-traffic DR-routing interval.
+          flows:
+            - api_dr_ok_f
+            - api_ingress_503_dr_f
+            - api_auth_dr_fail_f
+            - dash_primary_ok_f
+            - dash_primary_504_f
+          rate_multipliers:
+            api_dr_ok_f: 0.95
+            api_ingress_503_dr_f: 1.2
+            api_auth_dr_fail_f: 1.2
+            dash_dr_ok_f: 0.0
+            dash_dr_504_f: 0.0
+            dash_primary_ok_f: 0.70
+            dash_primary_504_f: 2.5
+            auth_db_primary.db_overload: 0.7
+          latency_multipliers:
+            dash_primary_ok_f: {p50: 1.3, p95: 1.6}
+          one_shots:
+            - ref: db_cluster_mgr.read_routing_enabled_api_only
+              count: 1
+              hosts: [dbmgr-a2]
+          manifestation:
+            - db_cluster_mgr.read_routing_enabled_api_only
+            - auth_service.auth_ok_primary
+            - dashboard_web.page_resp_504
+
+      steady:
+        - component: auth_db_primary
+          condition: |
+            Authentication DB primary remains overloaded due to missing local replicas while a rebuild is in progress; connection pressure and queuing continue.
+          user_impact: |
+            Some API calls fail with 503 due to auth timeouts; overall API availability is improved by DR reads but not perfect.
+          manifestation: [auth_db_primary.db_overload, api_gateway.api_resp_503]
+        - component: dashboard_web
+          condition: |
+            Dashboard requests remain slow and occasionally time out because session validation and auth reads are still constrained by the overloaded primary and cannot fully exploit cross-region redundancy without high latency.
+          user_impact: |
+            Dashboard pages are noticeably sluggish and some requests return 504.
+          manifestation: [dashboard_web.page_resp_200, dashboard_web.page_resp_504]
+        - component: db_cluster_mgr
+          condition: |
+            Replica rebuild continues, delaying restoration of normal read distribution within the primary region.
+          user_impact: |
+            Degraded performance persists until replicas return (not reached within this scenario window).
+          manifestation: [db_cluster_mgr.replica_rebuild_progress]
+
+      feedback_loops:
+        - id: retry_pressure_loop
+          desc: |
+            As auth calls time out, API gateway retries increase total dependency load and connection pressure on the auth service/DB,
+            which in turn causes more timeouts and more retries, sustaining the degraded state.
+
+      flows:
+        - api_primary_ok_f
+        - api_ingress_503_primary_f
+        - api_auth_primary_fail_f
+        - api_dr_ok_f
+        - api_ingress_503_dr_f
+        - api_auth_dr_fail_f
+        - dash_primary_ok_f
+        - dash_primary_504_f
+        - dash_dr_ok_f
+        - dash_dr_504_f
+      manifestation:
+        - rack_switch.switch_ping_loss
+        - etcd_cluster.raft_election_started
+        - etcd_cluster.raft_write_blocked
+        - db_cluster_mgr.replica_rebuild_progress
+        - auth_db_primary.db_overload
+        - api_gateway.api_resp_503
+        - api_gateway.api_retry
+        - dashboard_web.page_resp_504
+
+  assumptions:
+    - "Timeline is compressed to a 48-minute window that captures the causal beats; the real incident lasted hours and ended after replica rebuild, but this scenario ends mid-rebuild (still failing) to satisfy the 'ends in failure' requirement."
+    - "DB promotion realism fix: the promoted primary identity can be authdb-a1 or authdb-a2 (synchronous replica), avoiding a semantically misleading 'promotion to itself'."
+    - "Leader-gap alignment fix: during the 26–30 window, etcd stable-heartbeat logs are explicitly suppressed (multiplier 0.0) to avoid contradicting the 'no stable leader / writes blocked' narrative, then restored once the switch recovers."
+    - "Piecewise failure breakdown (minutes are scenario-relative): 24-26 (2 min) switch loss visible; 26-30 (4 min) etcd election/write blocks + leader gap + promotion/rebuild start; 30-34 (4 min) switch/etcd recover but DB overload persists; 34-40 (6 min) DR read routing for all auth reads; 40-48 (8 min) routing narrowed to API-only."
+    - "One-shot counts: 2 at min 26 (promotion + rebuild start), 2 at min 30 (switch recovered + leader stabilized), 2 at min 34 (throttle + routing enable all_traffic), 1 at min 40 (routing enable api_only)."
+    - "Retry visibility: API retries are emitted only by the retrying internal auth-attempt flows (api_auth_*_fail_*), while client-visible 503 responses are emitted by separate non-retrying ingress flows (api_ingress_503_*), preventing multiple terminal responses per retried request."
+    - "Expected log volume: Normal ~32k; Failure ~31k–36k (flow logs + retries + background + one-shots), totaling ~63k–68k (within 20k–100k). Key failure signals (switch loss, etcd churn and blocked writes, db_overload, routing one-shots, api_resp_503/api_retry, and dashboard 504/slow 200s) are modeled at rates that make them likely to appear in a single generated log file."
+```

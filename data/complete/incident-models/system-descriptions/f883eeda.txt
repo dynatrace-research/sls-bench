@@ -1,0 +1,456 @@
+```yaml
+sys:
+  id: quay_registry
+  desc: >
+    A hosted container registry that serves Docker Registry v2 pulls/pushes and an App Registry API used by
+    OpenShift OperatorHub clients. Requests enter through an ingress router and are handled by a Python
+    monolith (gunicorn/gevent) which performs frequent MySQL reads and occasional writes. Under heavy App
+    Registry load, slow code paths can hold DB connections longer and increase concurrent connection usage,
+    leading to lock contention and client-facing 502/503 errors.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: ingress_router
+    name: Ingress Router
+    svc: openshift-router
+    hosts: [router-a, router-b]
+    desc: >
+      Public entrypoint for quay.io. Terminates TLS and proxies to the Quay application pods. Emits a
+      completion-time access log for every request.
+    to:
+      - dst: quay_app
+        proto: https
+        desc: Routes external HTTP(S) to the Quay application service.
+    logs:
+      http_access:
+        desc: Access log emitted after a request completes at the router.
+        lvl: INFO
+        msg: "access method={method} uri={uri} status={status} dur_ms={dur_ms} bytes={bytes} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST, PUT, DELETE]}
+          uri: {k: ch, v: [/v2/*, /api/v1/appregistry/packages, /api/v1/appregistry/blobs]}
+          dur_ms: {k: i, v: [1, 70000]}
+          bytes: {k: i, v: [200, 6000000]}
+          trace_id: {k: hex, v: 32}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 201, 202, 404]}
+          f:
+            status: {k: ch, v: [200, 201, 202, 404, 502, 503]}
+      router_health:
+        desc: Periodic router health summary.
+        lvl: INFO
+        msg: "router health ok upstream_p50_ms={up_p50_ms} upstream_p95_ms={up_p95_ms}"
+        vars:
+          up_p50_ms: {k: i, v: [1, 50]}
+          up_p95_ms: {k: i, v: [5, 300]}
+      upstream_connect_warn:
+        desc: Warning when upstream connections flap under stress.
+        lvl: WARN
+        msg: "upstream connect warning upstream=quay_app err={err}"
+        vars:
+          err: {k: ch, v: [connect_timeout, connection_reset, tls_handshake_failed]}
+    beh:
+      n:
+        desc: Mostly clean router behavior with occasional health logs.
+        emit:
+          - id: router_health
+            per_min: 0.5
+            scope: per_host
+          - id: upstream_connect_warn
+            per_min: 0.02
+            scope: per_host
+      f:
+        desc: Router continues serving but sees more upstream-connect warnings during app/DB distress.
+        emit:
+          - id: router_health
+            per_min: 0.5
+            scope: per_host
+          - id: upstream_connect_warn
+            per_min: 0.25
+            scope: per_host
+
+  - id: quay_app
+    name: Quay Application (API/Registry/AppRegistry)
+    svc: quay-app
+    hosts: [quay-1, quay-2, quay-3, quay-4, quay-5, quay-6, quay-7, quay-8]
+    desc: >
+      Python monolith running gunicorn+gevent. Handles registry v2 and App Registry endpoints and accesses
+      MySQL for auth, manifests/blobs metadata, and App Registry package/blob indexing.
+    to:
+      - dst: mysql_rds
+        proto: tcp
+        desc: Performs MySQL queries for request handling and background maintenance tasks.
+      - dst: ingress_router
+        proto: https
+        desc: Returns HTTP responses back through the router (modeled as a logical return hop for path connectivity).
+    logs:
+      req_start:
+        desc: Request entry log in the Quay application.
+        lvl: INFO
+        msg: "req start method={method} endpoint={endpoint} req_id={req_id} ua={ua} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [GET, POST, PUT, DELETE]}
+          endpoint: {k: ch, v: [registry_pull, registry_push, appreg_list_packages, appreg_get_blobs]}
+          req_id: {k: uuid, v: null}
+          ua: {k: ch, v: [docker, helm, operatorhub, quay_web]}
+          trace_id: {k: hex, v: 32}
+      db_acquire:
+        desc: DB connection acquire/checkout attempt from the worker context.
+        lvl: DEBUG
+        msg: "db acquire worker={worker} open_conns={open_conns}"
+        vars:
+          worker: {k: i, v: [1, 32]}
+        state_vars:
+          n:
+            open_conns: {k: i, v: [0, 20]}
+          f:
+            open_conns: {k: i, v: [10, 80]}
+      db_query:
+        desc: Summary log for the primary DB query for a request.
+        lvl: INFO
+        msg: "db query endpoint={endpoint} op={op} rows={rows} db_ms={db_ms}"
+        vars:
+          endpoint: {k: ch, v: [registry_pull, registry_push, appreg_list_packages, appreg_get_blobs]}
+          op: {k: ch, v: [select, insert, update]}
+        state_vars:
+          n:
+            rows: {k: i, v: [0, 1200]}
+            db_ms: {k: i, v: [1, 500]}
+          f:
+            rows: {k: i, v: [0, 5000]}
+            db_ms: {k: i, v: [50, 60000]}
+      req_end:
+        desc: Request completion log on success.
+        lvl: INFO
+        msg: "req done req_id={req_id} status={status} total_ms={total_ms} db_ms={db_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          total_ms: {k: i, v: [1, 70000]}
+          db_ms: {k: i, v: [1, 60000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [200, 201, 202, 404]}
+          f:
+            status: {k: ch, v: [200, 201, 404]}
+      req_error:
+        desc: Request completion log for failures occurring before a DB query (e.g., connection refused/pool exhausted/forced read-only).
+        lvl: WARN
+        msg: "req fail req_id={req_id} status={status} err={err} total_ms={total_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          err: {k: ch, v: [db_connect_refused, db_pool_exhausted, readonly_mode]}
+          total_ms: {k: i, v: [1, 70000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [400, 401, 403, 404, 429]}
+          f:
+            status: {k: ch, v: [502, 503]}
+      req_error_db:
+        desc: Request completion log for failures after a DB query was issued (e.g., lock wait timeout).
+        lvl: WARN
+        msg: "req fail req_id={req_id} status={status} err={err} total_ms={total_ms}"
+        vars:
+          req_id: {k: uuid, v: null}
+          err: {k: ch, v: [db_lock_timeout, upstream_reset]}
+          total_ms: {k: i, v: [1, 70000]}
+        state_vars:
+          n:
+            status: {k: ch, v: [500]}
+          f:
+            status: {k: ch, v: [502, 503]}
+      worker_metric:
+        desc: Periodic snapshot of gevent/gunicorn worker load.
+        lvl: INFO
+        msg: "workers busy={busy} total={total} greenlets={greenlets} qlen={qlen}"
+        vars:
+          busy: {k: i, v: [0, 32]}
+          total: {k: i, v: [8, 32]}
+          greenlets: {k: i, v: [50, 4000]}
+          qlen: {k: i, v: [0, 2000]}
+      gc_run:
+        desc: Namespace garbage collection maintenance run that touches the DB.
+        lvl: INFO
+        msg: "namespace_gc run deleted={deleted} db_ms={db_ms}"
+        vars:
+          deleted: {k: i, v: [0, 200]}
+          db_ms: {k: i, v: [20, 20000]}
+      pod_restart:
+        desc: Application pod restart marker emitted during incident response.
+        lvl: WARN
+        msg: "pod restart reason={reason} generation={generation}"
+        vars:
+          reason: {k: ch, v: [oom_kill, liveness_probe_failed, manual_bounce]}
+          generation: {k: i, v: [1, 50]}
+      mode_changed:
+        desc: Configuration change marker (read-only mode and DB connection limiting).
+        lvl: INFO
+        msg: "config applied read_only={read_only} db_conn_limit={db_conn_limit}"
+        vars:
+          read_only: {k: ch, v: [true]}
+          db_conn_limit: {k: i, v: [30, 60]}
+    beh:
+      n:
+        desc: Periodic worker metrics and occasional background GC runs.
+        emit:
+          - id: worker_metric
+            per_min: 1.0
+            scope: per_host
+          - id: gc_run
+            per_min: 0.4
+            scope: per_host
+      f:
+        desc: Under failure, workers report higher load; GC may still run until explicitly disabled.
+        emit:
+          - id: worker_metric
+            per_min: 2.0
+            scope: per_host
+          - id: gc_run
+            per_min: 0.6
+            scope: per_host
+
+  - id: mysql_rds
+    name: MySQL RDS
+    svc: rds-mysql
+    hosts: [rds-1]
+    desc: >
+      Primary relational database backing Quay. Emits periodic connection/health snapshots and warnings
+      when lock waits and connection limits are hit.
+    to:
+      - dst: quay_app
+        proto: tcp
+        desc: Returns query results and errors to the Quay application (modeled as a logical return hop for path connectivity).
+    logs:
+      conn_stats_n:
+        desc: Periodic connection stats under normal load.
+        lvl: INFO
+        msg: "mysql stats current_conns={current} max_conns={max} threads_running={threads} slow_qpm={slow_qpm}"
+        vars:
+          current: {k: i, v: [35, 65]}
+          max: {k: i, v: [180, 260]}
+          threads: {k: i, v: [5, 35]}
+          slow_qpm: {k: i, v: [0, 10]}
+      conn_stats_high:
+        desc: Periodic connection stats during connection storm (pre-cap).
+        lvl: WARN
+        msg: "mysql stats current_conns={current} max_conns={max} threads_running={threads} slow_qpm={slow_qpm}"
+        vars:
+          max: {k: i, v: [260, 260]}
+          current: {k: i, v: [180, 260]}
+          threads: {k: i, v: [80, 260]}
+          slow_qpm: {k: i, v: [30, 200]}
+      conn_stats_capped:
+        desc: Periodic connection stats after max_connections is capped (post-mitigation).
+        lvl: INFO
+        msg: "mysql stats current_conns={current} max_conns={max} threads_running={threads} slow_qpm={slow_qpm}"
+        vars:
+          max: {k: i, v: [110, 110]}
+          current: {k: i, v: [70, 108]}
+          threads: {k: i, v: [40, 108]}
+          slow_qpm: {k: i, v: [10, 120]}
+      lock_wait:
+        desc: InnoDB lock wait timeout warning (symptom of lockups/long transactions).
+        lvl: WARN
+        msg: "innodb lock wait timeout trx={trx} wait_ms={wait_ms}"
+        vars:
+          trx: {k: hex, v: 16}
+          wait_ms: {k: i, v: [1000, 60000]}
+      too_many_conn:
+        desc: Connection refused because max_connections is exceeded.
+        lvl: ERROR
+        msg: "too many connections refused user={user} src={src_ip}"
+        vars:
+          user: {k: ch, v: [quay]}
+          src_ip: {k: ip, v: "10.0.0.0/16"}
+      set_max_connections:
+        desc: Operational change marker for max_connections.
+        lvl: INFO
+        msg: "set global max_connections={max}"
+        vars:
+          max: {k: i, v: [110, 110]}
+      instance_restart:
+        desc: Database instance restart marker.
+        lvl: CRITICAL
+        msg: "rds instance restart initiated reason={reason}"
+        vars:
+          reason: {k: ch, v: [lockup_recovery, maintenance]}
+    beh:
+      n:
+        desc: Normal background metrics with rare lock/connection errors.
+        emit:
+          - id: conn_stats_n
+            per_min: 1.0
+            scope: global
+          - id: lock_wait
+            per_min: 0.1
+            scope: global
+          - id: too_many_conn
+            per_min: 0.01
+            scope: global
+      f:
+        desc: Under failure, lock waits and connection refusals become frequent; stats reflect storm or cap.
+        emit:
+          - id: conn_stats_high
+            per_min: 1.0
+            scope: global
+          - id: conn_stats_capped
+            per_min: 1.0
+            scope: global
+          - id: lock_wait
+            per_min: 5.0
+            scope: global
+          - id: too_many_conn
+            per_min: 3.0
+            scope: global
+
+tracing:
+  on: true
+  origins: [ingress_router]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation with steady image pull/push traffic and low App Registry usage.
+    req:
+      - id: docker_pull_ok_n
+        desc: Successful registry v2 pull request.
+        rpm: 90
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[1, 3], [2, 8], [10, 60], [2, 10], [1, 3]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_push_ok_n
+        desc: Successful image push (write path).
+        rpm: 20
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[1, 3], [2, 10], [20, 150], [3, 15], [1, 3]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: appreg_list_packages_ok_n
+        desc: App Registry endpoint listing packages (low usage in normal).
+        rpm: 5
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[1, 3], [2, 10], [30, 200], [3, 20], [1, 3]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: appreg_get_blobs_ok_n
+        desc: App Registry endpoint returning blobs for a package (low usage in normal).
+        rpm: 5
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[1, 3], [2, 10], [40, 250], [3, 20], [1, 3]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+  f:
+    desc: >
+      Heavy App Registry load causes slow DB reads and higher connection concurrency, leading to lock waits
+      and 502s; mitigations cap connections and switch to read-only to stabilize.
+    req:
+      - id: appreg_list_packages_slow_f
+        desc: App Registry list-packages requests become slow due to inefficient DB queries under load.
+        rpm: 120
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[2, 6], [10, 80], [800, 45000], [10, 200], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: appreg_get_blobs_slow_f
+        desc: App Registry get-blobs requests are slow (includes expensive per-request processing).
+        rpm: 90
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[2, 6], [10, 90], [1200, 60000], [10, 250], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: appreg_502_f
+        desc: App Registry requests failing after a DB query due to lock waits/timeouts.
+        rpm: 35
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_error_db, ingress_router.http_access]
+        latency_ms: [[2, 6], [10, 120], [1500, 65000], [5, 60], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: appreg_502_conn_refused_f
+        desc: App Registry requests failing before any query due to refused DB connections or pool exhaustion.
+        rpm: 15
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.req_error, ingress_router.http_access]
+        latency_ms: [[2, 6], [5, 50], [20, 500], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_pull_ok_f
+        desc: Some image pulls still succeed, but with increased latency.
+        rpm: 70
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_end, ingress_router.http_access]
+        latency_ms: [[2, 5], [8, 60], [60, 4000], [5, 60], [2, 5]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_pull_502_f
+        desc: Image pulls failing after a DB query due to lock waits/timeouts.
+        rpm: 40
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_error_db, ingress_router.http_access]
+        latency_ms: [[2, 5], [10, 90], [500, 35000], [5, 50], [2, 5]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_pull_502_conn_refused_f
+        desc: Image pulls failing before any DB query due to refused DB connections or pool exhaustion.
+        rpm: 20
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.req_error, ingress_router.http_access]
+        latency_ms: [[2, 5], [5, 50], [20, 500], [2, 5]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_push_502_db_f
+        desc: Image push attempts failing after a DB query due to lock waits/timeouts (pre-readonly).
+        rpm: 15
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.db_query, quay_app.req_error_db, ingress_router.http_access]
+        latency_ms: [[2, 6], [10, 120], [800, 45000], [5, 60], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_push_502_conn_refused_f
+        desc: Image push attempts failing before any DB query due to refused DB connections or pool exhaustion (pre-readonly).
+        rpm: 10
+        path: [ingress_router, quay_app, mysql_rds, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.db_acquire, quay_app.req_error, ingress_router.http_access]
+        latency_ms: [[2, 6], [5, 60], [30, 700], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: docker_push_503_readonly_f
+        desc: Image push attempts rejected quickly after site is forced into read-only mode.
+        rpm: 25
+        path: [ingress_router, quay_app, ingress_router]
+        emit: [quay_app.req_start, quay_app.req_error, ingress_router.http_access]
+        latency_ms: [[2, 6], [2, 15], [2, 6]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+
+assumptions:
+  - |-
+    Added logical return-hop edges (mysql_rds->quay_app and quay_app->ingress_router) to satisfy path connectivity checks; these represent responses/results, not new primary dependencies.
+  - |-
+    Traffic volumes are intentionally scaled down (hundreds of rpm) while preserving the incident’s causal relationships (App Registry surge dominates and drives DB contention).
+  - |-
+    MySQL connection counts are scaled down to match the modeled request throughput/latencies; “connection storm” is represented as a sharp relative jump toward configured max_connections plus frequent connection refusals and lock waits.
+  - |-
+    Split Quay request error logging into pre-query failures (quay_app.req_error: connect refused/pool exhausted/read-only) vs post-query failures (quay_app.req_error_db: lock wait/timeouts) to avoid contradictory per-request log sequences.
+  - |-
+    Quay's DB-connection limiting mitigation is modeled as an explicit config marker (quay_app.mode_changed with db_conn_limit); per-request db_acquire does not include a limit field to avoid implying the limit existed before the mitigation event.
+  - |-
+    MySQL threads_running domains are constrained to not exceed the corresponding connection maxima for each conn_stats_* template; generators should choose coherent samples where threads_running <= current_conns.
+  - |-
+    Fixed max_conns within each MySQL conn_stats_* log type to prevent unrealistic combinations where current_conns > max_conns during generation (storm uses max=260; capped uses max=110).
+  - |-
+    App Registry slowness is modeled as high DB query latency and larger row counts, which increases connection hold time and contention symptoms (lock_wait, too_many_conn, 502s).
+  - |-
+    Read-only stabilization and feature reduction are represented by a config marker (mode_changed), shifting push failures to 503, and disabling gc_run via event multipliers.
+  - |-
+    Estimated baseline normal logs/min ≈ 600 (flows) + ~13 (background); estimated total logs for the scenario ≈ 56k (target 20k..100k).
+```

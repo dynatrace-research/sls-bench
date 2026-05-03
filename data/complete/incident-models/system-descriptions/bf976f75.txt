@@ -1,0 +1,646 @@
+```yaml
+sys:
+  id: mw_aux_services_external_storage_overload
+  desc: >
+    A set of non-user-facing MediaWiki deployments (api-int, parsoid, jobrunner) serve internal requests and background
+    jobs and rely on Memcached to avoid repeated reads of revision content stored in an External Storage database cluster.
+    Deployments are performed via Scap, which updates Helm release defaults and rolls pods. Logs are shipped through
+    Logstash and some alerts depend on metrics derived from the log pipeline. In this incident, a deployment caused
+    the services to lose Memcached configuration, increasing External Storage load and producing a log flood that
+    degraded observability.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: scap
+    name: Scap deploy tool
+    svc: scap
+    hosts: [deploy-1]
+    desc: Deployment tool that updates Helm defaults and rolls MediaWiki deployments.
+    to: []
+    logs:
+      deploy_start:
+        desc: Marks the start of the deployment that introduced the misconfiguration.
+        lvl: INFO
+        msg: "scap deploy started deploy_id={deploy_id} targets=mw-{api-int,parsoid,jobrunner} flags=-Dbuild_mw_container_image:False"
+        vars:
+          deploy_id: {k: hex, v: 8}
+    beh:
+      n: {desc: "Scap is idle between deployments.", emit: []}
+      f: {desc: "Scap is not continuously active during the incident.", emit: []}
+
+  - id: mw_api_int
+    name: MediaWiki api-int
+    svc: mw-api-int
+    hosts: [mw-api-int-1]
+    desc: Internal API MediaWiki deployment; depends on Memcached and External Storage.
+    to:
+      - dst: external_storage_db
+        proto: mysql
+        desc: Reads/writes revision text blobs from External Storage.
+      - dst: logstash
+        proto: tcp
+        desc: Ships application logs to centralized processing.
+    logs:
+      http_start:
+        desc: Start of a request/job execution in the app.
+        lvl: INFO
+        msg: "request start req_id={req_id} method={method} uri={uri}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/w/api.php", "/w/rest.php"]}
+      cache_hit:
+        desc: Cache lookup succeeded using the cluster memcache endpoint.
+        lvl: DEBUG
+        msg: "cache hit key={cache_key} server={server} ttl_s={ttl_s}"
+        vars:
+          cache_key: {k: str, v: "mw:cache:key"}
+          server: {k: ch, v: ["mcrouter.cache.svc:11213"]}
+          ttl_s: {k: i, v: [30, 600]}
+      cache_miss:
+        desc: Cache lookup reached Memcached but did not find the key; DB fallback may be used.
+        lvl: DEBUG
+        msg: "cache miss key={cache_key} server={server}"
+        vars:
+          cache_key: {k: str, v: "mw:cache:key"}
+          server: {k: ch, v: ["mcrouter.cache.svc:11213"]}
+      cache_lookup_failed:
+        desc: Cache lookup failed and the app falls back to database reads.
+        lvl: WARN
+        msg: "cache lookup failed key={cache_key} server={server} err={err}; falling back to DB"
+        vars:
+          cache_key: {k: str, v: "mw:cache:key"}
+          server: {k: ch, v: ["127.0.0.1:11213"]}
+          err: {k: ch, v: [ECONNREFUSED, ETIMEDOUT, ENETUNREACH]}
+      db_error:
+        desc: External Storage access failed for this request.
+        lvl: ERROR
+        msg: "db error req_id={req_id} cluster=external_storage op={op} err={db_err} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: [SELECT, UPDATE]}
+          db_err: {k: ch, v: [timeout, too_many_connections, lock_wait_timeout]}
+          dur_ms: {k: i, v: [500, 60000]}
+      http_end_ok:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: "request end req_id={req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 60000]}
+      http_end_err:
+        desc: Request completed with a server error.
+        lvl: INFO
+        msg: "request end req_id={req_id} status={status} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: ["500", "503"]}
+          dur_ms: {k: i, v: [100, 60000]}
+      memcached_spam:
+        desc: High-volume memcached client errors when configured to localhost.
+        lvl: ERROR
+        msg: "Memcached::set failed server={server} errno={errno} msg={errmsg}"
+        vars:
+          server: {k: ch, v: ["127.0.0.1:11213"]}
+          errno: {k: i, v: [110, 113]}
+          errmsg: {k: ch, v: ["Connection timed out", "Connection refused", "No route to host"]}
+      phpfpm_status:
+        desc: Periodic php-fpm worker snapshot.
+        lvl: INFO
+        msg: "php-fpm status active={active} idle={idle} queue={queue}"
+        vars: {}
+        state_vars:
+          n:
+            active: {k: i, v: [5, 25]}
+            idle: {k: i, v: [5, 40]}
+            queue: {k: i, v: [0, 10]}
+          f:
+            active: {k: i, v: [20, 60]}
+            idle: {k: i, v: [0, 10]}
+            queue: {k: i, v: [5, 200]}
+    beh:
+      n:
+        desc: Healthy worker pool; minimal background noise.
+        emit:
+          - id: phpfpm_status
+            per_min: 0.3
+      f:
+        desc: Worker pool is busy due to cache fallback; memcached errors are emitted at high rate.
+        emit:
+          - id: phpfpm_status
+            per_min: 0.5
+          - id: memcached_spam
+            per_min: 250
+
+  - id: mw_parsoid
+    name: MediaWiki parsoid
+    svc: mw-parsoid
+    hosts: [mw-parsoid-1]
+    desc: Parsoid rendering deployment; depends on Memcached and External Storage for revision content.
+    to:
+      - dst: external_storage_db
+        proto: mysql
+        desc: Reads revision text blobs from External Storage.
+      - dst: logstash
+        proto: tcp
+        desc: Ships application logs to centralized processing.
+    logs:
+      http_start:
+        desc: Start of a request/job execution in the app.
+        lvl: INFO
+        msg: "request start req_id={req_id} method={method} uri={uri}"
+        vars:
+          req_id: {k: hex, v: 16}
+          method: {k: ch, v: [GET, POST]}
+          uri: {k: ch, v: ["/v3/page/html", "/v3/transform/wikitext/to/html"]}
+      cache_hit:
+        desc: Cache lookup succeeded using the cluster memcache endpoint.
+        lvl: DEBUG
+        msg: "cache hit key={cache_key} server={server} ttl_s={ttl_s}"
+        vars:
+          cache_key: {k: str, v: "parsoid:cache:key"}
+          server: {k: ch, v: ["mcrouter.cache.svc:11213"]}
+          ttl_s: {k: i, v: [30, 600]}
+      cache_miss:
+        desc: Cache lookup reached Memcached but did not find the key; DB fallback may be used.
+        lvl: DEBUG
+        msg: "cache miss key={cache_key} server={server}"
+        vars:
+          cache_key: {k: str, v: "parsoid:cache:key"}
+          server: {k: ch, v: ["mcrouter.cache.svc:11213"]}
+      cache_lookup_failed:
+        desc: Cache lookup failed and the app falls back to database reads.
+        lvl: WARN
+        msg: "cache lookup failed key={cache_key} server={server} err={err}; falling back to DB"
+        vars:
+          cache_key: {k: str, v: "parsoid:cache:key"}
+          server: {k: ch, v: ["127.0.0.1:11213"]}
+          err: {k: ch, v: [ECONNREFUSED, ETIMEDOUT, ENETUNREACH]}
+      db_error:
+        desc: External Storage access failed for this request.
+        lvl: ERROR
+        msg: "db error req_id={req_id} cluster=external_storage op={op} err={db_err} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: [SELECT, UPDATE]}
+          db_err: {k: ch, v: [timeout, too_many_connections, lock_wait_timeout]}
+          dur_ms: {k: i, v: [500, 60000]}
+      http_end_ok:
+        desc: Request completed successfully.
+        lvl: INFO
+        msg: "request end req_id={req_id} status=200 dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 60000]}
+      http_end_err:
+        desc: Request completed with a server error.
+        lvl: INFO
+        msg: "request end req_id={req_id} status={status} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: ["500", "503"]}
+          dur_ms: {k: i, v: [100, 60000]}
+      memcached_spam:
+        desc: High-volume memcached client errors when configured to localhost.
+        lvl: ERROR
+        msg: "Memcached::set failed server={server} errno={errno} msg={errmsg}"
+        vars:
+          server: {k: ch, v: ["127.0.0.1:11213"]}
+          errno: {k: i, v: [110, 113]}
+          errmsg: {k: ch, v: ["Connection timed out", "Connection refused", "No route to host"]}
+      phpfpm_status:
+        desc: Periodic php-fpm worker snapshot.
+        lvl: INFO
+        msg: "php-fpm status active={active} idle={idle} queue={queue}"
+        vars: {}
+        state_vars:
+          n:
+            active: {k: i, v: [3, 20]}
+            idle: {k: i, v: [5, 35]}
+            queue: {k: i, v: [0, 8]}
+          f:
+            active: {k: i, v: [15, 50]}
+            idle: {k: i, v: [0, 8]}
+            queue: {k: i, v: [5, 150]}
+    beh:
+      n:
+        desc: Healthy worker pool.
+        emit:
+          - id: phpfpm_status
+            per_min: 0.25
+      f:
+        desc: Busy workers due to cache fallback; memcached errors are emitted at high rate.
+        emit:
+          - id: phpfpm_status
+            per_min: 0.45
+          - id: memcached_spam
+            per_min: 250
+
+  - id: mw_jobrunner
+    name: MediaWiki jobrunner
+    svc: mw-jobrunner
+    hosts: [mw-jobrunner-1]
+    desc: Background job runner (including changeprop-related jobs) that frequently reads revision content.
+    to:
+      - dst: external_storage_db
+        proto: mysql
+        desc: Reads/writes revision text blobs from External Storage.
+      - dst: logstash
+        proto: tcp
+        desc: Ships application logs to centralized processing.
+    logs:
+      http_start:
+        desc: Start of a job execution in the app.
+        lvl: INFO
+        msg: "job start req_id={req_id} job={job}"
+        vars:
+          req_id: {k: hex, v: 16}
+          job: {k: ch, v: [categoryMembershipChange, refreshLinks, cirrusUpdate]}
+      cache_hit:
+        desc: Cache lookup succeeded using the cluster memcache endpoint.
+        lvl: DEBUG
+        msg: "cache hit key={cache_key} server={server} ttl_s={ttl_s}"
+        vars:
+          cache_key: {k: str, v: "job:cache:key"}
+          server: {k: ch, v: ["mcrouter.cache.svc:11213"]}
+          ttl_s: {k: i, v: [30, 600]}
+      cache_miss:
+        desc: Cache lookup reached Memcached but did not find the key; DB fallback may be used.
+        lvl: DEBUG
+        msg: "cache miss key={cache_key} server={server}"
+        vars:
+          cache_key: {k: str, v: "job:cache:key"}
+          server: {k: ch, v: ["mcrouter.cache.svc:11213"]}
+      cache_lookup_failed:
+        desc: Cache lookup failed and the job falls back to database reads.
+        lvl: WARN
+        msg: "cache lookup failed key={cache_key} server={server} err={err}; falling back to DB"
+        vars:
+          cache_key: {k: str, v: "job:cache:key"}
+          server: {k: ch, v: ["127.0.0.1:11213"]}
+          err: {k: ch, v: [ECONNREFUSED, ETIMEDOUT, ENETUNREACH]}
+      db_error:
+        desc: External Storage access failed for this job.
+        lvl: ERROR
+        msg: "db error req_id={req_id} cluster=external_storage op={op} err={db_err} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: [SELECT, UPDATE]}
+          db_err: {k: ch, v: [timeout, too_many_connections, lock_wait_timeout]}
+          dur_ms: {k: i, v: [500, 60000]}
+      http_end_ok:
+        desc: Job completed successfully.
+        lvl: INFO
+        msg: "job end req_id={req_id} status=ok dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [50, 60000]}
+      http_end_err:
+        desc: Job completed with an error.
+        lvl: INFO
+        msg: "job end req_id={req_id} status=error dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [200, 60000]}
+      memcached_spam:
+        desc: High-volume memcached client errors when configured to localhost.
+        lvl: ERROR
+        msg: "Memcached::set failed server={server} errno={errno} msg={errmsg}"
+        vars:
+          server: {k: ch, v: ["127.0.0.1:11213"]}
+          errno: {k: i, v: [110, 113]}
+          errmsg: {k: ch, v: ["Connection timed out", "Connection refused", "No route to host"]}
+      phpfpm_status:
+        desc: Periodic php-fpm worker snapshot.
+        lvl: INFO
+        msg: "php-fpm status active={active} idle={idle} queue={queue}"
+        vars: {}
+        state_vars:
+          n:
+            active: {k: i, v: [5, 30]}
+            idle: {k: i, v: [5, 45]}
+            queue: {k: i, v: [0, 12]}
+          f:
+            active: {k: i, v: [25, 70]}
+            idle: {k: i, v: [0, 10]}
+            queue: {k: i, v: [10, 250]}
+    beh:
+      n:
+        desc: Healthy background job processing.
+        emit:
+          - id: phpfpm_status
+            per_min: 0.35
+      f:
+        desc: Extra database work due to cache fallback; high memcached error spam.
+        emit:
+          - id: phpfpm_status
+            per_min: 0.6
+          - id: memcached_spam
+            per_min: 250
+
+  - id: external_storage_db
+    name: External Storage DB cluster
+    svc: extstore-db
+    hosts: [extdb-1, extdb-2]
+    desc: Stores compressed revision text blobs; overloaded by increased cache-miss-driven reads.
+    to: []
+    logs:
+      pool_stats:
+        desc: Periodic connection pool/queue snapshot.
+        lvl: INFO
+        msg: "extstore pool active_conns={active_conns} waiting_conns={waiting_conns} p95_wait_ms={p95_wait_ms}"
+        vars: {}
+        state_vars:
+          n:
+            active_conns: {k: i, v: [60, 140]}
+            waiting_conns: {k: i, v: [0, 8]}
+            p95_wait_ms: {k: i, v: [1, 25]}
+          f:
+            active_conns: {k: i, v: [180, 520]}
+            waiting_conns: {k: i, v: [10, 160]}
+            p95_wait_ms: {k: i, v: [20, 800]}
+      query_timeout:
+        desc: Query timed out due to overload.
+        lvl: WARN
+        msg: "extstore query timeout client={client} dur_ms={dur_ms}"
+        vars:
+          client: {k: ch, v: [mw-api-int, mw-parsoid, mw-jobrunner]}
+          dur_ms: {k: i, v: [2000, 60000]}
+      too_many_connections:
+        desc: Connection attempt rejected due to connection pressure.
+        lvl: ERROR
+        msg: "extstore connection rejected client={client} active_conns={active_conns}"
+        vars:
+          client: {k: ch, v: [mw-api-int, mw-parsoid, mw-jobrunner]}
+          active_conns: {k: i, v: [350, 650]}
+    beh:
+      n:
+        desc: Stable connection counts with rare timeouts.
+        emit:
+          - id: pool_stats
+            per_min: 1.0
+          - id: query_timeout
+            per_min: 0.05
+          - id: too_many_connections
+            per_min: 0.01
+      f:
+        desc: Elevated connections and frequent timeouts/rejections.
+        emit:
+          - id: pool_stats
+            per_min: 2.0
+          - id: query_timeout
+            per_min: 2.0
+          - id: too_many_connections
+            per_min: 0.5
+
+  - id: logstash
+    name: Logstash pipeline
+    svc: logstash
+    hosts: [logstash-1]
+    desc: Processes application logs and feeds downstream dashboards/metrics; vulnerable to overload from high-volume channels.
+    to:
+      - dst: prometheus
+        proto: http
+        desc: Exposes derived metrics to Prometheus scraping/exporters.
+    logs:
+      pipeline_lag:
+        desc: Pipeline lag/queue depth snapshot.
+        lvl: WARN
+        msg: "logstash pipeline lag lag_s={lag_s} queue_depth={queue_depth} inflight={inflight} input_eps={input_eps}"
+        vars:
+          lag_s: {k: f, v: [0.0, 600.0]}
+          queue_depth: {k: i, v: [0, 500000]}
+          inflight: {k: i, v: [0, 50000]}
+        state_vars:
+          n:
+            input_eps: {k: i, v: [10, 35]}
+          f:
+            input_eps: {k: i, v: [25, 80]}
+      pipeline_drop:
+        desc: Events dropped due to overload.
+        lvl: ERROR
+        msg: "logstash dropped events dropped={dropped} reason={reason}"
+        vars:
+          dropped: {k: i, v: [100, 20000]}
+          reason: {k: ch, v: [queue_full, slow_filter]}
+    beh:
+      n:
+        desc: Low steady processing lag.
+        emit:
+          - id: pipeline_lag
+            per_min: 0.2
+            scope: global
+          - id: pipeline_drop
+            per_min: 0.02
+            scope: global
+      f:
+        desc: Elevated lag due to log flood; may progress to drops.
+        emit:
+          - id: pipeline_lag
+            per_min: 1.0
+            scope: global
+          - id: pipeline_drop
+            per_min: 0.2
+            scope: global
+
+  - id: prometheus
+    name: Prometheus / alerting
+    svc: prometheus
+    hosts: [prometheus-1]
+    desc: Scrapes metrics and fires alerts; some memcached-error visibility depends on log-derived metrics.
+    to: []
+    logs:
+      scrape_failed:
+        desc: A scrape did not return usable data (timeouts/no data).
+        lvl: WARN
+        msg: "scrape failed job={job} endpoint={endpoint} err={err}"
+        vars:
+          job: {k: ch, v: [logstash_prom_exporter, mediawiki_stats]}
+          endpoint: {k: ch, v: ["http://logstash-1:9108/metrics", "http://mw-metrics:9102/metrics"]}
+          err: {k: ch, v: [context_deadline_exceeded, no_data_returned, connection_reset]}
+      alert_firing:
+        desc: An alert is firing due to elevated latency/connections.
+        lvl: WARN
+        msg: "alert firing name={alert} severity={sev} value={value} target={target}"
+        vars:
+          alert: {k: ch, v: [MediaWikiHighBackendLatency, ExternalStorageHighConnections]}
+          sev: {k: ch, v: [warning, critical]}
+          value: {k: f, v: [0.5, 120.0]}
+          target: {k: ch, v: [mw-api-int, mw-parsoid, mw-jobrunner, extstore]}
+    beh:
+      n:
+        desc: Stable scrapes and no relevant alerts.
+        emit:
+          - id: scrape_failed
+            per_min: 0.05
+            scope: global
+          - id: alert_firing
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Alerts for backend latency and extstore connections; scrape failures may appear during log pipeline lag.
+        emit:
+          - id: scrape_failed
+            per_min: 0.2
+            scope: global
+          - id: alert_firing
+            per_min: 0.5
+            scope: global
+
+  - id: ops_console
+    name: Ops console actions
+    svc: ops
+    hosts: [ops-1]
+    desc: Represents responders applying mitigations via config changes during the incident.
+    to: []
+    logs:
+      reduce_cirrus_parallelism:
+        desc: Patch/config applied to reduce cirrus streaming updater parallelism.
+        lvl: INFO
+        msg: "config change service=cirrus-streaming-updater param=parallelism from=64 to=16 by=gmodena,brouberol"
+        vars: {}
+      reduce_changeprop_concurrency:
+        desc: Config applied to reduce changeprop-jobqueue categoryMembershipChange concurrency.
+        lvl: INFO
+        msg: "config change service=changeprop-jobqueue param=categoryMembershipChange_concurrency from=50 to=10 by=amir1"
+        vars: {}
+    beh:
+      n: {desc: "No background emissions from ops console.", emit: []}
+      f: {desc: "No background emissions from ops console.", emit: []}
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation where api-int/parsoid/jobrunner mostly hit Memcached and only occasionally touch External Storage.
+    req:
+      - id: api_int_request_ok
+        desc: Successful api-int request with cache hit.
+        rpm: 160
+        path: [mw_api_int, external_storage_db]
+        emit: [mw_api_int.http_start, mw_api_int.cache_hit, mw_api_int.http_end_ok]
+        latency_ms: [[1, 3], [2, 6], [20, 140]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: api_int_request_db_error
+        desc: api-int request that falls back to DB (e.g., cache miss) and then fails on External Storage access.
+        rpm: 2
+        path: [mw_api_int, external_storage_db]
+        emit: [mw_api_int.http_start, mw_api_int.cache_miss, mw_api_int.db_error, mw_api_int.http_end_err]
+        latency_ms: [[1, 3], [2, 6], [200, 1500], [300, 2000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: parsoid_request_ok
+        desc: Successful parsoid render with cache hit.
+        rpm: 60
+        path: [mw_parsoid, external_storage_db]
+        emit: [mw_parsoid.http_start, mw_parsoid.cache_hit, mw_parsoid.http_end_ok]
+        latency_ms: [[1, 3], [2, 6], [30, 220]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: parsoid_request_db_error
+        desc: Parsoid render that falls back to DB (e.g., cache miss) and fails due to External Storage error.
+        rpm: 1
+        path: [mw_parsoid, external_storage_db]
+        emit: [mw_parsoid.http_start, mw_parsoid.cache_miss, mw_parsoid.db_error, mw_parsoid.http_end_err]
+        latency_ms: [[1, 3], [2, 6], [250, 2000], [300, 2500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: jobrunner_job_ok
+        desc: Successful job execution with cache hit.
+        rpm: 120
+        path: [mw_jobrunner, external_storage_db]
+        emit: [mw_jobrunner.http_start, mw_jobrunner.cache_hit, mw_jobrunner.http_end_ok]
+        latency_ms: [[1, 3], [2, 6], [60, 500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: jobrunner_job_db_error
+        desc: Job that falls back to DB (e.g., cache miss) and fails due to External Storage errors.
+        rpm: 2
+        path: [mw_jobrunner, external_storage_db]
+        emit: [mw_jobrunner.http_start, mw_jobrunner.cache_miss, mw_jobrunner.db_error, mw_jobrunner.http_end_err]
+        latency_ms: [[1, 3], [2, 6], [400, 3000], [500, 3500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: Failure operation where Memcached is effectively unreachable (localhost), causing cache fallback to DB and overload.
+    req:
+      - id: api_int_request_ok
+        desc: api-int request succeeds but uses DB fallback due to cache lookup failures.
+        rpm: 120
+        path: [mw_api_int, external_storage_db]
+        emit: [mw_api_int.http_start, mw_api_int.cache_lookup_failed, mw_api_int.http_end_ok]
+        latency_ms: [[1, 4], [5, 25], [200, 2500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: api_int_request_db_error
+        desc: api-int request fails due to External Storage overload while cache is unavailable.
+        rpm: 42
+        path: [mw_api_int, external_storage_db]
+        emit: [mw_api_int.http_start, mw_api_int.cache_lookup_failed, mw_api_int.db_error, mw_api_int.http_end_err]
+        latency_ms: [[1, 4], [5, 25], [1200, 12000], [1500, 20000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: parsoid_request_ok
+        desc: Parsoid render succeeds but with DB fallback due to cache lookup failures.
+        rpm: 40
+        path: [mw_parsoid, external_storage_db]
+        emit: [mw_parsoid.http_start, mw_parsoid.cache_lookup_failed, mw_parsoid.http_end_ok]
+        latency_ms: [[1, 4], [5, 25], [250, 3500]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: parsoid_request_db_error
+        desc: Parsoid render fails due to External Storage overload while cache is unavailable.
+        rpm: 21
+        path: [mw_parsoid, external_storage_db]
+        emit: [mw_parsoid.http_start, mw_parsoid.cache_lookup_failed, mw_parsoid.db_error, mw_parsoid.http_end_err]
+        latency_ms: [[1, 4], [5, 25], [1500, 15000], [2000, 25000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: jobrunner_job_ok
+        desc: Job succeeds but uses DB fallback due to cache lookup failures.
+        rpm: 70
+        path: [mw_jobrunner, external_storage_db]
+        emit: [mw_jobrunner.http_start, mw_jobrunner.cache_lookup_failed, mw_jobrunner.http_end_ok]
+        latency_ms: [[1, 4], [5, 25], [400, 6000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: jobrunner_job_db_error
+        desc: Job fails due to External Storage errors while cache is unavailable.
+        rpm: 52
+        path: [mw_jobrunner, external_storage_db]
+        emit: [mw_jobrunner.http_start, mw_jobrunner.cache_lookup_failed, mw_jobrunner.db_error, mw_jobrunner.http_end_err]
+        latency_ms: [[1, 4], [5, 25], [2000, 20000], [2500, 30000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - >-
+    Repair note: external_storage_db connection-pressure domains were scaled down (hundreds, not thousands) to be
+    quantitatively realizable given the modeled request RPM/latency envelope, while still showing a clear n→f jump.
+  - >-
+    The incident model focuses on the March 12 deployment window and compresses multi-hour progression into a <60 minute
+    scenario while preserving the causal chain.
+  - >-
+    Memcached/StatsD envvar mechanics are represented via application logs showing server=127.0.0.1:11213 and high-volume
+    memcached client errors; the Prometheus StatsD address misconfiguration is omitted because it had no operational
+    impact (MediaWiki was dual-writing stats to Graphite and Prometheus).
+  - >-
+    The real memcached error volume (~2M/min) is scaled down to ~250/min per affected deployment to keep total log volume
+    within 20k..100k while still overwhelming Logstash in-model.
+  - >-
+    logstash.pipeline_lag.input_eps is modeled to match the in-scenario aggregate log rates (tens of events/sec) rather
+    than an unmodeled hundreds/thousands eps environment; this keeps pipeline snapshots coherent with modeled volumes.
+  - >-
+    Volume estimate: normal phase roughly ~1.0k logs/min (~17 eps); failure phase roughly ~1.8k-2.0k logs/min (~30-33 eps)
+    due to memcached_spam plus increased DB-error flows; total scenario volume expected ~60k-80k logs.
+  - >-
+    Diagnostic visibility anchors: cache_lookup_failed and memcached_spam (prove localhost memcached / missing envvar),
+    external_storage_db.pool_stats/query_timeout (prove connection pressure), logstash.pipeline_lag + prometheus.scrape_failed
+    (prove observability gap), prometheus.alert_firing (proxy for latency/overload detection).
+```

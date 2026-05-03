@@ -1,0 +1,614 @@
+```yaml
+sys:
+  id: cloud_backbone_low_priority_capacity
+  desc: >
+    A cloud provider backbone network connects regions and carries both high-priority user-facing traffic and
+    lower-priority batch/streaming/transfer traffic. A WAN control plane rolls out configuration and software
+    changes to SDN controllers and edge routers. During this incident, a control plane configuration rollout
+    reduced capacity for low-priority traffic in parts of the backbone, causing packet loss and elevated latency
+    for some dependent services while high-priority traffic remained largely unaffected.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: rollout_controller
+    name: Rollout Controller
+    svc: wan-rollout
+    hosts: [rc-1]
+    desc: >
+      Orchestrates staged rollouts and rollbacks of WAN control plane configuration across regions/domains.
+    to:
+      - dst: sdn_controller
+        proto: grpc
+        desc: Pushes rollout/rollback intents to SDN control plane leaders.
+    logs:
+      rollout_started:
+        desc: Marks the start/expansion of a rollout for a WAN domain.
+        lvl: INFO
+        msg: "rollout started domain={domain} config_version={config_version} scope={scope}"
+        vars:
+          domain: {k: ch, v: [wan-backbone]}
+          config_version: {k: ch, v: [2022.07.14.1, 2022.07.15.0]}
+          scope: {k: ch, v: [multi_region, global]}
+      rollout_paused:
+        desc: Marks a manual pause of the ongoing rollout.
+        lvl: WARN
+        msg: "rollout paused domain={domain} reason={reason}"
+        vars:
+          domain: {k: ch, v: [wan-backbone]}
+          reason: {k: ch, v: [capacity_drop_detected, operator_request]}
+      rollback_initiated:
+        desc: Marks initiation of a global rollback attempt.
+        lvl: WARN
+        msg: "rollback initiated domain={domain} target_config_version={config_version}"
+        vars:
+          domain: {k: ch, v: [wan-backbone]}
+          config_version: {k: ch, v: [2022.07.14.1]}
+    beh:
+      n:
+        desc: No notable background logging beyond standard infrastructure noise (omitted).
+        emit: []
+      f:
+        desc: No additional background logs; operational actions are represented as one-shots.
+        emit: []
+
+  - id: sdn_controller
+    name: WAN SDN Controller
+    svc: wan-sdn
+    hosts: [sdn-a, sdn-b]
+    desc: >
+      Applies control plane configuration to WAN edge/router nodes and tracks rollout status. Can experience
+      partial application when connectivity/capacity is degraded.
+    to:
+      - dst: backbone_edge
+        proto: gNMI
+        desc: Programs forwarding/QoS policy and capacity-related configuration on WAN edges.
+    logs:
+      controller_heartbeat:
+        desc: Periodic heartbeat showing outstanding control operations.
+        lvl: INFO
+        msg: "control-plane heartbeat domain={domain} leader={leader} pending_ops={pending_ops}"
+        vars:
+          domain: {k: ch, v: [wan-backbone]}
+          leader: {k: ch, v: [sdn-a, sdn-b]}
+        state_vars:
+          n:
+            pending_ops: {k: i, v: [0, 2]}
+          f:
+            pending_ops: {k: i, v: [10, 200]}
+      apply_ok:
+        desc: Control plane reports configuration applied successfully to all targeted nodes.
+        lvl: INFO
+        msg: "config applied domain={domain} version={config_version} nodes_total={nodes_total} duration_ms={duration_ms}"
+        vars:
+          domain: {k: ch, v: [wan-backbone]}
+          config_version: {k: ch, v: [2022.07.14.1, 2022.07.15.0]}
+          nodes_total: {k: i, v: [800, 1200]}
+          duration_ms: {k: i, v: [5000, 60000]}
+      apply_partial:
+        desc: Control plane reports partial application (some nodes not updated yet).
+        lvl: WARN
+        msg: "config partially applied domain={domain} version={config_version} nodes_total={nodes_total} nodes_updated_pct={nodes_updated_pct} duration_ms={duration_ms}"
+        vars:
+          domain: {k: ch, v: [wan-backbone]}
+          config_version: {k: ch, v: [2022.07.14.1, 2022.07.15.0]}
+          nodes_total: {k: i, v: [800, 1200]}
+          nodes_updated_pct: {k: f, v: [50.0, 99.5]}
+          duration_ms: {k: i, v: [10000, 180000]}
+      controller_disconnected:
+        desc: A local/remote controller link is unreachable, slowing coordinated changes.
+        lvl: WARN
+        msg: "local controller unreachable controller_id={controller_id} region={region} consecutive_failures={consecutive_failures}"
+        vars:
+          controller_id: {k: ch, v: [lc-01, lc-02, lc-03, lc-04]}
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+          consecutive_failures: {k: i, v: [3, 30]}
+    beh:
+      n:
+        desc: Control plane is stable with low pending operations.
+        emit:
+          - id: controller_heartbeat
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Control plane accumulates pending operations; some controller links may flap under degraded capacity.
+        emit:
+          - id: controller_heartbeat
+            per_min: 1.2
+            scope: per_host
+          - id: controller_disconnected
+            per_min: 0.15
+            scope: per_host
+
+  - id: backbone_edge
+    name: WAN Backbone Edge
+    svc: wan-edge
+    hosts: [be-uscentral, be-useast, be-samw]
+    desc: >
+      Data-plane edge nodes that enforce QoS and carry inter-region traffic. When capacity is reduced,
+      low-priority traffic experiences drops/queueing while high-priority traffic is preferentially served.
+    to:
+      - dst: net_telemetry
+        proto: udp
+        desc: Exports QoS and loss telemetry to monitoring.
+      - dst: gcs_api
+        proto: tcp
+        desc: Carries traffic to/from Cloud Storage API frontends.
+      - dst: bq_storage_api
+        proto: tcp
+        desc: Carries traffic to/from BigQuery Storage API endpoints.
+      - dst: gcs_storage
+        proto: tcp
+        desc: Carries traffic to/from Cloud Storage backends.
+    logs:
+      qos_stats:
+        desc: Periodic QoS drop/queue metrics as observed at the edge (normal baseline).
+        lvl: INFO
+        msg: "qos stats region={region} low_prio_drop_pct={low_prio_drop_pct} low_prio_queue_depth={low_prio_queue_depth} link_group={link_group}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+          link_group: {k: ch, v: [bgp-1, bgp-2]}
+        state_vars:
+          n:
+            low_prio_drop_pct: {k: f, v: [0.0, 1.0]}
+            low_prio_queue_depth: {k: i, v: [0, 50]}
+          f:
+            low_prio_drop_pct: {k: f, v: [0.0, 1.0]}
+            low_prio_queue_depth: {k: i, v: [0, 50]}
+      qos_stats_mild:
+        desc: QoS metrics during reduced low-priority capacity (mild/moderate degradation).
+        lvl: INFO
+        msg: "qos stats region={region} low_prio_drop_pct={low_prio_drop_pct} low_prio_queue_depth={low_prio_queue_depth} link_group={link_group}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+          link_group: {k: ch, v: [bgp-1, bgp-2]}
+          low_prio_drop_pct: {k: f, v: [5.0, 18.0]}
+          low_prio_queue_depth: {k: i, v: [200, 1200]}
+      qos_stats_severe:
+        desc: QoS metrics during worst-period low-priority capacity reduction (severe degradation).
+        lvl: INFO
+        msg: "qos stats region={region} low_prio_drop_pct={low_prio_drop_pct} low_prio_queue_depth={low_prio_queue_depth} link_group={link_group}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+          link_group: {k: ch, v: [bgp-1, bgp-2]}
+          low_prio_drop_pct: {k: f, v: [20.0, 35.0]}
+          low_prio_queue_depth: {k: i, v: [1200, 3500]}
+    beh:
+      n:
+        desc: Low drop/queue for low-priority traffic under normal capacity.
+        emit:
+          - id: qos_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Failure telemetry is modeled with two severities (mild vs severe) to support time-varying symptoms.
+        emit:
+          - id: qos_stats_mild
+            per_min: 6.0
+            scope: per_host
+          - id: qos_stats_severe
+            per_min: 6.0
+            scope: per_host
+
+  - id: net_telemetry
+    name: Network Telemetry Aggregator
+    svc: net-mon
+    hosts: [tele-1]
+    desc: Aggregates backbone telemetry and publishes regional summaries used by operators and dashboards.
+    to: []
+    logs:
+      capacity_summary:
+        desc: Periodic summary of low-priority capacity and packet loss indicators per region (normal baseline).
+        lvl: INFO
+        msg: "wan capacity summary region={region} low_prio_capacity_pct={low_prio_capacity_pct} egress_loss_pct={egress_loss_pct}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+        state_vars:
+          n:
+            low_prio_capacity_pct: {k: f, v: [95.0, 100.0]}
+            egress_loss_pct: {k: f, v: [0.0, 1.0]}
+          f:
+            low_prio_capacity_pct: {k: f, v: [95.0, 100.0]}
+            egress_loss_pct: {k: f, v: [0.0, 1.0]}
+      capacity_summary_mild:
+        desc: Capacity summary during reduced low-priority capacity (mild/moderate degradation).
+        lvl: INFO
+        msg: "wan capacity summary region={region} low_prio_capacity_pct={low_prio_capacity_pct} egress_loss_pct={egress_loss_pct}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+          low_prio_capacity_pct: {k: f, v: [60.0, 85.0]}
+          egress_loss_pct: {k: f, v: [0.0, 12.0]}
+      capacity_summary_severe:
+        desc: Capacity summary during worst-period low-priority capacity reduction (severe degradation).
+        lvl: INFO
+        msg: "wan capacity summary region={region} low_prio_capacity_pct={low_prio_capacity_pct} egress_loss_pct={egress_loss_pct}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1, southamerica-east1]}
+          low_prio_capacity_pct: {k: f, v: [35.0, 60.0]}
+          egress_loss_pct: {k: f, v: [15.0, 35.0]}
+    beh:
+      n:
+        desc: Regional capacity/loss summaries remain near nominal.
+        emit:
+          - id: capacity_summary
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Failure summaries are modeled with two severities to reflect progression and partial mitigation.
+        emit:
+          - id: capacity_summary_mild
+            per_min: 1.0
+            scope: global
+          - id: capacity_summary_severe
+            per_min: 1.0
+            scope: global
+
+  - id: gcs_api
+    name: Cloud Storage API Frontend
+    svc: gcs-frontend
+    hosts: [gcs-fe-1, gcs-fe-2]
+    desc: >
+      Serves Cloud Storage requests and proxies to storage backends. Low-priority/batch-style operations
+      are more sensitive to WAN capacity reductions and may see timeouts surfaced as HTTP 500, though
+      such errors can remain rare relative to overall request volume.
+    to:
+      - dst: gcs_storage
+        proto: grpc
+        desc: Issues RPCs to storage backends for data and metadata operations.
+      - dst: backbone_edge
+        proto: tcp
+        desc: Uses the WAN for cross-zone/region backend access and egress paths.
+      - dst: transfer_service
+        proto: https
+        desc: Returns API responses to transfer/ingest clients.
+    logs:
+      req_start:
+        desc: Request entry log for Cloud Storage operations.
+        lvl: INFO
+        msg: "req start op={op} method={method} pri={pri} bucket_loc={bucket_loc} req_id={req_id} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [metadata_get, object_get, object_put, multipart_upload_part]}
+          method: {k: ch, v: [GET, PUT, POST]}
+          pri: {k: ch, v: [high, low]}
+          bucket_loc: {k: ch, v: [us-central1, us-east1, southamerica-west1, nam4]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      req_ok:
+        desc: Successful response completion for Cloud Storage operations.
+        lvl: INFO
+        msg: "req ok op={op} status=200 latency_ms={latency_ms} bytes={bytes} req_id={req_id} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [metadata_get, object_get, object_put, multipart_upload_part]}
+          latency_ms: {k: i, v: [5, 8000]}
+          bytes: {k: i, v: [0, 10485760]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      req_500:
+        desc: Failed response completion (HTTP 500) typically due to upstream timeout during the incident.
+        lvl: ERROR
+        msg: "req failed op={op} status=500 cause={cause} latency_ms={latency_ms} req_id={req_id} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [metadata_get, object_get, object_put, multipart_upload_part]}
+          cause: {k: ch, v: [upstream_timeout, connect_reset, internal_error]}
+          latency_ms: {k: i, v: [500, 8000]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      http5xx_metric:
+        desc: Periodic aggregate HTTP 5xx rate for low-priority traffic as seen at the frontend.
+        lvl: INFO
+        msg: "gcs http5xx rate pri=low scope_region={scope_region} http_500_ppm={http_500_ppm}"
+        vars:
+          scope_region: {k: ch, v: [global, us-central1, us-east1, southamerica-west1]}
+        state_vars:
+          n:
+            http_500_ppm: {k: i, v: [0, 5]}
+          f:
+            http_500_ppm: {k: i, v: [10, 90]}
+    beh:
+      n:
+        desc: Emits a low-rate aggregate error-rate metric; request logs are modeled in flows.
+        emit:
+          - id: http5xx_metric
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Aggregate low-priority error-rate metric reflects elevated (but still low) 500 frequency.
+        emit:
+          - id: http5xx_metric
+            per_min: 1.0
+            scope: global
+
+  - id: gcs_storage
+    name: Cloud Storage Backend
+    svc: gcs-backend
+    hosts: [gcs-store-1, gcs-store-2]
+    desc: >
+      Storage backend handling data and metadata. It emits a minimal per-operation completion log to help
+      distinguish backend health from WAN-induced frontend timeouts in this incident model.
+    to:
+      - dst: gcs_api
+        proto: grpc
+        desc: Returns RPC responses to the API frontend.
+    logs:
+      backend_op_ok:
+        desc: Backend operation completed successfully.
+        lvl: INFO
+        msg: "backend op ok op={op} latency_ms={latency_ms} trace={trace_id}"
+        vars:
+          op: {k: ch, v: [metadata_get, object_get, object_put, multipart_upload_part]}
+          latency_ms: {k: i, v: [3, 4000]}
+          trace_id: {k: hex, v: 32}
+    beh:
+      n:
+        desc: No background logs; backend visibility comes from per-request completion logs in modeled flows.
+        emit: []
+      f:
+        desc: No background logs; backend remains mostly healthy while WAN capacity is reduced.
+        emit: []
+
+  - id: transfer_service
+    name: Batch Transfer Service
+    svc: transfer
+    hosts: [xfer-1, xfer-2]
+    desc: >
+      Generates low-priority transfer/streaming jobs that traverse the WAN and hit Cloud Storage APIs.
+      Sensitive to low-priority capacity drops.
+    to:
+      - dst: backbone_edge
+        proto: tcp
+        desc: Sends low-priority job traffic across the WAN.
+      - dst: gcs_api
+        proto: https
+        desc: Calls Cloud Storage API for transfer operations.
+    logs:
+      job_start:
+        desc: Transfer job/part begins.
+        lvl: INFO
+        msg: "transfer start job_id={job_id} src={src} dst_bucket_loc={dst_bucket_loc} pri=low trace={trace_id}"
+        vars:
+          job_id: {k: uuid, v: null}
+          src: {k: ch, v: [bigquery_export, streaming_ingest, gsutil_cp]}
+          dst_bucket_loc: {k: ch, v: [us-central1, us-east1, southamerica-west1, nam4]}
+          trace_id: {k: hex, v: 32}
+      job_done:
+        desc: Transfer job/part completes successfully.
+        lvl: INFO
+        msg: "transfer done job_id={job_id} status=ok duration_ms={duration_ms} trace={trace_id}"
+        vars:
+          job_id: {k: uuid, v: null}
+          duration_ms: {k: i, v: [200, 30000]}
+          trace_id: {k: hex, v: 32}
+      job_failed:
+        desc: Transfer job/part completes with failure.
+        lvl: WARN
+        msg: "transfer done job_id={job_id} status=failed reason={reason} duration_ms={duration_ms} trace={trace_id}"
+        vars:
+          job_id: {k: uuid, v: null}
+          reason: {k: ch, v: [http_500, timeout, packet_loss]}
+          duration_ms: {k: i, v: [1000, 20000]}
+          trace_id: {k: hex, v: 32}
+      worker_backpressure:
+        desc: Worker backlog grows when retries/timeouts increase.
+        lvl: WARN
+        msg: "worker backlog queue_depth={queue_depth} oldest_age_s={oldest_age_s}"
+        vars: {}
+        state_vars:
+          n:
+            queue_depth: {k: i, v: [0, 50]}
+            oldest_age_s: {k: i, v: [0, 5]}
+          f:
+            queue_depth: {k: i, v: [200, 4000]}
+            oldest_age_s: {k: i, v: [30, 600]}
+    beh:
+      n:
+        desc: Backpressure is typically absent in normal operation.
+        emit:
+          - id: worker_backpressure
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: Backpressure becomes visible when low-priority WAN capacity is constrained.
+        emit:
+          - id: worker_backpressure
+            per_min: 0.8
+            scope: per_host
+
+  - id: bq_storage_api
+    name: BigQuery Storage API
+    svc: bq-storage
+    hosts: [bq-sa-1, bq-sa-2]
+    desc: >
+      Serves BigQuery Storage Read/Write API calls; cross-region access can be sensitive to WAN degradation.
+    to:
+      - dst: backbone_edge
+        proto: tcp
+        desc: Uses the WAN for cross-region data paths.
+    logs:
+      read_start:
+        desc: BigQuery Storage read request begins.
+        lvl: INFO
+        msg: "storage read start dataset={dataset} region={region} pri=low req_id={req_id} trace={trace_id}"
+        vars:
+          dataset: {k: ch, v: [analytics, sales, logs]}
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      read_ok:
+        desc: BigQuery Storage read request completes (success with variable latency).
+        lvl: INFO
+        msg: "storage read ok dataset={dataset} status=200 latency_ms={latency_ms} bytes={bytes} req_id={req_id} trace={trace_id}"
+        vars:
+          dataset: {k: ch, v: [analytics, sales, logs]}
+          latency_ms: {k: i, v: [10, 15000]}
+          bytes: {k: i, v: [1024, 104857600]}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+      rpc_latency_metric:
+        desc: Periodic p95 latency summary for storage API RPCs.
+        lvl: INFO
+        msg: "rpc latency p95_ms={p95_ms} region={region}"
+        vars:
+          region: {k: ch, v: [us-central1, us-east1, southamerica-west1]}
+        state_vars:
+          n:
+            p95_ms: {k: i, v: [50, 250]}
+          f:
+            p95_ms: {k: i, v: [500, 8000]}
+    beh:
+      n:
+        desc: Latency p95 remains low.
+        emit:
+          - id: rpc_latency_metric
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Latency p95 rises for low-priority/cross-region calls.
+        emit:
+          - id: rpc_latency_metric
+            per_min: 1.2
+            scope: per_host
+
+tracing:
+  on: true
+  origins: [gcs_api, transfer_service, bq_storage_api]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic includes high-priority user-facing metadata reads, plus a larger volume of low-priority
+      batch/streaming object operations and a smaller volume of low-priority transfers and BigQuery Storage reads.
+    req:
+      - id: gcs_high_pri_metadata_get
+        desc: High-priority metadata read served with low latency.
+        rpm: 250.0
+        path: [gcs_api, gcs_storage, gcs_api]
+        emit: [gcs_api.req_start, gcs_storage.backend_op_ok, gcs_api.req_ok]
+        latency_ms: [[0, 0], [4, 20], [8, 40]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: gcs_low_pri_bulk_ops
+        desc: Low-priority bulk object operations (batch/streaming) that often traverse the WAN; mostly successful.
+        rpm: 450.0
+        path: [gcs_api, backbone_edge, gcs_storage, gcs_api]
+        emit: [gcs_api.req_start, gcs_api.req_ok]
+        latency_ms: [[0, 0], [25, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: transfer_low_pri_success
+        desc: Low-priority transfer job part completes successfully.
+        rpm: 12.0
+        path: [transfer_service, backbone_edge, gcs_api, gcs_storage, gcs_api, transfer_service]
+        emit: [transfer_service.job_start, gcs_api.req_start, gcs_storage.backend_op_ok, gcs_api.req_ok, transfer_service.job_done]
+        latency_ms: [[0, 0], [10, 80], [80, 500], [10, 80], [20, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: bigquery_storage_read
+        desc: Low-priority BigQuery Storage read; generally stable.
+        rpm: 60.0
+        path: [bq_storage_api, backbone_edge]
+        emit: [bq_storage_api.read_start, bq_storage_api.read_ok]
+        latency_ms: [[0, 0], [80, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: >
+      During reduced low-priority WAN capacity, high-priority user-facing reads mostly remain healthy,
+      while low-priority bulk operations, transfers, and cross-region reads see elevated latency and rare failures.
+    req:
+      - id: gcs_high_pri_metadata_get
+        desc: High-priority metadata read remains mostly unaffected.
+        rpm: 250.0
+        path: [gcs_api, gcs_storage, gcs_api]
+        emit: [gcs_api.req_start, gcs_storage.backend_op_ok, gcs_api.req_ok]
+        latency_ms: [[0, 0], [5, 25], [10, 70]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: gcs_low_pri_bulk_ops
+        desc: Low-priority bulk object operations remain mostly successful but with higher latency.
+        rpm: 450.0
+        path: [gcs_api, backbone_edge, gcs_storage, gcs_api]
+        emit: [gcs_api.req_start, gcs_api.req_ok]
+        latency_ms: [[0, 0], [120, 900]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: transfer_low_pri_ok
+        desc: Low-priority transfer job part succeeds but with higher latency.
+        rpm: 10.0
+        path: [transfer_service, backbone_edge, gcs_api, gcs_storage, gcs_api, transfer_service]
+        emit: [transfer_service.job_start, gcs_api.req_start, gcs_storage.backend_op_ok, gcs_api.req_ok, transfer_service.job_done]
+        latency_ms: [[0, 0], [30, 200], [250, 2500], [20, 200], [50, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: transfer_low_pri_500
+        desc: Low-priority transfer job part fails (HTTP 500 surfaced by frontend); modeled as extremely rare.
+        rpm: 0.04
+        path: [transfer_service, backbone_edge, gcs_api, gcs_storage, gcs_api, transfer_service]
+        emit: [transfer_service.job_start, gcs_api.req_start, gcs_api.req_500, transfer_service.job_failed]
+        latency_ms: [[0, 0], [50, 400], [800, 6000], [50, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: bigquery_storage_read
+        desc: BigQuery Storage reads experience elevated latency due to WAN degradation.
+        rpm: 60.0
+        path: [bq_storage_api, backbone_edge]
+        emit: [bq_storage_api.read_start, bq_storage_api.read_ok]
+        latency_ms: [[0, 0], [250, 2000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+assumptions:
+  - "The real incident lasted ~19.5 hours; this model compresses a representative severe window into a 50-minute scenario while preserving causal progression."
+  - "Time-varying severity of WAN capacity symptoms is represented by switching failure telemetry between mild vs severe log templates (backbone_edge.qos_stats_mild/qos_stats_severe and net_telemetry.capacity_summary_mild/capacity_summary_severe) using event multipliers, rather than relying only on log frequency."
+  - "The statement 'High-priority user-facing traffic was not affected' is modeled as a stable high-priority GCS metadata flow (gcs_high_pri_metadata_get) whose latency remains near-normal in failure."
+  - "To keep per-request HTTP 500 rare while still observable in aggregates, failure-mode low-priority GCS volume is represented by gcs_low_pri_bulk_ops, so that transfer_low_pri_500 implies tens-of-ppm 500 rates consistent with gcs_api.http5xx_metric."
+  - "Transfer job success duration_ms was widened to cover the failure-period latency envelope after event multipliers (multi-second to ~10s+)."
+  - "A minimal gcs_storage.backend_op_ok per-request log is kept to show the backend remains mostly healthy while WAN capacity is constrained."
+  - "Normal-phase log volume estimate: ~46k logs over 25 minutes (dominated by gcs_low_pri_bulk_ops and gcs_high_pri_metadata_get)."
+  - "Total scenario log volume estimate: ~92k logs (flows dominate; background telemetry adds modest volume; plus 5 one-shots), within the 20k–100k target."
+  - "Key diagnostic visibility is ensured by frequent WAN QoS metrics (backbone_edge.qos_stats_* plus net_telemetry.capacity_summary_*), periodic low-priority 5xx rate metric (gcs_api.http5xx_metric), and explicit one-shot rollout/rollback markers (rollout_controller.*, sdn_controller.apply_*)."
+```

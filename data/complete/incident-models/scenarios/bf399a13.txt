@@ -1,0 +1,293 @@
+```yaml
+scenario:
+  id: useast_2011_ebs_remirror_storm_control_plane_brownout
+  title: Misrouted AZ network change triggers EBS re-mirroring storm and control plane brownouts
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    EC2 instances in one AZ rely on EBS for block I/O, and customers use a regional EBS control plane for volume APIs.
+    A network scaling change in the AZ mistakenly routes primary EBS traffic onto a lower-capacity replication network,
+    isolating many EBS nodes and triggering a re-mirroring storm with capacity exhaustion. Volumes become "stuck",
+    EC2/RDS observe blocked I/O, and the control plane experiences thread pool saturation that briefly elevates API
+    errors/latencies across the region until mitigations isolate the degraded cluster.
+
+  trigger_desc: |
+    A planned network capacity upgrade shifts traffic off a redundant router, but the traffic is misrouted onto the
+    replication network, simultaneously breaking primary and secondary connectivity for many EBS nodes in one AZ.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Steady-state operation: EC2 hosts perform regular read/write I/O to EBS volumes with low latency, customers
+        create and attach volumes via the EBS control plane, and the EBS cluster occasionally runs low-rate primary
+        elections for normal maintenance. Metrics show low stuck volume percentage and minimal control plane errors.
+      flows: [ec2_volume_io_ok, ebs_api_create_volume_ok, ebs_api_attach_volume_ok, ebs_elect_primary_ok, rds_txn_ok]
+      manifestation:
+        - ebs_node_cluster.cluster_health
+        - ebs_control_plane.cp_metrics
+        - ebs_node_cluster.io_complete
+        - rds_service.txn_commit
+
+    f:
+      desc: |
+        After the network misroute, many EBS nodes lose replica connectivity and aggressively attempt re-mirroring.
+        Limited free capacity causes repeated capacity searches and a surge of primary election traffic, blocking
+        access to some volumes and making EC2/RDS I/O appear stuck. Long-running CreateVolume calls and elevated
+        internal election traffic contribute to control plane thread pool saturation that intermittently degrades
+        EBS APIs beyond the affected AZ. Operators mitigate by disabling CreateVolume in the affected AZ (turning
+        slow timeouts into fast rejects), then later blocking control-plane communication to the degraded cluster to
+        protect the rest of the region, leaving the affected AZ inaccessible with a persistent set of stuck volumes.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: net_ops
+          event: |
+            A network change is applied and traffic is misrouted to the replication network; rollback completes but
+            many nodes have already been isolated, triggering widespread re-mirroring searches and initial stuck I/O.
+          why: |
+            With both primary and effective secondary connectivity disrupted, nodes assume replicas failed and begin
+            re-mirroring. After connectivity returns, concurrent demand for new replicas quickly exhausts free capacity,
+            causing repeated searches and blocking I/O until a writable primary can be elected (directly observable via
+            remirror_activity/cluster_health and blocked I/O logs).
+          flows:
+            - ec2_volume_io_stuck
+            - ebs_api_create_volume_timeout
+            - ebs_elect_primary_ok_load
+          rate_multipliers:
+            ebs_api_create_volume_disabled_fast: 0.0
+            ebs_control_plane.partition_status: 0.0
+            ebs_control_plane.thread_pool_saturated: 0.8
+            ebs_elect_primary_err_blocked: 0.0
+          latency_multipliers:
+            ebs_api_create_volume_timeout: {p50: 1.2, p95: 1.2}
+          one_shots:
+            - ref: net_ops.change_start
+              count: 1
+              hosts: [netops-1]
+            - ref: net_ops.misroute_detected
+              count: 1
+              hosts: [netops-1]
+            - ref: net_ops.rollback_complete
+              count: 1
+              hosts: [netops-1]
+          manifestation:
+            - net_ops.misroute_detected
+            - ebs_node_cluster.remirror_activity
+            - ebs_node_cluster.io_blocked_remirror
+            - ebs_control_plane.thread_pool_saturated
+
+        - order: 2
+          at_min: 28
+          component: ebs_control_plane
+          event: |
+            Operators disable new CreateVolume requests in the affected AZ, shifting CreateVolume behavior from long
+            upstream timeouts to fast rejection; regional API behavior partially improves.
+          why: |
+            Long upstream timeouts from the degraded cluster cause queued work and thread starvation. Rejecting new
+            CreateVolume work immediately prevents those long holds on the shared thread pool, improving the control plane's
+            ability to handle other requests (observable via reduced saturation and improved metrics).
+          flows:
+            - ebs_api_create_volume_disabled_fast
+            - ebs_api_attach_volume_ok_slow
+            - ebs_api_attach_volume_err
+          rate_multipliers:
+            ebs_api_create_volume_timeout: 0.0
+            ebs_api_create_volume_disabled_fast: 1.0
+            ebs_control_plane.thread_pool_saturated: 0.2
+            ebs_api_attach_volume_err: 0.3
+          latency_multipliers:
+            ebs_api_attach_volume_ok_slow: {p50: 0.7, p95: 0.7}
+          one_shots:
+            - ref: ebs_control_plane.create_volume_disabled
+              count: 1
+              hosts: [ebs-cp-01]
+          manifestation:
+            - ebs_control_plane.create_volume_disabled
+            - ebs_control_plane.create_volume_reject_disabled
+            - ebs_control_plane.cp_metrics
+
+        - order: 3
+          at_min: 36
+          component: ebs_node_cluster
+          event: |
+            A rare race condition triggers additional EBS node crashes under extreme replication close-out volume,
+            increasing stuck volumes and sharply increasing primary election traffic, causing a second control plane brownout.
+          why: |
+            High connection churn during the storm raises the probability of the race, producing more node failures and more
+            volumes needing re-mirroring. Each blocked volume increases the volume of election negotiations and retries, which
+            raises control plane load (partially observable via node_crash_race spikes, increased remirror_activity, and
+            renewed thread_pool_saturated logs).
+          flows:
+            - ec2_volume_io_stuck
+            - ebs_elect_primary_ok_load
+          rate_multipliers:
+            ec2_volume_io_stuck: 1.5
+            ebs_elect_primary_ok_load: 1.8
+            ebs_node_cluster.node_crash_race: 10.0
+            ebs_control_plane.thread_pool_saturated: 1.3
+            ebs_api_attach_volume_err: 1.5
+          latency_multipliers:
+            ebs_elect_primary_ok_load: {p50: 1.4, p95: 1.4}
+          one_shots:
+            - ref: rds_service.failover_blocked
+              count: 2
+              hosts: [rds-ctl-01]
+          manifestation:
+            - ebs_node_cluster.node_crash_race
+            - ebs_control_plane.thread_pool_saturated
+            - rds_service.failover_blocked
+            - ebs_node_cluster.cluster_health
+
+        - order: 4
+          at_min: 42
+          component: ebs_control_plane
+          event: |
+            The control plane blocks communication to the degraded cluster to protect the rest of the region, restoring
+            regional API health but leaving the affected AZ unable to complete elections and control operations.
+          why: |
+            Isolating the degraded cluster stops the flood of election and slow upstream work from consuming the shared thread
+            pool. This containment is directly observable via partition_status logs and reduced thread_pool_saturated, while
+            the AZ continues to see stuck I/O and election failures.
+          flows:
+            - ebs_elect_primary_err_blocked
+            - ebs_api_attach_volume_ok_slow
+            - ebs_api_attach_volume_err
+          rate_multipliers:
+            ebs_elect_primary_ok_load: 0.0
+            ebs_elect_primary_err_blocked: 1.0
+            ebs_control_plane.thread_pool_saturated: 0.1
+            ebs_control_plane.partition_status: 1.0
+            ebs_api_attach_volume_err: 0.2
+          latency_multipliers:
+            ebs_api_attach_volume_ok_slow: {p50: 0.6, p95: 0.6}
+          one_shots:
+            - ref: ebs_control_plane.cluster_comm_blocked
+              count: 1
+              hosts: [ebs-cp-02]
+          manifestation:
+            - ebs_control_plane.cluster_comm_blocked
+            - ebs_control_plane.partition_status
+            - ebs_control_plane.cp_metrics
+            - ebs_control_plane.elect_primary_err
+
+        - order: 5
+          at_min: 46
+          component: ebs_node_cluster
+          event: |
+            EBS nodes are reconfigured to back off and avoid futile capacity searches, stabilizing the storm's growth
+            but leaving a persistent fraction of stuck volumes awaiting recovery actions not modeled here.
+          why: |
+            Reducing search frequency lowers internal churn and decreases crash likelihood without immediately freeing capacity,
+            so stuck volumes remain but the cluster stops degrading further (observable via reduced remirror_activity and fewer
+            node_crash_race logs).
+          flows:
+            - ec2_volume_io_stuck
+          rate_multipliers:
+            ebs_node_cluster.remirror_activity: 0.4
+            ebs_node_cluster.node_crash_race: 2.0
+            ec2_volume_io_stuck: 1.1
+          latency_multipliers: {}
+          one_shots:
+            - ref: ebs_node_cluster.remirror_throttle_enabled
+              count: 1
+              hosts: [ebs-node-01]
+          manifestation:
+            - ebs_node_cluster.remirror_throttle_enabled
+            - ebs_node_cluster.remirror_activity
+            - ebs_node_cluster.cluster_health
+
+      steady:
+        - component: ebs_node_cluster
+          condition: |
+            Re-mirroring storm remains active but stabilized; a persistent subset of volumes remain blocked awaiting writable
+            primary election and sufficient free capacity to complete replication.
+          user_impact: |
+            Affected EC2 instances and RDS databases experience "stuck" I/O and timeouts; some workloads are effectively hung.
+          manifestation:
+            - ebs_node_cluster.cluster_health
+            - ebs_node_cluster.io_blocked_remirror
+            - ec2_hypervisor.io_timeout
+        - component: ebs_control_plane
+          condition: |
+            Control plane remains operational for the rest of the region but keeps the degraded AZ partitioned and CreateVolume
+            disabled to avoid regional overload.
+          user_impact: |
+            Customers cannot reliably manage EBS resources in the affected AZ; region-wide APIs mostly work but AZ-specific
+            operations and elections fail or are blocked.
+          manifestation:
+            - ebs_control_plane.partition_status
+            - ebs_control_plane.cp_metrics
+            - ebs_control_plane.elect_primary_err
+            - ebs_control_plane.create_volume_reject_disabled
+        - component: rds_service
+          condition: |
+            A noticeable fraction of single-AZ databases in the affected AZ are stuck on storage I/O; a small number of multi-AZ
+            instances require manual intervention due to failover safety checks.
+          user_impact: |
+            Databases may become inaccessible or error; automatic failover is not always available.
+          manifestation:
+            - rds_service.rds_health
+            - rds_service.txn_error
+
+      feedback_loops:
+        - id: remirror_capacity_exhaustion_loop
+          desc: |
+            Node isolation triggers re-mirroring -> consumes free capacity -> repeated capacity searches -> higher internal load
+            and blocked I/O -> more election traffic -> control plane overload -> slower coordination and retries -> sustains storm.
+        - id: crash_amplifies_remirror
+          desc: |
+            High connection churn increases probability of the race-condition crash -> more volumes lose replicas -> more re-mirroring
+            demand -> more churn and elections.
+
+      flows:
+        - ec2_volume_io_ok
+        - ec2_volume_io_stuck
+        - ebs_api_create_volume_timeout
+        - ebs_api_create_volume_disabled_fast
+        - ebs_api_attach_volume_ok_slow
+        - ebs_api_attach_volume_err
+        - ebs_elect_primary_ok_load
+        - ebs_elect_primary_err_blocked
+        - rds_txn_stuck
+      manifestation:
+        - ebs_node_cluster.cluster_health
+        - ebs_node_cluster.remirror_activity
+        - ebs_control_plane.thread_pool_saturated
+        - ebs_control_plane.partition_status
+        - ebs_control_plane.create_volume_reject_disabled
+        - ec2_hypervisor.io_timeout
+        - rds_service.txn_error
+
+  assumptions:
+    - >
+      Timeline compression: hours of progression are represented as minutes. The two distinct "region-wide API impact"
+      periods are modeled as (1) early thread pool saturation driven by long CreateVolume timeouts, and (2) a later
+      saturation driven by increased ElectPrimary negotiation load and retries.
+    - >
+      CreateVolume mitigation fidelity: after CreateVolume is disabled, CreateVolume traffic continues but shifts from
+      ebs_api_create_volume_timeout (long latency) to ebs_api_create_volume_disabled_fast (fast reject), making the
+      narrative "rejecting new work reduces thread starvation" align with modeled behavior.
+    - >
+      Piecewise volume sanity (approx):
+      Normal (0-20, 20m): ~21.7k logs total (dominated by ec2_volume_io_ok at 300 rpm * 3 logs).
+      Failure (20-50, 30m): ~39.1k logs total with event multipliers:
+        - 20-28 (8m): storm begins; CreateVolume timeouts active; ~10.0k logs
+        - 28-36 (8m): CreateVolume shifts to fast rejects; saturation reduced; ~10.1k logs (+1 one-shot)
+        - 36-42 (6m): crash/election surge causes second brownout; ~9.3k logs (+2 RDS one-shots)
+        - 42-46 (4m): cluster comms blocked restores region; ~5.1k logs (+1 one-shot)
+        - 46-50 (4m): remirror backoff tuned stabilizes storm; ~4.7k logs (+1 one-shot)
+      Total scenario estimate: ~60.8k logs (within 20k..100k).
+    - >
+      Visibility rationale: the incident is diagnosable from frequent metrics (cluster_health/remirror_activity/cp_metrics),
+      frequent failure markers (io_blocked_remirror, io_timeout), the CreateVolume fast-reject signature after disable
+      (create_volume_reject_disabled), and event-tied operational markers (CreateVolume disabled, cluster comms blocked,
+      remirror backoff updated).
+```

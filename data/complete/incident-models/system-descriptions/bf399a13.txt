@@ -1,0 +1,572 @@
+```yaml
+sys:
+  id: ebs_ec2_rds_useast_ebs_stuck_2011
+  desc: >
+    A simplified model of an EC2/EBS/RDS region where EC2 instances perform block I/O to EBS volumes,
+    customers manage volumes through a regional EBS control plane, and RDS databases store data/logs on EBS.
+    The incident models a network change in one Availability Zone that isolates many EBS nodes, triggering a
+    re-mirroring storm that causes "stuck" volumes and control plane overload that briefly impacts APIs region-wide.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: net_ops
+    name: Network Operations
+    svc: null
+    hosts: [netops-1]
+    desc: >
+      Executes planned network scaling changes and rollbacks. During the incident, a traffic shift mistakenly
+      routes primary EBS traffic onto a lower-capacity replication network, isolating nodes.
+    to:
+      - dst: ebs_node_cluster
+        proto: ssh
+        desc: Change rollout tooling targets EBS network devices affecting the storage cluster.
+    logs:
+      change_start:
+        desc: Start of a planned network scaling change.
+        lvl: INFO
+        msg: "Applying network change {change_id} on {router} in {az}"
+        vars:
+          change_id: {k: hex, v: 12}
+          router: {k: ch, v: [rtr-a, rtr-b]}
+          az: {k: ch, v: [use1a]}
+      misroute_detected:
+        desc: Detected that traffic was shifted to the replication network by mistake.
+        lvl: ERROR
+        msg: "Unexpected traffic shift: primary traffic routed to replication network; affected_nodes={affected_nodes}"
+        vars:
+          affected_nodes: {k: i, v: [50, 250]}
+      rollback_complete:
+        desc: Rollback completed and routing restored.
+        lvl: WARN
+        msg: "Rollback completed; primary routing restored; duration_s={duration_s}"
+        vars:
+          duration_s: {k: i, v: [30, 240]}
+    beh:
+      n: {desc: "No periodic logs modeled for network operations in normal state.", emit: []}
+      f: {desc: "No periodic logs modeled for network operations in failure state.", emit: []}
+
+  - id: ec2_hypervisor
+    name: EC2 Hypervisor / Host
+    svc: ec2
+    hosts: [ip-10-0-1-10, ip-10-0-1-11]
+    desc: >
+      Represents EC2 instances performing block I/O to attached EBS volumes. When an EBS volume is blocked
+      during re-mirroring / primary election, instance I/O appears "stuck" and can time out.
+    to:
+      - dst: ebs_node_cluster
+        proto: tcp
+        desc: Instances send read/write requests to the EBS cluster over the storage network.
+    logs:
+      io_submit:
+        desc: Instance submits an EBS I/O request.
+        lvl: DEBUG
+        msg: "Submitting EBS I/O req={req_id} vol={vol_id} op={op}"
+        vars:
+          req_id: {k: hex, v: 16}
+          vol_id: {k: uuid, v: null}
+          op: {k: ch, v: [READ, WRITE]}
+      io_timeout:
+        desc: Instance-side timeout waiting for I/O completion.
+        lvl: ERROR
+        msg: "EBS I/O timeout req={req_id} vol={vol_id} waited_ms={waited_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          vol_id: {k: uuid, v: null}
+          waited_ms: {k: i, v: [500, 20000]}
+      io_health:
+        desc: Periodic host-level summary of observed I/O waits/timeouts.
+        lvl: INFO
+        msg: "io_health stuck_ios={stuck_ios} p95_wait_ms={p95_wait_ms} affected_instances={affected_instances}"
+        vars: {}
+        state_vars:
+          n:
+            stuck_ios: {k: i, v: [0, 5]}
+            p95_wait_ms: {k: i, v: [2, 25]}
+            affected_instances: {k: i, v: [0, 1]}
+          f:
+            stuck_ios: {k: i, v: [20, 400]}
+            p95_wait_ms: {k: i, v: [200, 15000]}
+            affected_instances: {k: i, v: [1, 200]}
+    beh:
+      n:
+        desc: Low-rate health summary in normal operation.
+        emit:
+          - id: io_health
+            per_min: 0.5
+      f:
+        desc: Health summary reflects widespread I/O waits/timeouts for impacted volumes.
+        emit:
+          - id: io_health
+            per_min: 1.0
+
+  - id: ebs_node_cluster
+    name: EBS Cluster (Storage Nodes)
+    svc: ebs-data
+    hosts: [ebs-node-01, ebs-node-02, ebs-node-03]
+    desc: >
+      Stores and serves EBS volume data with replication. When network isolation occurs, many replicas are
+      perceived lost, triggering aggressive re-mirroring. Under capacity exhaustion, nodes loop searching for
+      space and volumes become blocked until a writable primary can be elected.
+    to:
+      - dst: ebs_control_plane
+        proto: grpc
+        desc: Cluster contacts the control plane for authority/coordination of primary elections during re-mirroring.
+      - dst: ec2_hypervisor
+        proto: tcp
+        desc: Storage nodes return I/O responses (or prolonged stalls) back to EC2 hosts over the storage network.
+      - dst: rds_service
+        proto: tcp
+        desc: Storage nodes return I/O responses (or stalls) back to RDS database hosts using EBS-backed storage.
+    logs:
+      io_start:
+        desc: Storage node receives an I/O request.
+        lvl: DEBUG
+        msg: "I/O request {req_id} vol={vol_id} op={op} bytes={bytes}"
+        vars:
+          req_id: {k: hex, v: 16}
+          vol_id: {k: uuid, v: null}
+          op: {k: ch, v: [READ, WRITE]}
+          bytes: {k: i, v: [4096, 1048576]}
+      io_complete:
+        desc: Storage node completes an I/O request successfully.
+        lvl: INFO
+        msg: "I/O request {req_id} vol={vol_id} op={op} status=OK latency_ms={latency_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          vol_id: {k: uuid, v: null}
+          op: {k: ch, v: [READ, WRITE]}
+          latency_ms: {k: i, v: [1, 2000]}
+      io_blocked_remirror:
+        desc: I/O is blocked because the volume is waiting for re-mirroring / primary election.
+        lvl: WARN
+        msg: "I/O blocked vol={vol_id} reason=REMIRROR_PRIMARY_ELECTION waited_ms={waited_ms}"
+        vars:
+          vol_id: {k: uuid, v: null}
+          waited_ms: {k: i, v: [200, 20000]}
+      cluster_health:
+        desc: Periodic cluster health summary including stuck volume percentage and free capacity.
+        lvl: INFO
+        msg: "cluster_health stuck_vol_pct={stuck_vol_pct} remirror_q={remirror_q} free_gb={free_gb} node_crashes_5m={node_crashes_5m}"
+        vars: {}
+        state_vars:
+          n:
+            stuck_vol_pct: {k: f, v: [0.0, 0.5]}
+            remirror_q: {k: i, v: [0, 30]}
+            free_gb: {k: i, v: [5000, 20000]}
+            node_crashes_5m: {k: i, v: [0, 1]}
+          f:
+            stuck_vol_pct: {k: f, v: [10.0, 20.0]}
+            remirror_q: {k: i, v: [500, 6000]}
+            free_gb: {k: i, v: [0, 1500]}
+            node_crashes_5m: {k: i, v: [0, 40]}
+      remirror_activity:
+        desc: Periodic view of re-mirroring search and primary election activity.
+        lvl: INFO
+        msg: "remirror_activity searches_per_s={searches_per_s} elections_per_s={elections_per_s}"
+        vars: {}
+        state_vars:
+          n:
+            searches_per_s: {k: i, v: [0, 5]}
+            elections_per_s: {k: i, v: [0, 3]}
+          f:
+            searches_per_s: {k: i, v: [50, 1200]}
+            elections_per_s: {k: i, v: [20, 600]}
+      node_crash_race:
+        desc: Node crash triggered by a rare race while closing many replication requests.
+        lvl: ERROR
+        msg: "Node crash during replication request close; crash_id={crash_id} open_conns={open_conns}"
+        vars:
+          crash_id: {k: hex, v: 10}
+          open_conns: {k: i, v: [100, 20000]}
+      remirror_throttle_enabled:
+        desc: Operational change to reduce futile capacity-search traffic during the storm.
+        lvl: WARN
+        msg: "Updated remirror backoff policy mode={mode} base_ms={base_ms} max_ms={max_ms}"
+        vars:
+          mode: {k: ch, v: [aggressive_backoff]}
+          base_ms: {k: i, v: [200, 2000]}
+          max_ms: {k: i, v: [5000, 60000]}
+    beh:
+      n:
+        desc: Periodic health is logged at low rate in normal operation.
+        emit:
+          - id: cluster_health
+            per_min: 0.5
+          - id: remirror_activity
+            per_min: 0.2
+      f:
+        desc: In failure, health and re-mirroring activity metrics are emitted more frequently; rare node crashes may occur.
+        emit:
+          - id: cluster_health
+            per_min: 1.0
+          - id: remirror_activity
+            per_min: 1.0
+          - id: node_crash_race
+            per_min: 0.02
+
+  - id: ebs_control_plane
+    name: EBS Control Plane (Regional)
+    svc: ebs-control
+    hosts: [ebs-cp-01, ebs-cp-02]
+    desc: >
+      Regional control plane handling customer EBS APIs and acting as authority for volume primary elections.
+      Under long-running upstream calls and elevated election traffic, its thread pool can saturate, causing
+      elevated errors/latencies across the region. Operators can disable APIs for an AZ and block communication
+      to isolate a degraded cluster.
+    to:
+      - dst: ebs_node_cluster
+        proto: https
+        desc: Control plane forwards API operations to the AZ's EBS cluster and receives state updates.
+    logs:
+      create_volume_req:
+        desc: CreateVolume request received.
+        lvl: INFO
+        msg: "CreateVolume request_id={req_id} az={az} size_gb={size_gb}"
+        vars:
+          req_id: {k: hex, v: 16}
+          az: {k: ch, v: [use1a, use1b, use1c]}
+          size_gb: {k: i, v: [1, 1024]}
+      create_volume_ok:
+        desc: CreateVolume succeeded.
+        lvl: INFO
+        msg: "CreateVolume request_id={req_id} status=200 vol={vol_id} latency_ms={latency_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          vol_id: {k: uuid, v: null}
+          latency_ms: {k: i, v: [20, 5000]}
+      create_volume_err:
+        desc: CreateVolume failed due to slow/unavailable upstream processing (timeout semantics).
+        lvl: ERROR
+        msg: "CreateVolume request_id={req_id} status={status} err={err} latency_ms={latency_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: [503, 504]}
+          err: {k: ch, v: [UpstreamTimeout]}
+          latency_ms: {k: i, v: [200, 90000]}
+      create_volume_reject_disabled:
+        desc: CreateVolume was rejected immediately because the API is disabled for an Availability Zone.
+        lvl: ERROR
+        msg: "CreateVolume request_id={req_id} status=403 err=ApiDisabledInAz latency_ms={latency_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          latency_ms: {k: i, v: [10, 1500]}
+      attach_volume_req:
+        desc: AttachVolume request received.
+        lvl: INFO
+        msg: "AttachVolume request_id={req_id} instance={instance_id} vol={vol_id} az={az}"
+        vars:
+          req_id: {k: hex, v: 16}
+          instance_id: {k: str, v: "i-[a-f0-9]{8,17}"}
+          vol_id: {k: uuid, v: null}
+          az: {k: ch, v: [use1a, use1b, use1c]}
+      attach_volume_ok:
+        desc: AttachVolume succeeded.
+        lvl: INFO
+        msg: "AttachVolume request_id={req_id} status=200 latency_ms={latency_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          latency_ms: {k: i, v: [20, 20000]}
+      attach_volume_err:
+        desc: AttachVolume failed due to control plane overload.
+        lvl: ERROR
+        msg: "AttachVolume request_id={req_id} status={status} err={err} latency_ms={latency_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          status: {k: ch, v: [500, 503]}
+          err: {k: ch, v: [ThreadPoolExhausted, UpstreamTimeout]}
+          latency_ms: {k: i, v: [200, 60000]}
+      elect_primary_req:
+        desc: Internal request from EBS nodes to elect a writable primary replica.
+        lvl: INFO
+        msg: "ElectPrimary election_id={election_id} vol={vol_id} az={az}"
+        vars:
+          election_id: {k: hex, v: 16}
+          vol_id: {k: uuid, v: null}
+          az: {k: ch, v: [use1a]}
+      elect_primary_ok:
+        desc: Primary election succeeded.
+        lvl: INFO
+        msg: "ElectPrimary election_id={election_id} status=OK latency_ms={latency_ms}"
+        vars:
+          election_id: {k: hex, v: 16}
+          latency_ms: {k: i, v: [10, 20000]}
+      elect_primary_err:
+        desc: Primary election failed due to isolation/partition or timeout.
+        lvl: ERROR
+        msg: "ElectPrimary election_id={election_id} status={status} err={err} latency_ms={latency_ms}"
+        vars:
+          election_id: {k: hex, v: 16}
+          status: {k: ch, v: [403, 504]}
+          err: {k: ch, v: [ClusterPartitioned, UpstreamTimeout]}
+          latency_ms: {k: i, v: [200, 20000]}
+      thread_pool_saturated:
+        desc: Thread pool saturation due to long-running queued calls.
+        lvl: ERROR
+        msg: "thread_pool_saturated active={active} queued={queued} pool={pool}"
+        vars:
+          active: {k: i, v: [100, 2000]}
+          queued: {k: i, v: [500, 50000]}
+          pool: {k: i, v: [200, 2000]}
+      cp_metrics:
+        desc: Periodic control plane health summary.
+        lvl: INFO
+        msg: "cp_metrics api_5xx_rate={api_5xx_rate} p95_ms={p95_ms} active_threads={active_threads} queued={queued}"
+        vars: {}
+        state_vars:
+          n:
+            api_5xx_rate: {k: f, v: [0.0, 0.5]}
+            p95_ms: {k: i, v: [20, 200]}
+            active_threads: {k: i, v: [50, 200]}
+            queued: {k: i, v: [0, 200]}
+          f:
+            api_5xx_rate: {k: f, v: [1.0, 60.0]}
+            p95_ms: {k: i, v: [100, 60000]}
+            active_threads: {k: i, v: [200, 2000]}
+            queued: {k: i, v: [100, 50000]}
+      create_volume_disabled:
+        desc: Operator disables CreateVolume for the affected AZ.
+        lvl: WARN
+        msg: "CreateVolume disabled in {az} mode={mode}"
+        vars:
+          az: {k: ch, v: [use1a]}
+          mode: {k: ch, v: [reject_new]}
+      cluster_comm_blocked:
+        desc: Operator blocks comms between the degraded cluster and the control plane.
+        lvl: WARN
+        msg: "Blocked control-plane comms to cluster {az} reason={reason}"
+        vars:
+          az: {k: ch, v: [use1a]}
+          reason: {k: ch, v: [isolate_degraded_cluster]}
+      partition_status:
+        desc: Periodic indicator that an AZ/cluster is partitioned/blocked from the control plane.
+        lvl: INFO
+        msg: "partition_status az={az} blocked={blocked}"
+        vars:
+          az: {k: ch, v: [use1a]}
+          blocked: {k: ch, v: [true]}
+    beh:
+      n:
+        desc: Periodic metrics in normal operation.
+        emit:
+          - id: cp_metrics
+            per_min: 1.0
+      f:
+        desc: During failure, metrics remain and saturation/partition indicators may appear.
+        emit:
+          - id: cp_metrics
+            per_min: 1.0
+          - id: thread_pool_saturated
+            per_min: 2.0
+          - id: partition_status
+            per_min: 0.5
+
+  - id: rds_service
+    name: RDS Service
+    svc: rds
+    hosts: [rds-ctl-01]
+    desc: >
+      RDS databases store data and logs on EBS. When underlying EBS volumes are stuck, databases can become
+      inaccessible. A small portion of multi-AZ deployments can require manual failover when an edge-case
+      safety condition is triggered.
+    to:
+      - dst: ebs_node_cluster
+        proto: tcp
+        desc: Database engines perform block I/O to EBS-backed storage.
+    logs:
+      txn_commit:
+        desc: A database transaction commit completed.
+        lvl: INFO
+        msg: "txn_commit db={db_id} latency_ms={latency_ms}"
+        vars:
+          db_id: {k: str, v: "db-[a-z0-9]{6}"}
+          latency_ms: {k: i, v: [5, 2000]}
+      db_io_wait:
+        desc: Database waiting on storage I/O.
+        lvl: WARN
+        msg: "db_io_wait db={db_id} vol={vol_id} waited_ms={waited_ms}"
+        vars:
+          db_id: {k: str, v: "db-[a-z0-9]{6}"}
+          vol_id: {k: uuid, v: null}
+          waited_ms: {k: i, v: [200, 20000]}
+      txn_error:
+        desc: Transaction aborted due to storage I/O being stuck.
+        lvl: ERROR
+        msg: "txn_error db={db_id} err=StorageIOStuck waited_ms={waited_ms}"
+        vars:
+          db_id: {k: str, v: "db-[a-z0-9]{6}"}
+          waited_ms: {k: i, v: [500, 30000]}
+      failover_blocked:
+        desc: Automatic failover blocked because it is not safe to promote secondary.
+        lvl: ERROR
+        msg: "automatic_failover_blocked db={db_id} reason={reason}"
+        vars:
+          db_id: {k: str, v: "db-[a-z0-9]{6}"}
+          reason: {k: ch, v: [safety_check_failed_after_partition_and_io_stall]}
+      rds_health:
+        desc: Periodic RDS fleet health summary.
+        lvl: INFO
+        msg: "rds_health stuck_pct={stuck_pct} failovers_blocked_5m={failovers_blocked_5m}"
+        vars: {}
+        state_vars:
+          n:
+            stuck_pct: {k: f, v: [0.0, 0.5]}
+            failovers_blocked_5m: {k: i, v: [0, 0]}
+          f:
+            stuck_pct: {k: f, v: [5.0, 50.0]}
+            failovers_blocked_5m: {k: i, v: [0, 5]}
+    beh:
+      n:
+        desc: Low-rate health summaries in normal operation.
+        emit:
+          - id: rds_health
+            per_min: 0.5
+      f:
+        desc: Health summaries reflect elevated stuck databases during the incident.
+        emit:
+          - id: rds_health
+            per_min: 1.0
+
+tracing:
+  on: true
+  origins: [ec2_hypervisor, ebs_control_plane]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operations include steady EC2-to-EBS I/O, occasional volume management calls, and low-rate primary elections.
+    req:
+      - id: ec2_volume_io_ok
+        desc: EC2 instance performs an I/O operation that completes normally.
+        rpm: 300
+        path: [ec2_hypervisor, ebs_node_cluster]
+        emit: [ec2_hypervisor.io_submit, ebs_node_cluster.io_start, ebs_node_cluster.io_complete]
+        latency_ms: [[0, 1], [0, 2], [2, 8]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_api_create_volume_ok
+        desc: Customer CreateVolume succeeds.
+        rpm: 15
+        path: [ebs_control_plane, ebs_node_cluster]
+        emit: [ebs_control_plane.create_volume_req, ebs_control_plane.create_volume_ok]
+        latency_ms: [[0, 2], [50, 250]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_api_attach_volume_ok
+        desc: Customer AttachVolume succeeds.
+        rpm: 25
+        path: [ebs_control_plane, ebs_node_cluster]
+        emit: [ebs_control_plane.attach_volume_req, ebs_control_plane.attach_volume_ok]
+        latency_ms: [[0, 2], [40, 200]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_elect_primary_ok
+        desc: Background/maintenance primary election completes quickly.
+        rpm: 20
+        path: [ebs_node_cluster, ebs_control_plane]
+        emit: [ebs_control_plane.elect_primary_req, ebs_control_plane.elect_primary_ok]
+        latency_ms: [[0, 2], [20, 120]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: rds_txn_ok
+        desc: RDS transaction commits successfully.
+        rpm: 60
+        path: [rds_service]
+        emit: [rds_service.txn_commit]
+        latency_ms: [[10, 80]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: Failure includes blocked/stuck EBS I/O for a subset of volumes, elevated primary elections, and control-plane overload/mitigations.
+    req:
+      - id: ec2_volume_io_ok
+        desc: EC2 instance performs I/O that still completes for unaffected volumes.
+        rpm: 240
+        path: [ec2_hypervisor, ebs_node_cluster]
+        emit: [ec2_hypervisor.io_submit, ebs_node_cluster.io_start, ebs_node_cluster.io_complete]
+        latency_ms: [[0, 1], [0, 2], [4, 40]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ec2_volume_io_stuck
+        desc: EC2 I/O hits a stuck volume blocked during re-mirroring/primary election and times out.
+        rpm: 60
+        path: [ec2_hypervisor, ebs_node_cluster, ec2_hypervisor]
+        emit: [ec2_hypervisor.io_submit, ebs_node_cluster.io_start, ebs_node_cluster.io_blocked_remirror, ec2_hypervisor.io_timeout]
+        latency_ms: [[0, 1], [0, 2], [500, 8000], [1000, 20000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_api_create_volume_timeout
+        desc: CreateVolume requests to the degraded AZ hang on long upstream timeouts.
+        rpm: 10
+        path: [ebs_control_plane, ebs_node_cluster]
+        emit: [ebs_control_plane.create_volume_req, ebs_control_plane.create_volume_err]
+        latency_ms: [[0, 2], [10000, 90000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_api_create_volume_disabled_fast
+        desc: CreateVolume is immediately rejected when the API is disabled for the affected AZ.
+        rpm: 10
+        path: [ebs_control_plane]
+        emit: [ebs_control_plane.create_volume_req, ebs_control_plane.create_volume_reject_disabled]
+        latency_ms: [[0, 2], [15, 250]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_api_attach_volume_ok_slow
+        desc: AttachVolume succeeds but is slower due to control plane degradation.
+        rpm: 14
+        path: [ebs_control_plane, ebs_node_cluster]
+        emit: [ebs_control_plane.attach_volume_req, ebs_control_plane.attach_volume_ok]
+        latency_ms: [[0, 2], [200, 4000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_api_attach_volume_err
+        desc: AttachVolume fails due to control plane overload.
+        rpm: 6
+        path: [ebs_control_plane, ebs_node_cluster]
+        emit: [ebs_control_plane.attach_volume_req, ebs_control_plane.attach_volume_err]
+        latency_ms: [[0, 2], [500, 60000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: true
+      - id: ebs_elect_primary_ok_load
+        desc: Elevated internal primary elections during the storm (some succeed, but slower and numerous).
+        rpm: 90
+        path: [ebs_node_cluster, ebs_control_plane]
+        emit: [ebs_control_plane.elect_primary_req, ebs_control_plane.elect_primary_ok]
+        latency_ms: [[0, 2], [200, 8000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: ebs_elect_primary_err_blocked
+        desc: Primary election calls fail because the control plane blocks comms to the degraded cluster.
+        rpm: 30
+        path: [ebs_node_cluster, ebs_control_plane]
+        emit: [ebs_control_plane.elect_primary_req, ebs_control_plane.elect_primary_err]
+        latency_ms: [[0, 2], [200, 5000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+      - id: rds_txn_stuck
+        desc: RDS transaction experiences storage I/O wait and aborts.
+        rpm: 30
+        path: [rds_service, ebs_node_cluster, rds_service]
+        emit: [rds_service.db_io_wait, rds_service.txn_error]
+        latency_ms: [[200, 8000], [500, 15000]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - >
+    The real incident lasted multiple days; this model compresses the early outage progression into ~50 minutes
+    while preserving the causal core: misrouted network change -> re-mirroring storm/capacity exhaustion -> stuck I/O ->
+    control plane overload/thread starvation -> mitigations (disable CreateVolume, then block cluster comms).
+  - >
+    Post-disable CreateVolume is modeled as an immediate reject flow (ebs_api_create_volume_disabled_fast) distinct from
+    long upstream timeouts (ebs_api_create_volume_timeout) to keep mitigation behavior consistent with observability.
+  - >
+    The model focuses on a single degraded AZ's EBS cluster and treats "region-wide API impact" as control-plane
+    overload visible through AttachVolume/CreateVolume behavior; later multi-day recovery steps (capacity addition,
+    backlog processing) are omitted to keep the incident-specific model minimal.
+  - >
+    Volume/visibility: EC2-to-EBS I/O is modeled as a moderate-rate flow (hundreds rpm) rather than per-block IOPS,
+    and periodic metrics provide strong anchor signals (cluster_health, remirror_activity, cp_metrics, thread_pool_saturated).
+    Expected total logs for the scenario are ~61k (target range 20k..100k).
+```

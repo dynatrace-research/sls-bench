@@ -1,0 +1,559 @@
+```yaml
+sys:
+  id: public_ip_programming_pipeline
+  desc: >
+    A cloud control-plane pipeline programs public IP mappings for newly created or live-migrated compute instances,
+    VPN tunnels, and network load balancers. Resource provisioning submits address changes to a network control plane,
+    which runs a canary test before applying updates to shared layer-2 edge load balancers. If the canary step stalls,
+    subsequent public-IP updates queue behind it and affected resources become unreachable via public IP and lose outbound connectivity.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: resource_manager
+    name: Resource Manager
+    svc: rm
+    hosts: [rm-1, rm-2]
+    desc: >
+      Accepts create/migrate requests for compute, VPN, and L4 network load balancers and waits for public-IP programming
+      to complete before considering resources network-ready.
+    to:
+      - dst: net_control_plane
+        proto: grpc
+        desc: Submits public address programming requests and polls for readiness.
+    logs:
+      rm_create_request:
+        desc: Provisioning request received for a resource that needs public IP programming.
+        lvl: INFO
+        msg: "create {resource_type} request received resource_id={resource_id} zone={zone} public_ip={public_ip} req_id={req_id}"
+        vars:
+          resource_type: {k: ch, v: [gce_instance, cloud_vpn, net_lb]}
+          resource_id: {k: hex, v: 12}
+          zone: {k: ch, v: [us-west1-a, us-west1-b, us-west1-c]}
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          req_id: {k: uuid, v: null}
+      rm_net_program_submit:
+        desc: Indicates RM submitted a public address programming request to the control plane.
+        lvl: INFO
+        msg: "submitting public address programming resource_id={resource_id} req_id={req_id}"
+        vars:
+          resource_id: {k: hex, v: 12}
+          req_id: {k: uuid, v: null}
+      rm_create_ready:
+        desc: Resource reached network-ready state (public IP programmed).
+        lvl: INFO
+        msg: "resource network ready resource_id={resource_id} public_ip={public_ip} elapsed_ms={elapsed_ms} req_id={req_id}"
+        vars:
+          resource_id: {k: hex, v: 12}
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          elapsed_ms: {k: i, v: [500, 30000]}
+          req_id: {k: uuid, v: null}
+      rm_create_timeout:
+        desc: Resource did not become network-ready before RM timeout.
+        lvl: ERROR
+        msg: "resource network not ready (timeout) resource_id={resource_id} waited_ms={waited_ms} req_id={req_id}"
+        vars:
+          resource_id: {k: hex, v: 12}
+          waited_ms: {k: i, v: [60000, 180000]}
+          req_id: {k: uuid, v: null}
+      rm_pending_network:
+        desc: Periodic metric of provisioning operations blocked waiting for public-IP programming.
+        lvl: INFO
+        msg: "pending network programming requests={pending} oldest_age_s={oldest_age_s}"
+        vars: {}
+        state_vars:
+          n:
+            pending: {k: i, v: [0, 50]}
+            oldest_age_s: {k: i, v: [0, 15]}
+          f:
+            pending: {k: i, v: [500, 8000]}
+            oldest_age_s: {k: i, v: [60, 3600]}
+    beh:
+      n:
+        desc: Periodically reports a small number of pending requests in healthy operation.
+        emit:
+          - id: rm_pending_network
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Pending counts remain high while public-IP programming is queued behind a stuck canary gate.
+        emit:
+          - id: rm_pending_network
+            per_min: 1.0
+            scope: per_host
+
+  - id: net_control_plane
+    name: Network Control Plane
+    svc: ncp
+    hosts: [ncp-1, ncp-2]
+    desc: >
+      Queues and processes public address updates. Runs canary validation for configuration changes before applying them
+      to layer-2 edge load balancers. If canary validation times out, updates remain queued and block later address changes.
+    to:
+      - dst: canary_tester
+        proto: grpc
+        desc: Runs canary tests for proposed L2/LB configuration changes.
+      - dst: l2lb_edge
+        proto: grpc
+        desc: Applies validated public-IP mapping updates to edge dataplane devices.
+      - dst: resource_manager
+        proto: grpc
+        desc: Notifies provisioning when public-IP programming completes or remains pending.
+    logs:
+      ncp_config_batch_received:
+        desc: A batch of updates for a specific load-balancing configuration was accepted for processing.
+        lvl: WARN
+        msg: "received config update batch config={config_name} updates={updates} change_id={change_id}"
+        vars:
+          config_name: {k: ch, v: [rare_l2_extension]}
+          updates: {k: i, v: [1000, 8000]}
+          change_id: {k: hex, v: 10}
+      ncp_enqueue_update:
+        desc: An address update was enqueued for canary validation / propagation.
+        lvl: INFO
+        msg: "enqueued address update config={config_name} resource_id={resource_id} queue_depth={queue_depth} job_id={job_id}"
+        vars:
+          resource_id: {k: hex, v: 12}
+          job_id: {k: str, v: "ncp-job-[1-9]"}
+        state_vars:
+          n:
+            config_name: {k: ch, v: [standard_ipv4, standard_ipv6]}
+            queue_depth: {k: i, v: [0, 200]}
+          f:
+            config_name: {k: ch, v: [rare_l2_extension]}
+            queue_depth: {k: i, v: [500, 15000]}
+      ncp_apply_success:
+        desc: Control plane marked an update batch as successfully applied after edge programming completed.
+        lvl: INFO
+        msg: "applied address update to dataplane config={config_name} batch_id={batch_id} updated={updated} queue_depth={queue_depth}"
+        vars:
+          batch_id: {k: hex, v: 8}
+          updated: {k: i, v: [1, 300]}
+        state_vars:
+          n:
+            config_name: {k: ch, v: [standard_ipv4, standard_ipv6]}
+            queue_depth: {k: i, v: [0, 200]}
+          f:
+            config_name: {k: ch, v: [rare_l2_extension]}
+            queue_depth: {k: i, v: [200, 15000]}
+      ncp_worker_restart:
+        desc: Operator action to restart a zone's programming worker.
+        lvl: WARN
+        msg: "worker restart requested zone={zone} reason={reason}"
+        vars:
+          zone: {k: ch, v: [us-west1-a, us-west1-b, us-west1-c]}
+          reason: {k: ch, v: [stuck_canary, backlog_drain]}
+      ncp_queue_status_normal:
+        desc: Periodic queue metric in healthy operation.
+        lvl: INFO
+        msg: "queue status depth={queue_depth} oldest_s={oldest_s} canary_state={canary_state}"
+        vars:
+          queue_depth: {k: i, v: [0, 200]}
+          oldest_s: {k: i, v: [0, 30]}
+          canary_state: {k: ch, v: [passing]}
+      ncp_queue_status_timeout:
+        desc: Periodic queue metric when canary validation is timing out and gating updates.
+        lvl: WARN
+        msg: "queue status depth={queue_depth} oldest_s={oldest_s} canary_state={canary_state}"
+        vars:
+          queue_depth: {k: i, v: [2000, 15000]}
+          oldest_s: {k: i, v: [300, 3600]}
+          canary_state: {k: ch, v: [timing_out]}
+      ncp_queue_status_draining:
+        desc: Periodic queue metric when workers are draining backlog after restarts.
+        lvl: INFO
+        msg: "queue status depth={queue_depth} oldest_s={oldest_s} canary_state={canary_state}"
+        vars:
+          queue_depth: {k: i, v: [500, 9000]}
+          oldest_s: {k: i, v: [60, 2400]}
+          canary_state: {k: ch, v: [draining]}
+      ncp_queue_snapshot_high:
+        desc: On-demand snapshot of queue depth during investigation (high backlog).
+        lvl: WARN
+        msg: "queue snapshot depth={queue_depth} oldest_s={oldest_s}"
+        vars:
+          queue_depth: {k: i, v: [9000, 15000]}
+          oldest_s: {k: i, v: [1200, 3600]}
+      ncp_queue_snapshot_draining:
+        desc: On-demand snapshot of queue depth during investigation (draining).
+        lvl: INFO
+        msg: "queue snapshot depth={queue_depth} oldest_s={oldest_s}"
+        vars:
+          queue_depth: {k: i, v: [2000, 8000]}
+          oldest_s: {k: i, v: [300, 2400]}
+    beh:
+      n:
+        desc: Periodically reports low queue depth while canary validation passes.
+        emit:
+          - id: ncp_queue_status_normal
+            per_min: 1.0
+            scope: global
+      f:
+        desc: Emits queue metrics showing gating timeouts and later partial draining during mitigations.
+        emit:
+          - id: ncp_queue_status_timeout
+            per_min: 1.0
+            scope: global
+          - id: ncp_queue_status_draining
+            per_min: 1.0
+            scope: global
+
+  - id: canary_tester
+    name: Canary Tester
+    svc: canary
+    hosts: [canary-1]
+    desc: Runs validation tests for proposed L2/LB configuration updates before they are propagated.
+    to:
+      - dst: l2lb_edge
+        proto: tcp
+        desc: Sends synthetic traffic to validate edge programming.
+      - dst: net_control_plane
+        proto: grpc
+        desc: Reports canary results back to the control plane.
+    logs:
+      canary_pass:
+        desc: Canary validation passed within the allowed time.
+        lvl: INFO
+        msg: "canary succeeded config={config_name} elapsed_ms={elapsed_ms} canary_id={canary_id}"
+        vars:
+          elapsed_ms: {k: i, v: [100, 12000]}
+          canary_id: {k: hex, v: 12}
+        state_vars:
+          n:
+            config_name: {k: ch, v: [standard_ipv4, standard_ipv6]}
+          f:
+            config_name: {k: ch, v: [rare_l2_extension]}
+      canary_timeout:
+        desc: Canary validation exceeded the timeout.
+        lvl: ERROR
+        msg: "canary timed out config={config_name} timeout_ms={timeout_ms} elapsed_ms={elapsed_ms} canary_id={canary_id}"
+        vars:
+          config_name: {k: ch, v: [rare_l2_extension]}
+          timeout_ms: {k: i, v: [30000, 30000]}
+          elapsed_ms: {k: i, v: [30000, 45000]}
+          canary_id: {k: hex, v: 12}
+    beh:
+      n:
+        desc: No background emissions needed beyond request-driven canary results.
+        emit: []
+      f:
+        desc: No background emissions needed beyond request-driven canary results.
+        emit: []
+
+  - id: l2lb_edge
+    name: Shared L2 Edge Load Balancers
+    svc: l2lb
+    hosts: [l2lb-1, l2lb-2, l2lb-3]
+    desc: >
+      Shared layer-2 edge devices that accept inbound traffic for public IPs and forward to the correct backend.
+      If a public IP mapping is missing or pending, inbound traffic (including health checks) is dropped.
+    to:
+      - dst: net_control_plane
+        proto: grpc
+        desc: Acknowledges applied programming updates / reports status to the control plane.
+      - dst: health_checker
+        proto: https
+        desc: Returns health check connection outcomes (success, timeout, or close) to the checker.
+    logs:
+      l2lb_program_apply:
+        desc: Dataplane applied a public IP mapping update.
+        lvl: INFO
+        msg: "programmed public ip mapping public_ip={public_ip} resource_id={resource_id} zone={zone} version={version}"
+        vars:
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          resource_id: {k: hex, v: 12}
+          zone: {k: ch, v: [us-west1-a, us-west1-b, us-west1-c]}
+          version: {k: ch, v: [r20170130]}
+      l2lb_drop_nomap:
+        desc: Inbound traffic was dropped due to missing/pending public IP mapping.
+        lvl: WARN
+        msg: "dropped inbound packet public_ip={public_ip} reason={reason}"
+        vars:
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          reason: {k: ch, v: [no_mapping, pending_programming]}
+      l2lb_stats:
+        desc: Periodic dataplane counters.
+        lvl: INFO
+        msg: "dataplane stats packets_in={packets_in} drops_nomap={drops_nomap}"
+        vars: {}
+        state_vars:
+          n:
+            packets_in: {k: i, v: [10000, 50000]}
+            drops_nomap: {k: i, v: [0, 20]}
+          f:
+            packets_in: {k: i, v: [8000, 45000]}
+            drops_nomap: {k: i, v: [300, 7000]}
+    beh:
+      n:
+        desc: Dataplane stats show low drop rates when mappings are present.
+        emit:
+          - id: l2lb_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Dataplane stats show elevated drops due to missing mappings for newly created/migrated resources.
+        emit:
+          - id: l2lb_stats
+            per_min: 1.0
+            scope: per_host
+
+  - id: health_checker
+    name: Load Balancer Health Checker
+    svc: hc
+    hosts: [hc-1, hc-2]
+    desc: Performs periodic health checks against public IPs to determine backend health.
+    to:
+      - dst: l2lb_edge
+        proto: https
+        desc: Sends HTTP/TCP health checks through the public edge.
+    logs:
+      hc_ok:
+        desc: Health check succeeded.
+        lvl: INFO
+        msg: "health check ok target={target} public_ip={public_ip} rtt_ms={rtt_ms}"
+        vars:
+          target: {k: ch, v: [net_lb, gce_instance]}
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          rtt_ms: {k: i, v: [5, 80]}
+      hc_fail:
+        desc: Health check failed (timeout or no route).
+        lvl: WARN
+        msg: "health check failed target={target} public_ip={public_ip} error={error} waited_ms={waited_ms}"
+        vars:
+          target: {k: ch, v: [net_lb, gce_instance]}
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          error: {k: ch, v: [timeout, no_route, connection_refused]}
+          waited_ms: {k: i, v: [1000, 6000]}
+    beh:
+      n:
+        desc: No background emissions beyond per-check logs.
+        emit: []
+      f:
+        desc: No background emissions beyond per-check logs.
+        emit: []
+
+  - id: guest_agent
+    name: Guest Network Agent
+    svc: guest-agent
+    hosts: [guest-1, guest-2, guest-3]
+    desc: >
+      Agent inside new or migrated instances that runs simple egress connectivity probes.
+      During the incident, probes fail when public addressing is not fully programmed.
+    to: []
+    logs:
+      ga_egress_ok:
+        desc: Egress probe succeeded.
+        lvl: INFO
+        msg: "egress connection ok dest={dest} public_ip={public_ip} latency_ms={latency_ms}"
+        vars:
+          dest: {k: str, v: "external endpoint"}
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+          latency_ms: {k: i, v: [20, 300]}
+      ga_egress_fail:
+        desc: Egress probe failed.
+        lvl: WARN
+        msg: "egress connection failed dest={dest} error={error} public_ip={public_ip}"
+        vars:
+          dest: {k: str, v: "external endpoint"}
+          error: {k: ch, v: [no_route, timeout]}
+          public_ip: {k: ip, v: "203.0.113.0/24"}
+    beh:
+      n:
+        desc: No background emissions beyond probe flows.
+        emit: []
+      f:
+        desc: No background emissions beyond probe flows.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation where canary validation passes quickly and public IP mappings are applied promptly.
+    req:
+      - id: create_resource_ok
+        desc: Create/migrate operation successfully programs a public IP through canary and edge programming.
+        rpm: 120.0
+        path: [resource_manager, net_control_plane, canary_tester, net_control_plane, l2lb_edge, net_control_plane, resource_manager]
+        emit:
+          - resource_manager.rm_create_request
+          - resource_manager.rm_net_program_submit
+          - net_control_plane.ncp_enqueue_update
+          - canary_tester.canary_pass
+          - l2lb_edge.l2lb_program_apply
+          - net_control_plane.ncp_apply_success
+          - resource_manager.rm_create_ready
+        latency_ms:
+          - [2, 5]
+          - [10, 30]
+          - [20, 80]
+          - [200, 1500]
+          - [20, 120]
+          - [20, 120]
+          - [5, 20]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: health_check_ok
+        desc: Regular health checks succeed for public IPs with programmed mappings.
+        rpm: 250.0
+        path: [health_checker]
+        emit: [health_checker.hc_ok]
+        latency_ms: [[10, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: egress_probe_ok
+        desc: Guest egress probes succeed when public addressing is properly programmed.
+        rpm: 30.0
+        path: [guest_agent]
+        emit: [guest_agent.ga_egress_ok]
+        latency_ms: [[30, 200]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+  f:
+    desc: Failure where canary validation of a rare configuration stalls and queues public IP programming updates.
+    req:
+      - id: create_resource_blocked
+        desc: Create/migrate operations enqueue updates but canary times out, leading to RM network-ready timeouts.
+        rpm: 120.0
+        path: [resource_manager, net_control_plane, canary_tester, net_control_plane, resource_manager]
+        emit:
+          - resource_manager.rm_create_request
+          - resource_manager.rm_net_program_submit
+          - net_control_plane.ncp_enqueue_update
+          - canary_tester.canary_timeout
+          - resource_manager.rm_create_timeout
+        latency_ms:
+          - [2, 5]
+          - [10, 30]
+          - [50, 200]
+          - [30000, 45000]
+          - [60000, 180000]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: create_resource_recovered
+        desc: After worker restarts, some updates pass canary and get programmed, but with elevated latency.
+        rpm: 120.0
+        path: [resource_manager, net_control_plane, canary_tester, net_control_plane, l2lb_edge, net_control_plane, resource_manager]
+        emit:
+          - resource_manager.rm_create_request
+          - resource_manager.rm_net_program_submit
+          - net_control_plane.ncp_enqueue_update
+          - canary_tester.canary_pass
+          - l2lb_edge.l2lb_program_apply
+          - net_control_plane.ncp_apply_success
+          - resource_manager.rm_create_ready
+        latency_ms:
+          - [2, 5]
+          - [20, 60]
+          - [50, 200]
+          - [500, 4000]
+          - [50, 250]
+          - [100, 500]
+          - [20, 120]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: health_check_fail
+        desc: Health checks fail when public IP mappings are missing/pending; edge logs drops before the checker times out.
+        rpm: 250.0
+        path: [health_checker, l2lb_edge, health_checker]
+        emit:
+          - l2lb_edge.l2lb_drop_nomap
+          - health_checker.hc_fail
+        latency_ms:
+          - [1, 5]
+          - [1000, 6000]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: health_check_ok_in_failure
+        desc: Some health checks succeed in zones where programming has resumed.
+        rpm: 250.0
+        path: [health_checker]
+        emit: [health_checker.hc_ok]
+        latency_ms: [[10, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: inbound_public_drop
+        desc: Customer inbound connections to new/migrated public IPs are dropped due to missing mapping.
+        rpm: 80.0
+        path: [l2lb_edge]
+        emit: [l2lb_edge.l2lb_drop_nomap]
+        latency_ms: [[1, 5]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: egress_probe_fail
+        desc: Guest egress probes fail while public address programming is incomplete.
+        rpm: 30.0
+        path: [guest_agent]
+        emit: [guest_agent.ga_egress_fail]
+        latency_ms: [[200, 5000]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: egress_probe_ok_in_failure
+        desc: Some guest egress probes succeed in zones where programming has resumed.
+        rpm: 30.0
+        path: [guest_agent]
+        emit: [guest_agent.ga_egress_ok]
+        latency_ms: [[30, 400]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - "Model focuses on the public-IP programming pipeline (RM -> NCP -> canary -> L2 edge) as the incident causal core."
+  - "Shared layer-2 load balancers are represented as a single l2lb_edge component that drops inbound traffic when a public IP mapping is missing/pending."
+  - "Control-plane apply success is logged only after edge programming logs, to preserve known-at-this-time chronology."
+  - "Real incident lasted ~2h; scenario time-compresses while preserving ordering: trigger -> canary timeout/queueing -> worker restarts zone-by-zone -> partial drain."
+  - "Normal-phase expected volume is ~1120 logs/min dominated by create_resource_ok and health_check_ok; low background metrics provide baseline markers."
+  - "Estimated total scenario log volume is ~50k-60k, within the 20k-100k target; key diagnostics (canary_timeout, ncp_queue_status_*, l2lb_drop_nomap) are frequent enough to be visible."
+```

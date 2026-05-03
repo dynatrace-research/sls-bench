@@ -1,0 +1,257 @@
+```yaml
+scenario:
+  id: github_dns_outage_progression_slice
+  title: DNS ACL rollout triggers timeouts, then NXDOMAIN, then fileserver/routing backpressure
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The service normally answers public DNS queries via caching and authoritative name servers and serves repository traffic through a routing layer to fileservers.
+    A rollout to tighten DNS ACLs and change name server IP usage was applied, but a config management bug prevented the caching resolver from restarting and picking up the new settings.
+    DNS queries began timing out (SERVFAIL), then after a subsequent DNS deploy published an incomplete zone file, many names incorrectly returned NXDOMAIN.
+    After DNS responses improved, a subset of fileservers remained overloaded and refused connections, causing routing backpressure and elevated HTTP 502/503s for some repositories.
+
+  trigger_desc: |
+    Deploy/config changes update edge DNS ACLs and name server IP configuration; only the authoritative DNS service is restarted during rollout, leaving the caching resolver in an inconsistent state and causing upstream DNS timeouts.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        External DNS queries are answered quickly via the cache->authoritative path, and normal repo HTTP operations are routed to healthy fileservers.
+        Only low background noise appears in edge drops and routine service stats.
+      flows: [external_dns_query_ok, web_repo_request_ok]
+      manifestation:
+        - dns_cache_ns.dns_stats
+        - dns_auth_ns.auth_stats
+        - routing_lb.pool_stats
+        - web_frontend.http_resp_ok
+
+    f:
+      desc: |
+        Immediately after the rollout, the caching resolver does not restart while the edge ACL rules tighten, producing upstream timeouts and SERVFAIL responses.
+        After on-call reloads the DNS services, timeouts largely subside. During investigation, a DNS deploy rebuilds and publishes a zone file using provisioning-derived
+        data without adequate validation, causing widespread missing records and NXDOMAIN.
+        DNS records are partially restored, but a subset of fileservers remain resource-exhausted and refuse connections; routing backpressure blocks access to healthy nodes and web repo requests begin failing with 502/503.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: config_deployer
+          event: |
+            DNS ACL/IP rollout is applied; the authoritative DNS is restarted as part of the change while the caching resolver remains on the old effective configuration.
+            Edge DNS drops begin and external queries start timing out and returning SERVFAIL.
+          why: |
+            A config management restart bug leaves dns_cache_ns operating with inconsistent settings while the firewall/router enforces a new whitelist.
+            This is directly observable via net_edge drop logs, an authoritative reload marker, and dns_cache upstream timeout logs.
+          flows: [external_dns_query_timeout, external_dns_query_ok_degraded]
+          rate_multipliers:
+            external_dns_query_nxdomain: 0.0
+            web_repo_request_502: 0.0
+            net_edge.dns_drop: 3.0
+            routing_lb.pool_degraded: 0.0
+            dns_cache_ns.nxdomain_alert: 0.0
+            dns_auth_ns.nxdomain_alert: 0.0
+            dns_cache_ns.dns_stats_spike: 0.0
+            dns_auth_ns.auth_stats_spike: 0.0
+          latency_multipliers:
+            external_dns_query_timeout: {p50: 1.0, p95: 1.0}
+            external_dns_query_ok_degraded: {p50: 1.2, p95: 1.4}
+          one_shots:
+            - ref: net_edge.acl_update
+              count: 1
+              hosts: [edge-1]
+            - ref: config_deployer.puppet_apply
+              count: 2
+              hosts: [deploy-1]
+            - ref: dns_auth_ns.reload
+              count: 1
+              hosts: [dns-auth-1]
+          manifestation:
+            - net_edge.dns_drop
+            - dns_auth_ns.reload
+            - dns_cache_ns.query_timeout
+            - dns_cache_ns.dns_stats
+            - config_deployer.puppet_apply
+
+        - order: 2
+          at_min: 33
+          component: dns_cache_ns
+          event: |
+            On-call reloads/restarts the caching and authoritative DNS services, and DNS timeouts drop sharply while successful answers increase.
+          why: |
+            Reloading applies the intended configuration and clears the cache/authoritative processes into a consistent state.
+            Improvement is directly visible in reduced dns_cache timeouts and fewer edge drops.
+          flows: [external_dns_query_timeout, external_dns_query_ok_degraded]
+          rate_multipliers:
+            external_dns_query_timeout: 0.15
+            external_dns_query_ok_degraded: 1.5
+            net_edge.dns_drop: 0.3
+          latency_multipliers:
+            external_dns_query_ok_degraded: {p50: 0.8, p95: 0.8}
+          one_shots:
+            - ref: dns_cache_ns.reload
+              count: 1
+              hosts: [dns-cache-1]
+            - ref: dns_auth_ns.reload
+              count: 1
+              hosts: [dns-auth-1]
+          manifestation:
+            - dns_cache_ns.reload
+            - dns_cache_ns.respond_noerror
+            - net_edge.dns_drop
+            - dns_cache_ns.dns_stats
+
+        - order: 3
+          at_min: 38
+          component: config_deployer
+          event: |
+            A DNS deploy runs during investigation and publishes an incomplete zone file, after which many queries incorrectly return NXDOMAIN.
+            NXDOMAIN anomaly logs and spike-style DNS stats snapshots start appearing while regular stats snapshots are suppressed.
+          why: |
+            The deploy process rebuilds zones from provisioning-derived data that depends on DNS itself, and the output is not sanity-checked before publishing.
+            This is observable through a zone reload marker, increased per-query NXDOMAIN answers, and elevated NXDOMAIN in anomaly/spike metrics logs.
+          flows: [external_dns_query_nxdomain, external_dns_query_ok_degraded]
+          rate_multipliers:
+            external_dns_query_nxdomain: 1.0
+            external_dns_query_ok_degraded: 0.6
+            dns_cache_ns.nxdomain_alert: 6.0
+            dns_auth_ns.nxdomain_alert: 6.0
+            dns_cache_ns.dns_stats: 0.0
+            dns_auth_ns.auth_stats: 0.0
+            dns_cache_ns.dns_stats_spike: 1.0
+            dns_auth_ns.auth_stats_spike: 1.0
+          latency_multipliers:
+            external_dns_query_nxdomain: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: config_deployer.dns_deploy_start
+              count: 1
+              hosts: [deploy-1]
+            - ref: config_deployer.zone_build
+              count: 1
+              hosts: [deploy-1]
+            - ref: config_deployer.dns_deploy_end
+              count: 1
+              hosts: [deploy-1]
+            - ref: dns_auth_ns.zone_reload
+              count: 1
+              hosts: [dns-auth-1]
+          manifestation:
+            - dns_auth_ns.zone_reload
+            - dns_auth_ns.serve_nxdomain
+            - dns_cache_ns.respond_nxdomain
+            - dns_cache_ns.dns_stats_spike
+            - dns_auth_ns.auth_stats_spike
+            - dns_cache_ns.nxdomain_alert
+            - config_deployer.dns_deploy_end
+
+        - order: 4
+          at_min: 46
+          component: routing_lb
+          event: |
+            Operators manually restore missing DNS records, reducing NXDOMAIN; spike-style DNS metric snapshots largely stop and regular DNS stats resume.
+            Repo traffic becomes degraded as some fileservers refuse connections and are removed from the routing pool.
+          why: |
+            Manual zone restoration repairs many missing DNS records (observable via a restore marker and fewer NXDOMAIN responses), but prior process/memory spikes leave
+            some fileservers unstable. Routing backpressure prevents clean failover to healthy nodes until misbehaving backends are removed (observable via pool degradation and connection failures).
+          flows: [external_dns_query_nxdomain, web_repo_request_502, web_repo_request_ok_low]
+          rate_multipliers:
+            external_dns_query_nxdomain: 0.2
+            web_repo_request_502: 1.0
+            routing_lb.pool_degraded: 4.0
+            fileserver_pool.mem_pressure: 3.0
+            dns_cache_ns.nxdomain_alert: 0.5
+            dns_auth_ns.nxdomain_alert: 0.5
+            dns_cache_ns.dns_stats: 0.6
+            dns_auth_ns.auth_stats: 0.6
+            dns_cache_ns.dns_stats_spike: 0.0
+            dns_auth_ns.auth_stats_spike: 0.0
+          latency_multipliers:
+            web_repo_request_502: {p50: 1.2, p95: 1.4}
+            web_repo_request_ok_low: {p50: 1.2, p95: 1.5}
+          one_shots:
+            - ref: config_deployer.manual_zone_restore
+              count: 1
+              hosts: [deploy-1]
+            - ref: routing_lb.backend_removed
+              count: 5
+              hosts: [router-1]
+            - ref: fileserver_pool.kill_hung_procs
+              count: 2
+              hosts: [fs-02, fs-03]
+            - ref: fileserver_pool.ha_stonith
+              count: 1
+              hosts: [fs-04]
+          manifestation:
+            - config_deployer.manual_zone_restore
+            - routing_lb.pool_degraded
+            - routing_lb.conn_refused
+            - fileserver_pool.mem_pressure
+            - web_frontend.upstream_err
+
+      steady:
+        - component: routing_lb
+          condition: |
+            Routing remains degraded with intermittent connection refusals and elevated pool degradation warnings while backends are being triaged and removed, limiting access to healthy fileservers.
+          user_impact: |
+            A subset of repository operations intermittently fail with HTTP 502/503 or experience high latency even though DNS timeouts are mostly resolved.
+          manifestation:
+            - routing_lb.pool_stats
+            - routing_lb.pool_degraded
+            - routing_lb.conn_refused
+        - component: fileserver_pool
+          condition: |
+            One or more fileservers remain under elevated process/memory pressure after the DNS outage, contributing to connection refusals and slow responses.
+          user_impact: |
+            Repositories mapped to or routed through impacted nodes have higher error rates and slower responses; recovery requires continued operator triage.
+          manifestation:
+            - fileserver_pool.mem_pressure
+
+      feedback_loops:
+        - id: dns_retry_amplification
+          desc: |
+            DNS timeouts trigger resolver retries and repeated upstream attempts, sustaining load and increasing the chance of further timeouts and drops.
+        - id: routing_backpressure_blocking
+          desc: |
+            Connection refusals from a subset of fileservers increase in-flight connections/queues in the routing layer, which delays or blocks routing to otherwise healthy backends.
+
+      flows:
+        - external_dns_query_timeout
+        - external_dns_query_ok_degraded
+        - external_dns_query_nxdomain
+        - web_repo_request_ok_low
+        - web_repo_request_502
+      manifestation:
+        - dns_cache_ns.query_timeout
+        - net_edge.dns_drop
+        - dns_auth_ns.zone_reload
+        - dns_cache_ns.respond_nxdomain
+        - dns_cache_ns.dns_stats_spike
+        - dns_auth_ns.auth_stats_spike
+        - dns_cache_ns.nxdomain_alert
+        - fileserver_pool.mem_pressure
+        - routing_lb.pool_degraded
+        - web_frontend.http_resp_err
+
+  assumptions:
+    - |
+        Timeline is modeled as a 60-minute slice that ends before full recovery (the real incident lasted longer); the scenario intentionally ends in failure with ongoing fileserver/routing degradation.
+    - |
+        Piecewise failure breakdown (25..60):
+        - 25-33 (8m): DNS timeout-dominant; net_edge.dns_drop multiplier 3.0; external_dns_query_nxdomain suppressed (0.0); web_repo_request_502 suppressed (0.0); routing_lb.pool_degraded suppressed (0.0); DNS NXDOMAIN anomaly + spike stats suppressed (dns_cache_ns.nxdomain_alert=0.0; dns_auth_ns.nxdomain_alert=0.0; dns_cache_ns.dns_stats_spike=0.0; dns_auth_ns.auth_stats_spike=0.0).
+        - 33-38 (5m): DNS reload reduces timeouts (external_dns_query_timeout multiplier 0.15) and reduces drops (net_edge.dns_drop 0.3); NXDOMAIN remains suppressed and spike stats remain suppressed.
+        - 38-46 (8m): NXDOMAIN active (external_dns_query_nxdomain 1.0) after bad zone publish; anomaly logs enabled (dns_cache_ns.nxdomain_alert=6.0; dns_auth_ns.nxdomain_alert=6.0); spike stats enabled while regular stats are suppressed (dns_cache_ns.dns_stats_spike=1.0; dns_auth_ns.auth_stats_spike=1.0; dns_cache_ns.dns_stats=0.0; dns_auth_ns.auth_stats=0.0).
+        - 46-60 (14m): NXDOMAIN reduced (0.2) after manual restore; regular stats resume and spike stats stop (dns_cache_ns.dns_stats=0.6; dns_auth_ns.auth_stats=0.6; dns_cache_ns.dns_stats_spike=0.0; dns_auth_ns.auth_stats_spike=0.0; dns_cache_ns.nxdomain_alert=0.5; dns_auth_ns.nxdomain_alert=0.5), while routing/fileserver degradation begins (routing_lb.pool_degraded 4.0; fileserver_pool.mem_pressure 3.0; web_repo_request_502 activated).
+    - |
+        One-shot counts per event: e1=4 (ACL update + 2 puppet applies + auth reload marker), e2=2 (2 reloads), e3=4 (deploy start + input + deploy end + zone reload), e4=9 (manual restore + 5 backend removals + 2 proc kills + 1 stonith).
+    - |
+        Estimated total logs: ~55k–75k across 60 minutes, within the 20k..100k target.
+        Key failure signals are likely-visible due to (a) high-rpm DNS request failures/successes, (b) elevated net_edge.dns_drop during the timeout phase,
+        (c) enabled dns_cache_ns.dns_stats_spike / dns_auth_ns.auth_stats_spike and NXDOMAIN per-query logs during the NXDOMAIN phase while regular stats are suppressed,
+        and (d) elevated routing_lb.pool_degraded/conn_refused plus fileserver_pool.mem_pressure during the backpressure phase.
+```

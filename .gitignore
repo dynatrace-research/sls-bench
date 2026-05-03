@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data
+/data/*
+!/data/complete/
+!/data/incident-reports/
+
+# Other
+.DS_Store
+.vscode
+logs.csv
+.env
+*zip
+src/models/credentials_internal.py

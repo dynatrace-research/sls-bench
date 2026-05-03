@@ -1,0 +1,642 @@
+```yaml
+sys:
+  id: sessionstore_cassandra_quorum_outage
+  desc: >
+    MediaWiki application hosts rely on a SessionStore HTTP service to read/write user session data.
+    SessionStore persists sessions in a Cassandra cluster spanning two datacenters and uses QUORUM consistency for session operations.
+    When enough Cassandra nodes go down (here due to disk exhaustion), SessionStore cannot reach quorum and begins returning HTTP 500s to MediaWiki.
+    A disruptive mitigation is to wipe/truncate the session keyspace to free disk, restart Cassandra, and restore availability at the cost of losing all sessions.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: mediawiki_app
+    name: MediaWiki App Servers
+    svc: mediawiki
+    hosts: [mw1, mw2, mw3]
+    desc: >
+      Frontend application servers handling page views and edit submissions.
+      For authenticated actions, they depend on SessionStore availability; when SessionStore is unavailable, sessions can be lost and edits fail.
+
+    to:
+      - dst: sessionstore_api
+        proto: https
+        desc: Session read/write calls for user sessions.
+
+    logs:
+      heartbeat:
+        desc: Periodic application heartbeat.
+        lvl: INFO
+        msg: "heartbeat app=mediawiki build={build} heap_used_mb={heap_mb}"
+        vars:
+          build: {k: ch, v: ["1.42.0-wmf.15"]}
+          heap_mb: {k: i, v: [800, 2600]}
+
+      page_request:
+        desc: Handling a page view request with observed session availability.
+        lvl: INFO
+        msg: "page_request req_id={req_id} path=/wiki/{page} user={user} session={session_state}"
+        vars:
+          req_id: {k: hex, v: 16}
+          page: {k: ch, v: ["Main_Page", "Help:Editing", "Project:About", "Talk:Sandbox"]}
+          user: {k: ch, v: ["anon", "logged_in", "bot"]}
+        state_vars:
+          n:
+            session_state: {k: ch, v: ["present"]}
+          f:
+            session_state: {k: ch, v: ["present", "missing"]}
+
+      page_response_200:
+        desc: Final response for a page view request (served).
+        lvl: INFO
+        msg: "page_response req_id={req_id} status=200 dur_ms={dur_ms} cache={cache}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [10, 6000]}
+          cache: {k: ch, v: ["hit", "miss"]}
+
+      edit_submit:
+        desc: User submits an edit save.
+        lvl: INFO
+        msg: "edit_submit req_id={req_id} page={page} user={user}"
+        vars:
+          req_id: {k: hex, v: 16}
+          page: {k: ch, v: ["Main_Page", "Help:Editing", "Project:About", "Talk:Sandbox"]}
+          user: {k: ch, v: ["anon", "logged_in", "bot"]}
+
+      edit_result_ok:
+        desc: Successful edit save.
+        lvl: INFO
+        msg: "edit_result req_id={req_id} result=success rev_id={rev_id} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          rev_id: {k: i, v: [9000000, 9050000]}
+          dur_ms: {k: i, v: [150, 5000]}
+
+      edit_result_fail:
+        desc: Failed edit save, often due to session problems or SessionStore errors.
+        lvl: WARN
+        msg: "edit_result req_id={req_id} result=failed reason={reason} upstream_status={upstream_status} dur_ms={dur_ms}"
+        vars:
+          req_id: {k: hex, v: 16}
+          reason: {k: ch, v: ["session_lost", "sessionstore_5xx", "token_mismatch"]}
+          upstream_status: {k: i, v: [500, 503]}
+          dur_ms: {k: i, v: [200, 9000]}
+
+    beh:
+      n:
+        desc: Mostly quiet aside from periodic heartbeats.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: Heartbeats continue during dependency outages and mitigation.
+        emit:
+          - id: heartbeat
+            per_min: 0.2
+            scope: per_host
+
+  - id: sessionstore_api
+    name: SessionStore API
+    svc: sessionstore
+    hosts: [ss1, ss2, ss3, ss4]
+    desc: >
+      Stateless HTTP service providing session read/write endpoints.
+      Uses Cassandra with QUORUM consistency; when Cassandra is below quorum it may retry briefly and then returns 500 to callers.
+      After a disruptive wipe/restart, it returns to serving 200s but users may have missing sessions.
+
+    to:
+      - dst: cassandra_cluster
+        proto: tcp
+        desc: Cassandra native protocol connections for session reads/writes.
+      - dst: mediawiki_app
+        proto: https
+        desc: HTTP responses back to MediaWiki callers.
+
+    logs:
+      http_get_200:
+        desc: Successful SessionStore read request.
+        lvl: INFO
+        msg: "http_access req_id={req_id} method=GET route=/v1/session status=200 dur_ms={dur_ms} dc={dc}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [2, 3000]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+
+      http_get_500:
+        desc: Failed SessionStore read request.
+        lvl: ERROR
+        msg: "http_access req_id={req_id} method=GET route=/v1/session status=500 dur_ms={dur_ms} dc={dc}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [10, 8000]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+
+      http_put_200:
+        desc: Successful SessionStore write request.
+        lvl: INFO
+        msg: "http_access req_id={req_id} method=PUT route=/v1/session status=200 dur_ms={dur_ms} dc={dc} bytes_in={bytes_in}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [3, 4000]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+          bytes_in: {k: i, v: [200, 6000]}
+
+      http_put_500:
+        desc: Failed SessionStore write request.
+        lvl: ERROR
+        msg: "http_access req_id={req_id} method=PUT route=/v1/session status=500 dur_ms={dur_ms} dc={dc} bytes_in={bytes_in}"
+        vars:
+          req_id: {k: hex, v: 16}
+          dur_ms: {k: i, v: [20, 12000]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+          bytes_in: {k: i, v: [200, 6000]}
+
+      cassandra_op_ok:
+        desc: Result of a Cassandra operation used by SessionStore (sampled internal log).
+        lvl: INFO
+        msg: "cassandra_op req_id={req_id} op={op} consistency=QUORUM result=OK dur_ms={dur_ms} dc={dc}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: ["read", "write"]}
+          dur_ms: {k: i, v: [1, 2000]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+
+      cassandra_op_fail:
+        desc: Cassandra operation failure preventing quorum read/write (sampled internal log).
+        lvl: ERROR
+        msg: "cassandra_op req_id={req_id} op={op} consistency=QUORUM result=ERR err={err} waited_ms={waited_ms} dc={dc}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: ["read", "write"]}
+          err: {k: ch, v: ["UnavailableException", "NoHostAvailable", "ReadTimeout", "WriteTimeout"]}
+          waited_ms: {k: i, v: [50, 6000]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+
+      retrying_cassandra:
+        desc: Retry attempt after a failed Cassandra operation (sampled internal log).
+        lvl: WARN
+        msg: "retrying_cassandra req_id={req_id} op={op} attempt={attempt} backoff_ms={backoff_ms} err={err}"
+        vars:
+          req_id: {k: hex, v: 16}
+          op: {k: ch, v: ["read", "write"]}
+          attempt: {k: i, v: [2, 3]}
+          backoff_ms: {k: i, v: [20, 400]}
+          err: {k: ch, v: ["UnavailableException", "NoHostAvailable", "ReadTimeout", "WriteTimeout"]}
+
+      pool_health:
+        desc: Periodic health summary of Cassandra connectivity and quorum viability.
+        lvl: INFO
+        msg: "pool_health state={state} live_hosts={live_hosts} required_quorum={required_quorum} dc={dc}"
+        vars:
+          required_quorum: {k: i, v: [4, 4]}
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+        state_vars:
+          n:
+            state: {k: ch, v: ["OK"]}
+            live_hosts: {k: i, v: [6, 6]}
+          f:
+            state: {k: ch, v: ["DEGRADED"]}
+            live_hosts: {k: i, v: [1, 3]}
+
+      pool_health_ok:
+        desc: Periodic health summary after quorum is restored (used during post-wipe recovery).
+        lvl: INFO
+        msg: "pool_health state=OK live_hosts=6 required_quorum=4 dc={dc}"
+        vars:
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+
+    beh:
+      n:
+        desc: Periodic pool health logging while Cassandra is healthy.
+        emit:
+          - id: pool_health
+            per_min: 0.2
+            scope: per_host
+      f:
+        desc: During the incident window, pool health may be degraded; after wipe/restart it returns to OK.
+        emit:
+          - id: pool_health
+            per_min: 0.5
+            scope: per_host
+          - id: pool_health_ok
+            per_min: 0.5
+            scope: per_host
+
+  - id: cassandra_cluster
+    name: Cassandra Cluster (SessionStore)
+    svc: cassandra
+    hosts: [cass-a1, cass-a2, cass-a3, cass-b1, cass-b2, cass-b3]
+    desc: >
+      Cassandra cluster storing session rows.
+      Disk exhaustion prevents commitlog/SSTable growth and leads to Cassandra process shutdowns on some nodes, reducing live nodes below QUORUM.
+      Mitigation can truncate/wipe the session keyspace to free disk and restart nodes to restore quorum.
+
+    to:
+      - dst: sessionstore_api
+        proto: tcp
+        desc: Responses to SessionStore requests and connection lifecycle.
+
+    logs:
+      disk_usage:
+        desc: Disk utilization metric for Cassandra data directory (near exhaustion during incident).
+        lvl: INFO
+        msg: "disk_usage node={node} mount=/var/lib/cassandra free_pct={free_pct} used_gb={used_gb} pending_compactions={pending_compactions}"
+        vars:
+          node: {k: ch, v: ["cass-a1", "cass-a2", "cass-a3", "cass-b1", "cass-b2", "cass-b3"]}
+        state_vars:
+          n:
+            free_pct: {k: i, v: [30, 55]}
+            used_gb: {k: i, v: [350, 650]}
+            pending_compactions: {k: i, v: [0, 12]}
+          f:
+            free_pct: {k: i, v: [0, 5]}
+            used_gb: {k: i, v: [700, 980]}
+            pending_compactions: {k: i, v: [10, 120]}
+
+      disk_usage_recovered:
+        desc: Disk utilization metric after wipe frees space (post-mitigation).
+        lvl: INFO
+        msg: "disk_usage node={node} mount=/var/lib/cassandra free_pct={free_pct} used_gb={used_gb} pending_compactions={pending_compactions}"
+        vars:
+          node: {k: ch, v: ["cass-a1", "cass-a2", "cass-a3", "cass-b1", "cass-b2", "cass-b3"]}
+          free_pct: {k: i, v: [35, 65]}
+          used_gb: {k: i, v: [50, 220]}
+          pending_compactions: {k: i, v: [0, 25]}
+
+      compaction_backlog:
+        desc: Warning when compaction backlog is large.
+        lvl: WARN
+        msg: "compaction_backlog node={node} pending_compactions={pending_compactions} oldest_sstable_age_h={oldest_age_h}"
+        vars:
+          node: {k: ch, v: ["cass-a1", "cass-a2", "cass-a3", "cass-b1", "cass-b2", "cass-b3"]}
+          pending_compactions: {k: i, v: [0, 140]}
+          oldest_age_h: {k: i, v: [1, 96]}
+
+      commitlog_no_space:
+        desc: Cassandra shuts down after failing to allocate/write commitlog due to no free disk space.
+        lvl: CRITICAL
+        msg: "commitlog_error node={node} error='No space left on device' action=shutdown"
+        vars:
+          node: {k: ch, v: ["cass-a1", "cass-a2", "cass-a3", "cass-b1", "cass-b2", "cass-b3"]}
+
+      node_marked_down:
+        desc: Gossip marks a node down after shutdown.
+        lvl: WARN
+        msg: "gossip_event node={node} state=DOWN reason={reason}"
+        vars:
+          node: {k: ch, v: ["cass-a1", "cass-a2", "cass-a3", "cass-b1", "cass-b2", "cass-b3"]}
+          reason: {k: ch, v: ["disk_full_shutdown", "io_error"]}
+
+      truncate_sessions:
+        desc: Operator truncates/wipes the session keyspace to free disk space.
+        lvl: WARN
+        msg: "operator_action action=truncate_keyspace keyspace=sessionstore dc={dc} result=OK freed_gb={freed_gb}"
+        vars:
+          dc: {k: ch, v: ["eqiad", "codfw"]}
+          freed_gb: {k: i, v: [400, 950]}
+
+      cassandra_restart:
+        desc: Cassandra process restart on a node as part of recovery.
+        lvl: INFO
+        msg: "service_restart node={node} svc=cassandra reason={reason}"
+        vars:
+          node: {k: ch, v: ["cass-a1", "cass-a2", "cass-a3", "cass-b1", "cass-b2", "cass-b3"]}
+          reason: {k: ch, v: ["post_truncate", "disk_full_recovery"]}
+
+    beh:
+      n:
+        desc: Regular disk metrics with occasional mild compaction warnings.
+        emit:
+          - id: disk_usage
+            per_min: 1.0
+            scope: per_host
+          - id: compaction_backlog
+            per_min: 0.05
+            scope: per_host
+      f:
+        desc: During outage, disks are near full and compaction backlog warnings are more frequent; after wipe, recovered disk metrics appear.
+        emit:
+          - id: disk_usage
+            per_min: 1.0
+            scope: per_host
+          - id: compaction_backlog
+            per_min: 0.2
+            scope: per_host
+          - id: disk_usage_recovered
+            per_min: 0.5
+            scope: per_host
+
+  - id: monitoring_alerts
+    name: Monitoring / Alerting
+    svc: alerting
+    hosts: [mon1]
+    desc: >
+      Alerting system that evaluates error-rate and user-impact signals.
+      It pages on SessionStore 5xx rate and fires a critical edit-failure alert, then resolves them after mitigation.
+
+    to: []
+
+    logs:
+      alert_fired_sessionstore_5xx:
+        desc: SessionStoreErrorRateHigh transitions into firing.
+        lvl: CRITICAL
+        msg: "alert_fired name=SessionStoreErrorRateHigh severity=page summary={summary}"
+        vars:
+          summary: {k: str, v: "short_summary"}
+
+      alert_fired_edit_failures:
+        desc: MediaWikiEditFailures transitions into firing.
+        lvl: CRITICAL
+        msg: "alert_fired name=MediaWikiEditFailures severity=critical summary={summary}"
+        vars:
+          summary: {k: str, v: "short_summary"}
+
+      page_sent:
+        desc: A paging action is sent to the on-call batphone.
+        lvl: CRITICAL
+        msg: "page_sent name=SessionStoreErrorRateHigh target=batphone incident={incident}"
+        vars:
+          incident: {k: i, v: [5900, 6000]}
+
+      alert_active_sessionstore_5xx:
+        desc: Periodic reminder that SessionStoreErrorRateHigh is still active.
+        lvl: WARN
+        msg: "alert_active name=SessionStoreErrorRateHigh severity=page since_min={since_min}"
+        vars:
+          since_min: {k: i, v: [0, 60]}
+
+      alert_active_edit_failures:
+        desc: Periodic reminder that MediaWikiEditFailures is still active.
+        lvl: WARN
+        msg: "alert_active name=MediaWikiEditFailures severity=critical since_min={since_min}"
+        vars:
+          since_min: {k: i, v: [0, 60]}
+
+      alert_resolved_sessionstore_5xx:
+        desc: SessionStoreErrorRateHigh resolves after mitigation.
+        lvl: INFO
+        msg: "alert_resolved name=SessionStoreErrorRateHigh"
+        vars: {}
+
+      alert_resolved_edit_failures:
+        desc: MediaWikiEditFailures resolves after mitigation.
+        lvl: INFO
+        msg: "alert_resolved name=MediaWikiEditFailures"
+        vars: {}
+
+    beh:
+      n:
+        desc: No active alert reminders in normal operation.
+        emit:
+          - id: alert_active_sessionstore_5xx
+            per_min: 0.0
+            scope: global
+          - id: alert_active_edit_failures
+            per_min: 0.0
+            scope: global
+      f:
+        desc: Alert reminders are emitted while the incident is active; they are suppressed once resolved.
+        emit:
+          - id: alert_active_sessionstore_5xx
+            per_min: 0.25
+            scope: global
+          - id: alert_active_edit_failures
+            per_min: 0.25
+            scope: global
+
+  - id: oncall_ops
+    name: On-call Operations Notes
+    svc: ops
+    hosts: [ops1]
+    desc: >
+      Lightweight operator action markers used to model acknowledgment, escalation, and mitigation decisions.
+      These are discrete, incident-timeline-aligned one-shot logs.
+
+    to: []
+
+    logs:
+      ack_page:
+        desc: On-call acknowledges the page.
+        lvl: INFO
+        msg: "oncall_ack user={user} channel=batphone"
+        vars:
+          user: {k: ch, v: ["swfrench", "urandom"]}
+
+      investigation_note:
+        desc: Operator records an investigation note.
+        lvl: INFO
+        msg: "investigation_note user={user} note={note}"
+        vars:
+          user: {k: ch, v: ["swfrench", "urandom"]}
+          note: {k: ch, v: ["checking_sessionstore_errors", "suspect_cassandra", "confirmed_quorum_loss", "disk_full_root_cause"]}
+
+      decision_log:
+        desc: Operator records the mitigation decision.
+        lvl: WARN
+        msg: "decision user={user} action={action} scope={scope}"
+        vars:
+          user: {k: ch, v: ["swfrench"]}
+          action: {k: ch, v: ["wipe_sessionstore_cassandra_data"]}
+          scope: {k: ch, v: ["both_dcs"]}
+
+    beh:
+      n:
+        desc: No background emissions.
+        emit: []
+      f:
+        desc: No background emissions.
+        emit: []
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal traffic consists of frequent session reads for page views and less frequent session writes during edit saves.
+      SessionStore returns mostly-200 with low latency. Cassandra internal per-operation logs are modeled as sampled (not 1:1 with every HTTP request)
+      to keep log volume realistic while retaining diagnosability.
+    req:
+      - id: mw_page_view_ok
+        desc: MediaWiki page view that reads session successfully via SessionStore.
+        rpm: 140.0
+        path: [mediawiki_app, sessionstore_api, mediawiki_app]
+        emit: [mediawiki_app.page_request, sessionstore_api.http_get_200, mediawiki_app.page_response_200]
+        latency_ms: [[1, 3], [6, 25], [20, 120]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: mw_edit_save_ok
+        desc: MediaWiki edit save that writes session successfully via SessionStore.
+        rpm: 35.0
+        path: [mediawiki_app, sessionstore_api, mediawiki_app]
+        emit: [mediawiki_app.edit_submit, sessionstore_api.http_put_200, mediawiki_app.edit_result_ok]
+        latency_ms: [[1, 3], [10, 40], [120, 350]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: ss_cassandra_read_sample_ok
+        desc: Sampled internal QUORUM read telemetry from SessionStore (not every request).
+        rpm: 20.0
+        path: [sessionstore_api, cassandra_cluster, sessionstore_api]
+        emit: [sessionstore_api.cassandra_op_ok]
+        latency_ms: [[4, 20]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [sessionstore_api.retrying_cassandra]
+          backoff_ms: [[10, 30]]
+        trace: false
+
+      - id: ss_cassandra_write_sample_ok
+        desc: Sampled internal QUORUM write telemetry from SessionStore (not every request).
+        rpm: 6.0
+        path: [sessionstore_api, cassandra_cluster, sessionstore_api]
+        emit: [sessionstore_api.cassandra_op_ok]
+        latency_ms: [[6, 30]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [sessionstore_api.retrying_cassandra]
+          backoff_ms: [[10, 30]]
+        trace: false
+
+  f:
+    desc: >
+      During the outage, Cassandra node shutdowns due to disk exhaustion reduce live nodes below QUORUM.
+      SessionStore returns HTTP 500 for reads and writes. Sampled internal Cassandra telemetry shows QUORUM errors and retries.
+      After a wipe/truncate and Cassandra restart, SessionStore returns mostly-200 again, but sessions are lost.
+    req:
+      - id: mw_page_view_sessionstore_5xx
+        desc: MediaWiki page view where the session read fails (SessionStore returns HTTP 500) but the page is still served.
+        rpm: 140.0
+        path: [mediawiki_app, sessionstore_api, mediawiki_app]
+        emit: [mediawiki_app.page_request, sessionstore_api.http_get_500, mediawiki_app.page_response_200]
+        latency_ms: [[1, 3], [80, 1200], [30, 250]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: mw_page_view_ok_post_wipe
+        desc: MediaWiki page view after mitigation where SessionStore reads succeed again (sessions may still be missing due to wipe).
+        rpm: 140.0
+        path: [mediawiki_app, sessionstore_api, mediawiki_app]
+        emit: [mediawiki_app.page_request, sessionstore_api.http_get_200, mediawiki_app.page_response_200]
+        latency_ms: [[1, 3], [8, 35], [20, 140]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: mw_edit_save_500
+        desc: MediaWiki edit save where SessionStore cannot write/update session and returns HTTP 500.
+        rpm: 35.0
+        path: [mediawiki_app, sessionstore_api, mediawiki_app]
+        emit: [mediawiki_app.edit_submit, sessionstore_api.http_put_500, mediawiki_app.edit_result_fail]
+        latency_ms: [[1, 3], [120, 2200], [400, 4500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: mw_edit_save_ok_post_wipe
+        desc: MediaWiki edit save after mitigation where SessionStore writes succeed again.
+        rpm: 35.0
+        path: [mediawiki_app, sessionstore_api, mediawiki_app]
+        emit: [mediawiki_app.edit_submit, sessionstore_api.http_put_200, mediawiki_app.edit_result_ok]
+        latency_ms: [[1, 3], [12, 60], [140, 420]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: ss_cassandra_read_sample_fail
+        desc: Sampled internal QUORUM read attempts fail (unavailable/timeout), with retries.
+        rpm: 20.0
+        path: [sessionstore_api, cassandra_cluster, sessionstore_api]
+        emit: [sessionstore_api.cassandra_op_fail]
+        latency_ms: [[60, 900]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [sessionstore_api.retrying_cassandra]
+          backoff_ms: [[50, 200], [100, 400]]
+        trace: false
+
+      - id: ss_cassandra_write_sample_fail
+        desc: Sampled internal QUORUM write attempts fail (unavailable/timeout), with retries.
+        rpm: 6.0
+        path: [sessionstore_api, cassandra_cluster, sessionstore_api]
+        emit: [sessionstore_api.cassandra_op_fail]
+        latency_ms: [[80, 1300]]
+        retry:
+          max_attempts: 3
+          expected_attempts: 2.2
+          emit_per_retry: [sessionstore_api.retrying_cassandra]
+          backoff_ms: [[60, 240], [120, 480]]
+        trace: false
+
+      - id: ss_cassandra_read_sample_ok_post_wipe
+        desc: Sampled internal QUORUM read succeeds again after mitigation.
+        rpm: 20.0
+        path: [sessionstore_api, cassandra_cluster, sessionstore_api]
+        emit: [sessionstore_api.cassandra_op_ok]
+        latency_ms: [[6, 30]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [sessionstore_api.retrying_cassandra]
+          backoff_ms: [[15, 45]]
+        trace: false
+
+      - id: ss_cassandra_write_sample_ok_post_wipe
+        desc: Sampled internal QUORUM write succeeds again after mitigation.
+        rpm: 6.0
+        path: [sessionstore_api, cassandra_cluster, sessionstore_api]
+        emit: [sessionstore_api.cassandra_op_ok]
+        latency_ms: [[8, 40]]
+        retry:
+          max_attempts: 2
+          expected_attempts: 1.05
+          emit_per_retry: [sessionstore_api.retrying_cassandra]
+          backoff_ms: [[20, 60]]
+        trace: false
+
+assumptions:
+  - |
+    The two datacenters are modeled via a {dc} field rather than separate per-DC Cassandra components; node IDs include both sides (cass-a*, cass-b*).
+  - |
+    The proximate mechanism is Cassandra disk exhaustion causing node shutdowns; the distal cause (aberrant overwrite-heavy workload) is treated as external and not explicitly logged.
+  - |
+    Cassandra per-operation logs from SessionStore (cassandra_op_* and retrying_cassandra) are modeled as sampled internal telemetry flows (ss_cassandra_*_sample_*),
+    rather than 1:1 with every MediaWiki request, to keep volume under 100k while preserving diagnosability.
+  - |
+    Recovery is modeled inside the failure phase using post-wipe success flows plus recovered/OK background metrics, while keeping the phase as "failure" due to disruptive session loss.
+  - |
+    Normal-phase log volume estimate: ~10k flow logs over 18 minutes plus ~150 background logs.
+    Total scenario estimate: ~36k logs across normal+failure (including sampled retries, background, and one-shots), within the 20k–100k target.
+  - |
+    Key diagnostic visibility comes from: SessionStore HTTP 500 access logs, SessionStore pool_health showing low live_hosts, sampled SessionStore cassandra_op_fail + retrying_cassandra,
+    Cassandra disk_usage near 0–5% plus commitlog_no_space and DOWN gossip one-shots, alerting fire/resolve markers, and truncate/restart one-shots.
+```

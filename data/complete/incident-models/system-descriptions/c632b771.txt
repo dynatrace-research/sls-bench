@@ -1,0 +1,609 @@
+```yaml
+sys:
+  id: shapeshift_exchange_hotwallet
+  desc: >
+    A public crypto swap API accepts swap requests and uses an internal core service to initiate
+    hot-wallet withdrawals on dedicated wallet hosts. Operators can place the API into
+    maintenance mode during incidents. Centralized logging aggregates host logs; during this
+    incident a backdoor program (later identified as "udevd-bridge") on the wallet hosts performs
+    unauthorized withdrawals and then attempts to erase traces by truncating logs and stopping log forwarding.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: api_gateway
+    name: Public API Gateway
+    svc: api-gateway
+    hosts: [api-1, api-2]
+    desc: Terminates client HTTPS requests and forwards swap requests to the exchange core.
+
+    to:
+      - dst: exchange_core
+        proto: https
+        desc: Forwards swap requests to the core service over internal HTTPS.
+
+    logs:
+      http_in:
+        desc: Incoming HTTP request for a swap.
+        lvl: INFO
+        msg: "HTTP {method} {route} from {client_ip} req_id={req_id} trace={trace_id}"
+        vars:
+          method: {k: ch, v: [POST]}
+          route: {k: ch, v: [/api/v1/swap]}
+          client_ip: {k: ip, v: null}
+          req_id: {k: uuid, v: null}
+          trace_id: {k: hex, v: 32}
+
+      http_out_200:
+        desc: Successful HTTP response returned to client.
+        lvl: INFO
+        msg: "HTTP 200 {route} req_id={req_id} dur_ms={dur_ms} bytes={bytes}"
+        vars:
+          route: {k: ch, v: [/api/v1/swap]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [80, 6000]}
+          bytes: {k: i, v: [300, 2200]}
+
+      http_out_503_maint:
+        desc: Maintenance-mode response returned to client.
+        lvl: WARN
+        msg: "HTTP 503 maintenance {route} req_id={req_id} dur_ms={dur_ms}"
+        vars:
+          route: {k: ch, v: [/api/v1/swap]}
+          req_id: {k: uuid, v: null}
+          dur_ms: {k: i, v: [5, 120]}
+
+      health_tick:
+        desc: Periodic gateway health log.
+        lvl: INFO
+        msg: "health ok active_conns={active_conns}"
+        vars:
+          active_conns: {k: i, v: [30, 900]}
+
+    beh:
+      n:
+        desc: Normal gateway health reporting.
+        emit:
+          - id: health_tick
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Gateway remains healthy while serving maintenance responses.
+        emit:
+          - id: health_tick
+            per_min: 1.0
+            scope: per_host
+
+  - id: exchange_core
+    name: Exchange Core Service
+    svc: exchange-core
+    hosts: [core-1, core-2]
+    desc: Validates swap requests and requests withdrawals from the hot wallet hosts.
+
+    to:
+      - dst: hot_wallet_server
+        proto: ssh
+        desc: Uses an internal SSH key to invoke wallet operations on the hot wallet hosts.
+      - dst: api_gateway
+        proto: https
+        desc: Returns swap decisions/results to the API gateway over internal HTTPS.
+      - dst: log_aggregator
+        proto: tcp
+        desc: Ships logs to centralized logging.
+
+    logs:
+      swap_accepted:
+        desc: Swap request accepted and prepared for wallet send.
+        lvl: INFO
+        msg: "swap accepted pair={pair} req_id={req_id} quote_id={quote_id} trace={trace_id}"
+        vars:
+          pair: {k: ch, v: [BTC_ETH, ETH_BTC, BTC_LTC, LTC_BTC]}
+          req_id: {k: uuid, v: null}
+          quote_id: {k: hex, v: 16}
+          trace_id: {k: hex, v: 32}
+
+      wallet_send_req:
+        desc: Core requests a withdrawal from the wallet host for a swap (destination address omitted in this model).
+        lvl: INFO
+        msg: "wallet send requested asset={asset} amount={amount} quote_id={quote_id}"
+        vars:
+          asset: {k: ch, v: [BTC, ETH, LTC]}
+          amount: {k: f, v: [0.001, 25.0]}
+          quote_id: {k: hex, v: 16}
+
+      maintenance_enabled:
+        desc: Operator enables maintenance mode.
+        lvl: WARN
+        msg: "maintenance mode enabled by {actor} reason={reason}"
+        vars:
+          actor: {k: ch, v: [greg.ops, oncall.eng]}
+          reason: {k: ch, v: [unexpected_hot_wallet_debits, incident_investigation]}
+
+      maintenance_reject:
+        desc: Core rejects swaps due to maintenance mode.
+        lvl: WARN
+        msg: "swap rejected: maintenance mode req_id={req_id}"
+        vars:
+          req_id: {k: uuid, v: null}
+
+      worker_loop:
+        desc: Periodic core worker health log.
+        lvl: INFO
+        msg: "worker ok queue_depth={queue_depth}"
+        vars:
+          queue_depth: {k: i, v: [0, 300]}
+
+    beh:
+      n:
+        desc: Normal core worker health reporting.
+        emit:
+          - id: worker_loop
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Core continues to run while blocking swaps during maintenance.
+        emit:
+          - id: worker_loop
+            per_min: 1.0
+            scope: per_host
+
+  - id: hot_wallet_server
+    name: Hot Wallet Server
+    svc: hot-wallet
+    hosts: [wallet-1, wallet-2]
+    desc: >
+      Holds hot-wallet keys and signs/broadcasts withdrawals. During the incident, an unauthorized
+      local program later found on the host ("udevd-bridge") triggers withdrawals and performs
+      cleanup actions to reduce observability.
+
+    to:
+      - dst: exchange_core
+        proto: ssh
+        desc: Returns status/output to the core over the existing administrative channel.
+      - dst: log_aggregator
+        proto: tcp
+        desc: Ships logs to centralized logging.
+
+    logs:
+      ssh_login_success:
+        desc: Successful SSH login to the wallet host using a public key.
+        lvl: INFO
+        msg: "sshd: Accepted publickey for {user} from {src_ip} key_fp={key_fp}"
+        vars:
+          user: {k: ch, v: [core, admin]}
+          src_ip: {k: ip, v: null}
+        state_vars:
+          n:
+            key_fp: {k: ch, v: ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"]}
+          f:
+            key_fp: {k: ch, v: ["9c:3f:4b:ad:d6:43:ec:9a:55:de:b9:0b:d8:f5:0a:cb"]}
+
+      tx_signed_malware:
+        desc: Wallet signs a BTC transaction initiated locally (during the incident, commonly unauthorized).
+        lvl: ERROR
+        msg: "wallet: signed tx asset=BTC txid={txid} amount={amount} to={dst_addr}"
+        vars:
+          txid: {k: hex, v: 64}
+          amount: {k: f, v: [0.1, 75.0]}
+          dst_addr: {k: ch, v: ["14Kt9i5MdQCKvjX6HS2hEevVgbPhK13SKD"]}
+
+      tx_signed_malware_eth:
+        desc: Wallet signs an ETH transaction initiated locally (during the incident, commonly unauthorized).
+        lvl: ERROR
+        msg: "wallet: signed tx asset=ETH txid={txid} amount={amount} to={dst_addr}"
+        vars:
+          txid: {k: hex, v: 64}
+          amount: {k: f, v: [5.0, 3000.0]}
+          dst_addr: {k: ch, v: ["0xC26B321d50910f2f990EF92A8Effd8EC38aDE8f5"]}
+
+      tx_broadcast_malware:
+        desc: Wallet broadcasts a BTC transaction to an attacker destination (critical asset movement).
+        lvl: CRITICAL
+        msg: "wallet: broadcast tx asset=BTC txid={txid} to={dst_addr} balance_after={balance_after}"
+        vars:
+          txid: {k: hex, v: 64}
+          dst_addr: {k: ch, v: ["14Kt9i5MdQCKvjX6HS2hEevVgbPhK13SKD"]}
+          balance_after: {k: f, v: [0.0, 2000.0]}
+
+      tx_broadcast_malware_eth:
+        desc: Wallet broadcasts an ETH transaction to an attacker destination (critical asset movement).
+        lvl: CRITICAL
+        msg: "wallet: broadcast tx asset=ETH txid={txid} to={dst_addr} balance_after={balance_after}"
+        vars:
+          txid: {k: hex, v: 64}
+          dst_addr: {k: ch, v: ["0xC26B321d50910f2f990EF92A8Effd8EC38aDE8f5"]}
+          balance_after: {k: f, v: [0.0, 2000.0]}
+
+      tx_broadcast_swap:
+        desc: Wallet broadcasts a normal swap withdrawal (destination omitted to avoid address/asset mismatch).
+        lvl: INFO
+        msg: "wallet: broadcast tx asset={asset} txid={txid} balance_after={balance_after}"
+        vars:
+          asset: {k: ch, v: [BTC, ETH, LTC]}
+          txid: {k: hex, v: 64}
+        state_vars:
+          n:
+            balance_after: {k: f, v: [200.0, 20000.0]}
+          f:
+            balance_after: {k: f, v: [0.0, 2000.0]}
+
+      sudo_exec:
+        desc: Elevated command execution on wallet host during interactive sessions.
+        lvl: WARN
+        msg: "sudo: {user} ran '{cmd}'"
+        vars:
+          user: {k: ch, v: [root, admin]}
+          cmd: {k: ch, v: ["systemctl restart walletd", "systemctl status walletd"]}
+
+      sudo_exec_tamper:
+        desc: Elevated tampering commands used to reduce observability (modeled as part of later cleanup).
+        lvl: WARN
+        msg: "sudo: {user} ran '{cmd}'"
+        vars:
+          user: {k: ch, v: [root, admin]}
+          cmd: {k: ch, v: ["systemctl stop fluent-bit", "truncate -s 0 /var/log/auth.log", "truncate -s 0 /var/log/syslog"]}
+
+      audit_log_truncate:
+        desc: Audit log indicating truncation of a log file.
+        lvl: ERROR
+        msg: "audit: file truncated path={file_path} by {user}"
+        vars:
+          file_path: {k: ch, v: ["/var/log/auth.log", "/var/log/syslog", "/var/log/walletd.log"]}
+          user: {k: ch, v: [root, admin]}
+
+      log_forwarder_stopped:
+        desc: Local log forwarding service stops.
+        lvl: ERROR
+        msg: "log forwarder stopped service={service} exit_code={exit_code}"
+        vars:
+          service: {k: ch, v: [fluent-bit]}
+          exit_code: {k: i, v: [0, 143]}
+
+      hotwallet_balance:
+        desc: Periodic balance metric per asset.
+        lvl: INFO
+        msg: "hotwallet balance asset={asset} balance={balance}"
+        vars:
+          asset: {k: ch, v: [BTC, ETH, LTC]}
+        state_vars:
+          n:
+            balance: {k: f, v: [200.0, 20000.0]}
+          f:
+            balance: {k: f, v: [0.0, 2000.0]}
+
+    beh:
+      n:
+        desc: Normal wallet balance reporting.
+        emit:
+          - id: hotwallet_balance
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Balance reporting continues during the incident unless log forwarding is disrupted.
+        emit:
+          - id: hotwallet_balance
+            per_min: 1.0
+            scope: per_host
+
+  - id: log_aggregator
+    name: Central Log Aggregator
+    svc: log-agg
+    hosts: [log-1]
+    desc: Collects logs from hosts and emits ingestion/gap warnings visible to operators.
+
+    to: []
+
+    logs:
+      ingest_summary:
+        desc: Periodic ingestion summary.
+        lvl: INFO
+        msg: "ingest summary sources={sources} eps={eps} backlog_s={backlog_s}"
+        vars:
+          sources: {k: ch, v: ["api_gateway,exchange_core,hot_wallet_server"]}
+          backlog_s: {k: i, v: [0, 30]}
+        state_vars:
+          n:
+            eps: {k: f, v: [25.0, 70.0]}
+          f:
+            eps: {k: f, v: [10.0, 60.0]}
+
+      source_gap_warn:
+        desc: Aggregator detects missing logs from one or more sources.
+        lvl: WARN
+        msg: "missing logs from {missing_sources} for {gap_s}s"
+        vars:
+          missing_sources: {k: ch, v: [hot_wallet_server, exchange_core, "hot_wallet_server,exchange_core"]}
+          gap_s: {k: i, v: [10, 900]}
+
+    beh:
+      n:
+        desc: Normal ingestion reporting with rare transient gaps.
+        emit:
+          - id: ingest_summary
+            per_min: 1.0
+            scope: global
+          - id: source_gap_warn
+            per_min: 0.02
+            scope: global
+      f:
+        desc: In failure, ingestion continues; gap warnings remain rare unless forwarding is disrupted.
+        emit:
+          - id: ingest_summary
+            per_min: 1.0
+            scope: global
+          - id: source_gap_warn
+            per_min: 0.02
+            scope: global
+
+  - id: sec_ops
+    name: Security/Operations Console
+    svc: sec-ops
+    hosts: [secops-1]
+    desc: Operator actions and incident tooling logs (paging, key rotation, forensic triage, and monitoring alerts).
+
+    to:
+      - dst: exchange_core
+        proto: ssh
+        desc: Operators administer core services during incidents.
+      - dst: hot_wallet_server
+        proto: ssh
+        desc: Operators and forensic tooling access wallet hosts during triage.
+
+    logs:
+      incident_page:
+        desc: Incident declared and paged.
+        lvl: WARN
+        msg: "incident declared id={incident_id} by {actor}"
+        vars:
+          incident_id: {k: hex, v: 8}
+          actor: {k: ch, v: [greg.ops, oncall.eng]}
+
+      wallet_anomaly_alert:
+        desc: Monitoring flags an unexpected BTC hot-wallet transfer (destination/amount heuristic).
+        lvl: ERROR
+        msg: "alert: unexpected hotwallet transfer asset=BTC amount={amount} to={dst_addr} txid={txid}"
+        vars:
+          txid: {k: hex, v: 64}
+        state_vars:
+          n:
+            amount: {k: f, v: [0.01, 10.0]}
+            dst_addr: {k: ch, v: ["1BoatSLRHtKNngkdXEeobR76b53LETtpyT"]}
+          f:
+            amount: {k: f, v: [0.1, 75.0]}
+            dst_addr: {k: ch, v: ["14Kt9i5MdQCKvjX6HS2hEevVgbPhK13SKD"]}
+
+      wallet_anomaly_alert_eth:
+        desc: Monitoring flags an unexpected ETH hot-wallet transfer (destination/amount heuristic).
+        lvl: ERROR
+        msg: "alert: unexpected hotwallet transfer asset=ETH amount={amount} to={dst_addr} txid={txid}"
+        vars:
+          txid: {k: hex, v: 64}
+        state_vars:
+          n:
+            amount: {k: f, v: [0.1, 50.0]}
+            dst_addr: {k: ch, v: ["0x1111111111111111111111111111111111111111"]}
+          f:
+            amount: {k: f, v: [5.0, 3000.0]}
+            dst_addr: {k: ch, v: ["0xC26B321d50910f2f990EF92A8Effd8EC38aDE8f5"]}
+
+      keys_rotated:
+        desc: Credentials rotated as part of containment.
+        lvl: INFO
+        msg: "rotated credentials scope={scope} by {actor}"
+        vars:
+          scope: {k: ch, v: [ssh_keys, wallet_keys, all]}
+          actor: {k: ch, v: [greg.ops, oncall.eng]}
+
+      forensic_scan_found:
+        desc: Forensic scan flags a suspicious binary on a host.
+        lvl: ERROR
+        msg: "forensic scan found suspicious binary {file} sha256={sha256} host={host}"
+        vars:
+          file: {k: ch, v: ["/usr/bin/udevd-bridge", "/usr/local/bin/udevd-bridge"]}
+          sha256: {k: hex, v: 64}
+          host: {k: ch, v: [wallet-1, wallet-2]}
+
+      cron_tick:
+        desc: Low-rate automation tick.
+        lvl: INFO
+        msg: "secops automation tick ok"
+        vars: {}
+
+    beh:
+      n:
+        desc: Minimal background automation and rare false-positive alerting.
+        emit:
+          - id: cron_tick
+            per_min: 0.2
+            scope: global
+          - id: wallet_anomaly_alert
+            per_min: 0.005
+            scope: global
+          - id: wallet_anomaly_alert_eth
+            per_min: 0.005
+            scope: global
+      f:
+        desc: Automation continues during incident; anomaly alerts become frequent.
+        emit:
+          - id: cron_tick
+            per_min: 0.2
+            scope: global
+          - id: wallet_anomaly_alert
+            per_min: 0.35
+            scope: global
+          - id: wallet_anomaly_alert_eth
+            per_min: 0.25
+            scope: global
+
+tracing:
+  on: true
+  origins: [api_gateway, exchange_core]
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: Normal operation processes swaps end-to-end and broadcasts wallet withdrawals.
+    req:
+      - id: swap_request_success
+        desc: Client swap request resulting in a normal hot-wallet broadcast.
+        rpm: 500.0
+        path: [api_gateway, exchange_core, hot_wallet_server, exchange_core, api_gateway]
+        emit:
+          - api_gateway.http_in
+          - exchange_core.swap_accepted
+          - exchange_core.wallet_send_req
+          - hot_wallet_server.tx_broadcast_swap
+          - api_gateway.http_out_200
+        latency_ms: [[2, 8], [4, 20], [40, 220], [120, 900], [20, 180]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+  f:
+    desc: During the incident the public API is placed into maintenance while unauthorized wallet activity drains funds and disrupts logging.
+    req:
+      - id: swap_request_maintenance
+        desc: Client swap requests rejected due to maintenance mode.
+        rpm: 500.0
+        path: [api_gateway, exchange_core, api_gateway]
+        emit:
+          - api_gateway.http_in
+          - exchange_core.maintenance_reject
+          - api_gateway.http_out_503_maint
+        latency_ms: [[2, 8], [2, 15], [2, 20]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: true
+
+      - id: attacker_ssh_session
+        desc: Attacker uses a stolen key to open SSH sessions on a wallet host and run privileged commands.
+        rpm: 0.5
+        path: [hot_wallet_server]
+        emit:
+          - hot_wallet_server.ssh_login_success
+          - hot_wallet_server.sudo_exec
+        latency_ms: [[3, 40], [2, 60]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: unauthorized_withdrawal
+        desc: Unauthorized BTC withdrawal where the wallet signs and broadcasts to the attacker BTC address.
+        rpm: 1.0
+        path: [hot_wallet_server]
+        emit:
+          - hot_wallet_server.tx_signed_malware
+          - hot_wallet_server.tx_broadcast_malware
+        latency_ms: [[10, 120], [40, 500]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: unauthorized_withdrawal_eth
+        desc: Unauthorized ETH withdrawal where the wallet signs and broadcasts to the attacker ETH address.
+        rpm: 1.0
+        path: [hot_wallet_server]
+        emit:
+          - hot_wallet_server.tx_signed_malware_eth
+          - hot_wallet_server.tx_broadcast_malware_eth
+        latency_ms: [[10, 140], [40, 600]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: unauthorized_withdrawal_unobserved
+        desc: Unauthorized BTC withdrawals likely continue but produce no wallet-host logs due to forwarding/log loss.
+        rpm: 1.0
+        path: [hot_wallet_server]
+        emit: []
+        latency_ms: []
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: unauthorized_withdrawal_eth_unobserved
+        desc: Unauthorized ETH withdrawals likely continue but produce no wallet-host logs due to forwarding/log loss.
+        rpm: 1.0
+        path: [hot_wallet_server]
+        emit: []
+        latency_ms: []
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+      - id: attacker_log_wipe
+        desc: Cleanup activity truncates key log files on a wallet host.
+        rpm: 0.1
+        path: [hot_wallet_server]
+        emit:
+          - hot_wallet_server.sudo_exec_tamper
+          - hot_wallet_server.audit_log_truncate
+        latency_ms: [[2, 40], [5, 80]]
+        retry:
+          max_attempts: 1
+          expected_attempts: 1.0
+          emit_per_retry: []
+          backoff_ms: []
+        trace: false
+
+assumptions:
+  - >
+    This model focuses on the April 9 (HostCo) incident window: site was briefly back online,
+    then unauthorized hot-wallet withdrawals occurred and the site was taken down. The broader
+    month-long storyline (earlier thefts, later attribution to Bob/RDP, exchange negotiations)
+    is intentionally omitted to keep one diagnosable incident.
+  - >
+    The core's wallet_send_req log omits a destination address to avoid generating unrealistic high-volume
+    placeholder addresses; normal wallet broadcast logs also omit destination to avoid coupling address formats to assets.
+    Unauthorized BTC/ETH movements are modeled via explicit per-asset tx logs that carry fixed attacker addresses.
+  - >
+    To align with the "logs were wiped / missing" beat while still allowing continued theft, the model includes
+    unobserved withdrawal flows (unauthorized_withdrawal*_unobserved) that emit no wallet-host logs; continued activity
+    after forwarding stops is inferred via sec_ops anomaly alerts rather than local wallet logs.
+  - >
+    The malware name "udevd-bridge" is not assumed to be visible in live per-transaction logs at incident start;
+    it is introduced via a later forensic scan one-shot (sec_ops.forensic_scan_found).
+  - >
+    Cleanup/tampering commands are split from generic privileged commands: attacker_ssh_session emits only
+    non-forwarder, non-log-destructive sudo_exec commands, while later cleanup is modeled in attacker_log_wipe
+    via sudo_exec_tamper plus audit_log_truncate; log forwarder stopping is modeled as a scenario one-shot.
+  - >
+    Wallet signing/broadcast logs are modeled as generic wallet events; explicit suspicion is represented via
+    sec_ops.wallet_anomaly_alert* which flags unexpected transfers based on monitoring heuristics.
+  - >
+    log_aggregator.ingest_summary.sources is modeled as a stable list of configured sources; missing-data conditions
+    are represented by source_gap_warn rather than changing the ingest_summary.sources field.
+  - >
+    Volume estimate: normal phase ~500 rpm * 5 logs/request ≈ 2,500 logs/min plus small background noise;
+    failure phase adds maintenance responses (~1,500 logs/min) plus low-rate attacker activity, withdrawals (when visible),
+    alerts, gap warnings after forwarding disruption, and a few one-shots. Total expected logs over the scenario ≈ 65k–80k,
+    within the 20k–100k target.
+  - >
+    Key diagnostic anchors likely visible: maintenance enablement (exchange_core.maintenance_enabled),
+    early BTC/ETH broadcasts to fixed thief addresses (hot_wallet_server.tx_broadcast_malware*),
+    monitoring anomaly alerts (sec_ops.wallet_anomaly_alert*),
+    SSH login with a specific key fingerprint (hot_wallet_server.ssh_login_success),
+    and (after forwarding disruption) log-ingestion gaps (log_aggregator.source_gap_warn) plus
+    forensic identification of udevd-bridge (sec_ops.forensic_scan_found).
+```

@@ -1,0 +1,493 @@
+```yaml
+sys:
+  id: edge_html_rewrite_leak_incident
+  desc: >
+    An edge HTTP service proxies customer HTML pages and applies on-the-fly HTML rewriting features using NGINX
+    response filter modules. A legacy Ragel-based HTML parser and a newer streaming parser (cf-html) can both
+    be present in the filter chain depending on feature configuration. Under a rare malformed-HTML-at-EOF
+    condition, a pointer bug in the legacy parser can overrun a buffer when the cf-html chain changes NGINX
+    buffer boundaries, potentially leaking adjacent memory into responses.
+
+states: {n: normal, f: failure}
+
+components:
+  - id: edge_nginx
+    name: Edge NGINX (HTTP workers)
+    svc: edge-http
+    hosts: [edge-lhr-01, edge-lhr-02, edge-sfo-01, edge-sfo-02]
+    desc: >
+      Terminates HTTP (not SSL), fetches content from origins, and runs HTML filter modules.
+      In the failure state, a rare buffer overread can cause response bodies to include unintended memory bytes.
+    to:
+      - dst: origin_server
+        proto: https
+        desc: Fetches HTML from customer origins and returns it through the filter chain.
+      - dst: feature_flag_service
+        proto: grpc
+        desc: Receives globally propagated feature-flag (kill switch) updates.
+      - dst: synthetic_monitor
+        proto: https
+        desc: Returns HTTP responses to synthetic probes (modeled for path connectivity).
+    logs:
+      worker_stats:
+        desc: Periodic worker statistics for basic health and load context.
+        lvl: INFO
+        msg: "worker stats conns={conns} req_s={req_s} rss_mb={rss_mb}"
+        vars:
+          conns: {k: i, v: [20, 800]}
+          req_s: {k: f, v: [0.2, 8.0]}
+          rss_mb: {k: i, v: [150, 1200]}
+
+      req_start:
+        desc: Start of an HTTP request as seen by the edge worker.
+        lvl: INFO
+        msg: "req start {method} {host}{uri} ua={ua} ray={ray}"
+        vars:
+          method: {k: ch, v: [GET]}
+          host: {k: ch, v: [example.com, shop.example, blog.example, api.example]}
+          uri: {k: ch, v: [/, /index.html, /product/123, /login, /static/app.js, /cdn-cgi/probe/malformed.html]}
+          ua: {k: ch, v: [chrome, googlebot, curl, cf-synthetic]}
+          ray: {k: hex, v: 16}
+
+      html_parse_warn:
+        desc: HTML filter detected malformed HTML near end-of-buffer (non-fatal).
+        lvl: WARN
+        msg: "html parse warning: malformed tag near EOF tag={tag} rule={rule}"
+        vars:
+          tag: {k: ch, v: [script, img]}
+          rule: {k: ch, v: [consume_attr, consume_tag]}
+
+      html_buffer_overread_email:
+        desc: Guarded detection that HTML filtering overread the input buffer in the Email Obfuscation chain.
+        lvl: ERROR
+        msg: "html filter overread detected chain=dual_chain feature=email_obfuscation extra_bytes={extra_bytes} out_bytes={out_bytes}"
+        vars:
+          extra_bytes: {k: i, v: [1, 1024]}
+          out_bytes: {k: i, v: [400, 8000]}
+
+      html_buffer_overread_ahr:
+        desc: Guarded detection that HTML filtering overread the input buffer in an Automatic HTTPS Rewrites path.
+        lvl: ERROR
+        msg: "html filter overread detected chain=dual_chain feature=auto_https_rewrites extra_bytes={extra_bytes} out_bytes={out_bytes}"
+        vars:
+          extra_bytes: {k: i, v: [1, 1024]}
+          out_bytes: {k: i, v: [400, 8000]}
+
+      html_buffer_overread_sse:
+        desc: Guarded detection that HTML filtering overread the input buffer in a Server-Side Excludes path.
+        lvl: ERROR
+        msg: "html filter overread detected chain=dual_chain feature=server_side_excludes extra_bytes={extra_bytes} out_bytes={out_bytes}"
+        vars:
+          extra_bytes: {k: i, v: [1, 1024]}
+          out_bytes: {k: i, v: [400, 8000]}
+
+      access_ok:
+        desc: Completion/access log for a successful response (feature-agnostic to avoid contradiction with kill switches).
+        lvl: INFO
+        msg: "resp {status} {method} {host}{uri} bytes={bytes} dur_ms={dur_ms} cache={cache}"
+        vars:
+          status: {k: ch, v: [200, 304]}
+          method: {k: ch, v: [GET]}
+          host: {k: ch, v: [example.com, shop.example, blog.example, api.example]}
+          uri: {k: ch, v: [/, /index.html, /product/123, /login, /static/app.js, /cdn-cgi/probe/malformed.html]}
+          bytes: {k: i, v: [200, 20000]}
+          dur_ms: {k: i, v: [5, 1200]}
+          cache: {k: ch, v: [DYNAMIC, HIT, MISS, BYPASS]}
+
+      access_leak_email:
+        desc: Completion/access log for a response where unintended bytes were appended via Email Obfuscation path.
+        lvl: INFO
+        msg: "resp 200 {method} {host}{uri} bytes={bytes} dur_ms={dur_ms} html_chain=dual_chain features=email_obfuscation leak_bytes={leak_bytes}"
+        vars:
+          method: {k: ch, v: [GET]}
+          host: {k: ch, v: [example.com, shop.example, blog.example, api.example]}
+          uri: {k: ch, v: [/, /index.html, /product/123, /login, /cdn-cgi/probe/malformed.html]}
+          bytes: {k: i, v: [400, 30000]}
+          dur_ms: {k: i, v: [5, 2000]}
+          leak_bytes: {k: i, v: [1, 1024]}
+
+      access_leak_ahr:
+        desc: Completion/access log for a response where unintended bytes were appended via Automatic HTTPS Rewrites path.
+        lvl: INFO
+        msg: "resp 200 {method} {host}{uri} bytes={bytes} dur_ms={dur_ms} html_chain=dual_chain features=auto_https_rewrites leak_bytes={leak_bytes}"
+        vars:
+          method: {k: ch, v: [GET]}
+          host: {k: ch, v: [example.com, shop.example, blog.example, api.example]}
+          uri: {k: ch, v: [/, /index.html, /product/123, /login, /cdn-cgi/probe/malformed.html]}
+          bytes: {k: i, v: [400, 30000]}
+          dur_ms: {k: i, v: [5, 2200]}
+          leak_bytes: {k: i, v: [1, 1024]}
+
+      access_leak_sse:
+        desc: Completion/access log for a response where unintended bytes were appended via Server-Side Excludes path.
+        lvl: INFO
+        msg: "resp 200 {method} {host}{uri} bytes={bytes} dur_ms={dur_ms} html_chain=dual_chain features=server_side_excludes leak_bytes={leak_bytes}"
+        vars:
+          method: {k: ch, v: [GET]}
+          host: {k: ch, v: [example.com, shop.example, blog.example, api.example]}
+          uri: {k: ch, v: [/, /index.html, /product/123, /login, /cdn-cgi/probe/malformed.html]}
+          bytes: {k: i, v: [400, 30000]}
+          dur_ms: {k: i, v: [5, 2400]}
+          leak_bytes: {k: i, v: [1, 1024]}
+
+    beh:
+      n:
+        desc: Normal background noise from periodic stats.
+        emit:
+          - id: worker_stats
+            per_min: 1.0
+            scope: per_host
+      f:
+        desc: Similar periodic stats during the incident window.
+        emit:
+          - id: worker_stats
+            per_min: 1.0
+            scope: per_host
+
+  - id: origin_server
+    name: Customer Origin (simplified)
+    svc: origin
+    hosts: [origin-01, origin-02]
+    desc: >
+      Represents customer origin servers providing HTML. In this incident model it is not the source of the bug,
+      but provides upstream context and timing for edge access logs.
+    to:
+      - dst: edge_nginx
+        proto: https
+        desc: Returns origin responses back to the edge proxy (modeled for path connectivity).
+    logs:
+      origin_resp:
+        desc: Origin response summary as observed by edge upstream fetch.
+        lvl: INFO
+        msg: "origin resp {host}{uri} status={status} bytes={bytes} ttfb_ms={ttfb_ms}"
+        vars:
+          host: {k: ch, v: [example.com, shop.example, blog.example, api.example]}
+          uri: {k: ch, v: [/, /index.html, /product/123, /login, /static/app.js, /cdn-cgi/probe/malformed.html]}
+          status: {k: ch, v: [200, 404, 500]}
+          bytes: {k: i, v: [200, 20000]}
+          ttfb_ms: {k: i, v: [10, 600]}
+    beh:
+      n: {desc: "No standalone background logs modeled for origins.", emit: []}
+      f: {desc: "No standalone background logs modeled for origins.", emit: []}
+
+  - id: feature_flag_service
+    name: Feature Flag / Global Kill Service
+    svc: control-plane
+    hosts: [control-01, control-02]
+    desc: >
+      Distributes feature flags (including global kill switches) to all edges within seconds.
+      Used operationally during the incident to disable HTML-rewriting features that exercised the vulnerable chain.
+    to:
+      - dst: edge_nginx
+        proto: grpc
+        desc: Pushes feature flag updates to edge fleets.
+    logs:
+      cp_heartbeat:
+        desc: Periodic control-plane heartbeat for basic liveness/noise.
+        lvl: INFO
+        msg: "control-plane heartbeat queued_updates={queued_updates} healthy_edges={healthy_edges}"
+        vars:
+          queued_updates: {k: i, v: [0, 50]}
+          healthy_edges: {k: i, v: [1000, 20000]}
+
+      deploy_email_migration:
+        desc: Deployment marker for enabling dual parser chain for Email Obfuscation.
+        lvl: INFO
+        msg: "edge deploy change=email_obfuscation_dual_chain version=2017.02.13.1 rollout_pct={rollout_pct} change_id={change_id}"
+        vars:
+          rollout_pct: {k: i, v: [1, 100]}
+          change_id: {k: str, v: "CHG-#######"}
+
+      deploy_add_sse_kill:
+        desc: Deployment marker for adding a global kill for Server-Side Excludes.
+        lvl: INFO
+        msg: "edge deploy change=add_kill_switch_server_side_excludes version=2017.02.18.1 rollout_pct={rollout_pct} change_id={change_id}"
+        vars:
+          rollout_pct: {k: i, v: [1, 100]}
+          change_id: {k: str, v: "CHG-#######"}
+
+      kill_set_email_obfuscation:
+        desc: Operator action to disable Email Obfuscation via global kill.
+        lvl: INFO
+        msg: "global kill set feature=email_obfuscation state=disabled actor={actor} change_id={change_id}"
+        vars:
+          actor: {k: ch, v: [sre, seceng, release_bot]}
+          change_id: {k: str, v: "CHG-#######"}
+
+      kill_propagated_email_obfuscation:
+        desc: Confirmation that Email Obfuscation kill is applied across the edge fleet.
+        lvl: INFO
+        msg: "global kill propagated feature=email_obfuscation state=disabled edges={edges} latency_s={latency_s}"
+        vars:
+          edges: {k: i, v: [1000, 20000]}
+          latency_s: {k: f, v: [0.5, 10.0]}
+
+      kill_set_auto_https_rewrites:
+        desc: Operator action to disable Automatic HTTPS Rewrites via global kill.
+        lvl: INFO
+        msg: "global kill set feature=auto_https_rewrites state=disabled actor={actor} change_id={change_id}"
+        vars:
+          actor: {k: ch, v: [sre, seceng, release_bot]}
+          change_id: {k: str, v: "CHG-#######"}
+
+      kill_propagated_auto_https_rewrites:
+        desc: Confirmation that Automatic HTTPS Rewrites kill is applied across the edge fleet.
+        lvl: INFO
+        msg: "global kill propagated feature=auto_https_rewrites state=disabled edges={edges} latency_s={latency_s}"
+        vars:
+          edges: {k: i, v: [1000, 20000]}
+          latency_s: {k: f, v: [0.5, 10.0]}
+
+      kill_set_server_side_excludes:
+        desc: Operator action to disable Server-Side Excludes via global kill.
+        lvl: INFO
+        msg: "global kill set feature=server_side_excludes state=disabled actor={actor} change_id={change_id}"
+        vars:
+          actor: {k: ch, v: [sre, seceng, release_bot]}
+          change_id: {k: str, v: "CHG-#######"}
+
+      kill_propagated_server_side_excludes:
+        desc: Confirmation that Server-Side Excludes kill is applied across the edge fleet.
+        lvl: INFO
+        msg: "global kill propagated feature=server_side_excludes state=disabled edges={edges} latency_s={latency_s}"
+        vars:
+          edges: {k: i, v: [1000, 20000]}
+          latency_s: {k: f, v: [0.5, 10.0]}
+
+    beh:
+      n:
+        desc: Low-rate control-plane heartbeat.
+        emit:
+          - id: cp_heartbeat
+            per_min: 0.2
+            scope: global
+      f:
+        desc: Low-rate control-plane heartbeat during the incident.
+        emit:
+          - id: cp_heartbeat
+            per_min: 0.2
+            scope: global
+
+  - id: synthetic_monitor
+    name: Synthetic Monitor / Test URI Runner
+    svc: synthetic
+    hosts: [synthetic-01]
+    desc: >
+      Runs targeted probe URIs used by responders to validate whether a known malformed HTML response
+      can trigger leakage, and later to confirm mitigation.
+    to:
+      - dst: edge_nginx
+        proto: https
+        desc: Sends probe requests through the edge just like external clients.
+    logs:
+      probe_start_detect:
+        desc: Start of a targeted probe request expected to detect leakage.
+        lvl: INFO
+        msg: "probe start {host}{uri} expect=detect_leak run_id={run_id}"
+        vars:
+          host: {k: ch, v: [blog.example]}
+          uri: {k: ch, v: [/cdn-cgi/probe/malformed.html]}
+          run_id: {k: hex, v: 8}
+
+      probe_start_clean:
+        desc: Start of a targeted probe request expected to be clean.
+        lvl: INFO
+        msg: "probe start {host}{uri} expect=clean_html run_id={run_id}"
+        vars:
+          host: {k: ch, v: [blog.example]}
+          uri: {k: ch, v: [/cdn-cgi/probe/malformed.html]}
+          run_id: {k: hex, v: 8}
+
+      probe_ok:
+        desc: Probe completed with expected clean response.
+        lvl: INFO
+        msg: "probe ok {host}{uri} status={status} dur_ms={dur_ms}"
+        vars:
+          host: {k: ch, v: [blog.example]}
+          uri: {k: ch, v: [/cdn-cgi/probe/malformed.html]}
+          status: {k: ch, v: [200]}
+          dur_ms: {k: i, v: [10, 2000]}
+
+      probe_leak_detected:
+        desc: Probe detected leaked bytes (e.g., memory fragments) in the response body.
+        lvl: ERROR
+        msg: "probe detected leaked bytes bytes={bytes} leak_markers={leak_markers} sample_len={sample_len}"
+        vars:
+          bytes: {k: i, v: [400, 30000]}
+          leak_markers: {k: ch, v: [cookie, auth_token, post_body, binary_garbage]}
+          sample_len: {k: i, v: [32, 256]}
+    beh:
+      n: {desc: "No background probe traffic in normal operation.", emit: []}
+      f: {desc: "No background probe traffic; probes are modeled as explicit flows.", emit: []}
+
+  - id: secops
+    name: Security Operations (incident coordination)
+    svc: secops
+    hosts: [secops-01]
+    desc: >
+      Records external security reports and incident declaration as discrete actions, and emits low-rate
+      incident status updates during response.
+    to: []
+    logs:
+      report_received:
+        desc: External vulnerability report intake marker.
+        lvl: WARN
+        msg: "external vuln report received reporter={reporter} channel={channel} ref={ref}"
+        vars:
+          reporter: {k: ch, v: [project_zero]}
+          channel: {k: ch, v: [twitter, email]}
+          ref: {k: str, v: "P0-####"}
+
+      incident_declared:
+        desc: Incident declared and tracked.
+        lvl: INFO
+        msg: "incident declared id={inc_id} sev={sev} owner={owner}"
+        vars:
+          inc_id: {k: str, v: "INC-####"}
+          sev: {k: ch, v: [SEV1]}
+          owner: {k: ch, v: [seceng, sre]}
+
+      cache_purge_requested:
+        desc: Requests to search engines to purge cached leaked pages.
+        lvl: INFO
+        msg: "search cache purge requested engine={engine} urls={urls}"
+        vars:
+          engine: {k: ch, v: [google, bing, yahoo]}
+          urls: {k: i, v: [1, 1000]}
+
+      incident_status:
+        desc: Periodic incident status update during response.
+        lvl: INFO
+        msg: "incident status id={inc_id} phase={phase} open_actions={open_actions}"
+        vars:
+          inc_id: {k: str, v: "INC-####"}
+          phase: {k: ch, v: [triage, mitigation, cache_purge]}
+          open_actions: {k: i, v: [0, 20]}
+    beh:
+      n:
+        desc: No incident status updates when there is no active incident.
+        emit: []
+      f:
+        desc: Low-rate incident status updates once response is underway (suppressed until enabled by events).
+        emit:
+          - id: incident_status
+            per_min: 0.2
+            scope: global
+
+tracing:
+  on: false
+  origins: []
+  trace_id: {k: hex, v: 32}
+
+flows:
+  n:
+    desc: >
+      Normal edge proxying of HTML content with occasional malformed HTML warnings; no memory leakage occurs.
+    req:
+      - id: n_client_get_html_ok
+        desc: Typical client GET for HTML routed through edge to origin and back.
+        rpm: 400.0
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.access_ok]
+        latency_ms: [[1, 3], [35, 200], [40, 260]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: n_client_get_html_malformed
+        desc: Requests whose HTML ends with malformed tags; parser warns but remains safe in normal buffering.
+        rpm: 0.25
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.html_parse_warn, edge_nginx.access_ok]
+        latency_ms: [[1, 3], [35, 220], [36, 230], [42, 280]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+  f:
+    desc: >
+      After a feature migration introduces a dual-parser HTML filter chain, rare malformed-EOF cases can
+      overrun a buffer in the legacy parser and append unintended memory to the response body. Mitigations
+      progressively disable features via global kills and finally add a missing kill switch.
+    req:
+      - id: f_client_get_html_ok
+        desc: Typical client GET for HTML continues during the incident; most requests are unaffected.
+        rpm: 400.0
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.access_ok]
+        latency_ms: [[1, 3], [35, 240], [45, 320]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: f_client_get_html_malformed
+        desc: Malformed HTML at EOF still produces parse warnings; only a tiny subset is actually exploitable.
+        rpm: 0.25
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.html_parse_warn, edge_nginx.access_ok]
+        latency_ms: [[1, 3], [35, 260], [36, 270], [48, 340]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: f_client_get_html_email_leak_rare
+        desc: Extremely rare leakage when Email Obfuscation uses a dual parser chain and the HTML is malformed at EOF.
+        rpm: 0.00015
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.html_buffer_overread_email, edge_nginx.access_leak_email]
+        latency_ms: [[1, 3], [35, 300], [36, 320], [60, 600]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: f_client_get_html_ahr_leak_rare
+        desc: Extremely rare leakage involving Automatic HTTPS Rewrites combined with legacy parsing in the chain.
+        rpm: 0.00002
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.html_buffer_overread_ahr, edge_nginx.access_leak_ahr]
+        latency_ms: [[1, 3], [35, 320], [36, 340], [65, 700]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: f_client_get_html_sse_leak_rare
+        desc: Extremely rare leakage path tied to Server-Side Excludes and only for a small traffic subset.
+        rpm: 0.000002
+        path: [edge_nginx, origin_server, edge_nginx]
+        emit: [edge_nginx.req_start, origin_server.origin_resp, edge_nginx.html_buffer_overread_sse, edge_nginx.access_leak_sse]
+        latency_ms: [[1, 3], [35, 350], [36, 380], [70, 850]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: f_probe_detect_leak
+        desc: Targeted probe URI crafted to trigger malformed-EOF behavior and detect leakage when vulnerable.
+        rpm: 2.0
+        path: [synthetic_monitor, edge_nginx, origin_server, edge_nginx, synthetic_monitor]
+        emit:
+          - synthetic_monitor.probe_start_detect
+          - edge_nginx.req_start
+          - origin_server.origin_resp
+          - edge_nginx.html_buffer_overread_email
+          - edge_nginx.access_leak_email
+          - synthetic_monitor.probe_leak_detected
+        latency_ms: [[1, 2], [2, 5], [35, 250], [36, 280], [45, 380], [46, 450]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+      - id: f_probe_confirm_clean
+        desc: Targeted probe URI used after mitigations to confirm responses are clean.
+        rpm: 1.0
+        path: [synthetic_monitor, edge_nginx, origin_server, edge_nginx, synthetic_monitor]
+        emit:
+          - synthetic_monitor.probe_start_clean
+          - edge_nginx.req_start
+          - origin_server.origin_resp
+          - edge_nginx.access_ok
+          - synthetic_monitor.probe_ok
+        latency_ms: [[1, 2], [2, 5], [35, 250], [45, 350], [46, 420]]
+        retry: {max_attempts: 1, expected_attempts: 1.0, emit_per_retry: [], backoff_ms: []}
+        trace: false
+
+assumptions:
+  - "Repair per verifier feedback: edge_nginx.worker_stats.req_s is adjusted to a low-single-digit req/s range consistent with modeled traffic (~400 rpm total across a few edge hosts), avoiding contradictory load telemetry."
+  - "Repair per verifier feedback: edge_nginx.access_ok is made feature/chain-agnostic (removed features/html_chain carriers) so access logs cannot contradict kill-switch mitigations; feature-specific meaning remains only in dedicated leak logs and control-plane one-shots."
+  - "The real multi-day exposure window is compressed into a single 56-minute scenario with a normal phase and an incident phase."
+  - "The core mechanism is represented as edge overread detection logs on rare leak paths; since ambient leaks are extremely rare, a synthetic probe flow is included for diagnosability without inflating leak frequency."
+  - "Leak-flow RPMs preserve the post-mortem rarity (~1 in 3.3M requests overall), so ambient traffic is unlikely to show a leak; visibility comes from probes and explicit control-plane kill logs."
+  - "Normal-phase volume estimate: ~400 rpm * 28 min * 3 logs/req ≈ 33.6k flow logs, plus ~1 per_host/min worker stats across 4 edges ≈ 112 logs."
+  - "Total scenario volume estimate: ~67k–70k logs (dominant access/origin logs plus small probe/control-plane/secops markers), within the 20k–100k target."
+```

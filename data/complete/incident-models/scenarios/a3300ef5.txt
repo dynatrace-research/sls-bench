@@ -1,0 +1,212 @@
+```yaml
+scenario:
+  id: gitlab_com_primary_db_data_loss_20170131
+  title: Accidental wipe of PostgreSQL primary data directory during replication repair
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    GitLab.com serves web/API traffic backed by a single PostgreSQL primary with a hot-standby replica.
+    A spike in load (spam plus a heavy background user-deletion job) increases DB latency and causes partial write failures.
+    Replication then falls behind and breaks due to missing WAL segments; while attempting to rebuild the standby, an engineer accidentally runs a data-directory wipe on the primary.
+    The primary cannot start, GitLab.com returns 5xx broadly, and recovery is slowed because logical backups were failing and alerts were not delivered.
+
+  trigger_desc: |
+    A sudden increase in database load from concurrent spam traffic and a DB-intensive background job (user removal)
+    pushes the primary into high-latency operation, starting the cascade that later leads to replication breakage and a risky manual rebuild.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        GitLab.com handles typical read and write traffic successfully. The standby streams normally with low replay lag.
+        A scheduled pg_dump backup job runs on an application host; it fails due to a pg_dump/server version mismatch.
+        Failure notifications are sent as email but are rejected by DMARC policy, so operators do not notice backup failures.
+      flows: [web_read_ok_n, web_post_comment_ok_n, sidekiq_misc_job_n, pg_dump_backup_n]
+      manifestation: [gitlab_web.req_done_200, postgres_standby.repl_status, backup_runner.pg_dump_error, mail_relay.dmarc_reject]
+
+    f:
+      desc: |
+        The failure phase begins with severe DB load that increases request latency and error rates, especially for writes.
+        Replication falls behind and then stops because WAL needed by the standby has been removed on the primary.
+        Engineers attempt to re-seed the standby and adjust PostgreSQL settings to allow more replication connections, causing restarts.
+        During the manual recovery actions, the primary's data directory is accidentally wiped, leaving PostgreSQL unable to start
+        and GitLab.com broadly unavailable while operators begin a slow restore-from-staging copy.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: postgres_primary
+          event: |
+            Database load spikes and application requests slow down; write operations begin to fail more frequently.
+          why: |
+            Increased concurrent activity (spam + DB-heavy background job) elevates DB latency and lock/timeout pressure.
+            This is directly observable via higher request durations and more Rails DB exceptions.
+          flows: [web_read_ok_f, web_read_5xx_f, web_post_comment_ok_f, web_post_comment_5xx_f, sidekiq_user_destroy_f]
+          rate_multipliers:
+            web_read_ok_f: 1.0
+            web_read_5xx_f: 1.2
+            web_post_comment_ok_f: 0.9
+            web_post_comment_5xx_f: 1.4
+            sidekiq_user_destroy_f: 2.0
+            standby_basebackup_attempt_f: 0.0
+            postgres_primary.wal_removed: 0.0
+            postgres_standby.wal_missing: 0.0
+            postgres_primary.startup_panic: 0.0
+            ops_bastion.rsync_progress: 0.0
+          latency_multipliers:
+            web_read_ok_f: {p50: 2.0, p95: 2.8}
+            web_post_comment_ok_f: {p50: 2.3, p95: 3.2}
+            web_post_comment_5xx_f: {p50: 1.8, p95: 2.5}
+          one_shots: []
+          manifestation: [gitlab_web.db_error, gitlab_web.req_done_500, sidekiq_worker.job_done]
+
+        - order: 2
+          at_min: 33
+          component: postgres_standby
+          event: |
+            Standby replication falls far behind and then errors because required WAL segments are missing; operators begin repeated pg_basebackup attempts.
+          why: |
+            Under sustained load, the standby cannot replay WAL quickly enough and the primary removes old segments.
+            Without WAL archiving, the standby cannot fetch missing segments and must be re-seeded, prompting pg_basebackup attempts.
+            The missing-WAL condition is directly observable on the standby and WAL-removal warnings appear on the primary.
+          flows: [standby_basebackup_attempt_f]
+          rate_multipliers:
+            standby_basebackup_attempt_f: 3.0
+            postgres_primary.wal_removed: 1.0
+            postgres_standby.wal_missing: 1.0
+          latency_multipliers:
+            standby_basebackup_attempt_f: {p50: 1.2, p95: 1.8}
+          one_shots:
+            - ref: ops_bastion.cmd_exec
+              count: 2
+              hosts: [bastion-01.gitlab.com]
+          manifestation: [postgres_standby.wal_missing, postgres_primary.wal_removed, postgres_standby.basebackup_error]
+
+        - order: 3
+          at_min: 38
+          component: postgres_primary
+          event: |
+            Engineers change replication settings and restart PostgreSQL; the first restart fails due to semaphore limits, then succeeds after reducing max_connections.
+          why: |
+            Increasing max_wal_senders raises resource requirements; with an overly large max_connections value the system hits semaphore limits.
+            Operators reduce max_connections and PostgreSQL restarts successfully. This is directly observable via restart and fatal startup logs.
+          flows: [web_read_ok_f, web_read_5xx_f, web_post_comment_ok_f, web_post_comment_5xx_f]
+          rate_multipliers:
+            web_read_ok_f: 0.85
+            web_read_5xx_f: 1.6
+            web_post_comment_ok_f: 0.7
+            web_post_comment_5xx_f: 1.9
+          latency_multipliers:
+            web_read_5xx_f: {p50: 1.3, p95: 1.7}
+            web_post_comment_5xx_f: {p50: 1.3, p95: 1.9}
+          one_shots:
+            - ref: postgres_primary.config_apply_raise_wal
+              count: 1
+              hosts: [db1.cluster.gitlab.com]
+            - ref: postgres_primary.restart_failed_semaphores
+              count: 1
+              hosts: [db1.cluster.gitlab.com]
+            - ref: postgres_primary.config_apply_reduce_conn
+              count: 1
+              hosts: [db1.cluster.gitlab.com]
+            - ref: postgres_primary.server_ready
+              count: 1
+              hosts: [db1.cluster.gitlab.com]
+          manifestation: [postgres_primary.restart_failed_semaphores, postgres_primary.server_ready, gitlab_web.req_done_500]
+
+        - order: 4
+          at_min: 43
+          component: ops_bastion
+          event: |
+            A destructive rm command is executed against the primary PostgreSQL data directory, after which PostgreSQL cannot start and GitLab.com shifts to broad 5xx.
+            Operators then discover no usable pg_dump backups and begin a slow restore copy from staging.
+          why: |
+            Manual replication rebuild procedures require wiping the standby data directory; the command is mistakenly run on the primary.
+            With critical files removed, PostgreSQL startup fails repeatedly. Backup recovery is blocked because pg_dump backups were failing and notifications were not received.
+            The wipe is directly observable via bastion audit logs and repeated PostgreSQL startup failure logs.
+          flows: [web_read_ok_f, web_read_5xx_f, web_post_comment_ok_f, web_post_comment_5xx_f]
+          rate_multipliers:
+            web_read_ok_f: 0.0
+            web_read_5xx_f: 2.2
+            web_post_comment_ok_f: 0.0
+            web_post_comment_5xx_f: 1.8
+            pg_dump_backup_f: 0.0
+            postgres_primary.startup_panic: 1.0
+            postgres_primary.wal_removed: 0.0
+            postgres_primary.checkpoint_complete: 0.0
+            ops_bastion.rsync_progress: 1.0
+          latency_multipliers:
+            web_read_5xx_f: {p50: 1.8, p95: 2.4}
+            web_post_comment_5xx_f: {p50: 1.6, p95: 2.3}
+          one_shots:
+            - ref: ops_bastion.cmd_exec_rm_primary
+              count: 1
+              hosts: [bastion-01.gitlab.com]
+            - ref: ops_bastion.s3_backup_check_empty
+              count: 1
+              hosts: [bastion-01.gitlab.com]
+            - ref: ops_bastion.rsync_start
+              count: 1
+              hosts: [bastion-01.gitlab.com]
+          manifestation: [ops_bastion.cmd_exec_rm_primary, postgres_primary.startup_panic, ops_bastion.s3_backup_check_empty]
+
+      steady:
+        - component: postgres_primary
+          condition: |
+            PostgreSQL primary cannot start reliably due to missing files in the data directory, emitting repeated startup failures.
+          user_impact: |
+            GitLab.com cannot access the metadata database; most web/API requests return 500/503 and interactive actions like commenting fail.
+          manifestation: [postgres_primary.startup_panic, gitlab_web.req_done_500]
+        - component: postgres_standby
+          condition: |
+            Standby is not usable for failover because replication was broken and operators were attempting re-seeding.
+          user_impact: |
+            No immediate DB failover path exists; outage persists until a restore can be completed.
+          manifestation: [postgres_standby.wal_missing, postgres_standby.basebackup_error]
+        - component: backup_runner
+          condition: |
+            Logical backups are unavailable because pg_dump runs with a mismatched major version and failure notifications are rejected by DMARC;
+            operators confirm the backup repository has no recent dumps.
+          user_impact: |
+            Recovery must rely on an older snapshot copy (larger data loss window) and takes much longer than a standard restore.
+          manifestation: [backup_runner.pg_dump_error, mail_relay.dmarc_reject]
+
+      feedback_loops:
+        - id: load_to_replication_break
+          desc: |
+            High DB load increases replication lag; lag makes WAL retention insufficient, causing missing WAL on the standby, which forces risky manual rebuild steps.
+        - id: restore_slowness_extends_outage
+          desc: |
+            With no usable logical backups and no ready replica, restoration depends on copying large datasets over slow storage, prolonging downtime.
+
+      flows: [web_read_ok_f, web_read_5xx_f, web_post_comment_ok_f, web_post_comment_5xx_f, sidekiq_user_destroy_f, standby_basebackup_attempt_f, pg_dump_backup_f]
+      manifestation: [ops_bastion.cmd_exec_rm_primary, postgres_primary.startup_panic, gitlab_web.db_error, postgres_standby.wal_missing, backup_runner.pg_dump_error, mail_relay.dmarc_reject]
+
+  assumptions:
+    - |
+      The scenario compresses multiple real-world hours into 25 minutes of failure while preserving the causal ordering:
+      load spike → replication break → manual rebuild actions → accidental primary wipe → slow restore start.
+    - |
+      pg_basebackup attempts are modeled as a failure-state flow but suppressed at the start of failure (multiplier 0.0)
+      and only activated once replication breaks (minute 33) to align with the timeline.
+    - |
+      Backup failures are made visible via periodic pg_dump attempts (rpm=0.2) plus mail relay DMARC rejection logs emitted in the same window;
+      in reality the failures accumulated over days and were not noticed until the incident.
+    - |
+      After the primary wipe event, DB-dependent success flows are fully suppressed (web_read_ok_f=0.0 and web_post_comment_ok_f=0.0),
+      and pg_dump attempts are suppressed (pg_dump_backup_f=0.0) to align with “PostgreSQL cannot start”.
+    - |
+      Piecewise failure-phase volume/visibility (rough):
+      - Minutes 25-33 (8m): elevated latency; ~700-800 rpm across web flows; error-heavy writes; ~1.5k-2.0k logs/min; pg_basebackup suppressed.
+      - Minutes 33-38 (5m): replication break visible; pg_basebackup attempts increase; WAL-missing + WAL-removed background logs appear several times.
+      - Minutes 38-43 (5m): restart attempts coincide with higher 5xx rates; one-shot config/restart markers appear exactly once each.
+      - Minutes 43-50 (7m): near-total outage; web successes suppressed; startup failure logs ~5/min; rsync progress ~4/min after activation; backup check + restore-start one-shots.
+    - |
+      Total expected log count over 50 minutes is ~75k-90k, dominated by web request logs (2-3 per request) with smaller but decisive operational/DB/replication signals ensuring diagnosability.
+```

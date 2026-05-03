@@ -1,0 +1,199 @@
+```yaml
+scenario:
+  id: ingest_brownout_memory_leak_2019_11_06
+  title: Intermittent ingest rejects from synchronized OOM restarts
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally accepts telemetry batches through an ALB to ingest workers, returning 202 for almost all requests.
+    A slow memory leak pushes all ingest workers toward OOM at roughly the same time, causing near-synchronized restarts.
+    During crash waves, some requests in flight fail (504) and some new requests cannot find reachable backends (502), leading to ~1–3% ingest rejects.
+    The ingest SLO burn alert detects the brownout quickly, while a low-rate blackbox prober is intermittent and can appear to "blip" and recover.
+
+  trigger_desc: |
+    The ingest worker processes have been leaking memory for hours; at the start of the failure phase they reach OOM conditions
+    within minutes of each other, producing synchronized crashes and periodic brownouts.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Ingest traffic flows steadily through the ALB to three workers. Workers emit stable mem_sample logs and return 202 for
+        nearly all ingests. The SLO monitor reports low error_rate_pct and the blackbox prober mostly reports successful probes.
+      flows: [telemetry_ingest_accepted_n, blackbox_probe_ok_n]
+      manifestation: [aws_alb.alb_access_202, ingest_worker.mem_sample, slo_monitor.ingest_slo_eval, blackbox_prober.probe_ok]
+
+    f:
+      desc: |
+        Memory pressure causes all ingest workers to crash and restart within minutes of one another. This creates repeating
+        windows where the ALB logs backend_unreachable (502) and backend_processing_timeout (504). Most requests still succeed,
+        but intermittent rejects persist near the 1–3% level and SLO burn remains elevated. Backend-side metamonitoring summaries
+        are missing during the worst crash waves, contributing to misdiagnosis.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: ingest_worker
+          event: |
+            The first synchronized OOM/restart wave begins across ingest workers, increasing 502/504 responses at the ALB (still a small fraction overall) and triggering an ingest SLO burn alert.
+          why: |
+            The leak rate is similar across the worker fleet, so they hit OOM within minutes of each other. When workers exit, in-flight requests can time out (504)
+            and new connections may fail (502). OOM restarts are directly observable in worker logs; the leak itself is not directly logged.
+          flows: [telemetry_ingest_success_f, telemetry_ingest_unreachable_502_f, telemetry_ingest_timeout_504_f]
+          rate_multipliers:
+            telemetry_ingest_success_f: 0.99
+            telemetry_ingest_unreachable_502_f: 1.1
+            telemetry_ingest_timeout_504_f: 1.1
+            ingest_worker.oom_panic: 8.0
+            ingest_worker.startup: 6.0
+            worker_telemetry_agent.http_status_report: 0.0
+            blackbox_probe_timeout_f: 1.0
+          latency_multipliers:
+            telemetry_ingest_success_f: {p50: 1.3, p95: 1.6}
+          one_shots:
+            - ref: slo_monitor.slo_burn_alert
+              count: 1
+              hosts: [obs-1]
+            - ref: slo_monitor.slo_bubbleup_summary
+              count: 1
+              hosts: [obs-1]
+            - ref: chatops.alert_seen
+              count: 1
+              hosts: [chat-1]
+          manifestation: [aws_alb.alb_access_502_unreachable, aws_alb.alb_access_504_timeout, ingest_worker.oom_panic, slo_monitor.slo_burn_alert]
+
+        - order: 2
+          at_min: 33
+          component: aws_alb
+          event: |
+            The fleet partially stabilizes after restarts and error rate drops, but intermittent 5xx persist; the blackbox prober sees enough consecutive timeouts to briefly fire.
+          why: |
+            Auto-restarts restore some capacity, reducing backend_unreachable and timeouts, but the underlying memory leak remains so pressure quickly returns. The blackbox probe is low rate,
+            so it can miss the earlier brownout and then appear as a brief transient when consecutive runs happen to land in the failing fraction.
+          flows: [blackbox_probe_timeout_f, telemetry_ingest_unreachable_502_f, telemetry_ingest_timeout_504_f]
+          rate_multipliers:
+            telemetry_ingest_success_f: 1.01
+            telemetry_ingest_unreachable_502_f: 0.6
+            telemetry_ingest_timeout_504_f: 0.6
+            ingest_worker.oom_panic: 2.0
+            ingest_worker.startup: 2.0
+            blackbox_probe_timeout_f: 3.0
+            worker_telemetry_agent.http_status_report: 0.0
+          latency_multipliers:
+            telemetry_ingest_success_f: {p50: 1.1, p95: 1.3}
+          one_shots:
+            - ref: blackbox_prober.blackbox_alert_fired
+              count: 1
+              hosts: [probe-1]
+          manifestation: [blackbox_prober.probe_timeout, blackbox_prober.blackbox_alert_fired, slo_monitor.ingest_slo_eval]
+
+        - order: 3
+          at_min: 41
+          component: ingest_worker
+          event: |
+            A second synchronized crash wave hits, pushing 502/504 back up toward the top of the intermittent reject range while investigation focuses on ALB reachability.
+          why: |
+            With the leak still present, restarted workers again approach OOM together. Missing backend-side metamonitoring and the prominence of ALB "backend unreachable"
+            messages can bias responders toward a networking/load-balancer hypothesis.
+          flows: [telemetry_ingest_unreachable_502_f, telemetry_ingest_timeout_504_f]
+          rate_multipliers:
+            telemetry_ingest_success_f: 0.99
+            telemetry_ingest_unreachable_502_f: 1.05
+            telemetry_ingest_timeout_504_f: 1.05
+            ingest_worker.oom_panic: 7.0
+            ingest_worker.startup: 5.0
+            blackbox_probe_timeout_f: 1.5
+            worker_telemetry_agent.http_status_report: 0.0
+          latency_multipliers:
+            telemetry_ingest_success_f: {p50: 1.4, p95: 1.8}
+          one_shots:
+            - ref: chatops.aws_ticket_opened
+              count: 1
+              hosts: [chat-1]
+            - ref: chatops.hypothesis_note_alb_networking
+              count: 1
+              hosts: [chat-1]
+          manifestation: [aws_alb.alb_access_502_unreachable, ingest_worker.startup, chatops.aws_ticket_opened, chatops.hypothesis_note_alb_networking]
+
+        - order: 4
+          at_min: 47
+          component: chatops
+          event: |
+            A fresh review of service-side signals highlights frequent OOM exits and restarts as a better fit than an external ALB outage, but the brownout continues.
+          why: |
+            OOM/panic and restart logs, combined with even distribution of errors across workers/clients (bubbleup), support a systemic backend resource issue. This is directly observable
+            from worker logs and SLO diagnostics, but the underlying leaking allocation is not identified within this scenario window.
+          flows: [telemetry_ingest_unreachable_502_f, telemetry_ingest_timeout_504_f]
+          rate_multipliers:
+            telemetry_ingest_success_f: 0.99
+            telemetry_ingest_unreachable_502_f: 0.9
+            telemetry_ingest_timeout_504_f: 0.9
+            ingest_worker.oom_panic: 5.0
+            ingest_worker.startup: 4.0
+            blackbox_probe_timeout_f: 1.2
+            worker_telemetry_agent.http_status_report: 0.0
+          latency_multipliers:
+            telemetry_ingest_success_f: {p50: 1.3, p95: 1.6}
+          one_shots:
+            - ref: chatops.hypothesis_note_backend_restarts_oom
+              count: 1
+              hosts: [chat-1]
+          manifestation: [ingest_worker.oom_panic, ingest_worker.mem_sample, slo_monitor.ingest_slo_eval, chatops.hypothesis_note_backend_restarts_oom]
+
+      steady:
+        - component: aws_alb
+          condition: |
+            Intermittent 502 backend_unreachable and 504 backend_processing_timeout responses continue as the worker fleet flaps.
+          user_impact: |
+            A small fraction (~1–3%) of customer telemetry batches are rejected at ingest during each crash wave, risking loss unless clients retry.
+          manifestation: [aws_alb.alb_access_502_unreachable, aws_alb.alb_access_504_timeout]
+        - component: ingest_worker
+          condition: |
+            Workers remain memory-pressured with recurring OOM exits and restarts; mem_sample shows high RSS.
+          user_impact: |
+            Increased ingest latency and occasional timeouts; capacity drops during restart windows.
+          manifestation: [ingest_worker.mem_sample, ingest_worker.oom_panic, ingest_worker.startup]
+        - component: slo_monitor
+          condition: |
+            SLO evaluation remains elevated with sustained burn relative to normal, consistent with an ongoing brownout.
+          user_impact: |
+            Operators see error budget burn signals even when blackbox probing is intermittent.
+          manifestation: [slo_monitor.ingest_slo_eval]
+
+      feedback_loops:
+        - id: synchronized_restart_brownout
+          desc: |
+            Because all workers leak memory at similar rates, they approach OOM together and restart in a narrow window.
+            During that window the ALB has fewer (or no) reachable backends, increasing 502/504. The reduced capacity
+            concentrates load on the remaining workers, worsening latency and increasing the chance of additional timeouts.
+
+      flows: [telemetry_ingest_success_f, telemetry_ingest_unreachable_502_f, telemetry_ingest_timeout_504_f, blackbox_probe_ok_f, blackbox_probe_timeout_f]
+      manifestation: [aws_alb.alb_access_502_unreachable, aws_alb.alb_access_504_timeout, ingest_worker.oom_panic, slo_monitor.ingest_slo_eval]
+
+  assumptions:
+    - >
+      Timeline is compressed to a single 25-minute brownout segment of the multi-hour incident; repeated waves are represented by
+      event-driven multipliers that increase/decrease OOM restarts and ALB 5xx rates.
+    - >
+      Failure-phase piecewise breakdown (approx; using effective rpm after multipliers):
+      minutes 25–33: ~384 success + ~6.6 (502) + ~6.6 (504) per min => ~3.3% rejects; OOM/startup boosted; worker metamonitoring suppressed.
+      minutes 33–41: ~392 success + ~3.6 (502) + ~3.6 (504) per min => ~1.8% rejects; one brief blackbox alert one-shot.
+      minutes 41–47: ~384 success + ~6.3 (502) + ~6.3 (504) per min => ~3.2% rejects; AWS ticket + ALB-networking hypothesis marker.
+      minutes 47–50: ~384 success + ~5.4 (502) + ~5.4 (504) per min => ~2.7% rejects; hypothesis marker shifts toward OOM evidence.
+    - >
+      Rough effective volume:
+      normal ~25 min * ~812 logs/min ≈ 20k logs;
+      failure ~25 min * ~800 logs/min plus restart spikes/one-shots ≈ 21k logs;
+      total ≈ 41k logs (within 20k–100k).
+    - >
+      Visibility rationale: ALB 502/504 access logs appear reliably due to high ingest rpm even at 1–3% rates; OOM/restart background logs
+      are boosted during crash-wave events; SLO eval emits once per minute throughout, and key alerts/diagnostics are anchored with one-shots
+      so phase boundaries are clear even if blackbox probing is sparse. ChatOps hypothesis markers are fixed-value templates, preventing
+      contradictory one-shot content relative to the event narrative.
+```

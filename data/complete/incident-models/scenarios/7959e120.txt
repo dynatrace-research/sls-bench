@@ -1,0 +1,365 @@
+```yaml
+scenario:
+  id: tgw_packet_loss_autoscale_provision_bottleneck_2021_01_04
+  title: TGW packet loss triggers web saturation; scale-up blocked by provision-service bottlenecks
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system normally serves message sends via a web tier calling a backend API, with autoscaling and a provision-service
+    bringing new web instances online. An inter-VPC transit-gateway-like network layer becomes saturated and begins dropping packets,
+    raising RTT and causing backend calls to stall. Initially, errors creep up but the vast majority of requests still succeed; at the next
+    mini-peak the web tier saturates and error rates spike sharply. Autoscaling attempts a large scale-out but provision-service hits open-file
+    and AWS API throttling bottlenecks, leaving the fleet under-capacity, while the internal monitoring dashboard UI is largely unavailable.
+
+  trigger_desc: |
+    A sudden post-holiday traffic jump (cold clients + automation mini-peak) overwhelms a transit-gateway-like network layer,
+    increasing packet drops between VPCs and degrading service-to-service connectivity.
+
+  time:
+    total_minutes: 40
+    phases:
+      n: {start_min: 0, end_min: 20}
+      f: {start_min: 20, end_min: 40}
+
+  phases:
+    n:
+      desc: |
+        Message sends complete quickly and successfully. Synthetic ping checks are clean and the monitoring dashboard UI is available.
+        Provisioning runs at a low steady rate.
+      flows: [message_send_normal, synthetic_ping_ok, view_dashboard_ok, provision_web_instance_ok]
+      manifestation:
+        - web_tier.apache_status
+        - edge_lb.healthcheck_summary_small
+        - external_monitor.ping_check_ok
+        - web_tier.msg_send_respond_200
+        - provision_service.pool_metrics_8192
+        - monitoring_ui.ui_request_ok
+        - network_fabric.tgw_stats
+
+    f:
+      desc: |
+        Packet loss and RTT across the inter-VPC network fabric increases, slowing backend calls from the web tier and raising timeouts.
+        Initially the effect is subtle (creeping errors with most traffic still succeeding), but during the next mini-peak the web tier saturates,
+        producing a sharp spike in 503s and health check failures (triggering load balancer panic mode). Autoscaling reacts aggressively, but a rapid
+        scale-out floods provision-service, which then fails due to pre-fix open-file exhaustion and AWS API throttling; many new instances remain
+        unprovisioned and do not enter service. As broken instances accumulate, the web ASG reaches its configured max and further scale-out is blocked
+        until responders repair provision-service and increase ASG headroom; the incident ends still degraded because packet drops persist.
+
+      events:
+        - order: 1
+          at_min: 20
+          component: network_fabric
+          event: |
+            Packet drops and RTT rise above normal. External synthetic monitoring pages on elevated errors, but message sending still mostly succeeds
+            (errors are creeping up rather than a full outage). The monitoring dashboard UI begins timing out to its backend, and the load balancer
+            observes increased health check failures against the existing (smaller) set of registered targets.
+          why: |
+            The transit-gateway-like network layer becomes saturated and starts dropping packets. This is directly observable via TGW telemetry and
+            indirectly via elevated request latency, occasional timeouts, and failed UI backend connections. Large-scale provisioning overload and ASG
+            headroom issues have not yet begun.
+          flows:
+            - message_send_success
+            - message_send_fail_timeout
+            - synthetic_ping_fail
+            - synthetic_ping_ok_small
+            - view_dashboard_fail
+          rate_multipliers:
+            message_send_success: 1.1
+            message_send_fail_timeout: 0.05
+            synthetic_ping_fail: 0.1
+            synthetic_ping_ok_small: 4.0
+            provision_web_instance_ok: 0.0
+            provision_web_instance_fail_emfile: 0.0
+            provision_web_instance_fail_quota: 0.0
+            network_fabric.packet_drop_alert: 1.2
+            monitoring_ui.db_timeout: 1.5
+            autoscaler.asg_limit: 0.0
+            edge_lb.healthcheck_summary_small: 1.0
+            edge_lb.healthcheck_summary_large: 0.0
+            provision_service.pool_metrics_8192: 1.0
+            provision_service.pool_metrics_16384: 0.0
+            provision_service.pool_overload_8192: 0.0
+            provision_service.fd_exhaustion_8192: 0.0
+            provision_service.pool_overload_16384: 0.0
+            provision_service.fd_exhaustion_16384: 0.0
+            web_tier.worker_queue_high: 0.2
+          latency_multipliers:
+            message_send_success: {p50: 1.4, p95: 1.6}
+            message_send_fail_timeout: {p50: 1.0, p95: 1.0}
+            view_dashboard_fail: {p50: 1.0, p95: 1.0}
+          one_shots:
+            - ref: external_monitor.page_sent
+              count: 1
+              hosts: [extmon-1]
+          manifestation:
+            - external_monitor.page_sent
+            - network_fabric.packet_drop_alert
+            - monitoring_ui.db_timeout
+            - edge_lb.healthcheck_summary_small
+            - edge_lb.access_message_503
+
+        - order: 2
+          at_min: 25
+          component: web_tier
+          event: |
+            A mini-peak in traffic coincides with worsening packet loss, saturating Apache workers; 503s and health check failures surge and the load balancer enables panic mode.
+            Autoscaling begins a concentrated scale-out burst, but at the same time some instances are terminated by automation (brief scale-in due to low CPU and/or unhealthy
+            replacement because instances cannot reliably reach backends). Several responders lose active SSH sessions when those instances are deprovisioned. The load balancer
+            starts tracking a larger set of targets, while provision-service becomes overloaded (EMFILE and AWS throttling), leaving many newly launched instances unprovisioned.
+            Synthetic ping checks now fail most of the time.
+          why: |
+            Slow/stalled backend calls hold worker threads, growing queues and forcing timeouts. The waiting-heavy behavior can temporarily depress CPU utilization even as the
+            service is unhealthy, which can trigger scale-in policies; independently, inability to reach backends can cause targets to be marked unhealthy and replaced. In parallel,
+            high worker utilization drives scale-out requests. Provisioning depends on the same degraded network and AWS APIs and becomes resource constrained. Panic mode and instance
+            terminations are directly observable via load balancer and autoscaler markers; provisioning overload/failure is visible in provision-service logs.
+          flows:
+            - message_send_success
+            - message_send_fail_timeout
+            - synthetic_ping_fail
+            - synthetic_ping_ok_small
+            - provision_web_instance_fail_emfile
+            - provision_web_instance_fail_quota
+            - provision_web_instance_ok
+          rate_multipliers:
+            message_send_success: 1.3
+            message_send_fail_timeout: 8.0
+            synthetic_ping_fail: 1.0
+            synthetic_ping_ok_small: 0.2
+            provision_web_instance_ok: 3.0
+            provision_web_instance_fail_emfile: 4.0
+            provision_web_instance_fail_quota: 2.0
+            autoscaler.asg_limit: 0.0
+            edge_lb.healthcheck_summary_small: 0.0
+            edge_lb.healthcheck_summary_large: 1.0
+            provision_service.pool_metrics_8192: 1.0
+            provision_service.pool_metrics_16384: 0.0
+            provision_service.pool_overload_8192: 1.0
+            provision_service.fd_exhaustion_8192: 3.0
+            provision_service.pool_overload_16384: 0.0
+            provision_service.fd_exhaustion_16384: 0.0
+            web_tier.worker_queue_high: 2.0
+          latency_multipliers:
+            message_send_success: {p50: 3.0, p95: 4.0}
+            message_send_fail_timeout: {p50: 1.0, p95: 1.0}
+            provision_web_instance_ok: {p50: 2.2, p95: 3.0}
+          one_shots:
+            - ref: edge_lb.panic_mode_enabled
+              count: 1
+              hosts: [lb-a]
+            - ref: autoscaler.instance_terminated
+              count: 6
+              hosts: [asctl-1]
+          manifestation:
+            - edge_lb.panic_mode_enabled
+            - autoscaler.instance_terminated
+            - edge_lb.healthcheck_summary_large
+            - web_tier.worker_queue_high
+            - web_tier.msg_send_backend_timeout
+            - provision_service.pool_overload_8192
+            - provision_service.provision_fail_emfile
+            - provision_service.provision_fail_quota
+            - external_monitor.ping_check_fail
+
+        - order: 3
+          at_min: 29
+          component: autoscaler
+          event: |
+            Broken and unprovisioned instances accumulate and the web autoscaling group reaches its configured max capacity, causing scale-out to be blocked.
+            Provisioning attempt volume drops sharply while ASG limit warnings become frequent; user-facing traffic remains mostly down because the web tier is still saturated
+            and packet loss persists.
+          why: |
+            When desired capacity hits the ASG max, the autoscaler cannot request additional instances even though utilization is high; this is directly observable via
+            asg_limit warnings. Provision-service continues to show backlog/FD pressure from the earlier burst, but fewer new provisioning attempts enter the system.
+          flows:
+            - message_send_success
+            - message_send_fail_timeout
+            - synthetic_ping_fail
+            - synthetic_ping_ok_small
+            - provision_web_instance_fail_emfile
+            - provision_web_instance_fail_quota
+            - provision_web_instance_ok
+          rate_multipliers:
+            message_send_success: 1.1
+            message_send_fail_timeout: 7.0
+            synthetic_ping_fail: 1.0
+            synthetic_ping_ok_small: 0.1
+            provision_web_instance_ok: 0.2
+            provision_web_instance_fail_emfile: 0.1
+            provision_web_instance_fail_quota: 0.1
+            autoscaler.asg_limit: 5.0
+            provision_service.pool_metrics_8192: 1.0
+            provision_service.pool_metrics_16384: 0.0
+            provision_service.pool_overload_8192: 0.6
+            provision_service.fd_exhaustion_8192: 1.5
+            provision_service.pool_overload_16384: 0.0
+            provision_service.fd_exhaustion_16384: 0.0
+            web_tier.worker_queue_high: 2.2
+          latency_multipliers:
+            message_send_success: {p50: 3.2, p95: 4.2}
+            message_send_fail_timeout: {p50: 1.0, p95: 1.0}
+          one_shots: []
+          manifestation:
+            - autoscaler.asg_limit
+            - edge_lb.healthcheck_summary_large
+            - provision_service.fd_exhaustion_8192
+            - external_monitor.ping_check_fail
+
+        - order: 4
+          at_min: 33
+          component: provision_service
+          event: |
+            Responders restart provision-service with higher file descriptor limits and adjust autoscaling safeguards (disable downscaling and raise ASG max),
+            allowing more provisioning to succeed; user-facing errors drop from the peak but remain elevated due to continued network drops.
+          why: |
+            Removing a local resource bottleneck (open files) and allowing higher ASG headroom reduces the provisioning backlog and brings more web hosts into service.
+            However, packet loss remains, so latency and some failures persist. These changes are directly observable via operator action markers and the shift from EMFILE
+            failures/FD pressure to more successful provisions and post-fix pool metrics.
+          flows:
+            - provision_web_instance_ok
+            - provision_web_instance_fail_quota
+            - synthetic_ping_fail
+            - synthetic_ping_ok_small
+            - message_send_success
+            - message_send_fail_timeout
+          rate_multipliers:
+            provision_web_instance_ok: 6.0
+            provision_web_instance_fail_emfile: 0.0
+            provision_web_instance_fail_quota: 0.5
+            synthetic_ping_fail: 0.25
+            synthetic_ping_ok_small: 2.0
+            message_send_success: 1.6
+            message_send_fail_timeout: 0.3
+            autoscaler.asg_limit: 0.0
+            provision_service.pool_metrics_8192: 0.0
+            provision_service.pool_metrics_16384: 1.0
+            provision_service.pool_overload_8192: 0.0
+            provision_service.fd_exhaustion_8192: 0.0
+            provision_service.pool_overload_16384: 0.3
+            provision_service.fd_exhaustion_16384: 0.2
+            web_tier.worker_queue_high: 1.2
+          latency_multipliers:
+            message_send_success: {p50: 2.0, p95: 3.0}
+            message_send_fail_timeout: {p50: 1.0, p95: 1.0}
+            provision_web_instance_ok: {p50: 1.6, p95: 2.2}
+          one_shots:
+            - ref: provision_service.restarted
+              count: 1
+              hosts: [prov-1]
+            - ref: autoscaler.downscaling_disabled
+              count: 1
+              hosts: [asctl-1]
+            - ref: autoscaler.asg_max_increased
+              count: 1
+              hosts: [asctl-1]
+          manifestation:
+            - provision_service.restarted
+            - autoscaler.downscaling_disabled
+            - autoscaler.asg_max_increased
+            - provision_service.pool_metrics_16384
+            - provision_service.provision_ok
+            - web_tier.apache_status
+
+      steady:
+        - component: network_fabric
+          condition: |
+            TGW/network fabric remains saturated with elevated RTT and packet drops.
+          user_impact: |
+            Cross-service calls are slower and less reliable, amplifying request latency and occasional timeouts.
+          manifestation: [network_fabric.tgw_stats, network_fabric.packet_drop_alert]
+
+        - component: web_tier
+          condition: |
+            Web tier operates under elevated latency; most requests succeed but a low single-digit fraction still fail with 503 due to backend timeouts/overload.
+          user_impact: |
+            Message sending is degraded: elevated latency and intermittent failures.
+          manifestation: [web_tier.worker_queue_high, web_tier.msg_send_backend_timeout, web_tier.msg_send_respond_503]
+
+        - component: provision_service
+          condition: |
+            Provisioning throughput improves after the restart, but overall provisioning is still slower than normal due to network conditions.
+          user_impact: |
+            Capacity recovery is delayed; the system requires extra hosts to compensate for network inefficiency.
+          manifestation: [provision_service.pool_metrics_16384, provision_service.provision_ok]
+
+        - component: monitoring_ui
+          condition: |
+            Dashboard UI remains unreliable because it continues to time out reaching its backend dependency across the degraded network.
+          user_impact: |
+            Incident response is slowed by reduced access to prebuilt dashboards and alerts.
+          manifestation: [monitoring_ui.db_timeout, monitoring_ui.ui_request_fail]
+
+        - component: edge_lb
+          condition: |
+            Load balancer continues to observe a meaningful rate of health check failures to web instances due to network problems (with panic mode recently used).
+          user_impact: |
+            Users are more likely to be routed to slow/unhealthy targets, increasing perceived latency and intermittent errors.
+          manifestation: [edge_lb.healthcheck_summary_large]
+
+      feedback_loops:
+        - id: packet_loss_retry_pps_amplification
+          desc: |
+            Packet loss increases timeouts and can trigger client-side or proxy retries, raising packets-per-second and further stressing the network fabric.
+        - id: undercapacity_provision_overload
+          desc: |
+            Under-capacity web tier increases per-host load and failures, prompting more scale-out requests that overload provision-service,
+            delaying the arrival of healthy capacity.
+
+      flows:
+        - message_send_success
+        - message_send_fail_timeout
+        - provision_web_instance_ok
+        - provision_web_instance_fail_emfile
+        - provision_web_instance_fail_quota
+        - view_dashboard_fail
+        - synthetic_ping_fail
+        - synthetic_ping_ok_small
+      manifestation:
+        - network_fabric.packet_drop_alert
+        - web_tier.worker_queue_high
+        - web_tier.msg_send_backend_timeout
+        - autoscaler.asg_limit
+        - autoscaler.instance_terminated
+        - provision_service.pool_overload_8192
+        - provision_service.provision_fail_emfile
+        - monitoring_ui.db_timeout
+        - edge_lb.healthcheck_summary_large
+        - external_monitor.ping_check_fail
+
+  assumptions:
+    - |-
+      Verifier fix: event 2 now explicitly models and explains automation-driven instance terminations (brief downscale due to low CPU while threads wait, and/or unhealthy
+      replacement when instances cannot reach backends), consistent with the post-mortem detail that responders' SSH sessions were cut when instances were deprovisioned.
+      The autoscaler.instance_terminated one-shot remains at event 2 and is added to event 2 manifestations.
+    - |-
+      Verifier fix: synthetic_ping_fail now includes a web-tier terminal ping failure log (web_tier.ping_respond_503) before edge_lb.access_ping_503, making the
+      chronology plausible for an upstream-served 503 (web tier logs receipt and response; LB logs access; external monitor records failure).
+    - |-
+      Verifier fix: message_send_fail_timeout represents a deadline-bounded timeout path (web_tier.msg_send_backend_call timeout_ms and backend_timeout waited_ms),
+      so all failure events keep latency_multipliers.message_send_fail_timeout at {p50: 1.0, p95: 1.0} to avoid implying waits beyond modeled timeout domains.
+      Severity changes for this flow are expressed via rate_multipliers (more timeouts) rather than longer timeout durations.
+    - |-
+      Timeline is compressed into a 40-minute window and intentionally ends while still in failure/degraded state (before full network recovery)
+      to satisfy the scenario requirement that the incident ends in failure.
+    - |-
+      Failure-phase intervals and effective rates (rough, after multipliers):
+      - 20–25 (5 min): early degradation; message_send_success ~198 rpm; message_send_fail_timeout ~2 rpm (~1%); synthetic pings mostly succeeding; provisioning flows suppressed;
+        LB healthchecks reported via edge_lb.healthcheck_summary_small (large suppressed); autoscaler.asg_limit suppressed.
+      - 25–29 (4 min): mini-peak + start of scale burst; message_send_fail_timeout ~320 rpm; synthetic pings mostly failing; provisioning attempts increase to ~32/min (mix of ok/EMFILE/quota);
+        fleet worker-saturation warnings increase; panic mode enabled; a small batch of instance terminations logged; LB healthchecks switch to edge_lb.healthcheck_summary_large; autoscaler.asg_limit still suppressed.
+      - 29–33 (4 min): ASG max hit; provisioning attempts drop to near-zero while autoscaler.asg_limit becomes frequent; web tier remains saturated with high 503/timeout rates.
+      - 33–40 (7 min): partial mitigation; EMFILE failures and pre-fix FD-pressure logs stop; post-fix (limit=16384) pool metrics begin; provisioning successes increase;
+        ASG limit warnings stop after ASG max increase; message_send_fail_timeout drops (~12 rpm, low single-digit %) but latency remains elevated due to ongoing packet loss.
+    - |-
+      One-shots per event: event1=1 (external_monitor.page_sent), event2=7 (edge_lb.panic_mode_enabled + 6 autoscaler.instance_terminated),
+      event3=0, event4=3 (provision_service.restarted + autoscaler.downscaling_disabled + autoscaler.asg_max_increased).
+    - |-
+      Normal-phase log volume estimate (20 min): ~27k–30k logs (message_send_normal dominates).
+    - |-
+      Total scenario log estimate after rate tuning and failure multipliers: ~60k–80k logs (within 20k–100k), dominated by message sends during the mini-peak interval.
+    - |-
+      Visibility rationale: TGW telemetry (tgw_stats/packet_drop_alert) is persistent; the shift from low early error rates to spike is visible in edge_lb access logs and
+      web_tier backend_timeout/503 logs; the LB target-set change is visible via healthcheck_summary_small -> healthcheck_summary_large; provision-service overload
+      (pool_overload_8192/fd_exhaustion_8192) spikes only during the scale burst; autoscaler.instance_terminated appears as a discrete action marker during the chaotic mid-incident
+      scaling period; autoscaler.asg_limit becomes frequent once ASG max is hit; and monitoring UI backend timeouts confirm tooling impairment.
+```

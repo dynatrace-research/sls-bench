@@ -1,0 +1,250 @@
+```yaml
+scenario:
+  id: livefile1_ebs_volume_failure_cascade
+  title: livefile1 volume failure causes NFS timeouts, global errors, and slow recovery
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The platform normally serves a control-panel web app and tenant websites/tasks from worker nodes that mount user
+    home directories over NFS. The incident is triggered by a rare underlying block-volume failure on file server
+    livefile1, causing NFS I/O to block and time out. That stalls site start/reload and causes elevated errors on the
+    control panel due to worker backlog. Recovery restores volumes from backup snapshots and remounts NFS via rolling
+    reboots, but the restored volumes are slow to read while "warming up", leaving livefile1 tenants degraded.
+
+  trigger_desc: |
+    A storage subsystem failure affecting a single cloud block volume on livefile1 causes kernel I/O errors and
+    blocked reads/writes; NFS operations hang and then time out for clients mounting that server.
+
+  time:
+    total_minutes: 50
+    phases:
+      n: {start_min: 0, end_min: 25}
+      f: {start_min: 25, end_min: 50}
+
+  phases:
+    n:
+      desc: |
+        Control-panel requests and tenant site traffic are served normally. A smaller subset of requests trigger
+        site start/reload, which reads code from NFS but completes quickly. Worker pool metrics stay low and alerts
+        are rare.
+      flows: [control_panel_dashboard_ok, control_panel_files_ok, hosted_site_hot_ok, hosted_site_coldstart_ok, scheduled_task_ok]
+      manifestation:
+        [edge_proxy.access_ok, platform_api.req_done_ok, web_runtime.site_req_ok, web_runtime.pool_metric, file_server_livefile1.disk_latency]
+
+    f:
+      desc: |
+        Failure begins with livefile1 storage I/O hanging and timing out, producing NFS server timeouts and NFS client
+        warnings on worker nodes. Control-panel errors rise due to blocked workers and queueing, and site start/reload
+        fails broadly. Operators attempt a stop/start and engage support; later they restore volumes from backup snapshots.
+        NFS becomes available again but mounts are stale on some workers until rolling reboots. Even after remount, the new
+        volumes read slowly while warming up, causing long startups and intermittent errors for sites whose homes are on livefile1.
+
+      events:
+        - order: 1
+          at_min: 25
+          component: file_server_livefile1
+          event: |
+            livefile1 begins experiencing blocked storage I/O; NFS operations start timing out, and platform errors rise.
+          why: |
+            Underlying volume failures manifest as kernel I/O errors and stalled reads/writes; NFS server threads block and
+            clients experience timeouts. This is directly observable via kernel/NFS logs and elevated HTTP 5xx.
+          flows: [control_panel_files_err, control_panel_dashboard_err, hosted_site_other_coldstart_err, hosted_site_livefile1_err, scheduled_task_fs_fail]
+          rate_multipliers:
+            file_server_livefile1.nfsd_timeout: 2.5
+            file_server_livefile1.kernel_io_hang: 3.0
+            monitoring.alert: 2.0
+            web_runtime.pool_metric: 1.5
+            web_runtime.nfs_stale_handle: 0.0
+            hosted_site_livefile1_slow_ok: 0.0
+            hosted_site_other_hot_err_reboot: 0.0
+            scheduled_task_slow_ok: 0.0
+          latency_multipliers:
+            control_panel_files_err: {p50: 1.2, p95: 1.2}
+            hosted_site_livefile1_err: {p50: 1.1, p95: 1.2}
+            scheduled_task_fs_fail: {p50: 1.1, p95: 1.2}
+          one_shots: []
+          manifestation: [file_server_livefile1.nfsd_timeout, file_server_livefile1.kernel_io_hang, monitoring.alert, edge_proxy.access_err]
+
+        - order: 2
+          at_min: 30
+          component: ops
+          event: |
+            Operators stop and then start livefile1, but the start is delayed while the provider provisions new hardware;
+            an escalated support case is opened. During this disruption, the file server stops emitting server-side logs
+            and NFS clients report "server not responding" more frequently.
+          why: |
+            The stop/start moves the instance and can temporarily remove access to the problematic storage path; clients keep
+            retrying NFS, producing repeated warnings. The stop/start and support escalation are directly observable via ops
+            audit logs; the shift from server-side to client-side warnings is observable in worker logs.
+          flows: [control_panel_dashboard_err, control_panel_files_err, hosted_site_other_coldstart_err, hosted_site_livefile1_err, scheduled_task_fs_fail]
+          rate_multipliers:
+            file_server_livefile1.nfsd_timeout: 0.0
+            file_server_livefile1.kernel_io_hang: 0.0
+            file_server_livefile1.disk_latency: 0.0
+            web_runtime.nfs_server_not_responding: 4.0
+            monitoring.alert: 2.5
+            control_panel_dashboard_err: 1.2
+            hosted_site_livefile1_err: 1.2
+            scheduled_task_fs_fail: 1.2
+            scheduled_task_slow_ok: 0.0
+          latency_multipliers:
+            control_panel_dashboard_err: {p50: 1.3, p95: 1.2}
+            hosted_site_other_coldstart_err: {p50: 1.2, p95: 1.2}
+            scheduled_task_fs_fail: {p50: 1.2, p95: 1.2}
+          one_shots:
+            - ref: ops.stop_instance
+              count: 1
+              hosts: [ops1]
+            - ref: ops.start_instance_delayed
+              count: 1
+              hosts: [ops1]
+            - ref: ops.open_aws_case
+              count: 1
+              hosts: [ops1]
+          manifestation: [web_runtime.nfs_server_not_responding, ops.start_instance_delayed, ops.open_aws_case, edge_proxy.access_err, monitoring.alert]
+
+        - order: 3
+          at_min: 38
+          component: ops
+          event: |
+            Snapshots are created from the backup server and restored volumes are attached to livefile1; the filesystem becomes
+            mountable again. As livefile1 I/O transitions from "blocked" to "slow", the global start/reload coupling for
+            other tenants drops, but some workers still have stale mount state so livefile1-backed tasks and startups are a
+            mix of slow success and failures until remount catches up.
+          why: |
+            Restored-from-snapshot volumes can be initially slow to read and NFS clients that timed out can hold stale mount
+            state. This is partially observable: snapshot/attach is visible via ops markers and fsck completion, while "stale file handle"
+            appears on worker nodes.
+          flows: [hosted_site_livefile1_err, hosted_site_livefile1_slow_ok, control_panel_dashboard_ok_slow, scheduled_task_fs_fail, scheduled_task_slow_ok]
+          rate_multipliers:
+            file_server_livefile1.disk_latency: 1.0
+            file_server_livefile1.nfsd_timeout: 0.8
+            file_server_livefile1.kernel_io_hang: 0.2
+            web_runtime.nfs_server_not_responding: 1.5
+            web_runtime.nfs_stale_handle: 2.0
+            hosted_site_other_coldstart_err: 0.25
+            hosted_site_livefile1_err: 0.6
+            hosted_site_livefile1_slow_ok: 0.9
+            control_panel_dashboard_err: 0.7
+            scheduled_task_fs_fail: 0.7
+            scheduled_task_slow_ok: 0.4
+          latency_multipliers:
+            hosted_site_livefile1_slow_ok: {p50: 3.5, p95: 4.5}
+            control_panel_dashboard_ok_slow: {p50: 1.4, p95: 1.6}
+            scheduled_task_slow_ok: {p50: 1.4, p95: 1.6}
+          one_shots:
+            - ref: ops.create_snapshots
+              count: 1
+              hosts: [ops1]
+            - ref: ops.attach_restored_volumes
+              count: 1
+              hosts: [ops1]
+            - ref: file_server_livefile1.fsck_complete
+              count: 1
+              hosts: [livefile1]
+          manifestation: [ops.attach_restored_volumes, file_server_livefile1.fsck_complete, web_runtime.nfs_stale_handle, web_runtime.task_ok]
+
+        - order: 4
+          at_min: 44
+          component: ops
+          event: |
+            A rolling reboot/remount across worker nodes clears most stale mounts. Site start/reload failures for tenants on
+            other file servers largely disappear, while scheduled tasks resume broadly; livefile1-backed work remains slow due
+            to volume warm-up, and brief 5xx appear on some otherwise-unaffected tenant sites during restarts.
+          why: |
+            Rebooting clears timed-out NFS mounts and stale handles, improving access to livefile1. During restarts, some
+            tenant requests fail briefly. Warm-up slowness persists because snapshot-backed volumes fetch blocks on first read.
+          flows: [hosted_site_other_hot_err_reboot, hosted_site_livefile1_slow_ok, hosted_site_livefile1_err, scheduled_task_slow_ok]
+          rate_multipliers:
+            web_runtime.nfs_stale_handle: 0.3
+            web_runtime.nfs_server_not_responding: 0.2
+            hosted_site_other_coldstart_err: 0.05
+            hosted_site_other_hot_err_reboot: 1.0
+            control_panel_files_err: 0.2
+            control_panel_dashboard_err: 0.2
+            hosted_site_livefile1_err: 0.4
+            hosted_site_livefile1_slow_ok: 1.0
+            monitoring.alert: 1.2
+            scheduled_task_fs_fail: 0.15
+            scheduled_task_slow_ok: 1.0
+          latency_multipliers:
+            hosted_site_other_hot_ok: {p50: 1.1, p95: 1.3}
+            hosted_site_livefile1_slow_ok: {p50: 3.0, p95: 4.0}
+            scheduled_task_slow_ok: {p50: 1.3, p95: 1.5}
+          one_shots:
+            - ref: ops.rolling_reboot
+              count: 1
+              hosts: [ops1]
+          manifestation: [ops.rolling_reboot, web_runtime.nfs_stale_handle, web_runtime.task_ok, edge_proxy.access_err]
+
+      steady:
+        - component: file_server_livefile1
+          condition: |
+            livefile1 is back online with restored-from-snapshot volumes, but read performance is degraded while blocks warm up.
+          user_impact: |
+            Tenants whose homes are on livefile1 see slow filesystem access, long site startups, and intermittent HTTP errors
+            until frequently-used data is warmed; other tenants are mostly OK after remounts.
+          manifestation: [file_server_livefile1.disk_latency, web_runtime.site_req_ok, web_runtime.site_req_err]
+        - component: web_runtime
+          condition: |
+            NFS client mounts are mostly recovered after reboots; only occasional stale-handle warnings remain and some tasks run slowly.
+          user_impact: |
+            Most sites can start/reload and scheduled tasks run again, but livefile1-backed work may still be slow and error-prone under load.
+          manifestation: [web_runtime.nfs_stale_handle, web_runtime.task_ok, web_runtime.pool_metric]
+
+      feedback_loops:
+        - id: worker_backlog_loop
+          desc: |
+            Slow or blocked filesystem I/O ties up worker threads/processes. That increases queue depth, raises request latency,
+            and leads to more timeouts, which further increases retries/reloads by users and amplifies load on shared workers.
+
+      flows:
+        [
+          control_panel_dashboard_err,
+          control_panel_dashboard_ok_slow,
+          control_panel_files_err,
+          hosted_site_other_hot_ok,
+          hosted_site_other_coldstart_err,
+          hosted_site_livefile1_err,
+          hosted_site_livefile1_slow_ok,
+          hosted_site_other_hot_err_reboot,
+          scheduled_task_fs_fail,
+          scheduled_task_slow_ok
+        ]
+      manifestation:
+        [
+          file_server_livefile1.nfsd_timeout,
+          web_runtime.nfs_server_not_responding,
+          web_runtime.nfs_stale_handle,
+          web_runtime.pool_metric,
+          monitoring.alert,
+          edge_proxy.access_err,
+          web_runtime.task_fail_fs,
+          web_runtime.task_ok
+        ]
+
+  assumptions:
+    - >
+      Repair for verifier feedback (S7): control_panel_files_err now has end-to-end latency hints for the completion logs
+      (platform_api.req_done_err and edge_proxy.access_err) consistent with the preceding filesystem timeout window.
+    - >
+      The original multi-hour incident is compressed into 25 minutes of failure while preserving key beats:
+      NFS I/O timeouts, attempted stop/start and escalation, restore-from-backup-snapshot, stale mounts/rolling reboot,
+      and lingering warm-up slowness.
+    - >
+      Volume and request mix is simplified: livefile1 represents the affected shard; "unaffected file servers" are modeled
+      via a stable successful flow plus a later rolling-reboot error flow; the coldstart error flow is only significant early
+      and is suppressed after recovery.
+    - >
+      Failure-phase piecewise estimate (rough):
+      minutes 25-30 (~5 min): ~1.5k logs/min (high NFS timeouts + elevated 5xx + task failures);
+      minutes 30-38 (~8 min): ~1.6k logs/min (server-side logs drop, client NFS warnings rise, task failures persist);
+      minutes 38-44 (~6 min): ~1.35k–1.4k logs/min (partial recovery, stale-handle warnings, mix of task fail + slow task ok; other-coldstart errors reduced);
+      minutes 44-50 (~6 min): ~1.25k–1.35k logs/min (stale-handle reduced, brief reboot errors, tasks mostly slow-ok, warm-up persists; other-coldstart errors near-zero).
+      One-shots: event2=3 (stop, delayed start, open case), event3=3 (create snapshots, attach volumes, fsck), event4=1 (rolling reboot).
+    - >
+      Total estimated logs: normal ~32k plus failure ~34k–40k => ~66k–72k. Key failure signals are likely visible due to
+      high per-minute NFS timeout/warning rates and sustained elevated edge_proxy.access_err during early failure,
+      followed by a clear shift toward hosted_site_livefile1_slow_ok and scheduled_task_slow_ok after restoration.
+```

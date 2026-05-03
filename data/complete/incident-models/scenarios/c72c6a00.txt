@@ -1,0 +1,267 @@
+```yaml
+scenario:
+  id: gce_bgp_withdrawal_global_inbound_loss_20160411
+  title: Bad BGP config rollout withdraws all GCE IP blocks causing global inbound loss
+
+  states: {n: normal, f: failure}
+
+  summary: |
+    The system announces GCE public IP blocks via BGP from multiple edge sites and relies on a config manager to safely roll out changes.
+    A configuration management bug produces a candidate config missing all GCE-related IP blocks, and a second bug prevents the canary failure verdict from stopping rollout.
+    As more sites stop advertising, VPN reachability drops and external probe latency rises, followed by near-total loss of inbound internet connectivity once announcements reach zero.
+    SREs initiate rollback and freeze changes; announcements and external connectivity are restored within the modeled outage window, while incident response remains active.
+
+  trigger_desc: |
+    A network configuration change (removal of an unused IP block) triggers inconsistent inputs; the config manager "fails safe" incorrectly,
+    generating a config with all GCE IP blocks removed and pushing it through progressive rollout even though the canary verifier reports failure.
+
+  time:
+    total_minutes: 60
+    phases:
+      n: {start_min: 0, end_min: 30}
+      f: {start_min: 30, end_min: 60}
+
+  phases:
+    n:
+      desc: |
+        External monitoring probes to representative GCE VM IPs and VPN endpoints succeed at steady rates, and the edge fabric reports
+        stable multi-site BGP announcement coverage. Only low-rate summary/audit background logs appear.
+      flows: [gce_external_probe_ok_n, vpn_keepalive_ok_n]
+      manifestation:
+        - edge_bgp_fabric.bgp_announce_ok
+        - netmon.probe_ok
+        - vpn_gateway.ike_keepalive_ok
+        - netmon.probe_summary
+
+    f:
+      desc: |
+        A bad edge routing configuration is rolled out progressively: individual sites apply a config that contains zero GCE/VPN prefixes.
+        Early on, overall coverage is degraded but non-zero, which increases path stretch and latency while masking the underlying rollout failure.
+        As rollout continues, announcements collapse to zero and inbound connectivity to GCE public endpoints fails broadly; monitoring raises critical alerts and probes time out.
+        SREs revert the change and freeze further pushes; BGP announcements return and external reachability is restored, while investigation/verification continues.
+
+      events:
+        - order: 1
+          at_min: 30
+          component: netcfg_mgr
+          event: |
+            The config manager begins pushing a new routing config; validation detects an inconsistency and the canary verification reports failure,
+            but the rollout controller continues and edge sites start applying a config with zero GCE/VPN prefixes.
+          why: |
+            Partially observable: the inconsistency and canary failure are visible in netcfg_mgr logs; the fact that rollout proceeds is visible
+            via rollout controller markers and subsequent edge apply logs. The missing canary-to-rollout feedback is inferred from this mismatch.
+          flows: [netcfg_push_bad_f, gce_external_probe_ok_f, gce_external_probe_timeout_f, vpn_keepalive_ok_f, vpn_keepalive_fail_f]
+          rate_multipliers:
+            edge_bgp_fabric.bgp_announce_zero: 0.0
+            edge_bgp_fabric.bgp_announce_restored: 0.0
+            netmon.alert_latency_anomaly: 0.0
+            netmon.alert_vpn_unreachable: 0.0
+            netmon.alert_inbound_loss: 0.0
+            netcfg_push_rollback_f: 0.0
+            sre_ops.change_freeze_status: 0.0
+          latency_multipliers: {}
+          one_shots:
+            - ref: netcfg_mgr.cfg_change_requested
+              count: 1
+              hosts: [netcfg-1]
+            - ref: netcfg_mgr.cfg_validation_inconsistency
+              count: 1
+              hosts: [netcfg-1]
+            - ref: netcfg_mgr.canary_failed
+              count: 1
+              hosts: [netcfg-1]
+            - ref: netcfg_mgr.rollout_continues
+              count: 1
+              hosts: [netcfg-1]
+          manifestation:
+            - netcfg_mgr.canary_failed
+            - netcfg_mgr.rollout_continues
+            - edge_bgp_fabric.bgp_announce_degraded
+            - edge_bgp_fabric.apply_bad_config
+
+        - order: 2
+          at_min: 35
+          component: netmon
+          event: |
+            VPN reachability in asia-east1 becomes unreliable and external probe RTTs increase as fewer announcing sites remain.
+            Monitoring begins emitting latency and VPN-unreachable alerts while many GCE probes still succeed.
+          why: |
+            Observable: probe RTTs and VPN keepalive outcomes shift; the underlying mechanism is routing to more distant remaining sites
+            because progressive withdrawal reduces announcement redundancy.
+          flows: [gce_external_probe_ok_f, gce_external_probe_timeout_f, vpn_keepalive_ok_f, vpn_keepalive_fail_f]
+          rate_multipliers:
+            vpn_keepalive_ok_f: 0.7
+            vpn_keepalive_fail_f: 2.0
+            netmon.alert_latency_anomaly: 1.0
+            netmon.alert_vpn_unreachable: 1.0
+          latency_multipliers:
+            gce_external_probe_ok_f: {p50: 1.7, p95: 2.0}
+            vpn_keepalive_ok_f: {p50: 1.5, p95: 2.0}
+          one_shots:
+            - ref: sre_ops.pager_triggered
+              count: 1
+              hosts: [sre-console]
+          manifestation:
+            - netmon.alert_vpn_unreachable
+            - netmon.alert_latency_anomaly
+            - vpn_gateway.ike_keepalive_fail
+            - netmon.probe_ok
+
+        - order: 3
+          at_min: 42
+          component: edge_bgp_fabric
+          event: |
+            Announcement coverage collapses to zero: no sites are advertising the GCE/VPN prefixes.
+            External probes begin timing out at high rates and critical inbound-loss alerts fire.
+          why: |
+            Partially observable: netmon sees widespread probe timeouts and loss alerts; the edge fabric reports missing announcements,
+            indicating that the progressive rollout has removed the prefixes from all announcing sites.
+          flows: [gce_external_probe_ok_f, gce_external_probe_timeout_f, vpn_keepalive_ok_f, vpn_keepalive_fail_f]
+          rate_multipliers:
+            edge_bgp_fabric.bgp_announce_degraded: 0.0
+            edge_bgp_fabric.bgp_announce_zero: 1.0
+            gce_external_probe_ok_f: 0.1
+            gce_external_probe_timeout_f: 6.0
+            vpn_keepalive_ok_f: 0.0
+            vpn_keepalive_fail_f: 4.0
+            netmon.alert_inbound_loss: 1.0
+          latency_multipliers:
+            gce_external_probe_timeout_f: {p50: 1.1, p95: 1.2}
+            vpn_keepalive_fail_f: {p50: 1.1, p95: 1.2}
+          one_shots: []
+          manifestation:
+            - edge_bgp_fabric.bgp_announce_zero
+            - netmon.alert_inbound_loss
+            - netmon.probe_timeout
+            - vpn_gateway.ike_keepalive_fail
+
+        - order: 4
+          at_min: 52
+          component: sre_ops
+          event: |
+            SREs approve rollback and the config manager starts pushing a rollback configuration; change freeze is enabled.
+            Announcement coverage begins to return and probe success improves, but timeouts and loss are still present during rollout.
+          why: |
+            Observable for actions (ops + netcfg_mgr markers and site apply logs). Partially observable for impact: probes improve as some
+            sites re-advertise, but restoration is still in progress at this moment.
+          flows: [netcfg_push_rollback_f, netcfg_push_bad_f, gce_external_probe_ok_f, gce_external_probe_timeout_f, vpn_keepalive_ok_f, vpn_keepalive_fail_f]
+          rate_multipliers:
+            netcfg_push_bad_f: 0.2
+            netcfg_push_rollback_f: 1.0
+            edge_bgp_fabric.bgp_announce_degraded: 0.7
+            edge_bgp_fabric.bgp_announce_zero: 0.6
+            gce_external_probe_ok_f: 0.3
+            gce_external_probe_timeout_f: 2.5
+            vpn_keepalive_ok_f: 0.1
+            vpn_keepalive_fail_f: 2.0
+            netmon.alert_inbound_loss: 0.6
+            sre_ops.change_freeze_status: 1.0
+          latency_multipliers:
+            gce_external_probe_ok_f: {p50: 1.2, p95: 1.3}
+          one_shots:
+            - ref: sre_ops.rollback_approved
+              count: 1
+              hosts: [sre-console]
+            - ref: netcfg_mgr.rollback_started
+              count: 1
+              hosts: [netcfg-2]
+            - ref: sre_ops.change_freeze_enabled
+              count: 1
+              hosts: [sre-console]
+          manifestation:
+            - sre_ops.rollback_approved
+            - netcfg_mgr.rollback_started
+            - edge_bgp_fabric.apply_safe_config
+            - netmon.probe_timeout
+
+        - order: 5
+          at_min: 56
+          component: edge_bgp_fabric
+          event: |
+            Rollback reaches full coverage: edge sites resume advertising the GCE/VPN prefixes broadly and external reachability returns.
+            Inbound-loss and VPN-unreachable alerts stop firing as probes stabilize.
+          why: |
+            Observable via the restored BGP coverage summary and sharply improved probe outcomes; the underlying mechanism is that the
+            rollback reinstates the prior prefix set across the announcing sites.
+          flows: [netcfg_push_rollback_f, netcfg_push_bad_f, gce_external_probe_ok_f, gce_external_probe_timeout_f, vpn_keepalive_ok_f, vpn_keepalive_fail_f]
+          rate_multipliers:
+            edge_bgp_fabric.bgp_announce_zero: 0.0
+            edge_bgp_fabric.bgp_announce_degraded: 0.0
+            edge_bgp_fabric.bgp_announce_restored: 1.0
+            netcfg_push_bad_f: 0.0
+            netcfg_push_rollback_f: 0.2
+            gce_external_probe_ok_f: 1.1
+            gce_external_probe_timeout_f: 0.1
+            vpn_keepalive_ok_f: 1.1
+            vpn_keepalive_fail_f: 0.1
+            netmon.alert_inbound_loss: 0.0
+            netmon.alert_vpn_unreachable: 0.0
+            netmon.alert_latency_anomaly: 0.2
+          latency_multipliers:
+            gce_external_probe_ok_f: {p50: 0.7, p95: 0.8}
+            vpn_keepalive_ok_f: {p50: 0.7, p95: 0.8}
+          one_shots: []
+          manifestation:
+            - edge_bgp_fabric.bgp_announce_restored
+            - netmon.probe_ok
+            - netmon.probe_summary
+
+      steady:
+        - component: sre_ops
+          condition: |
+            External connectivity is restored after rollback; a change freeze remains in effect while SREs verify stability and investigate
+            the configuration management failure.
+          user_impact: |
+            No ongoing customer impact at the end of this window; the earlier period included widespread dropped inbound connections and
+            inability to reconnect for VM external IPs, VPN, and L3 load balancers.
+          manifestation:
+            - edge_bgp_fabric.bgp_announce_restored
+            - sre_ops.change_freeze_status
+            - netmon.probe_summary
+
+      feedback_loops:
+        - id: redundancy_masks_rollout
+          desc: |
+            Multi-site BGP announcements route around partial site failures, masking early withdrawal and shifting traffic to remaining sites.
+            This delays clear "down" signals until coverage is very low, while latency rises first due to longer internet paths.
+
+      flows:
+        - netcfg_push_bad_f
+        - netcfg_push_rollback_f
+        - gce_external_probe_ok_f
+        - gce_external_probe_timeout_f
+        - vpn_keepalive_ok_f
+        - vpn_keepalive_fail_f
+      manifestation:
+        - edge_bgp_fabric.bgp_announce_degraded
+        - edge_bgp_fabric.bgp_announce_zero
+        - edge_bgp_fabric.bgp_announce_restored
+        - netmon.probe_timeout
+        - netmon.alert_inbound_loss
+        - netcfg_mgr.rollout_continues
+        - sre_ops.change_freeze_status
+
+  assumptions:
+    - >
+      Absolute timestamps are compressed into a 60-minute window while preserving the causal beats: bad rendered config, canary failure not
+      stopping rollout, progressive reduction in redundancy (latency/VPN issues), full inbound loss when announcements hit zero, then rollback
+      restoring announcements and reachability within the modeled window (while incident response continues).
+    - >
+      Failure-phase breakdown (minutes within scenario):
+      30-35: degraded coverage begins; probes mostly succeed (~800-900 logs/min).
+      35-42: VPN failures + latency alerts activate (~850-950 logs/min).
+      42-52: announcements at/near zero; probe timeouts dominate with retries (~1700-2000 logs/min).
+      52-56: rollback starts; partial restoration (~850-1000 logs/min); change-freeze status logs begin.
+      56-60: announcements restored; probes stabilize, alerts mostly stop (~500-650 logs/min).
+    - >
+      One-shots: event1 (4), event2 (1), event4 (3). These provide explicit, time-pinned operational markers for trigger, paging, rollback,
+      and change-freeze enablement.
+    - >
+      Visibility rationale: high-rate active probes plus BGP coverage summaries and alert logs make phase boundaries (degraded -> zero announcements
+      -> rollback start -> restored) obvious in a single log file; the canary-vs-rollout mismatch is diagnosable by temporal correlation of
+      netcfg_mgr.canary_failed followed by netcfg_mgr.rollout_continues and edge withdrawals; low-rate change-freeze status logs provide evidence
+      of the continuing freeze in the end-state without inflating customer-traffic symptoms.
+    - >
+      Total log estimate: normal phase ~16k logs; failure phase ~33k-37k logs (probe retries dominate during outage); plus background metrics
+      and alerts. Expected total ~49k-54k logs, within the 20k-100k target.
+```
