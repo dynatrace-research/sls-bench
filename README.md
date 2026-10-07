@@ -149,3 +149,14 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+## Citation
+
+```bibtex
+@inproceedings{iakovlev2026slsbench,
+  title     = {{SLS-Bench}: A Benchmark for Incident Log Summarization with Synthetic Observability Data},
+  author    = {Iakovlev, Valerii and Spanring, Markus and Flechl, Martin},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS), Track on Evaluations and Datasets},
+  year      = {2026}
+}
+```
