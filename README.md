@@ -2,7 +2,7 @@
 
 Generation and evaluation code for **SLS-Bench**, a benchmark for incident log summarization with synthetic observability data.
 
-Each benchmark problem is a CSV log file (~20k–100k lines) plus a reference incident summary. An agent reads the logs and writes its own summary; an LLM judge scores it against the reference. See the paper for details.
+Each benchmark problem is a CSV log file (~20k–100k lines) plus a reference incident summary. An agent reads the logs and writes its own summary; an LLM judge scores it against the reference. See our [paper](https://github.com/valerii-iakovlev/sls-bench) for details. The generated benchmark data can be found in our [data repo](https://huggingface.co/datasets/dynatrace-oss/SLS-Bench).
 
 ## Setup
 
